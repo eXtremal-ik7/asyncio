@@ -100,7 +100,7 @@ int main(int argc, char **argv)
   }  
   
   HostAddress address;
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
   srand(static_cast<unsigned>(time(nullptr)));
 
   URI uri;

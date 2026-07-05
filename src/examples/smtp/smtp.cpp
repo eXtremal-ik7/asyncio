@@ -206,7 +206,7 @@ int main(int argc, char **argv)
   }
 
 
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
   asyncBase *base = createAsyncBase(amOSDefault);
 
   HostAddress localHost;

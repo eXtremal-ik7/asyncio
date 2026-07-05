@@ -16,6 +16,10 @@ socketTy aioObjectSocket(aioObject *object);
 iodevTy aioObjectDevice(aioObject *object);
 aioObjectRoot *aioObjectHandle(aioObject *object);
 
+// Library-wide one-time initialization; must be called before any other API.
+// Replaces initializeSocketSubsystem().
+void initializeAsyncIo(AsyncInitFlags flags);
+
 asyncBase *createAsyncBase(AsyncMethod method);
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket);
 aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice);

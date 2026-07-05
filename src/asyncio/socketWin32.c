@@ -1,12 +1,5 @@
 #include "asyncio/socket.h"
 
-void initializeSocketSubsystem()
-{
-  WSADATA wsadata;
-  WSAStartup(MAKEWORD(2, 2), &wsadata);
-}
-
-
 socketTy socketCreate(int af, int type, int protocol, int isAsync)
 {
   SOCKET hSocket = WSASocket(af, type, protocol, NULL, 0, isAsync ? WSA_FLAG_OVERLAPPED : 0);

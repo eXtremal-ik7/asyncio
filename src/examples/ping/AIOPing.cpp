@@ -198,7 +198,7 @@ int main(int argc, char **argv)
   }
 
   gTarget = argv[optind];
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
   HostAddress localAddress;  
 
   hostent *host = gethostbyname(gTarget);

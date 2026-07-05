@@ -83,7 +83,7 @@ int main(int argc, char **argv)
   address.ipv4 = INADDR_ANY;
   address.port = static_cast<uint16_t>(atoi(argv[2]));
   
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
   socketTy hSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
   socketReuseAddr(hSocket);
   if (socketBind(hSocket, &address) != 0) {

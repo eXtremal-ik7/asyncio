@@ -496,7 +496,7 @@ int main(int argc, char **argv)
   __UNUSED(argc);
   __UNUSED(argv);
 
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
   uint16_t port = gPortBase;
   
   // Blocking tests

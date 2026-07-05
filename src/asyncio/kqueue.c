@@ -444,11 +444,21 @@ AsyncOpStatus kqueueAsyncRead(asyncOpRoot *opptr)
 AsyncOpStatus kqueueAsyncWrite(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((aioObject*)op->root.object);
+  aioObject *object = (aioObject*)op->root.object;
+  int fd = getFd(object);
 
-  ssize_t bytesWritten = write(fd,
-                               (uint8_t *)op->buffer + op->bytesTransferred,
-                               op->transactionSize - op->bytesTransferred);
+  // Sockets are covered by SO_NOSIGPIPE from newSocketIo, and on Darwin/NetBSD
+  // pipes are covered by F_SETNOSIGPIPE (needSigpipeGuard stays zero); the
+  // masked branch is only reachable for pipes on FreeBSD.
+  ssize_t bytesWritten;
+  if (object->needSigpipeGuard && !sigpipeIgnored) {
+    struct SigpipeGuard guard;
+    sigpipeGuardEnter(&guard);
+    bytesWritten = write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+    sigpipeGuardLeave(&guard, bytesWritten == -1 && errno == EPIPE);
+  } else {
+    bytesWritten = write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+  }
   if (bytesWritten > 0) {
     op->bytesTransferred += bytesWritten;
     if (op->root.flags & afWaitAll && op->bytesTransferred < op->transactionSize)

@@ -7,15 +7,6 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
-void initializeSocketSubsystem()
-{
-#ifdef OS_WINDOWS
-  WSADATA wsadata;
-  WSAStartup(MAKEWORD(2, 2), &wsadata);
-#endif
-}
-
-
 socketTy socketCreate(int af, int type, int protocol, int isAsync)
 {
 #ifdef OS_WINDOWS
@@ -29,6 +20,9 @@ socketTy socketCreate(int af, int type, int protocol, int isAsync)
   
   int optval = 1;
   setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&optval, sizeof(optval) );
+#ifdef SO_NOSIGPIPE
+  setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
+#endif
   return hSocket;
 #endif
 }
@@ -92,10 +86,10 @@ int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, siz
 
 int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitAll, size_t *bytesTransferred)
 {
-#ifdef OS_LINUX
+#ifdef MSG_NOSIGNAL
   int flags = MSG_NOSIGNAL;
 #else
-  int flags = 0;
+  int flags = 0;  // Darwin: SIGPIPE is suppressed per-descriptor via SO_NOSIGPIPE
 #endif
   if (!waitAll) {
     ssize_t result = send(hSocket, buffer, size, flags);

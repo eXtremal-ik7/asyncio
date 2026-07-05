@@ -5,9 +5,15 @@
 #include "asyncioImpl.h"
 #include "atomic.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef OS_WINDOWS
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#endif
 
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
@@ -152,6 +158,23 @@ aioObjectRoot *aioObjectHandle(aioObject *object)
   return &object->root;
 }
 
+void initializeAsyncIo(AsyncInitFlags flags)
+{
+#ifdef OS_WINDOWS
+  (void)flags;
+  WSADATA wsadata;
+  WSAStartup(MAKEWORD(2, 2), &wsadata);
+#else
+  if (flags & aiIgnoreSigpipe) {
+    struct sigaction ignoreAction;
+    memset(&ignoreAction, 0, sizeof(ignoreAction));
+    ignoreAction.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ignoreAction, 0);
+    sigpipeIgnored = 1;
+  }
+#endif
+}
+
 asyncBase *createAsyncBase(AsyncMethod method)
 {
   asyncBase *base = 0;
@@ -237,12 +260,39 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
 
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket)
 {
-  return base->methodImpl.newAioObject(base, ioObjectSocket, &hSocket);
+#ifdef SO_NOSIGPIPE
+  // Accepted sockets never pass through socketCreate, and Darwin/BSD have no
+  // MSG_NOSIGNAL, so SIGPIPE suppression must be a property of the descriptor
+  // itself, set at the point every socket enters the async machinery.
+  int optval = 1;
+  setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
+#endif
+  aioObject *object = base->methodImpl.newAioObject(base, ioObjectSocket, &hSocket);
+  object->needSigpipeGuard = 0;
+  return object;
 }
 
 aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice)
 {
-  return base->methodImpl.newAioObject(base, ioObjectDevice, &hDevice);
+  int needGuard = 0;
+#ifndef OS_WINDOWS
+  // write() has no MSG_NOSIGNAL equivalent, so descriptors that can raise
+  // SIGPIPE need protection: pipes, plus sockets handed here by mistake.
+  // Character devices (serial ports, ttys) cannot raise it and stay
+  // guard-free.
+  struct stat deviceStat;
+  if (fstat(hDevice, &deviceStat) == 0 &&
+      (S_ISFIFO(deviceStat.st_mode) || S_ISSOCK(deviceStat.st_mode)))
+    needGuard = 1;
+#ifdef F_SETNOSIGPIPE
+  // Per-fd suppression (Darwin/NetBSD) makes per-write masking unnecessary.
+  if (needGuard && fcntl(hDevice, F_SETNOSIGPIPE, 1) == 0)
+    needGuard = 0;
+#endif
+#endif
+  aioObject *object = base->methodImpl.newAioObject(base, ioObjectDevice, &hDevice);
+  object->needSigpipeGuard = needGuard;
+  return object;
 }
 
 void deleteAioObject(aioObject *object)
@@ -359,9 +409,21 @@ asyncOpRoot *implWrite(aioObject *object,
   AsyncFlags extraFlags = afRunning;
 #endif
   size_t bytes = 0;
-  int result = object->root.type == ioObjectSocket ?
-    socketSyncWrite(object->hSocket, buffer, size, flags & afWaitAll, &bytes) :
-    deviceSyncWrite(object->hDevice, buffer, size, flags & afWaitAll, &bytes);
+  int result;
+  if (object->root.type == ioObjectSocket) {
+    result = socketSyncWrite(object->hSocket, buffer, size, flags & afWaitAll, &bytes);
+  }
+#ifndef OS_WINDOWS
+  else if (object->needSigpipeGuard && !sigpipeIgnored) {
+    struct SigpipeGuard guard;
+    sigpipeGuardEnter(&guard);
+    result = deviceSyncWrite(object->hDevice, buffer, size, flags & afWaitAll, &bytes);
+    sigpipeGuardLeave(&guard, !result && errno == EPIPE);
+  }
+#endif
+  else {
+    result = deviceSyncWrite(object->hDevice, buffer, size, flags & afWaitAll, &bytes);
+  }
   if (result) {
     *bytesTransferred = bytes;
     return 0;

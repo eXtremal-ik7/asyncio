@@ -1,11 +1,51 @@
 #include "asyncio/device.h"
+#include "asyncioImpl.h"
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+int sigpipeIgnored = 0;
+
+void sigpipeGuardEnter(struct SigpipeGuard *guard)
+{
+  sigset_t pipeMask;
+  sigset_t pendingSet;
+  sigemptyset(&pipeMask);
+  sigaddset(&pipeMask, SIGPIPE);
+  pthread_sigmask(SIG_BLOCK, &pipeMask, &guard->savedMask);
+  // Snapshot after blocking: from here on only our own write can add a
+  // pending SIGPIPE to this thread.
+  sigpending(&pendingSet);
+  guard->wasPending = sigismember(&pendingSet, SIGPIPE);
+}
+
+void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe)
+{
+  int savedErrno = errno;
+  if (consumeSigpipe && !guard->wasPending) {
+#ifndef F_SETNOSIGPIPE
+    // Only reachable on platforms without per-fd suppression (Linux,
+    // FreeBSD): needSigpipeGuard is always zero elsewhere, and Darwin has
+    // no sigtimedwait to compile.
+    sigset_t pipeMask;
+    struct timespec zeroTimeout = {0, 0};
+    sigemptyset(&pipeMask);
+    sigaddset(&pipeMask, SIGPIPE);
+    while (sigtimedwait(&pipeMask, 0, &zeroTimeout) == -1 && errno == EINTR)
+      continue;
+#endif
+  }
+  pthread_sigmask(SIG_SETMASK, &guard->savedMask, 0);
+  errno = savedErrno;
+}
 
 
 iodevTy serialPortOpen(const char *name)

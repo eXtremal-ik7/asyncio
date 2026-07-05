@@ -6,7 +6,12 @@
 #include "asyncioextras/rlpx.h"
 #include "atomic.h"
 #include <chrono>
+#include <cerrno>
+#include <cstdlib>
 #include <thread>
+#ifdef OS_COMMONUNIX
+#include <unistd.h>
+#endif
 
 asyncBase *gBase = nullptr;
 
@@ -251,6 +256,106 @@ TEST(basic, test_tcp_rw)
   deleteAioObject(context.serverSocket);
   ASSERT_TRUE(context.success);
 }
+
+#ifdef OS_COMMONUNIX
+// B8 regression test: aioWrite() to a connection dropped by the peer must
+// report an error through the operation status, never kill the process with
+// SIGPIPE. The protection is per-fd: MSG_NOSIGNAL on send paths where the
+// flag exists (Linux/BSD), SO_NOSIGPIPE as a descriptor property on
+// Darwin/BSD (set in socketCreate and in newSocketIo - the latter also
+// covers accept()ed sockets, which never pass through socketCreate).
+// The death-test child must reach exit(0).
+//
+// Determinism:
+// - the peer closes with SO_LINGER{1,0}, so the client gets RST, not FIN;
+// - the client socket is blocking: recv() returns ECONNRESET exactly when the
+//   client TCP has processed that RST (the kernel marks the socket
+//   send-closed before waking the reader), after which an unprotected send()
+//   is guaranteed to raise SIGPIPE - no sleeps or timing assumptions;
+// - two writes in a row: on stacks where the first send() after a reset
+//   reports ECONNRESET without raising the signal, the second one hits
+//   EPIPE + SIGPIPE;
+// - the asyncBase is created inside the death-test child: kqueue descriptors
+//   do not survive fork(), the shared gBase must not be touched here.
+static void writeTwiceAfterPeerReset()
+{
+  alarm(30);  // if anything blocks, fail the death test instead of hanging it
+
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;  // ephemeral port: immune to gPort clashes and TIME_WAIT
+  ASSERT_EQ(bind(listenSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  ASSERT_EQ(listen(listenSocket, 1), 0);
+  socklen_t addressLength = sizeof(address);
+  ASSERT_EQ(getsockname(listenSocket, reinterpret_cast<sockaddr*>(&address), &addressLength), 0);
+
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  ASSERT_EQ(connect(clientSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  socketTy peerSocket = accept(listenSocket, nullptr, nullptr);
+  ASSERT_GE(peerSocket, 0);
+
+  linger abortiveClose;
+  abortiveClose.l_onoff = 1;
+  abortiveClose.l_linger = 0;
+  ASSERT_EQ(setsockopt(peerSocket, SOL_SOCKET, SO_LINGER, &abortiveClose, sizeof(abortiveClose)), 0);
+  socketClose(peerSocket);
+
+  char c;
+  ASSERT_EQ(recv(clientSocket, &c, 1, 0), -1);
+  ASSERT_EQ(errno, ECONNRESET);
+
+  aioObject *object = newSocketIo(createAsyncBase(amOSDefault), clientSocket);
+  const char payload[] = "ping";
+  aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+  aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+  exit(0);
+}
+
+TEST(SocketDeathTest, write_after_peer_reset)
+{
+  EXPECT_EXIT(writeTwiceAfterPeerReset(), ::testing::ExitedWithCode(0), "");
+}
+
+// Same contract for the device path: writing to a pipe whose reader is gone
+// must not kill the process. write() has no MSG_NOSIGNAL equivalent, so the
+// shield depends on the platform and init flags, and each variant below pins
+// one of them:
+// - aiNone on Darwin/NetBSD: F_SETNOSIGPIPE set by newDeviceIo (per-fd);
+// - aiNone on Linux/FreeBSD: SIGPIPE masked around the write itself
+//   (sigpipeGuard, libpq pattern) - there is no per-fd opt-out there;
+// - aiIgnoreSigpipe anywhere: process-wide SIG_IGN, masking is skipped.
+// Fully deterministic: the kernel tracks pipe readers synchronously, so the
+// first write() after the last reader closed raises SIGPIPE, no timing
+// involved.
+static void writeTwiceAfterPipeReaderClosed(AsyncInitFlags initFlags)
+{
+  alarm(30);  // if anything blocks, fail the death test instead of hanging it
+  initializeAsyncIo(initFlags);
+
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+  close(unnamedPipe.read);
+
+  aioObject *object = newDeviceIo(createAsyncBase(amOSDefault), unnamedPipe.write);
+  const char payload[] = "ping";
+  aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+  aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+  exit(0);
+}
+
+TEST(PipeDeathTest, write_after_reader_closed)
+{
+  EXPECT_EXIT(writeTwiceAfterPipeReaderClosed(aiNone), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(PipeDeathTest, ignore_sigpipe_flag)
+{
+  EXPECT_EXIT(writeTwiceAfterPipeReaderClosed(aiIgnoreSigpipe), ::testing::ExitedWithCode(0), "");
+}
+#endif
 
 void test_udp_rw_client_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
@@ -626,7 +731,7 @@ int main(int argc, char **argv)
     }
   }
 
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
 
   gBase = createAsyncBase(method);
 

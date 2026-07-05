@@ -25,6 +25,20 @@ typedef enum AsyncMethod {
 } AsyncMethod;
 
 
+typedef enum AsyncInitFlags {
+  aiNone = 0,
+  // Set the SIGPIPE disposition to ignored, process-wide (POSIX; no-op on
+  // Windows). Opt-in because signal disposition is global policy owned by
+  // the application: writes to a dead stdout pipeline stop killing the
+  // process, and the ignored disposition is inherited by exec()ed children.
+  // Without the flag the library still protects its own descriptors: sockets
+  // per-fd (MSG_NOSIGNAL / SO_NOSIGPIPE), pipes via F_SETNOSIGPIPE where the
+  // OS has it, elsewhere by masking SIGPIPE around pipe writes; the flag
+  // additionally removes that per-write masking cost.
+  aiIgnoreSigpipe = 1
+} AsyncInitFlags;
+
+
 typedef enum IoObjectTy {
   ioObjectSocket,
   ioObjectDevice,

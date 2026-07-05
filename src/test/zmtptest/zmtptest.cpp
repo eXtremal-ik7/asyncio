@@ -607,7 +607,7 @@ void runBenchmark(SenderTy senderType, ReceiverTy receiverType, uint16_t port)
 
 int main(int, char **)
 {
-  initializeSocketSubsystem();
+  initializeAsyncIo(aiNone);
   uint16_t port = gPort;
 
   // Original

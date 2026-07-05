@@ -486,9 +486,17 @@ AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr)
   EPollObject *object = (EPollObject*)op->root.object;
   int fd = getFd(object);
 
-  ssize_t bytesWritten = object->Object.root.type == ioObjectSocket ?
-    send(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred, MSG_NOSIGNAL) :
-    write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+  ssize_t bytesWritten;
+  if (object->Object.root.type == ioObjectSocket) {
+    bytesWritten = send(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred, MSG_NOSIGNAL);
+  } else if (object->Object.needSigpipeGuard && !sigpipeIgnored) {
+    struct SigpipeGuard guard;
+    sigpipeGuardEnter(&guard);
+    bytesWritten = write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+    sigpipeGuardLeave(&guard, bytesWritten == -1 && errno == EPIPE);
+  } else {
+    bytesWritten = write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+  }
   if (bytesWritten > 0) {
     op->bytesTransferred += (size_t)bytesWritten;
     if (op->root.flags & afWaitAll && op->bytesTransferred < op->transactionSize)
