@@ -8,6 +8,8 @@
 #if defined(OS_WINDOWS)
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
+// sockaddr_in6 and socklen_t come from ws2ipdef.h/ws2tcpip.h, not winsock2.h
+#include <ws2tcpip.h>
 #include <mswsock.h>
 #include <windows.h>
 typedef HANDLE iodevTy;

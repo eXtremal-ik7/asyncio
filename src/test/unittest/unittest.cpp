@@ -5,6 +5,7 @@
 #include "p2putils/HttpRequestParse.h"
 #include "asyncioextras/rlpx.h"
 #include "atomic.h"
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
