@@ -17,7 +17,6 @@ static ConcurrentQueue eventPool;
 asyncBase *iocpNewAsyncBase();
 #endif
 #ifdef OS_LINUX
-asyncBase *selectNewAsyncBase(void);
 asyncBase *epollNewAsyncBase(void);
 #endif
 #if defined(OS_DARWIN) || defined (OS_FREEBSD)
@@ -162,9 +161,6 @@ asyncBase *createAsyncBase(AsyncMethod method)
       base = iocpNewAsyncBase();
       break;
 #elif defined(OS_LINUX)
-    case amSelect :
-      base = selectNewAsyncBase();
-      break;
     case amEPoll :
       base = epollNewAsyncBase();
       break;
@@ -182,7 +178,7 @@ asyncBase *createAsyncBase(AsyncMethod method)
 #elif defined(OS_DARWIN) || defined(OS_FREEBSD)
       base = kqueueNewAsyncBase();
 #else
-      base = selectNewAsyncBase();
+#error "Unsupported OS: no I/O multiplexor backend available"
 #endif
       break;
   }

@@ -19,8 +19,6 @@ extern "C" {
 
 typedef enum AsyncMethod {
   amOSDefault = 0,
-  amSelect,
-  amPoll,
   amEPoll,
   amKQueue,
   amIOCP,

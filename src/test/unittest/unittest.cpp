@@ -615,8 +615,6 @@ int main(int argc, char **argv)
   if (argc >= 2) {
     if (strcmp(argv[1], "default") == 0) {
       method = amOSDefault;
-    } else if (strcmp(argv[1], "select") == 0) {
-      method = amSelect;
     } else if (strcmp(argv[1], "epoll") == 0) {
       method = amEPoll;
     } else if (strcmp(argv[1], "kqueue") == 0) {
