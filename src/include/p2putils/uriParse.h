@@ -34,6 +34,7 @@ struct URIComponent {
     } raw;
     int32_t i32;
     uint32_t u32;
+    uint16_t ipv6[8];   // groups in written order, host byte order
   };
   struct {
     const char *data;
@@ -48,6 +49,10 @@ ParserResultTy uriParseQuery(const char **ptr, const char *end, bool uriOnly, ur
 ParserResultTy uriParseFragment(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
 
 int uriParse(const char *uri, uriParseCb callback, void *arg);
+
+// host[:port] without scheme/userinfo/path; the whole string must match.
+// uriCtPort is emitted only when the port is present
+int uriParseHostPort(const char *hostport, uriParseCb callback, void *arg);
 
 // High-level interface
 
@@ -83,5 +88,8 @@ protected:
 };
 
 int uriParse(const char *uri, URI *data);
+
+// Absent port → defaultPort; an explicit port (including ":0") wins
+int uriParseHostPort(const char *hostport, URI *data, uint16_t defaultPort);
 
 #endif //__LIBP2P_URIPARSE_H_

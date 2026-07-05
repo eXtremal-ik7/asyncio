@@ -83,27 +83,27 @@ int main(int argc, char **argv)
 
   // Build HostAddress for server
   {
-    char *colonPos = (char*)strchr(context.server, ':');
-    if (colonPos == nullptr) {
+    URI uri;
+    if (!uriParseHostPort(context.server, &uri, 0) || uri.port == 0) {
       fprintf(stderr, "Invalid server %s\nIt must have address:port format\n", context.server);
       return 1;
     }
 
-    *colonPos = 0;
-    hostent *host = gethostbyname(context.server);
-    if (!host) {
-      fprintf(stderr, " * cannot retrieve address of %s (gethostbyname failed)\n", context.server);
-    }
-
-    u_long addr = host->h_addr ? *reinterpret_cast<u_long*>(host->h_addr) : 0;
-    if (!addr) {
-      fprintf(stderr, " * cannot retrieve address of %s (gethostbyname returns 0)\n", context.server);
+    context.SmtpServerAddress.family = AF_INET;
+    context.SmtpServerAddress.port = static_cast<uint16_t>(uri.port);
+    if (uri.hostType == URI::HostTypeIPv4) {
+      context.SmtpServerAddress.ipv4 = uri.ipv4;
+    } else if (uri.hostType == URI::HostTypeDNS) {
+      hostent *host = gethostbyname(uri.domain.c_str());
+      if (!host || !host->h_addr) {
+        fprintf(stderr, " * cannot retrieve address of %s (gethostbyname failed)\n", uri.domain.c_str());
+        return 1;
+      }
+      memcpy(&context.SmtpServerAddress.ipv4, host->h_addr, sizeof(context.SmtpServerAddress.ipv4));
+    } else {
+      fprintf(stderr, "IPv6 address is not supported by this example\n");
       return 1;
     }
-
-    context.SmtpServerAddress.family = AF_INET;
-    context.SmtpServerAddress.ipv4 = static_cast<uint32_t>(addr);
-    context.SmtpServerAddress.port = htons(atoi(colonPos + 1));
   }
 
   // Analyze type

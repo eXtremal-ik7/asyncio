@@ -1,6 +1,6 @@
 set(TelnetClientSources TelnetClient.cpp)
 add_executable(TelnetClient ${TelnetClientSources})
-target_link_libraries(TelnetClient asyncio-0.5)
+target_link_libraries(TelnetClient asyncio-0.5 p2putils)
 if (WIN32)
   target_link_libraries(TelnetClient ws2_32 mswsock)
 endif()

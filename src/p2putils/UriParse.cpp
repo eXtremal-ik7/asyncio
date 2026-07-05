@@ -1,5 +1,4 @@
 #include "asyncioconfig.h"
-#include "macro.h"
 #include "p2putils/uriParse.h"
 #include "p2putils/strExtras.h"
 #include <string.h>
@@ -95,47 +94,186 @@ int uriParseScheme(const char **ptr, uriParseCb callback, void *arg)
   return 0;
 }
 
+static char decodeHex(char s);
+
+// RFC 3986 IPv6address (IPvFuture not supported); *ptr points just past '[',
+// on success it is moved past ']'
 int uriParseIpLiteral(const char **ptr, uriParseCb callback, void *arg)
 {
-  __UNUSED(ptr); __UNUSED(callback); __UNUSED(arg);
-  return 0;
+  const char *p = *ptr;
+  uint16_t groups[8];
+  uint16_t tail[8];
+  int headCount = 0;
+  int tailCount = 0;
+  int compression = 0;
+
+  memset(groups, 0, sizeof(groups));
+  memset(tail, 0, sizeof(tail));
+
+  if (*p == ':') {
+    if (p[1] != ':')
+      return 0;
+    p += 2;
+    compression = 1;
+  }
+
+  while (*p != ']') {
+    if (headCount + tailCount == 8)
+      return 0;
+
+    const char *groupStart = p;
+    uint32_t value = 0;
+    while (isHexDigit(*p)) {
+      value = (value << 4) | static_cast<uint32_t>(decodeHex(*p));
+      p++;
+      if (p - groupStart > 4)
+        return 0;
+    }
+    if (p == groupStart)
+      return 0;
+
+    if (*p == '.') {
+      // embedded IPv4 (ls32): reparse the group as a dotted quad closing the literal
+      uint32_t octets[4];
+      p = groupStart;
+      for (int i = 0; i < 4; i++) {
+        if (i != 0) {
+          if (*p != '.')
+            return 0;
+          p++;
+        }
+        const char *octetStart = p;
+        uint32_t octet = 0;
+        while (isDigit(*p)) {
+          octet = octet*10u + static_cast<uint32_t>(*p - '0');
+          p++;
+          if (p - octetStart > 3)
+            return 0;
+        }
+        if (p == octetStart || octet > 255)
+          return 0;
+        octets[i] = octet;
+      }
+      if (*p != ']' || headCount + tailCount > 6)
+        return 0;
+      uint16_t high = static_cast<uint16_t>((octets[0] << 8) | octets[1]);
+      uint16_t low = static_cast<uint16_t>((octets[2] << 8) | octets[3]);
+      if (compression) {
+        tail[tailCount++] = high;
+        tail[tailCount++] = low;
+      } else {
+        groups[headCount++] = high;
+        groups[headCount++] = low;
+      }
+      break;
+    }
+
+    if (compression)
+      tail[tailCount++] = static_cast<uint16_t>(value);
+    else
+      groups[headCount++] = static_cast<uint16_t>(value);
+
+    if (*p == ':') {
+      if (p[1] == ':') {
+        if (compression)
+          return 0;
+        compression = 1;
+        p += 2;
+      } else {
+        p++;
+        if (!isHexDigit(*p))
+          return 0;
+      }
+    } else if (*p != ']') {
+      return 0;
+    }
+  }
+
+  // '::' must stand for at least one zero group
+  if (compression ? (headCount + tailCount > 7) : (headCount != 8))
+    return 0;
+
+  for (int i = 0; i < tailCount; i++)
+    groups[8 - tailCount + i] = tail[i];
+
+  URIComponent component;
+  component.type = uriCtHostIPv6;
+  memcpy(component.ipv6, groups, sizeof(component.ipv6));
+  callback(&component, arg);
+
+  *ptr = p + 1;
+  return 1;
 }
 
-int uriParseIpv4(const char **ptr, uriParseCb callback, void *arg)
+// Strict dotted-quad over exactly [p, end): decimal octets 0-255, no leading
+// zeros (RFC 3986 dec-octet; "192.168.000.001" is a reg-name, as in inet_pton)
+static int spanIsIpv4(const char *p, const char *end, uint32_t *out)
 {
-  const char *p = *ptr;
-  uint32_t u32 = 0;
   uint32_t ipv4 = 0;
-  int segments = 0;
-  for (;;) {
-    if (isDigit(*p)) {
-      u32 = u32*10 + static_cast<uint32_t>(*p - '0');
-      p++;
-    } else if (*p == '.' && segments < 3) {
-      ipv4 |= (u32 << (8*segments));
-      u32 = 0;
-      segments++;
-      p++;
-    } else {
-      if (segments != 3)
+  for (int i = 0; i < 4; i++) {
+    if (i != 0) {
+      if (p == end || *p != '.')
         return 0;
-      ipv4 |= (u32 << (8*segments));
-      URIComponent component;
-      component.type = uriCtHostIPv4;
-      component.u32 = ipv4;
-      callback(&component, arg);
+      p++;
+    }
+    const char *octetStart = p;
+    uint32_t octet = 0;
+    while (p != end && isDigit(*p)) {
+      octet = octet*10u + static_cast<uint32_t>(*p - '0');
+      p++;
+      if (p - octetStart > 3)
+        return 0;
+    }
+    if (p == octetStart || octet > 255)
+      return 0;
+    if (p - octetStart > 1 && *octetStart == '0')
+      return 0;
+    ipv4 |= octet << (8*i);
+  }
+  if (p != end)
+    return 0;
+  *out = ipv4;
+  return 1;
+}
+
+// host = full-span IPv4address or reg-name (RFC 3986: IPv4 wins only when the
+// whole span matches); empty span emits nothing; returns consumed length
+static size_t uriParseRegnameHost(const char **ptr, uriParseCb callback, void *arg)
+{
+  const char *b = *ptr, *p = *ptr;
+  for (;;) {
+    if (isUnreserved(*p) || isSubDelims(*p)) {
+      p++;
+    } else if (isPctEncoded(&p)) {
+      continue;
+    } else {
       break;
     }
   }
-  
+
+  if (p != b) {
+    URIComponent component;
+    uint32_t ipv4;
+    if (spanIsIpv4(b, p, &ipv4)) {
+      component.type = uriCtHostIPv4;
+      component.u32 = ipv4;
+    } else {
+      component.type = uriCtHostDNS;
+      component.raw.data = b;
+      component.raw.size = static_cast<size_t>(p-b);
+    }
+    callback(&component, arg);
+  }
+
   *ptr = p;
-  return 1;
+  return static_cast<size_t>(p-b);
 }
 
 
 ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg)
 {
   URIComponent component;
+  const char *begin = *ptr;
   const char *p = *ptr;
   const char *lastElement = p;
   while (p != end) {
@@ -171,8 +309,8 @@ ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uri
 
     // send entire path
     component.type = uriCtPath;
-    component.raw.data = *ptr;
-    component.raw.size = static_cast<size_t>(p-*ptr);
+    component.raw.data = begin;
+    component.raw.size = static_cast<size_t>(p-begin);
     if (!callback(&component, arg))
       return ParserResultCancelled;
   }
@@ -182,143 +320,56 @@ ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uri
 
 int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
 {
-  enum {
-    StBegin = 0,
-    StUserinfoOrRegname,
-    StWaitHost,
-    StWaitRegname,
-    StWaitPort
-  };
-  
-  int state;
-  const char *b = *ptr, *p = *ptr;
+  const char *p = *ptr;
+
+  // userinfo: lookahead over its charset (reg-name + ':'), present only if it ends at '@'
+  const char *scan = p;
+  for (;;) {
+    if (isUnreserved(*scan) || isSubDelims(*scan) || *scan == ':') {
+      scan++;
+    } else if (isPctEncoded(&scan)) {
+      continue;
+    } else {
+      break;
+    }
+  }
+  if (*scan == '@') {
+    URIComponent component;
+    component.type = uriCtUserInfo;
+    component.raw.data = p;
+    component.raw.size = static_cast<size_t>(scan-p);
+    callback(&component, arg);
+    p = scan + 1;
+  }
 
   if (*p == '[') {
     p++;
     if (!uriParseIpLiteral(&p, callback, arg))
       return 0;
-    state = StWaitPort;
-  } else if (isDigit(*p)) {
-    if (!uriParseIpv4(&p, callback, arg))
-      return 0;
-    state = StWaitPort;
-  } else if (isUnreserved(*p) || isSubDelims(*p)) {
-    state = StUserinfoOrRegname;
-    p++;
-  } else if (isPctEncoded(&p)) {
-    state = StUserinfoOrRegname;
   } else {
-    state = StWaitPort;
+    uriParseRegnameHost(&p, callback, arg);
   }
-    
-  if (state == StUserinfoOrRegname) {
-    state = StWaitPort;
-    const char *firstColon = nullptr;
-    for (;;) {
-      if (isUnreserved(*p) || isSubDelims(*p)) {
-        p++;
-      } else if (isPctEncoded(&p)) {
-        continue;
-      } else if (*p == ':') {
-        if (!firstColon)
-          firstColon = p;        
-        p++;
-      } else if (*p == '@') {
-        p++;
-        state = StWaitHost;
-        break;
-      } else {
-        break;
-      }
-    }
-    
-    if (state == StWaitPort) {
-      // host found
-      if (firstColon)
-        p = firstColon;
-      
-      URIComponent component;
-      component.type = uriCtHostDNS;
-      component.raw.data = b;
-      component.raw.size = static_cast<size_t>(p-b);
-      callback(&component, arg);
-    } else if (state == StWaitHost) {
-      // user info found
-      URIComponent component;
-      component.type = uriCtUserInfo;
-      component.raw.data = b;
-      component.raw.size = static_cast<size_t>(p-b-1);
-      callback(&component, arg);      
-    }
-  }
-  
-  b = p;
-  if (state == StWaitHost) {
-    if (*p == '[') {
-      p++;
-      if (!uriParseIpLiteral(&p, callback, arg))
-        return 0;
-      state = StWaitPort;
-    } else if (isDigit(*p)) {
-      if (!uriParseIpv4(&p, callback, arg))
-        return 0;
-      state = StWaitPort;
-    } else if (isUnreserved(*p) || isSubDelims(*p)) {
-      state = StWaitRegname;
-      p++;
-    } else if (isPctEncoded(&p)) {
-      state = StWaitRegname;
-    } else {
-      state = StWaitPort;
-    }
-    
-    if (state == StWaitRegname) {
-      for (;;) {
-        if (isUnreserved(*p) || isSubDelims(*p)) {
-          p++;
-        } else if (isPctEncoded(&p)) {
-          continue;
-        } else {
-          // host found
-          URIComponent component;
-          component.type = uriCtHostDNS;
-          component.raw.data = b;
-          component.raw.size = static_cast<size_t>(p-b);
-          callback(&component, arg);
-        }
-      }
-    }
-    
-    state = StWaitPort;    
-  }
-  
-  if (state == StWaitPort && *p == ':') {
+
+  if (*p == ':') {
     p++;
     int32_t i32 = 0;
-    for (;;) {
-      if (isDigit(*p)) {
-        i32 = i32*10 + (*p - '0');
-      } else {
-        break;
-      }
-        
+    while (isDigit(*p)) {
+      i32 = i32*10 + (*p - '0');
       p++;
     }
-    
     URIComponent component;
     component.type = uriCtPort;
     component.i32 = i32;
-    callback(&component, arg);      
+    callback(&component, arg);
   }
-  
+
   if (*p == '/') {
     if (uriParsePath(&p, p+strlen(p), true, callback, arg) != ParserResultOk)
       return 0;
   }
-  
+
   *ptr = p;
   return 1;
-
 }
 
 
@@ -348,6 +399,7 @@ int uriParseHierPart(const char **ptr, uriParseCb callback, void *arg)
 ParserResultTy uriParseQuery(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg)
 {
   URIComponent component;
+  const char *begin = *ptr;
   const char *p = *ptr;
   const char *lastName = p;
   const char *lastValue = nullptr;
@@ -397,8 +449,8 @@ ParserResultTy uriParseQuery(const char **ptr, const char *end, bool uriOnly, ur
     }
 
     component.type = uriCtQuery;
-    component.raw.data = *ptr;
-    component.raw.size = static_cast<size_t>(p-*ptr);
+    component.raw.data = begin;
+    component.raw.size = static_cast<size_t>(p-begin);
     if (!callback(&component, arg))
       return ParserResultCancelled;
     *ptr = p;
@@ -449,17 +501,52 @@ int uriParse(const char *uri, uriParseCb callback, void *arg)
   
   if (*ptr == '?') {
     ptr++;
-    if (!uriParseQuery(&ptr, ptr + strlen(ptr), true, callback, arg))
+    if (uriParseQuery(&ptr, ptr + strlen(ptr), true, callback, arg) != ParserResultOk)
       return 0;
   }
   
   if (*ptr == '#') {
     ptr++;
-    if (!uriParseFragment(&ptr, ptr + strlen(ptr), true, callback, arg))
+    if (uriParseFragment(&ptr, ptr + strlen(ptr), true, callback, arg) != ParserResultOk)
       return 0;
   }
   
   return 1;
+}
+
+// host[:port] only (no scheme/userinfo/path), the whole string must match;
+// uriCtPort is emitted only when the port is present
+int uriParseHostPort(const char *hostport, uriParseCb callback, void *arg)
+{
+  const char *p = hostport;
+
+  if (*p == '[') {
+    p++;
+    if (!uriParseIpLiteral(&p, callback, arg))
+      return 0;
+  } else {
+    if (uriParseRegnameHost(&p, callback, arg) == 0)
+      return 0;
+  }
+
+  if (*p == ':') {
+    p++;
+    if (!isDigit(*p))
+      return 0;
+    uint32_t port = 0;
+    while (isDigit(*p)) {
+      port = port*10u + static_cast<uint32_t>(*p - '0');
+      p++;
+      if (port > 65535)
+        return 0;
+    }
+    URIComponent component;
+    component.type = uriCtPort;
+    component.i32 = static_cast<int32_t>(port);
+    callback(&component, arg);
+  }
+
+  return *p == 0;
 }
 
 static char decodeHex(char s)
@@ -528,6 +615,10 @@ static int stdCb(URIComponent *component, void *arg)
       data->hostType = URI::HostTypeIPv4;
       data->ipv4 = component->u32;
       break;
+    case uriCtHostIPv6 :
+      data->hostType = URI::HostTypeIPv6;
+      memcpy(data->ipv6, component->ipv6, sizeof(data->ipv6));
+      break;
     case uriCtHostDNS :
       data->hostType = URI::HostTypeDNS;
       uriPctDecode(component->raw.data, component->raw.size, data->domain);
@@ -560,6 +651,20 @@ int uriParse(const char *uri, URI *data)
   data->fragment.clear();
   
   return uriParse(uri, stdCb, data);
+}
+
+
+int uriParseHostPort(const char *hostport, URI *data, uint16_t defaultPort)
+{
+  data->schema.clear();
+  data->userInfo.clear();
+  data->hostType = URI::HostTypeNone;
+  data->port = defaultPort;
+  data->path.clear();
+  data->query.clear();
+  data->fragment.clear();
+
+  return uriParseHostPort(hostport, stdCb, data);
 }
 
 

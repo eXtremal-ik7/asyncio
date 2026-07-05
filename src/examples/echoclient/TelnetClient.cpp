@@ -1,9 +1,14 @@
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
+#include "p2putils/uriParse.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if !defined(OS_WINDOWS)
+#include <netdb.h>
+#endif
 
 
 const size_t clientBufferSize = 1024;
@@ -75,8 +80,8 @@ void connectCb(AsyncOpStatus status, aioObject *object, void *arg)
 
 int main(int argc, char **argv)
 {
-  if (argc != 4) {
-    fprintf(stderr, "usage: %s <method> <ip> <port>\n", argv[0]);
+  if (argc != 3) {
+    fprintf(stderr, "usage: %s <method> <host:port>\n", argv[0]);
     return 1;
   }
   
@@ -98,6 +103,27 @@ int main(int argc, char **argv)
   initializeSocketSubsystem();
   srand(static_cast<unsigned>(time(nullptr)));
 
+  URI uri;
+  if (!uriParseHostPort(argv[2], &uri, 0) || uri.port == 0) {
+    fprintf(stderr, "Invalid address %s\nIt must have host:port format\n", argv[2]);
+    return 1;
+  }
+
+  uint32_t remoteIPv4 = 0;
+  if (uri.hostType == URI::HostTypeIPv4) {
+    remoteIPv4 = uri.ipv4;
+  } else if (uri.hostType == URI::HostTypeDNS) {
+    hostent *host = gethostbyname(uri.domain.c_str());
+    if (!host || !host->h_addr) {
+      fprintf(stderr, " * cannot retrieve address of %s (gethostbyname failed)\n", uri.domain.c_str());
+      return 1;
+    }
+    memcpy(&remoteIPv4, host->h_addr, sizeof(remoteIPv4));
+  } else {
+    fprintf(stderr, "IPv6 address is not supported by this example\n");
+    return 1;
+  }
+
   asyncBase *base = createAsyncBase(method);
   
   address.family = AF_INET;
@@ -113,8 +139,8 @@ int main(int argc, char **argv)
   aioUserEvent *stdInputOp = newUserEvent(base, 0, pingTimerCb, &data);
 
   address.family = AF_INET;
-  address.ipv4 = inet_addr(argv[2]);
-  address.port = htons(static_cast<uint16_t>(atoi(argv[3])));
+  address.ipv4 = remoteIPv4;
+  address.port = static_cast<uint16_t>(uri.port);
   data.base = base;
   data.socket = socketOp;
   data.isConnected = false;    

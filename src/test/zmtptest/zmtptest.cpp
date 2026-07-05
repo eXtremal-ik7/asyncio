@@ -206,7 +206,7 @@ void senderAsync(SenderContext *ctx)
 
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(ctx->cfg->port);
+  address.port = ctx->cfg->port;
   zmtpSocket *zmtpSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, senderSocket), zmtpSocketPUSH);
   aioZmtpConnect(zmtpSocket, &address, afNone, 1000000, senderAsyncConnectCb, ctx);
   asyncLoop(ctx->base);
@@ -219,7 +219,7 @@ void senderCoroutineProc(void *arg)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(ctx->cfg->port);
+  address.port = ctx->cfg->port;
   int connectResult = ioZmtpConnect(ctx->socket, &address, afNone, 1000000);
   if (connectResult == 0) {
     auto data = std::unique_ptr<uint8_t[]>(new uint8_t[ctx->cfg->packetSize]);
@@ -285,7 +285,7 @@ void senderRawProc(void *arg)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(ctx->cfg->port);
+  address.port = ctx->cfg->port;
   int connectResult = ioZmtpConnect(ctx->socket, &address, afNone, 1000000);
   if (connectResult == 0) {
     auto data = std::unique_ptr<uint8_t[]>(new uint8_t[ctx->cfg->packetSize]);
@@ -476,7 +476,7 @@ static void receiverAsync(ReceiverContext *ctx)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
-  address.port = htons(ctx->cfg->port);
+  address.port = ctx->cfg->port;
   socketTy listener = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
   if (socketBind(listener, &address) != 0) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -535,7 +535,7 @@ static void receiverCoroutine(ReceiverContext *ctx)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
-  address.port = htons(ctx->cfg->port);
+  address.port = ctx->cfg->port;
   socketTy listener = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
   if (socketBind(listener, &address) != 0) {
     std::this_thread::sleep_for(std::chrono::seconds(1));

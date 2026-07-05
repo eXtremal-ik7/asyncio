@@ -5,7 +5,7 @@ if(MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_SILENCE_TR1_NAMESPACE_DEPRECATION_WARNING")
 endif(MSVC)
 
-set(SOURCES unittest.cpp)
+set(SOURCES unittest.cpp uriparsetest.cpp)
 set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2putils ${GTEST_LIBRARIES})
 include_directories(${GTEST_INCLUDE_DIRS})
 

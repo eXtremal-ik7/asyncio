@@ -479,7 +479,7 @@ ssize_t aioReadMsg(aioObject *object,
     HostAddress host;
     host.family = 0;
     host.ipv4 = source.sin_addr.s_addr;
-    host.port = source.sin_port;
+    host.port = ntohs(source.sin_port);
     currentFinishedSync++;
     if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
       return result;
@@ -513,7 +513,7 @@ ssize_t aioWriteMsg(aioObject *object,
   struct sockaddr_in remoteAddress;
   remoteAddress.sin_family = address->family;
   remoteAddress.sin_addr.s_addr = address->ipv4;
-  remoteAddress.sin_port = address->port;
+  remoteAddress.sin_port = htons(address->port);
 #ifdef OS_WINDOWS
   ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, sizeof(remoteAddress));
 #else
@@ -632,7 +632,7 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
   struct sockaddr_in remoteAddress;
   remoteAddress.sin_family = address->family;
   remoteAddress.sin_addr.s_addr = address->ipv4;
-  remoteAddress.sin_port = address->port;
+  remoteAddress.sin_port = htons(address->port);
 #ifdef OS_WINDOWS
   ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, sizeof(remoteAddress));
 #else

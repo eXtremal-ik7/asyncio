@@ -132,7 +132,7 @@ void test_aio_writecb(AsyncOpStatus status, aioObject *object, size_t transferre
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(senderCtx->config->port);
+  address.port = senderCtx->config->port;
   while (aioWriteMsg(object, &address, &senderCtx->buffer, senderCtx->config->messageSize, afActiveOnce, 0, test_aio_writecb, senderCtx) > 0)
     senderCtx->counter++;
 }
@@ -150,7 +150,7 @@ void *test_aio_sender(void *arg)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(senderCtx->config->port);
+  address.port = senderCtx->config->port;
   aioWriteMsg(senderCtx->client, &address, &senderCtx->buffer, senderCtx->config->messageSize, afNone, 0, test_aio_writecb, senderCtx);
   asyncLoop(localBase);
   return nullptr;
@@ -165,7 +165,7 @@ void test_coroutine_sender_coro(void *arg)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(senderCtx->config->port); 
+  address.port = senderCtx->config->port; 
   for (uint64_t i = 0; i < senderCtx->config->totalPacketNum; i++)
     ioWriteMsg(senderCtx->client, &address, msg, senderCtx->config->messageSize, afNone, 0);
 }
@@ -372,7 +372,7 @@ void test_aio(unsigned senderThreads, unsigned receiverThreads, uint16_t port, A
   
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
-  address.port = htons(ctx->port);
+  address.port = ctx->port;
   socketTy serverSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, receiverTy == aioReceiverBlocking ? 0 : 1);
   socketReuseAddr(serverSocket);
   if (socketBind(serverSocket, &address) != 0)

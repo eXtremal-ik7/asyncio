@@ -63,7 +63,7 @@ int main(int argc, char **argv)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
-  address.port = htons(static_cast<uint16_t>(atoi(argv[2])));
+  address.port = static_cast<uint16_t>(atoi(argv[2]));
   
   initializeSocketSubsystem();
   socketTy hSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);

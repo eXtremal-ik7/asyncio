@@ -16,7 +16,7 @@ aioObject *startTCPServer(asyncBase *base, aioAcceptCb callback, void *arg, uint
 
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
-  address.port = htons(port);
+  address.port = port;
   socketTy acceptSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
   socketReuseAddr(acceptSocket);
   if (socketBind(acceptSocket, &address) != 0) {
@@ -40,7 +40,7 @@ aioObject *startUDPServer(asyncBase *base, aioReadMsgCb callback, void *arg, voi
 
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
-  address.port = htons(port);
+  address.port = port;
   socketTy acceptSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
   if (socketBind(acceptSocket, &address) != 0) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -70,7 +70,7 @@ aioObject *initializeTCPClient(asyncBase *base, aioConnectCb callback, void *arg
   if (callback) {
     address.family = AF_INET;
     address.ipv4 = inet_addr("127.0.0.1");
-    address.port = htons(port);
+    address.port = port;
     aioConnect(object, &address, 333000, callback, arg);
   }
 
@@ -298,7 +298,7 @@ TEST(basic, test_udp_rw)
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
-  address.port = htons(gPort);
+  address.port = gPort;
   aioWriteMsg(context.clientSocket, &address, "123456", 7, afNone, 0, nullptr, nullptr);
   aioReadMsg(context.clientSocket, context.clientBuffer, sizeof(context.clientBuffer), afNone, 1000000, test_udp_rw_client_readcb, &context);
   asyncLoop(gBase);

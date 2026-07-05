@@ -359,7 +359,7 @@ TEST(zmtp, aio_push)
   HostAddress address;
   address.ipv4 = inet_addr("127.0.0.1");
   address.family = AF_INET;
-  address.port = htons(gPort);
+  address.port = gPort;
   aioZmtpConnect(context.clientSocket, &address, afNone, 1000000, aio_push_connectcb, &context);
   asyncLoop(gBase);
   serverThread.join();
@@ -374,7 +374,7 @@ void aio_push_client_coro(void *arg)
   HostAddress address;
   address.ipv4 = inet_addr("127.0.0.1");
   address.family = AF_INET;
-  address.port = htons(gPort);
+  address.port = gPort;
   int connectResult = ioZmtpConnect(ctx->clientSocket, &address, afNone, 1000000);
   EXPECT_EQ(connectResult, 0);
   if (connectResult == 0) {
@@ -733,7 +733,7 @@ TEST(zmtp, aio_req)
   HostAddress address;
   address.ipv4 = inet_addr("127.0.0.1");
   address.family = AF_INET;
-  address.port = htons(gPort);
+  address.port = gPort;
   aioZmtpConnect(context.clientSocket, &address, afNone, 1000000, aio_req_connectcb, &context);
   asyncLoop(gBase);
   serverThread.join();
@@ -748,7 +748,7 @@ void aio_req_client_coro(void *arg)
   HostAddress address;
   address.ipv4 = inet_addr("127.0.0.1");
   address.family = AF_INET;
-  address.port = htons(gPort);
+  address.port = gPort;
   int connectResult = ioZmtpConnect(ctx->clientSocket, &address, afNone, 1000000);
   EXPECT_EQ(connectResult, 0);
   if (connectResult == 0) {

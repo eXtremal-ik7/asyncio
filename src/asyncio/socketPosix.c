@@ -43,7 +43,7 @@ int socketBind(socketTy hSocket, const HostAddress *address)
   struct sockaddr_in localAddr;
   localAddr.sin_family = address->family;
   localAddr.sin_addr.s_addr = address->ipv4;
-  localAddr.sin_port = address->port;
+  localAddr.sin_port = htons(address->port);
   return bind(hSocket, (struct sockaddr*)&localAddr, sizeof(localAddr));
 }
 
