@@ -1,11 +1,11 @@
 include("cmake/cxx-pm.cmake")
 cxxpm_initialize(
-  https://github.com/eXtremal-ik7/cxx-pm/archive/refs/tags/0.0.4.tar.gz
-  409fdb16b267926d0cae526041f6b6174fe17b7170519e3d35ae2486e9139f1a
+  https://github.com/eXtremal-ik7/cxx-pm/archive/refs/tags/0.0.5.tar.gz
+  d520a56610477f1911d1a390775e2ce19c47dfaa098d9692de5340cb174e3c43
 )
 
-project(libp2p)
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.11)
+project(asyncio)
 
 set (CMAKE_CXX_STANDARD 11)
 
@@ -125,8 +125,8 @@ endif(MSVC)
 include(TestBigEndian)
 TEST_BIG_ENDIAN(IS_BIGENDIAN)
 configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/libp2pconfig.h.in
-  ${CMAKE_CURRENT_BINARY_DIR}/include/libp2pconfig.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/asyncioconfig.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/include/asyncioconfig.h
 )
 
 include_directories(

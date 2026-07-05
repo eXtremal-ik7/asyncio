@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <algorithm>
-#include "libp2pconfig.h"
+#include "asyncioconfig.h"
 
 #if defined(__GNUC__) || defined(__clang__)
 static inline uint16_t xswap(uint16_t value) { return __builtin_bswap16(value); }

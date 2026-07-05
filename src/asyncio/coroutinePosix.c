@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include "asyncio/coroutine.h"
-#include "libp2pconfig.h"
+#include "asyncioconfig.h"
 
 typedef struct contextTy {
 #if defined(ARCH_X86)

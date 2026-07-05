@@ -1,4 +1,7 @@
-project(asyncio C ASM)
+# posix.s (coroutine context switch) needs the assembler on POSIX platforms only
+if (NOT WIN32)
+  enable_language(ASM)
+endif()
 
 set(Sources
   asyncio.c

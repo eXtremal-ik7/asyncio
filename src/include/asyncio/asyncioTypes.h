@@ -1,7 +1,7 @@
 #ifndef __ASYNCTYPES_H_
 #define __ASYNCTYPES_H_
 
-#include "libp2pconfig.h"
+#include "asyncioconfig.h"
 #include <stdint.h>
 #include <string.h>
 
