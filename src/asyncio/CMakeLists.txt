@@ -13,7 +13,7 @@ set(Sources
   base64.c
 )
 
-if (SSL_ENABLED)
+if (ASYNCIO_ENABLE_SSL)
   include_directories(${OPENSSL_INCLUDE_DIRECTORY})
   set(Sources ${Sources} socketSSL.c)
 endif()
@@ -38,9 +38,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" O
 endif ()
 
 add_library(asyncio-0.5 STATIC ${Sources})
-if (HTTP_ENABLED)
-  add_dependencies(asyncio-0.5 p2putils)
-endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
   target_link_libraries(asyncio-0.5 rt)

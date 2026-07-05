@@ -49,6 +49,91 @@ static inline int __uintptr_atomic_compare_and_swap(uintptr_t volatile *ptr, uin
 #endif
 }
 
+typedef enum AtomicMemoryOrder {
+#ifndef _MSC_VER // Not Microsoft compiler
+  amoRelaxed = __ATOMIC_RELAXED,
+  amoAcquire = __ATOMIC_ACQUIRE,
+  amoRelease = __ATOMIC_RELEASE,
+  amoSeqCst = __ATOMIC_SEQ_CST
+#else
+  // Values match GCC/Clang __ATOMIC_* constants
+  amoRelaxed = 0,
+  amoAcquire = 2,
+  amoRelease = 3,
+  amoSeqCst = 5
+#endif
+} AtomicMemoryOrder;
+
+// MSVC branches below fold to a single instruction when 'order' is a compile-time constant;
+// seq_cst load maps to acquire (sufficient on x86 TSO and when paired with full-barrier stores)
+static inline unsigned __uint_atomic_load(unsigned volatile *ptr, AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_load_n(ptr, order);
+#else
+  return order == amoRelaxed ? (unsigned)ReadNoFence((volatile LONG*)ptr) : (unsigned)ReadAcquire((volatile LONG*)ptr);
+#endif
+}
+
+static inline void __uint_atomic_store(unsigned volatile *ptr, unsigned value, AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  __atomic_store_n(ptr, value, order);
+#else
+  if (order == amoRelaxed)
+    WriteNoFence((volatile LONG*)ptr, (LONG)value);
+  else if (order == amoRelease)
+    WriteRelease((volatile LONG*)ptr, (LONG)value);
+  else
+    InterlockedExchange((volatile LONG*)ptr, (LONG)value);
+#endif
+}
+
+static inline uintptr_t __uintptr_atomic_load(uintptr_t volatile *ptr, AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_load_n(ptr, order);
+#else
+#ifdef OS_32
+  return order == amoRelaxed ? (uintptr_t)ReadNoFence((volatile LONG*)ptr) : (uintptr_t)ReadAcquire((volatile LONG*)ptr);
+#else
+  return order == amoRelaxed ? (uintptr_t)ReadNoFence64((volatile LONG64*)ptr) : (uintptr_t)ReadAcquire64((volatile LONG64*)ptr);
+#endif
+#endif
+}
+
+static inline void __uintptr_atomic_store(uintptr_t volatile *ptr, uintptr_t value, AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  __atomic_store_n(ptr, value, order);
+#else
+#ifdef OS_32
+  if (order == amoRelaxed)
+    WriteNoFence((volatile LONG*)ptr, (LONG)value);
+  else if (order == amoRelease)
+    WriteRelease((volatile LONG*)ptr, (LONG)value);
+  else
+    InterlockedExchange((volatile LONG*)ptr, (LONG)value);
+#else
+  if (order == amoRelaxed)
+    WriteNoFence64((volatile LONG64*)ptr, (LONG64)value);
+  else if (order == amoRelease)
+    WriteRelease64((volatile LONG64*)ptr, (LONG64)value);
+  else
+    InterlockedExchange64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+#endif
+}
+
+static inline void *__pointer_atomic_load(void *volatile *ptr, AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_load_n(ptr, order);
+#else
+  return order == amoRelaxed ? ReadPointerNoFence(ptr) : ReadPointerAcquire(ptr);
+#endif
+}
+
 static inline int __pointer_atomic_compare_and_swap(void *volatile *tag, void *v1, void *v2)
 {
 #ifndef _MSC_VER // Not Microsoft compiler
@@ -90,7 +175,7 @@ static inline int __spinlock_try_acquire(volatile unsigned *lock)
 
 static inline void __spinlock_release(volatile unsigned *lock)
 {
-  *lock = 0;
+  __uint_atomic_store(lock, 0, amoRelease);
 }
 
 __NO_UNUSED_FUNCTION_END

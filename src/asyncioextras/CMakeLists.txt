@@ -4,17 +4,17 @@ set(Sources
   asyncioextras.cpp
 )
 
-if (ZMTP_ENABLED)
+if (ASYNCIO_ENABLE_ZMTP)
   set(Sources ${Sources} zmtp.cpp)
 endif()
 
 
-if (BTC_ENABLED)
+if (ASYNCIO_ENABLE_BTC)
   include_directories(${OPENSSL_INCLUDE_DIRECTORY})
   set(Sources ${Sources} btc.cpp)
 endif()
 
-if (RLPX_ENABLED)
+if (ASYNCIO_ENABLE_RLPX)
     set(Sources ${Sources} rlpx.cpp)
 endif()
 
