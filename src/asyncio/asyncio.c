@@ -526,7 +526,7 @@ ssize_t aioReadMsg(aioObject *object,
                    aioReadMsgCb callback,
                    void *arg)
 {
-  struct sockaddr_in source;
+  struct sockaddr_storage source;
   socketLenTy addrlen = sizeof(source);
 #ifdef OS_WINDOWS
   ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&source, &addrlen);
@@ -539,9 +539,7 @@ ssize_t aioReadMsg(aioObject *object,
   if (result >= 0) {
     // Data received synchronously
     HostAddress host;
-    host.family = 0;
-    host.ipv4 = source.sin_addr.s_addr;
-    host.port = ntohs(source.sin_port);
+    sockaddrToHostAddress(&source, &host);
     currentFinishedSync++;
     if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
       return result;
@@ -572,14 +570,12 @@ ssize_t aioWriteMsg(aioObject *object,
                     void *arg)
 {
   // Datagram socket can be accessed by multiple threads without lock
-  struct sockaddr_in remoteAddress;
-  remoteAddress.sin_family = address->family;
-  remoteAddress.sin_addr.s_addr = address->ipv4;
-  remoteAddress.sin_port = htons(address->port);
+  struct sockaddr_storage remoteAddress;
+  socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
 #ifdef OS_WINDOWS
-  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, sizeof(remoteAddress));
+  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, addrlen);
 #else
-  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr *)&remoteAddress, sizeof(remoteAddress));
+  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr *)&remoteAddress, addrlen);
 #endif
 
   struct Context context;
@@ -658,7 +654,7 @@ ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags f
 ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
   // Datagram socket can be accessed by multiple threads without lock
-  struct sockaddr_in source;
+  struct sockaddr_storage source;
   socketLenTy addrlen = sizeof(source);
 #ifdef OS_WINDOWS
   ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&source, &addrlen);
@@ -691,14 +687,12 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
 ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
   // Datagram socket can be accessed by multiple threads without lock
-  struct sockaddr_in remoteAddress;
-  remoteAddress.sin_family = address->family;
-  remoteAddress.sin_addr.s_addr = address->ipv4;
-  remoteAddress.sin_port = htons(address->port);
+  struct sockaddr_storage remoteAddress;
+  socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
 #ifdef OS_WINDOWS
-  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, sizeof(remoteAddress));
+  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, addrlen);
 #else
-  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr *)&remoteAddress, sizeof(remoteAddress));
+  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr *)&remoteAddress, addrlen);
 #endif
 
   struct Context context;

@@ -410,6 +410,108 @@ TEST(basic, test_udp_rw)
   ASSERT_TRUE(context.success);
 }
 
+// aioReadMsg reports the sender address through two code paths that must
+// agree. A read armed before the datagram arrives completes through the event
+// loop, which fills HostAddress from sockaddr_storage; a datagram already
+// buffered at aioReadMsg call time is consumed by the synchronous fast path.
+// Both datagrams below are placed into the server socket buffer inside the
+// loopback sendto calls, before asyncLoop() starts, so path selection is
+// deterministic: the first one is picked up by the parked operation (event
+// loop path), the second is found in the buffer by the re-armed read (fast
+// path). Without a valid 'family' the HostAddress union cannot be interpreted
+// and aioWriteMsg cannot reply to the sender.
+void test_udp_sender_address_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
+{
+  TestContext *ctx = static_cast<TestContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->serverState++;
+    EXPECT_EQ(transferred, 5u);
+    EXPECT_EQ(address.family, AF_INET);
+    EXPECT_EQ(address.ipv4, inet_addr("127.0.0.1"));
+    EXPECT_NE(address.port, 0);
+    if (ctx->serverState < 2) {
+      aioReadMsg(socket, ctx->serverBuffer, sizeof(ctx->serverBuffer), afNone, 1000000, test_udp_sender_address_readcb, ctx);
+      return;
+    }
+    ctx->success = true;
+  }
+
+  deleteAioObject(ctx->clientSocket);
+  deleteAioObject(ctx->serverSocket);
+  postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_udp_sender_address)
+{
+  TestContext context(gBase);
+  context.serverSocket = startUDPServer(gBase, test_udp_sender_address_readcb, &context, context.serverBuffer, sizeof(context.serverBuffer), gPort);
+  context.clientSocket = initializeUDPClient(gBase);
+  ASSERT_NE(context.serverSocket, nullptr);
+  ASSERT_NE(context.clientSocket, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
+  aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
+  asyncLoop(gBase);
+  ASSERT_TRUE(context.success);
+}
+
+// Same two-path check for an IPv6 socket. Here the fast path loses more than
+// the family tag: it reads the sender into sockaddr_in, so a sockaddr_in6 is
+// truncated and the address bytes are lost as well. socketBind() still builds
+// sockaddr_in, so the server socket is bound directly.
+void test_udp_sender_address_ipv6_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
+{
+  TestContext *ctx = static_cast<TestContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->serverState++;
+    EXPECT_EQ(transferred, 5u);
+    EXPECT_EQ(address.family, AF_INET6);
+    EXPECT_EQ(memcmp(address.ipv6, &in6addr_loopback, sizeof(address.ipv6)), 0);
+    EXPECT_NE(address.port, 0);
+    if (ctx->serverState < 2) {
+      aioReadMsg(socket, ctx->serverBuffer, sizeof(ctx->serverBuffer), afNone, 1000000, test_udp_sender_address_ipv6_readcb, ctx);
+      return;
+    }
+    ctx->success = true;
+  }
+
+  deleteAioObject(ctx->clientSocket);
+  deleteAioObject(ctx->serverSocket);
+  postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_udp_sender_address_ipv6)
+{
+  TestContext context(gBase);
+  socketTy serverSocket = socketCreate(AF_INET6, SOCK_DGRAM, IPPROTO_UDP, 1);
+  struct sockaddr_in6 bindAddress;
+  memset(&bindAddress, 0, sizeof(bindAddress));
+  bindAddress.sin6_family = AF_INET6;
+  bindAddress.sin6_addr = in6addr_loopback;
+  bindAddress.sin6_port = htons(gPort);
+  ASSERT_EQ(bind(serverSocket, (struct sockaddr*)&bindAddress, sizeof(bindAddress)), 0);
+  context.serverSocket = newSocketIo(gBase, serverSocket);
+  context.clientSocket = newSocketIo(gBase, socketCreate(AF_INET6, SOCK_DGRAM, IPPROTO_UDP, 1));
+  ASSERT_NE(context.serverSocket, nullptr);
+  ASSERT_NE(context.clientSocket, nullptr);
+  aioReadMsg(context.serverSocket, context.serverBuffer, sizeof(context.serverBuffer), afNone, 1000000, test_udp_sender_address_ipv6_readcb, &context);
+
+  HostAddress address;
+  address.family = AF_INET6;
+  memcpy(address.ipv6, &in6addr_loopback, sizeof(address.ipv6));
+  address.port = gPort;
+  aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
+  aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
+  asyncLoop(gBase);
+  ASSERT_TRUE(context.success);
+}
+
 void test_timeout_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   __UNUSED(socket);
