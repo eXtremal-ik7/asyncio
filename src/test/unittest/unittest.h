@@ -1,5 +1,4 @@
 #include <asyncio/asyncio.h>
-#include <p2p/p2p.h>
 #include <gtest/gtest.h>
 #include "macro.h"
 
@@ -14,7 +13,6 @@ struct TestContext {
   aioObject *pipeWrite;
   uint8_t clientBuffer[65536];
   uint8_t serverBuffer[128];
-  p2pStream serverStream;
   asyncBase *base;
   int serverState;
   int clientState;

@@ -138,7 +138,6 @@ include_directories(
 add_subdirectory(asyncio)
 add_subdirectory(asyncioextras)
 add_subdirectory(p2putils)
-add_subdirectory(p2p)
 add_subdirectory(examples)
 
 if (ASYNCIO_BUILD_TESTS)

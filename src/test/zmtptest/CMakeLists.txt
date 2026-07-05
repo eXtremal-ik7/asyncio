@@ -1,9 +1,9 @@
 include_directories(${ZMQ_INCLUDE_DIRECTORY})
 
 if (WIN32)
-  set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2p ws2_32 mswsock ZeroMQ::libzmq-static iphlpapi)
+  set(LIBRARIES asyncio-0.5 asyncioextras-0.5 ws2_32 mswsock ZeroMQ::libzmq-static iphlpapi)
 else()
-  set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2p ZeroMQ::libzmq-static)
+  set(LIBRARIES asyncio-0.5 asyncioextras-0.5 ZeroMQ::libzmq-static)
 endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")

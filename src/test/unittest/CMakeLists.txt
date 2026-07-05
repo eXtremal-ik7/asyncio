@@ -6,7 +6,7 @@ if(MSVC)
 endif(MSVC)
 
 set(SOURCES unittest.cpp)
-set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2p p2putils ${GTEST_LIBRARIES})
+set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2putils ${GTEST_LIBRARIES})
 include_directories(${GTEST_INCLUDE_DIRS})
 
 if (ASYNCIO_ENABLE_ZMTP)
