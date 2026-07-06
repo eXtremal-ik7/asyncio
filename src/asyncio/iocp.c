@@ -295,6 +295,12 @@ void iocpNextFinishedOperation(asyncBase *base)
             struct recvFromData *rf = op->info.internalBuffer;
             sockaddrToHostAddress(&rf->addr, &op->info.host);
           }
+        } else if (result == aosBufferTooSmall && op->info.root.opCode == actReadMsg) {
+          // WSAEMSGSIZE: the buffer holds the first part of the datagram, the
+          // tail is dropped; the kernel still reports the source address
+          struct recvFromData *rf = op->info.internalBuffer;
+          op->info.bytesTransferred = entry->dwNumberOfBytesTransferred;
+          sockaddrToHostAddress(&rf->addr, &op->info.host);
         }
 
         opSetStatus(&op->info.root, opGetGeneration(&op->info.root), result);
@@ -599,6 +605,12 @@ AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *opptr)
   int result = WSARecvFrom(object->hSocket, &wsabuf, 1, NULL, &flags, (SOCKADDR*)&rf->addr, &rf->size, &op->overlapped, NULL);
   if (result == 0 || WSAGetLastError() == WSA_IO_PENDING) {
     return aosPending;
+  } else if (WSAGetLastError() == WSAEMSGSIZE) {
+    // The datagram is consumed and cut down to the buffer size right away;
+    // no completion packet follows an immediate failure
+    op->info.bytesTransferred = op->info.transactionSize;
+    sockaddrToHostAddress(&rf->addr, &op->info.host);
+    return aosBufferTooSmall;
   } else {
     return aosUnknownError;
   }

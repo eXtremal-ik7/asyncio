@@ -527,16 +527,43 @@ ssize_t aioReadMsg(aioObject *object,
                    void *arg)
 {
   struct sockaddr_storage source;
-  socketLenTy addrlen = sizeof(source);
+  int truncated;
 #ifdef OS_WINDOWS
+  socketLenTy addrlen = sizeof(source);
   ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&source, &addrlen);
+  // Winsock consumes the datagram even when it does not fit into the buffer
+  truncated = result == -1 && WSAGetLastError() == WSAEMSGSIZE;
 #else
-  ssize_t result = recvfrom(object->hSocket, buffer, size, 0, (struct sockaddr*)&source, &addrlen);
+  struct iovec iov;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  iov.iov_base = buffer;
+  iov.iov_len = size;
+  msg.msg_name = &source;
+  msg.msg_namelen = sizeof(source);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  ssize_t result = recvmsg(object->hSocket, &msg, 0);
+  truncated = result >= 0 && (msg.msg_flags & MSG_TRUNC);
 #endif
 
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.readMsg, readMsgFinish, buffer, size);
-  if (result >= 0) {
+  if (truncated) {
+    // The datagram is already consumed and cut down to the buffer size:
+    // parking the operation here would lose it with no completion at all
+    HostAddress host;
+    sockaddrToHostAddress(&source, &host);
+    if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
+      return -(ssize_t)aosBufferTooSmall;
+    } else {
+      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
+      op->bytesTransferred = size;
+      op->host = host;
+      opForceStatus(&op->root, aosBufferTooSmall);
+      addToGlobalQueue(&op->root);
+    }
+  } else if (result >= 0) {
     // Data received synchronously
     HostAddress host;
     sockaddrToHostAddress(&source, &host);
@@ -655,15 +682,42 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
 {
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage source;
-  socketLenTy addrlen = sizeof(source);
+  int truncated;
 #ifdef OS_WINDOWS
+  socketLenTy addrlen = sizeof(source);
   ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&source, &addrlen);
+  // Winsock consumes the datagram even when it does not fit into the buffer
+  truncated = result == -1 && WSAGetLastError() == WSAEMSGSIZE;
 #else
-  ssize_t result = recvfrom(object->hSocket, buffer, size, 0, (struct sockaddr*)&source, &addrlen);
+  struct iovec iov;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  iov.iov_base = buffer;
+  iov.iov_len = size;
+  msg.msg_name = &source;
+  msg.msg_namelen = sizeof(source);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  ssize_t result = recvmsg(object->hSocket, &msg, 0);
+  truncated = result >= 0 && (msg.msg_flags & MSG_TRUNC);
 #endif
 
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.readMsg, 0, buffer, size);
+  if (truncated) {
+    // The datagram is already consumed and cut down to the buffer size:
+    // parking the operation here would lose it with no completion at all
+    if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {
+      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
+      op->bytesTransferred = size;
+      opForceStatus(&op->root, aosBufferTooSmall);
+      addToGlobalQueue(&op->root);
+      coroutineYield();
+      return coroutineRwFinish(op, object);
+    } else {
+      return -(ssize_t)aosBufferTooSmall;
+    }
+  }
   if (result >= 0) {
     // Data received synchronously
     if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {

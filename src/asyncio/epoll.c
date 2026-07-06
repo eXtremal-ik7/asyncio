@@ -517,19 +517,23 @@ AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *opptr)
   int fd = getFd((EPollObject*)op->root.object);
 
   struct sockaddr_storage source;
-  socklen_t addrlen = sizeof(source);
-  ssize_t result = recvfrom(fd, op->buffer, op->transactionSize, 0, (struct sockaddr*)&source, &addrlen);
+  struct iovec iov;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  iov.iov_base = op->buffer;
+  iov.iov_len = op->transactionSize;
+  msg.msg_name = &source;
+  msg.msg_namelen = sizeof(source);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  ssize_t result = recvmsg(fd, &msg, 0);
   if (result != -1) {
     sockaddrToHostAddress(&source, &op->host);
     op->bytesTransferred = (size_t)result;
-    return aosSuccess;
+    // MSG_TRUNC: the datagram did not fit, the kernel dropped its tail
+    return (msg.msg_flags & MSG_TRUNC) ? aosBufferTooSmall : aosSuccess;
   } else {
-    if (errno == EAGAIN)
-      return aosPending;
-    if (errno == ENOMEM)
-      return aosBufferTooSmall;
-    else
-      return aosUnknownError;
+    return errno == EAGAIN ? aosPending : aosUnknownError;
   }
 }
 

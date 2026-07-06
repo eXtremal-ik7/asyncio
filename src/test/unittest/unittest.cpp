@@ -589,6 +589,58 @@ TEST(basic, test_udp_write_error)
   ASSERT_TRUE(context.success);
 }
 
+// A datagram that does not fit into the caller's buffer must complete with
+// aosBufferTooSmall on every backend. Both delivery paths are exercised the
+// same way as in test_udp_sender_address: the first 100-byte datagram
+// completes a parked read through the event loop, the second is picked up by
+// the re-armed read's synchronous fast path. Broken behavior differs by
+// platform. The POSIX backends call recvfrom() without MSG_TRUNC, so the
+// kernel silently drops the tail and both reads complete with aosSuccess and
+// 10 transferred bytes. On Windows the parked overlapped read is completed
+// correctly (WSAEMSGSIZE -> aosBufferTooSmall), but the fast-path recvfrom()
+// in aioReadMsg fails with WSAEMSGSIZE - which on Windows consumes and drops
+// the datagram - and the error code is never examined: the operation is
+// parked as if no data had arrived, so the second read loses its datagram and
+// ends in aosTimeout.
+void test_udp_read_truncated_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
+{
+  __UNUSED(address);
+  __UNUSED(transferred);
+  TestContext *ctx = static_cast<TestContext*>(arg);
+  EXPECT_EQ(status, aosBufferTooSmall);
+  if (status == aosBufferTooSmall) {
+    ctx->serverState++;
+    if (ctx->serverState < 2) {
+      aioReadMsg(socket, ctx->serverBuffer, 10, afNone, 1000000, test_udp_read_truncated_readcb, ctx);
+      return;
+    }
+    ctx->success = true;
+  }
+
+  deleteAioObject(ctx->clientSocket);
+  deleteAioObject(ctx->serverSocket);
+  postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_udp_read_truncated)
+{
+  TestContext context(gBase);
+  context.serverSocket = startUDPServer(gBase, test_udp_read_truncated_readcb, &context, context.serverBuffer, 10, gPort);
+  context.clientSocket = initializeUDPClient(gBase);
+  ASSERT_NE(context.serverSocket, nullptr);
+  ASSERT_NE(context.clientSocket, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  uint8_t payload[100] = {};
+  aioWriteMsg(context.clientSocket, &address, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+  aioWriteMsg(context.clientSocket, &address, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+  asyncLoop(gBase);
+  ASSERT_TRUE(context.success);
+}
+
 void test_timeout_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   __UNUSED(socket);
