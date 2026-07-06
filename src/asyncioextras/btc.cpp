@@ -326,7 +326,8 @@ asyncOpRoot *implBtcRecv(BTCSocket *socket,
 
   stream.seekSet(0);
   memcpy(command, header->command, 12);
-  *bytesTransferred = header->length + sizeof(MessageHeader);
+  // payload bytes only, the way ioBtcRecv and the zmtp pair report it
+  *bytesTransferred = header->length;
   return nullptr;
 }
 
@@ -424,7 +425,8 @@ asyncOpRoot *implBtcSend(BTCSocket *socket,
     return &op->root;
   }
 
-  *bytesTransferred = size + sizeof(MessageHeader);
+  // payload bytes only, the way ioBtcSend and the zmtp pair report it
+  *bytesTransferred = size;
   return nullptr;
 }
 
