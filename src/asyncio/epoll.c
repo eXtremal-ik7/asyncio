@@ -150,6 +150,13 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
 
   uint32_t needStart = ioEvents;
 
+  // Process the current action before completing the exclusive connect from
+  // the accumulated fd event: an aaStart delivered together with the event
+  // must enter its queue first, otherwise a failed connect cancels the queues
+  // without it and the operation would start on the dead socket afterwards
+  if (op)
+    processAction(op, opMethod, &needStart);
+
   // A parked connect (the object's exclusive operation) is driven by fd
   // events directly, not through a queue; its completion is signaled by
   // writability or an error. Drive it before the disconnect sweep so that
@@ -168,8 +175,6 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
     cancelOperationList(&object->writeQueue, aosDisconnected);
   }
 
-  if (op)
-    processAction(op, opMethod, &needStart);
   if (needStart & IO_EVENT_READ)
     executeOperationList(&object->readQueue);
   if (needStart & IO_EVENT_WRITE)

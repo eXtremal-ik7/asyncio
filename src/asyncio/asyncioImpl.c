@@ -360,12 +360,13 @@ static void opRun(asyncOpRoot *op, List *list)
   opArmTimer(op);
 }
 
-// An exclusive operation (afExclusive: connect) does not live in the
-// read/write queues: it occupies the object's exclusiveOp slot, claimed by
-// CAS at submission time, and both queues do not start operations while the
-// slot is busy. Leaving the slot kicks both queues; leaving it with a
-// non-success status also cancels everything queued behind the exclusive
-// with that status.
+// An exclusive operation (connect) does not live in the read/write queues:
+// it occupies the object's exclusiveOp slot, claimed by CAS at submission
+// time — the ownership itself routes it to the exclusive path, there is no
+// dedicated flag. Both queues do not start operations while the slot is
+// busy. Leaving the slot kicks both queues; leaving it with a non-success
+// status also cancels everything queued behind the exclusive with that
+// status.
 static void exclusiveRelease(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
 {
   aioObjectRoot *object = op->object;
@@ -424,7 +425,10 @@ void processAction(asyncOpRoot *opptr, AsyncOpActionTy actionType, uint32_t *nee
   uint32_t tag = 0;
   aioObjectRoot *object = opptr->object;
 
-  if (opptr->flags & afExclusive) {
+  // Ownership of the exclusive slot (claimed by CAS at submission, e.g. in
+  // aioConnect) is what routes an operation to the exclusive path; there is
+  // no flag to spoof, any other operation goes to its read/write queue
+  if (object->exclusiveOp == (uintptr_t)opptr) {
     switch (actionType) {
       case aaStart : {
         if (opGetStatus(opptr) != aosPending) {

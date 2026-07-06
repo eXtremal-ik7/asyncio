@@ -67,11 +67,7 @@ typedef enum AsyncFlags {
   afRealtime = 4,
   afActiveOnce = 8,
   afRunning = 16,
-  afCoroutine = 32,
-  // Object-level operation (connect): lives in aioObjectRoot::exclusiveOp
-  // instead of a read/write queue; while it is in flight neither queue starts
-  // operations, its failure cancels everything queued behind it
-  afExclusive = 64
+  afCoroutine = 32
 } AsyncFlags;
 
 typedef enum AsyncOpActionTy {

@@ -456,7 +456,7 @@ void aioConnect(aioObject *object,
 {
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.connect, connectFinish, 0, 0);
-  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afExclusive, usTimeout, (void*)callback, arg, actConnect, &context);
+  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afNone, usTimeout, (void*)callback, arg, actConnect, &context);
   op->host = *address;
   if (!__uintptr_atomic_compare_and_swap(&object->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
     // Another exclusive operation is in flight: one connect per object at a time
@@ -638,7 +638,7 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
 {
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.connect, connectFinish, 0, 0);
-  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afCoroutine | afExclusive, usTimeout, 0, 0, actConnect, &context);
+  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afCoroutine, usTimeout, 0, 0, actConnect, &context);
   op->host = *address;
   if (!__uintptr_atomic_compare_and_swap(&object->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
     // Another exclusive operation is in flight: one connect per object at a time
