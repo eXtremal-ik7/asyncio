@@ -16,18 +16,23 @@
 static option longOpts[] = {
   {"interval", required_argument, nullptr, 'i'},
   {"count", required_argument, nullptr, 'c'},
+  {"ipv4", no_argument, nullptr, '4'},
+  {"ipv6", no_argument, nullptr, '6'},
   {"help", no_argument, nullptr, 0},
   {nullptr, 0, nullptr, 0}
 };
 
-static const char shortOpts[] = "i:c:";
+static const char shortOpts[] = "i:c:46";
 static const char *gTarget = nullptr;
 static double gInterval = 1.0;
 static unsigned gCount = 4;
+static int gFamily = AF_UNSPEC;
 
 
 static const uint8_t ICMP_ECHO = 8;
 static const uint8_t ICMP_ECHOREPLY = 0;
+static const uint8_t ICMP6_ECHO = 128;
+static const uint8_t ICMP6_ECHOREPLY = 129;
 
 
 #pragma pack(push, 1)
@@ -55,6 +60,7 @@ static const uint8_t ICMP_ECHOREPLY = 0;
 
 __NO_PADDING_BEGIN
 struct ICMPClientData {
+  asyncBase *base;
   aioObject *rawSocket;
   HostAddress remoteAddress;
   icmp data;
@@ -96,7 +102,9 @@ void printHelpMessage(const char *appName)
     "%s <options> address\n"
     "General options:\n"
     "  --count or -c packets count\n"
-    "  --interval or -i interval between packets sending\n",
+    "  --interval or -i interval between packets sending\n"
+    "  --ipv4 or -4 use IPv4 only\n"
+    "  --ipv6 or -6 use IPv6 only\n",
     appName, appName);
 }
 
@@ -105,11 +113,15 @@ void readCb(AsyncOpStatus status, aioObject *rawSocket, HostAddress address, siz
 {
   __UNUSED(address);
   ICMPClientData *client = static_cast<ICMPClientData*>(arg);
-  if (status == aosSuccess && transferred >= (sizeof(ip) + sizeof(icmp))) {
-    uint8_t *ptr = static_cast<uint8_t*>(client->buffer);
-    icmp *receivedIcmp = reinterpret_cast<icmp*>(ptr + sizeof(ip));
+  // raw IPv4 sockets deliver the IP header in front of the ICMP message,
+  // raw IPv6 sockets deliver the ICMPv6 message alone (RFC 3542)
+  bool isIpv6 = client->remoteAddress.family == AF_INET6;
+  size_t ipHeaderSize = isIpv6 ? 0 : sizeof(ip);
+  uint8_t echoReplyType = isIpv6 ? ICMP6_ECHOREPLY : ICMP_ECHOREPLY;
+  if (status == aosSuccess && transferred >= (ipHeaderSize + sizeof(icmp))) {
+    icmp *receivedIcmp = reinterpret_cast<icmp*>(client->buffer + ipHeaderSize);
 
-    if (receivedIcmp->icmp_type == ICMP_ECHOREPLY) {     
+    if (receivedIcmp->icmp_type == echoReplyType) {
       std::map<unsigned, timeMark>::iterator F = client->times.find(receivedIcmp->icmp_id);
       if (F != client->times.end()) {
         double diff = static_cast<double>(usDiff(F->second, getTimeMark()));
@@ -122,7 +134,13 @@ void readCb(AsyncOpStatus status, aioObject *rawSocket, HostAddress address, siz
       }
     }
   }
-  
+
+  // -c limit: all requests are sent and every one is answered or timed out
+  if (gCount != 0 && client->id >= gCount && client->times.empty()) {
+    postQuitOperation(client->base);
+    return;
+  }
+
   aioReadMsg(rawSocket, client->buffer, sizeof(client->buffer), afNone, 0, readCb, client);
 }
 
@@ -133,9 +151,13 @@ void pingTimerCb(aioUserEvent *event, void *arg)
   clientData->id++;
   clientData->data.icmp_id = clientData->id;
   clientData->data.icmp_cksum = 0;
-  clientData->data.icmp_cksum =
-    InternetChksum(reinterpret_cast<uint16_t*>(&clientData->data), sizeof(icmp));
-    
+  // the ICMPv6 checksum needs a pseudo-header with source/destination
+  // addresses, so the kernel always computes it for raw ICMPv6 sockets
+  if (clientData->remoteAddress.family != AF_INET6)
+    clientData->data.icmp_cksum =
+      InternetChksum(reinterpret_cast<uint16_t*>(&clientData->data), sizeof(icmp));
+
+
   aioWriteMsg(clientData->rawSocket,
               &clientData->remoteAddress,
               &clientData->data, sizeof(icmp),
@@ -160,6 +182,10 @@ void printTimerCb(aioUserEvent *event, void *arg)
 
   for (size_t i = 0; i < forDelete.size(); i++)
     clientData->times.erase(forDelete[i]);
+
+  // -c limit: all requests are sent and every one is answered or timed out
+  if (gCount != 0 && clientData->id >= gCount && clientData->times.empty())
+    postQuitOperation(clientData->base);
 }
 
 
@@ -170,7 +196,7 @@ int main(int argc, char **argv)
     switch(res) {
       case 0 :
         if (strcmp(longOpts[index].name, "help") == 0) {
-          printHelpMessage("modstress");
+          printHelpMessage(argv[0]);
           return 0;
         }
         break;
@@ -179,6 +205,12 @@ int main(int argc, char **argv)
         break;
       case 'i' :
         gInterval = atof(optarg);
+        break;
+      case '4' :
+        gFamily = AF_INET;
+        break;
+      case '6' :
+        gFamily = AF_INET6;
         break;
       case ':' :
         fprintf(stderr, "Error: option %s missing argument\n",
@@ -199,51 +231,113 @@ int main(int argc, char **argv)
 
   gTarget = argv[optind];
   initializeAsyncIo(aiNone);
-  HostAddress localAddress;  
 
-  hostent *host = gethostbyname(gTarget);
-  if (!host) {
+  HostAddress remoteAddress;
+  {
+    struct addrinfo hints;
+    struct addrinfo *result = nullptr;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = gFamily;
+    int err = getaddrinfo(gTarget, nullptr, &hints, &result);
+    if (err != 0 || !result) {
+      fprintf(stderr,
+              " * cannot retrieve address of %s (%s)\n",
+              gTarget,
+              err != 0 ? gai_strerror(err) : "no addresses returned");
+      return 1;
+    }
+
+    struct sockaddr_storage sa;
+    memset(&sa, 0, sizeof(sa));
+    memcpy(&sa, result->ai_addr, result->ai_addrlen);
+    sockaddrToHostAddress(&sa, &remoteAddress);
+    freeaddrinfo(result);
+  }
+
+  char addressText[INET6_ADDRSTRLEN];
+  inet_ntop(remoteAddress.family,
+            remoteAddress.family == AF_INET6 ?
+              static_cast<const void*>(remoteAddress.ipv6) :
+              static_cast<const void*>(&remoteAddress.ipv4),
+            addressText, sizeof(addressText));
+
+  // ICMPv6 cannot reach v4-mapped ::ffff:a.b.c.d addresses; macOS getaddrinfo
+  // returns them for AF_INET6 requests when the host has no global IPv6
+  if (remoteAddress.family == AF_INET6 &&
+      remoteAddress.ipv6[0] == 0 && remoteAddress.ipv6[1] == 0 &&
+      remoteAddress.ipv6[2] == 0 && remoteAddress.ipv6[3] == 0 &&
+      remoteAddress.ipv6[4] == 0 && remoteAddress.ipv6[5] == 0xffff) {
     fprintf(stderr,
-            " * cannot retrieve address of %s (gethostbyname failed)\n",
-            argv[optind]);
+            " * %s has no reachable IPv6 address (resolver returned v4-mapped %s)\n",
+            gTarget, addressText);
     return 1;
   }
 
-  u_long addr = host->h_addr ? *reinterpret_cast<u_long*>(host->h_addr) : 0;
-  if (!addr) {
-    fprintf(stderr,
-            " * cannot retrieve address of %s (gethostbyname returns 0)\n",
-            argv[optind]);
-    return 1;
+  // route check and source address discovery, the trick system ping uses:
+  // connect() on a UDP socket only does a routing lookup - no datagram is
+  // sent - and getsockname() reports the source address the kernel picked
+  HostAddress localAddress;
+  {
+    HostAddress probeAddress = remoteAddress;
+    probeAddress.port = 1025;
+    struct sockaddr_storage sa;
+    socketLenTy addrlen = hostAddressToSockaddr(&probeAddress, &sa);
+    socketTy probeSocket = socketCreate(remoteAddress.family, SOCK_DGRAM, IPPROTO_UDP, 0);
+    if (connect(probeSocket, (struct sockaddr*)&sa, addrlen) != 0) {
+      fprintf(stderr, " * connect: %s is unreachable (no route)\n", addressText);
+      socketClose(probeSocket);
+      return 1;
+    }
+    socketLenTy nameLen = sizeof(sa);
+    getsockname(probeSocket, (struct sockaddr*)&sa, &nameLen);
+    sockaddrToHostAddress(&sa, &localAddress);
+    localAddress.port = 0;  // raw sockets have no port
+    socketClose(probeSocket);
+
+    // a link-local source needs a scope id that HostAddress cannot carry yet;
+    // fall back to the wildcard address and let the kernel pick the source
+    // for every packet, the way this example always worked
+    if (localAddress.family == AF_INET6 &&
+        (localAddress.ipv6[0] & htons(0xffc0)) == htons(0xfe80))
+      memset(localAddress.ipv6, 0, sizeof(localAddress.ipv6));
   }
 
-  localAddress.family = AF_INET;
-  localAddress.ipv4 = INADDR_ANY;
-  localAddress.port = 0;
-  socketTy S = socketCreate(AF_INET, SOCK_RAW, IPPROTO_ICMP, 1);
+  fprintf(stdout, "PING %s (%s)\n", gTarget, addressText);
+
+  socketTy S = socketCreate(remoteAddress.family, SOCK_RAW,
+                            remoteAddress.family == AF_INET6 ?
+                              static_cast<int>(IPPROTO_ICMPV6) :
+                              static_cast<int>(IPPROTO_ICMP), 1);
   socketReuseAddr(S);
   if (socketBind(S, &localAddress) != 0) {
-    fprintf(stderr, " * bind error\n");
+    char sourceText[INET6_ADDRSTRLEN];
+    inet_ntop(localAddress.family,
+              localAddress.family == AF_INET6 ?
+                static_cast<const void*>(localAddress.ipv6) :
+                static_cast<const void*>(&localAddress.ipv4),
+              sourceText, sizeof(sourceText));
+    fprintf(stderr, " * bind to %s error (raw sockets require root/administrator)\n", sourceText);
     exit(1);
   }
 
   ICMPClientData client;
   client.id = 0;
-  client.remoteAddress.family = AF_INET;
-  client.remoteAddress.ipv4 = static_cast<uint32_t>(addr);
+  client.remoteAddress = remoteAddress;
 
-  client.data.icmp_type = ICMP_ECHO;
+  client.data.icmp_type = remoteAddress.family == AF_INET6 ? ICMP6_ECHO : ICMP_ECHO;
   client.data.icmp_code = 0;
   client.data.icmp_seq = 0;
 
   asyncBase *base = createAsyncBase(amOSDefault);
+  client.base = base;
   aioUserEvent *pingTimer = newUserEvent(base, 0, pingTimerCb, &client);
   aioUserEvent *printTimer = newUserEvent(base, 0, printTimerCb, &client);
   client.rawSocket = newSocketIo(base, S);
 
   aioReadMsg(client.rawSocket, client.buffer, sizeof(client.buffer), afNone, 0, readCb, &client);
   userEventStartTimer(printTimer, 100000, -1);
-  userEventStartTimer(pingTimer, static_cast<uint64_t>(gInterval*1000000.0), -1);
+  // the timer counter stops sending after gCount packets (0 means no limit)
+  userEventStartTimer(pingTimer, static_cast<uint64_t>(gInterval*1000000.0), static_cast<int>(gCount));
   asyncLoop(base);
   return 0;
 }
