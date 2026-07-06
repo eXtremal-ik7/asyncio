@@ -34,11 +34,9 @@ void socketClose(socketTy hSocket)
 
 int socketBind(socketTy hSocket, const HostAddress *address)
 {
-  struct sockaddr_in localAddr;
-  localAddr.sin_family = address->family;
-  localAddr.sin_addr.s_addr = address->ipv4;
-  localAddr.sin_port = htons(address->port);
-  return bind(hSocket, (struct sockaddr*)&localAddr, sizeof(localAddr));
+  struct sockaddr_storage localAddr;
+  socketLenTy addrlen = hostAddressToSockaddr(address, &localAddr);
+  return bind(hSocket, (struct sockaddr*)&localAddr, addrlen);
 }
 
 
@@ -56,12 +54,6 @@ void socketReuseAddr(socketTy hSocket)
 {
   int optval = 1;
   setsockopt(hSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(int));
-}
-
-uint32_t addrfromAscii(const char *cp)
-{
-  uint32_t res = inet_addr(cp);
-  return (res != INADDR_NONE) ? res : 0;
 }
 
 int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, size_t *bytesTransferred)

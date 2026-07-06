@@ -493,7 +493,7 @@ static void smtpClientDestructor(aioObjectRoot *root)
 SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerType type)
 {
   // Create and socket first
-  socketTy socket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  socketTy socket = socketCreate(localAddress.family, SOCK_STREAM, IPPROTO_TCP, 1);
   socketReuseAddr(socket);
   if (socketBind(socket, &localAddress) != 0) {
     socketClose(socket);
@@ -514,7 +514,7 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
   if (type == smtpServerPlain)
     client->PlainSocket = newSocketIo(base, socket);
   else if (type == smtpServerSmtps)
-    client->TlsSocket = sslSocketNew(base, 0);
+    client->TlsSocket = sslSocketNew(base, newSocketIo(base, socket));
 
   return client;
 }

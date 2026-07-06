@@ -269,16 +269,12 @@ void sslSocketDestructor(aioObjectRoot *root)
 }
 
 
-SSLSocket *sslSocketNew(asyncBase *base, aioObject *existingSocket)
+SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket)
 {
-  // Create socket if need
-  aioObject *socket = existingSocket;
-  if (!socket) {
-    socketTy fd = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-    // TODO: check fd
-    socketReuseAddr(fd);
-    socket = newSocketIo(base, fd);
-  }
+  // The caller always provides the transport socket and thereby chooses the
+  // address family, as in the http/btc/zmtp/rlpx modules
+  if (!socket)
+    return 0;
 
   SSLSocket *S = 0;
   if (!concurrentQueuePop(&objectPool, (void**)&S)) {

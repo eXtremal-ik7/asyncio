@@ -258,6 +258,54 @@ TEST(basic, test_tcp_rw)
   ASSERT_TRUE(context.success);
 }
 
+// IPv6 counterpart of test_tcp_rw. Both endpoints are set up through the
+// public API only: socketBind() with an AF_INET6 HostAddress ([::1] listener,
+// [::] client), then aioConnect/aioAccept over IPv6 loopback. The accept
+// callback must see the peer as AF_INET6 loopback with a non-zero port.
+void test_tcp_rw_ipv6_acceptcb(AsyncOpStatus status, aioObject *listener, HostAddress client, socketTy acceptSocket, void *arg)
+{
+  __UNUSED(listener);
+  TestContext *ctx = static_cast<TestContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    EXPECT_EQ(client.family, AF_INET6);
+    EXPECT_EQ(memcmp(client.ipv6, &in6addr_loopback, sizeof(client.ipv6)), 0);
+    EXPECT_NE(client.port, 0);
+    aioObject *newSocketOp = newSocketIo(ctx->base, acceptSocket);
+    aioRead(newSocketOp, ctx->serverBuffer, sizeof(ctx->serverBuffer), afNone, 0, test_tcp_rw_server_readcb, ctx);
+  } else {
+    postQuitOperation(ctx->base);
+  }
+}
+
+TEST(basic, test_tcp_rw_ipv6)
+{
+  TestContext context(gBase);
+
+  HostAddress serverAddress;
+  ASSERT_EQ(hostAddressFromAscii("::1", &serverAddress), 1);
+  serverAddress.port = gPort;
+  socketTy serverSocket = socketCreate(AF_INET6, SOCK_STREAM, IPPROTO_TCP, 1);
+  socketReuseAddr(serverSocket);
+  ASSERT_EQ(socketBind(serverSocket, &serverAddress), 0);
+  ASSERT_EQ(socketListen(serverSocket), 0);
+  context.serverSocket = newSocketIo(gBase, serverSocket);
+  aioAccept(context.serverSocket, 333000, test_tcp_rw_ipv6_acceptcb, &context);
+
+  // the client socket must be bound before aioConnect: iocp ConnectEx
+  // requires an already bound socket
+  HostAddress clientAddress;
+  ASSERT_EQ(hostAddressFromAscii("::", &clientAddress), 1);
+  socketTy clientSocket = socketCreate(AF_INET6, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &clientAddress), 0);
+  context.clientSocket = newSocketIo(gBase, clientSocket);
+  aioConnect(context.clientSocket, &serverAddress, 333000, test_tcp_rw_connectcb, &context);
+
+  asyncLoop(gBase);
+  deleteAioObject(context.serverSocket);
+  ASSERT_TRUE(context.success);
+}
+
 #ifdef OS_COMMONUNIX
 // B8 regression test: aioWrite() to a connection dropped by the peer must
 // report an error through the operation status, never kill the process with
@@ -461,10 +509,10 @@ TEST(basic, test_udp_sender_address)
   ASSERT_TRUE(context.success);
 }
 
-// Same two-path check for an IPv6 socket. Here the fast path loses more than
-// the family tag: it reads the sender into sockaddr_in, so a sockaddr_in6 is
-// truncated and the address bytes are lost as well. socketBind() still builds
-// sockaddr_in, so the server socket is bound directly.
+// Same two-path check for an IPv6 socket: the sender address must survive
+// both paths as AF_INET6 with intact address bytes. Both endpoints are set up
+// through the public API only (socketCreate + socketBind with an AF_INET6
+// HostAddress).
 void test_udp_sender_address_ipv6_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   TestContext *ctx = static_cast<TestContext*>(arg);
@@ -490,23 +538,17 @@ void test_udp_sender_address_ipv6_readcb(AsyncOpStatus status, aioObject *socket
 TEST(basic, test_udp_sender_address_ipv6)
 {
   TestContext context(gBase);
+  HostAddress address;
+  ASSERT_EQ(hostAddressFromAscii("::1", &address), 1);
+  address.port = gPort;
   socketTy serverSocket = socketCreate(AF_INET6, SOCK_DGRAM, IPPROTO_UDP, 1);
-  struct sockaddr_in6 bindAddress;
-  memset(&bindAddress, 0, sizeof(bindAddress));
-  bindAddress.sin6_family = AF_INET6;
-  bindAddress.sin6_addr = in6addr_loopback;
-  bindAddress.sin6_port = htons(gPort);
-  ASSERT_EQ(bind(serverSocket, (struct sockaddr*)&bindAddress, sizeof(bindAddress)), 0);
+  ASSERT_EQ(socketBind(serverSocket, &address), 0);
   context.serverSocket = newSocketIo(gBase, serverSocket);
   context.clientSocket = newSocketIo(gBase, socketCreate(AF_INET6, SOCK_DGRAM, IPPROTO_UDP, 1));
   ASSERT_NE(context.serverSocket, nullptr);
   ASSERT_NE(context.clientSocket, nullptr);
   aioReadMsg(context.serverSocket, context.serverBuffer, sizeof(context.serverBuffer), afNone, 1000000, test_udp_sender_address_ipv6_readcb, &context);
 
-  HostAddress address;
-  address.family = AF_INET6;
-  memcpy(address.ipv6, &in6addr_loopback, sizeof(address.ipv6));
-  address.port = gPort;
   aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
   aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
   asyncLoop(gBase);

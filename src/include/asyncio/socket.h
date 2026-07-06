@@ -18,7 +18,6 @@ extern "C" {
 #define SOCKET_SHUTDOWN_READWRITE SHUT_RDWR
 #endif
 
-uint32_t addrfromAscii(const char *cp);
 socketTy socketCreate(int af, int type, int protocol, int isAsync);
 void socketClose(socketTy hSocket);
 int socketBind(socketTy hSocket, const HostAddress *address);

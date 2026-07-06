@@ -80,4 +80,28 @@ static inline void sockaddrToHostAddress(const struct sockaddr_storage *sa, Host
   }
 }
 
+/* Fill HostAddress from a bare IPv4 ("127.0.0.1") or IPv6 ("::1") literal;
+   no port, no brackets - "host:port" strings belong to the URI parser level.
+   Sets family and address bytes, resets port to 0, so the structure is fully
+   defined after a successful call.
+   Returns 1 on success, 0 if the string is not a valid address literal. */
+static inline int hostAddressFromAscii(const char *cp, HostAddress *host)
+{
+  struct in_addr a4;
+  struct in6_addr a6;
+  if (inet_pton(AF_INET, cp, &a4) == 1) {
+    host->family = AF_INET;
+    host->ipv4 = a4.s_addr;
+    host->port = 0;
+    return 1;
+  }
+  if (inet_pton(AF_INET6, cp, &a6) == 1) {
+    host->family = AF_INET6;
+    memcpy(host->ipv6, &a6, sizeof(host->ipv6));
+    host->port = 0;
+    return 1;
+  }
+  return 0;
+}
+
 #endif //__ASYNCTYPES_H_
