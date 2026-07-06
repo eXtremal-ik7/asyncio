@@ -417,9 +417,19 @@ static inline void runAioOperation(aioObjectRoot *object,
     AsyncOpTaggedPtr forRun = taggedAsyncOpNull();
     asyncOpRoot *op = syncImpl(object, flags, usTimeout, callback, arg, contextPtr);
     if (!op) {
-      if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
+      // Fire-and-forget has no completion channel: the inline return value is
+      // the only way the caller ever learns the result, so it must not depend
+      // on the budget. The budget only pushes afActiveOnce callers back to
+      // callback delivery and is not consumed by operations that cannot
+      // return inline
+      if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
         makeResult(contextPtr);
       } else {
+        // Budget exhausted: this completion goes through the loop, the inline
+        // window restarts - without the reset a thread that never drains the
+        // queues would lose the fast path forever after the first 32 calls
+        if (flags & afActiveOnce)
+          currentFinishedSync = 0;
         asyncOpRoot *op = createAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
         initOp(op, contextPtr);
         opForceStatus(op, aosSuccess);

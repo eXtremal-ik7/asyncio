@@ -211,6 +211,17 @@ void *test_sync_receiver(void *arg)
   }
 }
 
+// Account one received datagram for rate/liveness bookkeeping
+static void receiverAccountPacket(ReceiverCtx *ctx)
+{
+  ctx->started = true;
+  if (ctx->packetsNum == 0)
+    ctx->beginPt = getTimeMark();
+  ctx->packetsNum++;
+  if (ctx->packetsNum % ctx->config->groupSize == 0)
+    ctx->endPt = getTimeMark();
+}
+
 // Asynchronous receiver callback
 void test_readcb(AsyncOpStatus status,
                  aioObject *socket,
@@ -218,20 +229,20 @@ void test_readcb(AsyncOpStatus status,
                  size_t transferred,
                  void *arg)
 {
-  __UNUSED(status);
   __UNUSED(transferred);
   __UNUSED(address);
   threadPacketsNum++;
   ReceiverCtx *ctx = static_cast<ReceiverCtx*>(arg);
-  if (status == aosSuccess) {
-    ctx->started = true;
-    if (ctx->packetsNum == 0)
-      ctx->beginPt = getTimeMark();
-    ctx->packetsNum++;
-    if (ctx->packetsNum % ctx->config->groupSize == 0)
-      ctx->endPt = getTimeMark();
+  if (status == aosSuccess)
+    receiverAccountPacket(ctx);
+  // Drain the socket buffer inline, mirroring the sender at test_aio_writecb:
+  // afActiveOnce reports every buffered datagram through the return value,
+  // one completion per budget window comes back through this callback and
+  // restarts the drain
+  while (aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afActiveOnce, 0, test_readcb, ctx) > 0) {
+    threadPacketsNum++;
+    receiverAccountPacket(ctx);
   }
-  aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afNone, 0, test_readcb, ctx);
 }
 
 // Asynchronous receiver with timer callback
@@ -247,13 +258,11 @@ void test_readcb_timer(AsyncOpStatus status,
   ReceiverCtx *ctx = static_cast<ReceiverCtx*>(arg);
   
   if (status == aosSuccess) {
-    ctx->started = true;
-    if (ctx->packetsNum == 0)
-      ctx->beginPt = getTimeMark();
-    ctx->packetsNum++;
-    if (ctx->packetsNum % ctx->config->groupSize == 0)
-      ctx->endPt = getTimeMark();
-    aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afNone, 1000000, test_readcb_timer, ctx);
+    receiverAccountPacket(ctx);
+    while (aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afActiveOnce, 1000000, test_readcb_timer, ctx) > 0) {
+      threadPacketsNum++;
+      receiverAccountPacket(ctx);
+    }
   } else {
     if (!ctx->started || ctx->oldPacketsNum != ctx->packetsNum) {
       ctx->oldPacketsNum = ctx->packetsNum;
@@ -277,13 +286,11 @@ void test_readcb_timer_rt(AsyncOpStatus status,
   ReceiverCtx *ctx = static_cast<ReceiverCtx*>(arg);
   
   if (status == aosSuccess) {
-    ctx->started = true;
-    if (ctx->packetsNum == 0)
-      ctx->beginPt = getTimeMark();
-    ctx->packetsNum++;
-    if (ctx->packetsNum % ctx->config->groupSize == 0)
-      ctx->endPt = getTimeMark();
-    aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afRealtime, 1000000, test_readcb_timer_rt, ctx);
+    receiverAccountPacket(ctx);
+    while (aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), static_cast<AsyncFlags>(afRealtime | afActiveOnce), 1000000, test_readcb_timer_rt, ctx) > 0) {
+      threadPacketsNum++;
+      receiverAccountPacket(ctx);
+    }
   } else {
     if (!ctx->started || ctx->oldPacketsNum != ctx->packetsNum) {
       ctx->oldPacketsNum = ctx->packetsNum;

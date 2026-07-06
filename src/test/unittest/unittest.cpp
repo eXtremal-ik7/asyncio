@@ -1443,6 +1443,177 @@ TEST(basic, test_udp_read_truncated)
   ASSERT_TRUE(context.success);
 }
 
+// afActiveOnce makes the callback a fallback rather than a guarantee: an
+// operation that completed inline reports through the return value and its
+// callback never fires, -aosPending means the callback will. Which way a
+// completed operation is reported is decided by the per-thread budget: at
+// most MAX_SYNCHRONOUS_FINISHED_OPERATION consecutive inline reports, then
+// one completion goes through the event loop and the window restarts. Only
+// afActiveOnce makes both outcomes countable - the coroutine variants hide
+// which path delivered the result. Submissions run on freshly created
+// threads so the thread-local budget deterministically starts at zero (the
+// main thread's counter state depends on previous tests).
+constexpr unsigned udpBudgetPeriod = MAX_SYNCHRONOUS_FINISHED_OPERATION + 1;
+constexpr unsigned udpBudgetTotal = 3*udpBudgetPeriod;
+
+struct UdpBudgetContext;
+
+struct UdpBudgetSlot {
+  UdpBudgetContext *ctx;
+  unsigned index;
+};
+
+struct UdpBudgetContext {
+  asyncBase *base;
+  aioObject *serverSocket = nullptr;
+  aioObject *clientSocket = nullptr;
+  uint32_t writePayload[udpBudgetTotal];
+  uint32_t readPayload[udpBudgetTotal];
+  ssize_t writeResult[udpBudgetTotal];
+  ssize_t readResult[udpBudgetTotal];
+  bool writeCallbackFired[udpBudgetTotal] = {};
+  bool readCallbackFired[udpBudgetTotal] = {};
+  UdpBudgetSlot writeSlot[udpBudgetTotal];
+  UdpBudgetSlot readSlot[udpBudgetTotal];
+  unsigned expectedCallbacks = 0;
+  unsigned deliveredCallbacks = 0;
+  UdpBudgetContext(asyncBase *baseArg) : base(baseArg) {}
+};
+
+static void udpBudgetCallbackDelivered(UdpBudgetContext *ctx)
+{
+  if (++ctx->deliveredCallbacks == ctx->expectedCallbacks)
+    postQuitOperation(ctx->base);
+}
+
+void test_udp_active_once_writecb(AsyncOpStatus status, aioObject*, size_t transferred, void *arg)
+{
+  UdpBudgetSlot *slot = static_cast<UdpBudgetSlot*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  EXPECT_EQ(transferred, sizeof(uint32_t));
+  slot->ctx->writeCallbackFired[slot->index] = true;
+  udpBudgetCallbackDelivered(slot->ctx);
+}
+
+void test_udp_active_once_readcb(AsyncOpStatus status, aioObject*, HostAddress, size_t transferred, void *arg)
+{
+  UdpBudgetSlot *slot = static_cast<UdpBudgetSlot*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  EXPECT_EQ(transferred, sizeof(uint32_t));
+  slot->ctx->readCallbackFired[slot->index] = true;
+  udpBudgetCallbackDelivered(slot->ctx);
+}
+
+TEST(basic, test_udp_active_once_sync_budget)
+{
+  UdpBudgetContext context(gBase);
+  context.serverSocket = startUDPServer(gBase, nullptr, nullptr, nullptr, 0, gPort);
+  context.clientSocket = initializeUDPClient(gBase);
+  ASSERT_NE(context.serverSocket, nullptr);
+  ASSERT_NE(context.clientSocket, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+
+  std::thread writer([&context, &address]() {
+    for (unsigned i = 0; i < udpBudgetTotal; i++) {
+      context.writePayload[i] = i;
+      context.writeSlot[i].ctx = &context;
+      context.writeSlot[i].index = i;
+      context.writeResult[i] = aioWriteMsg(context.clientSocket, &address, &context.writePayload[i], sizeof(uint32_t), afActiveOnce, 1000000, test_udp_active_once_writecb, &context.writeSlot[i]);
+    }
+  });
+  writer.join();
+
+  // sendto always runs inside aioWriteMsg no matter how the result is
+  // reported: by now every datagram sits in the server socket buffer and
+  // each aioReadMsg below consumes one inline, so only the budget decides
+  // between the return value and the callback
+  std::thread reader([&context]() {
+    for (unsigned i = 0; i < udpBudgetTotal; i++) {
+      context.readSlot[i].ctx = &context;
+      context.readSlot[i].index = i;
+      context.readResult[i] = aioReadMsg(context.serverSocket, &context.readPayload[i], sizeof(uint32_t), afActiveOnce, 1000000, test_udp_active_once_readcb, &context.readSlot[i]);
+    }
+  });
+  reader.join();
+
+  unsigned syncWrites = 0, syncReads = 0;
+  for (unsigned i = 0; i < udpBudgetTotal; i++) {
+    bool expectInline = ((i + 1) % udpBudgetPeriod) != 0;
+    EXPECT_EQ(context.writeResult[i], expectInline ? (ssize_t)sizeof(uint32_t) : -(ssize_t)aosPending) << "write " << i;
+    EXPECT_EQ(context.readResult[i], expectInline ? (ssize_t)sizeof(uint32_t) : -(ssize_t)aosPending) << "read " << i;
+    syncWrites += context.writeResult[i] >= 0;
+    syncReads += context.readResult[i] >= 0;
+  }
+  EXPECT_EQ(syncWrites, udpBudgetTotal - 3);
+  EXPECT_EQ(syncReads, udpBudgetTotal - 3);
+
+  context.expectedCallbacks = 2*udpBudgetTotal - syncWrites - syncReads;
+  if (context.expectedCallbacks)
+    asyncLoop(gBase);
+  deleteAioObject(context.clientSocket);
+  deleteAioObject(context.serverSocket);
+
+  for (unsigned i = 0; i < udpBudgetTotal; i++) {
+    // exactly one report per operation: inline return or callback, never both
+    EXPECT_NE(context.writeResult[i] >= 0, context.writeCallbackFired[i]) << "write " << i;
+    EXPECT_NE(context.readResult[i] >= 0, context.readCallbackFired[i]) << "read " << i;
+    // loopback keeps datagrams ordered: every payload landed in the buffer
+    // of its own read no matter which path reported the completion
+    EXPECT_EQ(context.readPayload[i], i) << "read " << i;
+  }
+}
+
+// With no callback at all the return value is the only channel that exists,
+// so an inline completion must be reported inline no matter how many came
+// before it: a -aosPending here would throw the result away (the operation
+// finishes through the loop, where a null callback is silently dropped) -
+// for reads that loses an already consumed datagram
+TEST(basic, test_udp_fire_and_forget_sync_result)
+{
+  TestContext context(gBase);
+  context.serverSocket = startUDPServer(gBase, nullptr, nullptr, nullptr, 0, gPort);
+  context.clientSocket = initializeUDPClient(gBase);
+  ASSERT_NE(context.serverSocket, nullptr);
+  ASSERT_NE(context.clientSocket, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+
+  std::vector<uint32_t> writePayload(udpBudgetTotal), readPayload(udpBudgetTotal);
+  std::vector<ssize_t> writeResult(udpBudgetTotal), readResult(udpBudgetTotal);
+
+  std::thread writer([&]() {
+    for (unsigned i = 0; i < udpBudgetTotal; i++) {
+      writePayload[i] = i;
+      writeResult[i] = aioWriteMsg(context.clientSocket, &address, &writePayload[i], sizeof(uint32_t), afNone, 0, nullptr, nullptr);
+    }
+  });
+  writer.join();
+
+  std::thread reader([&]() {
+    for (unsigned i = 0; i < udpBudgetTotal; i++)
+      readResult[i] = aioReadMsg(context.serverSocket, &readPayload[i], sizeof(uint32_t), afNone, 1000000, nullptr, nullptr);
+  });
+  reader.join();
+
+  for (unsigned i = 0; i < udpBudgetTotal; i++) {
+    EXPECT_EQ(writeResult[i], (ssize_t)sizeof(uint32_t)) << "write " << i;
+    EXPECT_EQ(readResult[i], (ssize_t)sizeof(uint32_t)) << "read " << i;
+    EXPECT_EQ(readPayload[i], i) << "read " << i;
+  }
+
+  postQuitOperation(gBase);
+  asyncLoop(gBase);
+  deleteAioObject(context.clientSocket);
+  deleteAioObject(context.serverSocket);
+}
+
 void test_timeout_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   __UNUSED(socket);

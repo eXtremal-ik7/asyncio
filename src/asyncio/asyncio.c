@@ -561,9 +561,11 @@ ssize_t aioReadMsg(aioObject *object,
     // parking the operation here would lose it with no completion at all
     HostAddress host;
     sockaddrToHostAddress(&source, &host);
-    if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
+    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
       return -(ssize_t)aosBufferTooSmall;
     } else {
+      if (flags & afActiveOnce)
+        currentFinishedSync = 0;
       asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
       op->bytesTransferred = size;
       op->host = host;
@@ -574,10 +576,11 @@ ssize_t aioReadMsg(aioObject *object,
     // Data received synchronously
     HostAddress host;
     sockaddrToHostAddress(&source, &host);
-    currentFinishedSync++;
-    if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
+    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
       return result;
     } else {
+      if (flags & afActiveOnce)
+        currentFinishedSync = 0;
       asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
       op->bytesTransferred = (size_t)result;
       op->host = host;
@@ -615,10 +618,11 @@ ssize_t aioWriteMsg(aioObject *object,
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
   if (result >= 0) {
-    currentFinishedSync++;
-    if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION && (callback == 0 || flags & afActiveOnce)) {
+    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
       return result;
     } else {
+      if (flags & afActiveOnce)
+        currentFinishedSync = 0;
       asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
       op->bytesTransferred = (size_t)result;
       opForceStatus(&op->root, aosSuccess);
