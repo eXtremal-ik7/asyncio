@@ -3,9 +3,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
 endif ()
 
 add_library(p2putils
-  LiteFlatHashTable.c
   HttpParse.cpp
   HttpRequestParse.cpp
+  HttpTokens.c
   UriParse.cpp
 )
 
