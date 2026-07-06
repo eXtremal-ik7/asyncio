@@ -546,5 +546,5 @@ AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *opptr)
     return aosSuccess;
   }
 
-  return aosPending;
+  return errno == EAGAIN ? aosPending : aosUnknownError;
 }

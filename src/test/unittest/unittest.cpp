@@ -307,7 +307,7 @@ TEST(basic, test_tcp_rw_ipv6)
 }
 
 #ifdef OS_COMMONUNIX
-// B8 regression test: aioWrite() to a connection dropped by the peer must
+// Regression test: aioWrite() to a connection dropped by the peer must
 // report an error through the operation status, never kill the process with
 // SIGPIPE. The protection is per-fd: MSG_NOSIGNAL on send paths where the
 // flag exists (Linux/BSD), SO_NOSIGPIPE as a descriptor property on
@@ -552,6 +552,40 @@ TEST(basic, test_udp_sender_address_ipv6)
   aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
   aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
   asyncLoop(gBase);
+  ASSERT_TRUE(context.success);
+}
+
+// A sendto() error must finish the operation with an error callback.
+// A 70 KB datagram cannot fit into a UDP packet (65507-byte payload limit),
+// so sendto() fails with EMSGSIZE deterministically - no peer and no network
+// are involved. The broken path treats every sendto() error as aosPending and
+// re-arms the always-writable UDP socket, so the callback never fires and the
+// event loop spins on sendto() at 100% CPU: the test then hangs instead of
+// failing.
+void test_udp_write_error_writecb(AsyncOpStatus status, aioObject *socket, size_t transferred, void *arg)
+{
+  __UNUSED(socket);
+  __UNUSED(transferred);
+  TestContext *ctx = static_cast<TestContext*>(arg);
+  EXPECT_NE(status, aosSuccess);
+  ctx->success = (status != aosSuccess);
+  postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_udp_write_error)
+{
+  TestContext context(gBase);
+  context.clientSocket = initializeUDPClient(gBase);
+  ASSERT_NE(context.clientSocket, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  static uint8_t oversized[70 * 1024];
+  aioWriteMsg(context.clientSocket, &address, oversized, sizeof(oversized), afNone, 0, test_udp_write_error_writecb, &context);
+  asyncLoop(gBase);
+  deleteAioObject(context.clientSocket);
   ASSERT_TRUE(context.success);
 }
 

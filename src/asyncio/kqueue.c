@@ -508,5 +508,5 @@ AsyncOpStatus kqueueAsyncWriteMsg(asyncOpRoot *opptr)
     return aosSuccess;
   }
 
-  return aosPending;
+  return errno == EAGAIN ? aosPending : aosUnknownError;
 }
