@@ -201,7 +201,12 @@ static AsyncOpStatus connectProc(asyncOpRoot *opptr)
   int connectResult = SSL_connect(socket->ssl);
   int errCode = SSL_get_error(socket->ssl, connectResult);
   if (connectResult == 1) {
-    // Successfully connected
+    // Successfully connected. In TLS 1.3 the handshake completes on our side
+    // right after the final flight (Finished) is queued to bioOut: flush it,
+    // or the server never finishes its accept
+    size_t finalFlightSize = copyFromOut(socket);
+    if (finalFlightSize)
+      aioWrite(socket->object, socket->sslWriteBuffer, finalFlightSize, afWaitAll, 0, 0, 0);
     return aosSuccess;
   } else if (errCode == SSL_ERROR_WANT_READ) {
     // Need data exchange
@@ -247,6 +252,12 @@ static AsyncOpStatus readProc(asyncOpRoot *opptr)
     if (op->bytesTransferred == op->transactionSize || (op->bytesTransferred && !(op->root.flags & afWaitAll))) {
       return aosSuccess;
     } else {
+      // only "want more transport data" may continue the loop: a fatal TLS
+      // error is sticky, no amount of new data can revive the stream
+      int sslError = SSL_get_error(socket->ssl, R);
+      if (sslError != SSL_ERROR_WANT_READ)
+        return sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError;
+
       size_t bytes = 0;
       asyncOpRoot *readOp = implRead(socket->object, socket->sslReadBuffer, socket->sslReadBufferSize, afNone, 0, sslReadReadCb, op, &bytes);
       if (!readOp) {
@@ -362,6 +373,19 @@ asyncOpRoot *implSslRead(SSLSocket *socket,
       *bytesTransferred = sslBytesTransferred;
       return 0;
     } else {
+      // only "want more transport data" may continue the loop: a fatal TLS
+      // error is sticky, no amount of new data can revive the stream; report
+      // it through an already finished operation
+      int sslError = SSL_get_error(socket->ssl, R);
+      if (sslError != SSL_ERROR_WANT_READ) {
+        struct Context context;
+        fillContext(&context, readProc, rwFinish, buffer, size);
+        SSLOp *sslOp = (SSLOp*)newReadAsyncOp(&socket->root, flags, usTimeout, (void*)callback, arg, sslOpRead, &context);
+        sslOp->bytesTransferred = sslBytesTransferred;
+        opForceStatus(&sslOp->root, sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError);
+        return &sslOp->root;
+      }
+
       size_t bytes = 0;
       asyncOpRoot *readOp = implRead(socket->object, socket->sslReadBuffer, socket->sslReadBufferSize, afNone, 0, sslReadReadCb, 0, &bytes);
       if (!readOp) {

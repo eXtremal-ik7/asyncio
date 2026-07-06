@@ -5,6 +5,9 @@
 #include "asyncio/socket.h"
 #include "asyncioextras/rlpx.h"
 #include "atomic.h"
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
@@ -407,7 +410,7 @@ TEST(PipeDeathTest, ignore_sigpipe_flag)
 }
 #endif
 
-// F14: the server streams a header block larger than the client's fixed 64KB
+// The server streams a header block larger than the client's fixed 64KB
 // input buffer. The request must fail with aosBufferTooSmall instead of
 // re-parsing the full buffer in a hot loop that pins the event loop thread
 // forever (implRead of the 0 remaining bytes completes synchronously with 0,
@@ -499,6 +502,189 @@ static void httpOversizedHeaderScenario()
 TEST(HttpDeathTest, oversized_header)
 {
   EXPECT_EXIT(httpOversizedHeaderScenario(), ::testing::ExitedWithCode(0), "");
+}
+
+// A plain-text server answers the ClientHello with garbage. The connect
+// must fail with a protocol error: OpenSSL knows the stream is dead (fatal
+// SSL error), and treating that as "want more data" hangs the operation (or
+// spins when the peer keeps streaming). Same watchdog scheme as above.
+static const char gSslGarbage[] = "this is a plain text server, definitely not TLS\r\n";
+
+struct SslGarbageContext {
+  asyncBase *base;
+  SSLSocket *client;
+  aioObject *serverConn;
+  uint8_t readBuffer[1024];
+  int flood;
+};
+
+static void sslGarbageWriteCb(AsyncOpStatus status, aioObject *object, size_t, void *arg)
+{
+  SslGarbageContext *ctx = static_cast<SslGarbageContext*>(arg);
+  if (ctx->flood && status == aosSuccess)
+    aioWrite(object, gSslGarbage, sizeof(gSslGarbage)-1, afWaitAll, 0, sslGarbageWriteCb, ctx);
+}
+
+static void sslGarbageAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  SslGarbageContext *ctx = static_cast<SslGarbageContext*>(arg);
+  if (status != aosSuccess)
+    exit(2);
+
+  ctx->serverConn = newSocketIo(ctx->base, acceptSocket);
+  aioWrite(ctx->serverConn, gSslGarbage, sizeof(gSslGarbage)-1, afWaitAll, 0, sslGarbageWriteCb, ctx);
+}
+
+static void sslGarbageConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  __UNUSED(arg);
+  // any error is the expected outcome; success would mean garbage passed as TLS
+  exit(status == aosSuccess ? 1 : 0);
+}
+
+static void sslConnectGarbageScenario(int flood)
+{
+  armDeathTestWatchdog(30);
+
+  SslGarbageContext ctx;
+  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.client = nullptr;
+  ctx.serverConn = nullptr;
+  ctx.flood = flood;
+
+  if (!startTCPServer(ctx.base, sslGarbageAcceptCb, &ctx, gPort))
+    exit(2);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  if (socketBind(clientSocket, &address) != 0)
+    exit(2);
+
+  ctx.client = sslSocketNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  // no timeout: the garbage must produce an error, not wait for a rescue timer
+  aioSslConnect(ctx.client, &address, nullptr, 0, sslGarbageConnectCb, &ctx);
+
+  asyncLoop(ctx.base);
+  exit(3);  // event loop ended without the connect callback
+}
+
+TEST(SslDeathTest, connect_plain_garbage)
+{
+  EXPECT_EXIT(sslConnectGarbageScenario(0), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(SslDeathTest, connect_plain_garbage_flood)
+{
+  EXPECT_EXIT(sslConnectGarbageScenario(1), ::testing::ExitedWithCode(0), "");
+}
+
+// The same garbage after a completed handshake exercises the read path,
+// which never calls SSL_get_error. The server does a genuine TLS handshake
+// (self-signed cert, blocking OpenSSL in a helper thread), then the wire
+// turns into a plain-text stream. SSL_read fails fatally and can never
+// recover, yet the code treats any non-positive result as "want more data":
+// with a silent peer the operation waits forever, with a streaming peer it
+// cycles forever.
+static void sslTlsThenGarbageServer(socketTy listenSocket, int flood)
+{
+  socketTy fd = accept(listenSocket, nullptr, nullptr);
+  if (fd == (socketTy)(-1))
+    _Exit(4);
+
+  EVP_PKEY *key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256");
+  if (!key)
+    _Exit(4);
+  X509 *cert = X509_new();
+  ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+  X509_gmtime_adj(X509_getm_notBefore(cert), -60);
+  X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
+  X509_set_pubkey(cert, key);
+  X509_NAME *subject = X509_get_subject_name(cert);
+  X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, (const unsigned char*)"localhost", -1, -1, 0);
+  X509_set_issuer_name(cert, subject);
+  if (X509_sign(cert, key, EVP_sha256()) == 0)
+    _Exit(4);
+
+  SSL_CTX *serverContext = SSL_CTX_new(TLS_server_method());
+  SSL_CTX_use_certificate(serverContext, cert);
+  SSL_CTX_use_PrivateKey(serverContext, key);
+  SSL *ssl = SSL_new(serverContext);
+  SSL_set_fd(ssl, (int)fd);
+  if (SSL_accept(ssl) != 1)
+    _Exit(4);
+
+  do {
+    if (send(fd, (const char*)gSslGarbage, (int)(sizeof(gSslGarbage)-1), 0) <= 0)
+      break;
+  } while (flood);
+}
+
+static void sslGarbageReadCb(AsyncOpStatus status, SSLSocket*, size_t, void *arg)
+{
+  __UNUSED(arg);
+  // fatal TLS garbage must surface as an error; success would mean it decrypted
+  exit(status == aosSuccess ? 1 : 0);
+}
+
+static void sslGarbageHandshakeConnectCb(AsyncOpStatus status, SSLSocket *socket, void *arg)
+{
+  SslGarbageContext *ctx = static_cast<SslGarbageContext*>(arg);
+  if (status != aosSuccess)
+    exit(4);  // the handshake against a real TLS server must succeed
+
+  aioSslRead(socket, ctx->readBuffer, sizeof(ctx->readBuffer), afNone, 0, sslGarbageReadCb, ctx);
+}
+
+static void sslReadGarbageScenario(int flood)
+{
+  armDeathTestWatchdog(30);
+
+  SslGarbageContext ctx;
+  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.client = nullptr;
+  ctx.serverConn = nullptr;
+  ctx.flood = flood;
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  if (socketBind(listenSocket, &address) != 0)
+    exit(2);
+  if (socketListen(listenSocket) != 0)
+    exit(2);
+  std::thread(sslTlsThenGarbageServer, listenSocket, flood).detach();
+
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  if (socketBind(clientSocket, &address) != 0)
+    exit(2);
+
+  ctx.client = sslSocketNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  // no timeout: the dead stream must produce an error, not wait for a rescue timer
+  aioSslConnect(ctx.client, &address, nullptr, 0, sslGarbageHandshakeConnectCb, &ctx);
+
+  asyncLoop(ctx.base);
+  exit(3);  // event loop ended without the read callback
+}
+
+TEST(SslDeathTest, read_garbage_after_handshake)
+{
+  EXPECT_EXIT(sslReadGarbageScenario(0), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(SslDeathTest, read_garbage_after_handshake_flood)
+{
+  EXPECT_EXIT(sslReadGarbageScenario(1), ::testing::ExitedWithCode(0), "");
 }
 #endif
 
