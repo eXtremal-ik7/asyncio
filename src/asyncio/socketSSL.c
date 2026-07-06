@@ -329,7 +329,6 @@ void aioSslConnect(SSLSocket *socket,
                    sslConnectCb callback,
                    void *arg)
 {
-  SSL_set_connect_state(socket->ssl);
   struct Context context;
   fillContext(&context, connectProc, connectFinish, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afNone, usTimeout, (void*)callback, arg, sslOpConnect, &context);
@@ -339,6 +338,16 @@ void aioSslConnect(SSLSocket *socket,
   else
     op->state = sslStProcessing;
 
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
+    // Another exclusive operation is in flight: one connect per object at a time
+    opForceStatus(&op->root, aosUnknownError);
+    addToGlobalQueue(&op->root);
+    return;
+  }
+
+  // The SSL state machine belongs to the slot owner: after a lost CAS a
+  // handshake may be running on it right now, so it must not be touched
+  SSL_set_connect_state(socket->ssl);
   if (tlsextHostName)
     SSL_set_tlsext_host_name(socket->ssl, op->buffer);
 
@@ -452,7 +461,12 @@ static AsyncOpStatus writeProc(asyncOpRoot *opptr)
   if (op->state == sslStInitalize) {
     size_t bytes = 0;
     op->state = sslStProcessing;
-    SSL_write(socket->ssl, op->buffer, (int)op->transactionSize);
+    int writeResult = SSL_write(socket->ssl, op->buffer, (int)op->transactionSize);
+    if (writeResult <= 0 && op->transactionSize) {
+      // Same as the sync path: nothing entered the TLS stream
+      int sslError = SSL_get_error(socket->ssl, writeResult);
+      return sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError;
+    }
     size_t writeSize = copyFromOut(socket);
     asyncOpRoot *writeOp = implWrite(socket->object, socket->sslWriteBuffer, writeSize, afWaitAll, 0, sslWriteWriteCb, op, &bytes);
     if (writeOp) {
@@ -475,7 +489,21 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
                           sslCb callback,
                           void *arg)
 {
-  SSL_write(socket->ssl, buffer, (int)size);
+  int writeResult = SSL_write(socket->ssl, buffer, (int)size);
+  if (writeResult <= 0 && size) {
+    // Mirror of the read path: a fatal TLS error is sticky, and WANT_READ
+    // here means the handshake is not complete - either way SSL_write
+    // accepted nothing, and silently flushing bioOut would report the
+    // payload as sent; report the error through an already finished
+    // operation instead
+    int sslError = SSL_get_error(socket->ssl, writeResult);
+    struct Context context;
+    fillContext(&context, writeProc, rwFinish, (void*)(uintptr_t)buffer, size);
+    SSLOp *sslOp = (SSLOp*)newWriteAsyncOp(&socket->root, flags, usTimeout, (void*)callback, arg, sslOpWrite, &context);
+    opForceStatus(&sslOp->root, sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError);
+    return &sslOp->root;
+  }
+
   size_t writeSize = copyFromOut(socket);
   size_t bytes = 0;
   asyncOpRoot *op = implWrite(socket->object, socket->sslWriteBuffer, writeSize, afWaitAll, 0, sslWriteWriteCb, 0, &bytes);
@@ -514,12 +542,20 @@ ssize_t aioSslWrite(SSLSocket *socket,
 
 int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlsextHostName, uint64_t usTimeout)
 {
-  SSL_set_connect_state(socket->ssl);
   struct Context context;
   fillContext(&context, connectProc, 0, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afCoroutine, usTimeout, 0, 0, sslOpConnect, &context);
   op->address = *address;
-  combinerPushOperation(&op->root, aaStart);
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
+    // Another exclusive operation is in flight: one connect per object at a time
+    opForceStatus(&op->root, aosUnknownError);
+    addToGlobalQueue(&op->root);
+  } else {
+    SSL_set_connect_state(socket->ssl);
+    if (tlsextHostName)
+      SSL_set_tlsext_host_name(socket->ssl, op->buffer);
+    combinerPushOperation(&op->root, aaStart);
+  }
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);

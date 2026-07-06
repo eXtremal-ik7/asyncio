@@ -774,6 +774,112 @@ TEST(ssl, write_before_handshake)
     deleteAioObject(ctx.serverConn);
 }
 
+// SSL_write on a socket whose handshake was never even started can accept
+// nothing: the operation must fail instead of claiming the payload was sent
+// (the write path used to ignore the SSL_write result entirely).
+struct SslWriteNoConnectContext {
+  asyncBase *base;
+  AsyncOpStatus status;
+  size_t transferred;
+  bool finished;
+  SslWriteNoConnectContext(asyncBase *baseArg) :
+    base(baseArg), status(aosUnknown), transferred(0), finished(false) {}
+};
+
+static void sslWriteNoConnectCb(AsyncOpStatus status, SSLSocket*, size_t transferred, void *arg)
+{
+  SslWriteNoConnectContext *ctx = static_cast<SslWriteNoConnectContext*>(arg);
+  ctx->status = status;
+  ctx->transferred = transferred;
+  ctx->finished = true;
+  postQuitOperation(ctx->base);
+}
+
+TEST(ssl, write_without_connect)
+{
+  static const char payload[] = "no handshake was ever started";
+
+  SslWriteNoConnectContext ctx(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  SSLSocket *client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
+
+  aioSslWrite(client, payload, sizeof(payload)-1, afNone, 1000000, sslWriteNoConnectCb, &ctx);
+  asyncLoop(gBase);
+
+  ASSERT_TRUE(ctx.finished);
+  EXPECT_EQ(ctx.status, aosUnknownError);
+  EXPECT_EQ(ctx.transferred, 0u);
+  sslSocketDelete(client);
+}
+
+// The SSL connect claims its object's exclusive slot the same way the plain
+// TCP connect does: a second handshake submitted while the first is still in
+// flight must be rejected immediately, without touching the shared SSL state
+// machine.
+struct SslDoubleConnectContext {
+  asyncBase *base;
+  AsyncOpStatus firstStatus;
+  AsyncOpStatus secondStatus;
+  int events;
+  int firstOrder;
+  int secondOrder;
+  SslDoubleConnectContext(asyncBase *baseArg) :
+    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
+    events(0), firstOrder(-1), secondOrder(-1) {}
+};
+
+static void sslDoubleConnectFirstCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  SslDoubleConnectContext *ctx = static_cast<SslDoubleConnectContext*>(arg);
+  ctx->firstStatus = status;
+  ctx->firstOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+static void sslDoubleConnectSecondCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  SslDoubleConnectContext *ctx = static_cast<SslDoubleConnectContext*>(arg);
+  ctx->secondStatus = status;
+  ctx->secondOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+TEST(ssl, double_connect_rejected)
+{
+  SslDoubleConnectContext ctx(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  SSLSocket *client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
+
+  address.ipv4 = inet_addr("192.0.2.1");
+  address.port = 9;
+  aioSslConnect(client, &address, nullptr, 300000, sslDoubleConnectFirstCb, &ctx);
+  aioSslConnect(client, &address, nullptr, 300000, sslDoubleConnectSecondCb, &ctx);
+
+  asyncLoop(gBase);
+  sslSocketDelete(client);
+
+  if (ctx.firstStatus != aosTimeout)
+    GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
+                 << "), exclusive slot contention cannot be exercised on this network";
+  EXPECT_EQ(ctx.secondStatus, aosUnknownError);
+  EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
+    << "the second SSL connect was not rejected while the first was in flight";
+}
+
 // Pipelined "aioConnect; aioRead" on one TCP socket: an operation submitted
 // after the connect must wait for the connect outcome instead of completing
 // ahead of it. On epoll/kqueue the kernel provides this gate (read() during

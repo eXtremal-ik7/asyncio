@@ -729,6 +729,14 @@ void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpA
 {
   Context context(startZmtpAccept, acceptFinish, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpAccept, &context);
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(op))) {
+    // Another exclusive operation is in flight: one handshake (connect or
+    // accept) per object at a time
+    opForceStatus(op, aosUnknownError);
+    addToGlobalQueue(op);
+    return;
+  }
+
   combinerPushOperation(op, aaStart);
 }
 
@@ -738,6 +746,14 @@ void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags f
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpConnect, &context));
   op->address = *address;
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(&op->root))) {
+    // Another exclusive operation is in flight: one handshake (connect or
+    // accept) per object at a time
+    opForceStatus(&op->root, aosUnknownError);
+    addToGlobalQueue(&op->root);
+    return;
+  }
+
   combinerPushOperation(&op->root, aaStart);
 }
 
@@ -778,7 +794,14 @@ int ioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout)
 {
   Context context(startZmtpAccept, 0, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpAccept, &context);
-  combinerPushOperation(op, aaStart);
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(op))) {
+    // Another exclusive operation is in flight: one handshake (connect or
+    // accept) per object at a time
+    opForceStatus(op, aosUnknownError);
+    addToGlobalQueue(op);
+  } else {
+    combinerPushOperation(op, aaStart);
+  }
   coroutineYield();
 
   AsyncOpStatus status = opGetStatus(op);
@@ -792,7 +815,14 @@ int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags fla
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpConnect, &context));
   op->address = *address;
-  combinerPushOperation(&op->root, aaStart);
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(&op->root))) {
+    // Another exclusive operation is in flight: one handshake (connect or
+    // accept) per object at a time
+    opForceStatus(&op->root, aosUnknownError);
+    addToGlobalQueue(&op->root);
+  } else {
+    combinerPushOperation(&op->root, aaStart);
+  }
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);

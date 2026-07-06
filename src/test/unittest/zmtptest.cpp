@@ -1062,3 +1062,243 @@ TEST(zmtp, aio_rep_coro)
   ASSERT_EQ(context.clientState, 4);
   ASSERT_EQ(context.serverState, 4);
 }
+
+// The ZMTP handshake operations (connect and accept) are exclusive: they
+// claim the object's exclusiveOp slot, and recv/send submitted behind them
+// stay frozen in the object queues until the handshake outcome. Without the
+// slot the opposite lane is open: connect lives in the write queue, so a
+// pipelined recv used to take the inline fast path and read on the plain
+// socket, stealing greeting bytes from the handshake state machine (and
+// mirrored for send during accept). Both ends run on this library in one
+// event loop - the peer must also be driven while the handshake is parked.
+struct zmtpPipelineContext {
+  asyncBase *base;
+  aioObject *listener;
+  zmtpSocket *clientSocket;
+  zmtpSocket *serverSocket;
+  zmtpStream stream;
+  reqStruct serverReq;
+  AsyncOpStatus connectStatus;
+  AsyncOpStatus acceptStatus;
+  AsyncOpStatus sendStatus;
+  AsyncOpStatus recvStatus;
+  int pending;
+  zmtpPipelineContext(asyncBase *baseArg) :
+    base(baseArg), listener(nullptr), clientSocket(nullptr), serverSocket(nullptr),
+    connectStatus(aosUnknown), acceptStatus(aosUnknown),
+    sendStatus(aosUnknown), recvStatus(aosUnknown), pending(0) {}
+  void completed() {
+    if (--pending == 0)
+      postQuitOperation(base);
+  }
+};
+
+static void pipeline_sendcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->sendStatus = status;
+  ctx->completed();
+}
+
+static void pipeline_recvcb(AsyncOpStatus status, zmtpSocket*, zmtpUserMsgTy, zmtpStream*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->recvStatus = status;
+  ctx->completed();
+}
+
+static void pipeline_connectcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->connectStatus = status;
+  ctx->completed();
+}
+
+static void recv_pipeline_zmtpacceptcb(AsyncOpStatus status, zmtpSocket *socket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->acceptStatus = status;
+  if (status == aosSuccess) {
+    ctx->serverReq.a = 11;
+    ctx->serverReq.b = 77;
+    aioZmtpSend(socket, &ctx->serverReq, sizeof(ctx->serverReq), zmtpMessage, afNone, 3000000, pipeline_sendcb, ctx);
+  } else {
+    ctx->completed();  // the send that will never be submitted
+  }
+  ctx->completed();
+}
+
+static void recv_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
+    aioZmtpAccept(ctx->serverSocket, afNone, 3000000, recv_pipeline_zmtpacceptcb, ctx);
+  } else {
+    ctx->pending -= 2;  // neither accept nor send will be submitted
+    ctx->completed();
+  }
+}
+
+TEST(zmtp, recv_pipelined_with_connect)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 4;  // connect, recv, accept, send
+  ctx.listener = startTCPServer(gBase, recv_pipeline_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, pipeline_connectcb, &ctx);
+  // pipelined right behind the connect: must wait for the handshake outcome
+  // instead of racing it for the greeting bytes
+  aioZmtpRecv(ctx.clientSocket, ctx.stream, 1024, afNone, 3000000, pipeline_recvcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.acceptStatus, aosSuccess);
+  EXPECT_EQ(ctx.sendStatus, aosSuccess);
+  EXPECT_EQ(ctx.recvStatus, aosSuccess);
+  if (ctx.recvStatus == aosSuccess) {
+    ASSERT_EQ(ctx.stream.sizeOf(), sizeof(reqStruct));
+    reqStruct *req = ctx.stream.data<reqStruct>();
+    EXPECT_EQ(req->a, 11u);
+    EXPECT_EQ(req->b, 77u);
+  }
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.serverSocket)
+    zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+static void send_pipeline_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->acceptStatus = status;
+  ctx->completed();
+}
+
+static void send_pipeline_connectcb(AsyncOpStatus status, zmtpSocket *socket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->connectStatus = status;
+  if (status == aosSuccess) {
+    aioZmtpRecv(socket, ctx->stream, 1024, afNone, 3000000, pipeline_recvcb, ctx);
+  } else {
+    ctx->completed();  // the recv that will never be submitted
+  }
+  ctx->completed();
+}
+
+static void send_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
+    ctx->serverReq.a = 11;
+    ctx->serverReq.b = 77;
+    aioZmtpAccept(ctx->serverSocket, afNone, 3000000, send_pipeline_zmtpacceptcb, ctx);
+    // pipelined right behind the accept: the frame must not hit the wire
+    // before the greeting exchange completes
+    aioZmtpSend(ctx->serverSocket, &ctx->serverReq, sizeof(ctx->serverReq), zmtpMessage, afNone, 3000000, pipeline_sendcb, ctx);
+  } else {
+    ctx->pending -= 2;  // neither accept nor send will be submitted
+    ctx->completed();
+  }
+}
+
+TEST(zmtp, send_pipelined_with_accept)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 4;  // connect, recv, accept, send
+  ctx.listener = startTCPServer(gBase, send_pipeline_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, send_pipeline_connectcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.acceptStatus, aosSuccess);
+  EXPECT_EQ(ctx.sendStatus, aosSuccess);
+  EXPECT_EQ(ctx.recvStatus, aosSuccess);
+  if (ctx.recvStatus == aosSuccess) {
+    ASSERT_EQ(ctx.stream.sizeOf(), sizeof(reqStruct));
+    reqStruct *req = ctx.stream.data<reqStruct>();
+    EXPECT_EQ(req->a, 11u);
+    EXPECT_EQ(req->b, 77u);
+  }
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.serverSocket)
+    zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+// Same contract as connect.double_connect_rejected on the plain socket: a
+// second handshake operation on a zmtp socket must fail immediately while
+// the first one is still in flight.
+struct zmtpDoubleConnectContext {
+  asyncBase *base;
+  AsyncOpStatus firstStatus;
+  AsyncOpStatus secondStatus;
+  int events;
+  int firstOrder;
+  int secondOrder;
+  zmtpDoubleConnectContext(asyncBase *baseArg) :
+    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
+    events(0), firstOrder(-1), secondOrder(-1) {}
+};
+
+static void zmtp_double_connect_firstcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpDoubleConnectContext*>(arg);
+  ctx->firstStatus = status;
+  ctx->firstOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+static void zmtp_double_connect_secondcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpDoubleConnectContext*>(arg);
+  ctx->secondStatus = status;
+  ctx->secondOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+TEST(zmtp, double_connect_rejected)
+{
+  zmtpDoubleConnectContext ctx(gBase);
+  zmtpSocket *client = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("192.0.2.1");
+  address.port = 9;
+  aioZmtpConnect(client, &address, afNone, 300000, zmtp_double_connect_firstcb, &ctx);
+  aioZmtpConnect(client, &address, afNone, 300000, zmtp_double_connect_secondcb, &ctx);
+
+  asyncLoop(gBase);
+  zmtpSocketDelete(client);
+
+  if (ctx.firstStatus != aosTimeout)
+    GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
+                 << "), exclusive slot contention cannot be exercised on this network";
+  EXPECT_EQ(ctx.secondStatus, aosUnknownError);
+  EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
+    << "the second zmtp connect was not rejected while the first was in flight";
+}

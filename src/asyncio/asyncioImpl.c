@@ -389,9 +389,15 @@ static void exclusiveTryComplete(asyncOpRoot *op, AsyncOpStatus status, uint32_t
   }
 
   // On a lost status race (operation timed out concurrently) the status
-  // winner has pushed aaCancel, which performs the release
+  // winner has pushed aaCancel, which performs the release. The state
+  // machine has already consumed its child operations, so a cancelMethod
+  // that aborts children (SSL/zmtp connect) would find nothing and nobody
+  // would ever finish the operation - mark it not running so the pending
+  // aaCancel releases it directly instead of cancelling
   if (opSetStatus(op, opGetGeneration(op), status))
     exclusiveRelease(op, status, needStart);
+  else
+    op->running = arCancelling;
 }
 
 // Re-drive a parked exclusive operation from a backend event handler
