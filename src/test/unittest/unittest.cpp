@@ -9,11 +9,13 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 #ifdef OS_COMMONUNIX
 #include <unistd.h>
 #endif
@@ -687,6 +689,304 @@ TEST(SslDeathTest, read_garbage_after_handshake_flood)
   EXPECT_EXIT(sslReadGarbageScenario(1), ::testing::ExitedWithCode(0), "");
 }
 #endif
+
+// A write queued while the TLS handshake is still in flight must not report
+// success for bytes that never entered the SSL stream. The server accepts the
+// TCP connection but never answers the ClientHello, so the connect op fails
+// by timeout; the queued write then runs with an incomplete handshake:
+// SSL_write() rejects the payload (WANT_READ), but its result is ignored,
+// bioOut is empty, and the operation completes with aosSuccess claiming the
+// full payload size - the application believes the data was sent.
+struct SslSilentServerContext {
+  asyncBase *base;
+  SSLSocket *client;
+  aioObject *serverConn;
+  AsyncOpStatus connectStatus;
+  AsyncOpStatus writeStatus;
+  size_t writeTransferred;
+  bool writeFinished;
+  SslSilentServerContext(asyncBase *baseArg) :
+    base(baseArg), client(nullptr), serverConn(nullptr),
+    connectStatus(aosUnknown), writeStatus(aosUnknown),
+    writeTransferred(0), writeFinished(false) {}
+};
+
+static void sslSilentServerAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  SslSilentServerContext *ctx = static_cast<SslSilentServerContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess)
+    ctx->serverConn = newSocketIo(ctx->base, acceptSocket);  // keep the connection open, never answer
+  else
+    postQuitOperation(ctx->base);
+}
+
+static void sslWriteBeforeHandshakeConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  SslSilentServerContext *ctx = static_cast<SslSilentServerContext*>(arg);
+  ctx->connectStatus = status;
+}
+
+static void sslWriteBeforeHandshakeWriteCb(AsyncOpStatus status, SSLSocket*, size_t transferred, void *arg)
+{
+  SslSilentServerContext *ctx = static_cast<SslSilentServerContext*>(arg);
+  ctx->writeStatus = status;
+  ctx->writeTransferred = transferred;
+  ctx->writeFinished = true;
+  postQuitOperation(ctx->base);
+}
+
+TEST(ssl, write_before_handshake)
+{
+  static const char payload[] = "must not be reported as sent";
+
+  SslSilentServerContext ctx(gBase);
+  aioObject *listener = startTCPServer(gBase, sslSilentServerAcceptCb, &ctx, gPort);
+  ASSERT_NE(listener, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+
+  ctx.client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioSslConnect(ctx.client, &address, nullptr, 300000, sslWriteBeforeHandshakeConnectCb, &ctx);
+  // queued right behind the connect, as an application pipelining its first
+  // request would do; the write timeout only bounds the test if a fix leaves
+  // the operation waiting for a handshake that can no longer complete
+  aioSslWrite(ctx.client, payload, sizeof(payload)-1, afNone, 3000000, sslWriteBeforeHandshakeWriteCb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosTimeout);
+  ASSERT_TRUE(ctx.writeFinished);
+  EXPECT_NE(ctx.writeStatus, aosSuccess)
+    << "write reported success for " << ctx.writeTransferred
+    << " bytes that never entered the TLS stream";
+
+  sslSocketDelete(ctx.client);
+  deleteAioObject(listener);
+  if (ctx.serverConn)
+    deleteAioObject(ctx.serverConn);
+}
+
+// Pipelined "aioConnect; aioRead" on one TCP socket: an operation submitted
+// after the connect must wait for the connect outcome instead of completing
+// ahead of it. On epoll/kqueue the kernel provides this gate (read() during
+// SYN_SENT returns EAGAIN, the op parks and later times out - after the
+// connect did); on iocp WSARecv on a not-yet-connected socket fails
+// synchronously with WSAENOTCONN, so the read completes with aosUnknownError
+// while the connect is still in flight. The connect target is a TEST-NET-1
+// blackhole (RFC 5737, never answers), which keeps the connect pending until
+// its timeout; if the local network answers it with an ICMP error instead,
+// the gating scenario cannot be exercised and the test skips.
+struct TcpPipelineContext {
+  asyncBase *base;
+  AsyncOpStatus connectStatus;
+  AsyncOpStatus readStatus;
+  int events;
+  int connectOrder;
+  int readOrder;
+  uint8_t buffer[16];
+  TcpPipelineContext(asyncBase *baseArg) :
+    base(baseArg), connectStatus(aosUnknown), readStatus(aosUnknown),
+    events(0), connectOrder(-1), readOrder(-1) {}
+};
+
+static void tcpPipelineConnectCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  TcpPipelineContext *ctx = static_cast<TcpPipelineContext*>(arg);
+  ctx->connectStatus = status;
+  ctx->connectOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+static void tcpPipelineReadCb(AsyncOpStatus status, aioObject*, size_t, void *arg)
+{
+  TcpPipelineContext *ctx = static_cast<TcpPipelineContext*>(arg);
+  ctx->readStatus = status;
+  ctx->readOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_tcp_read_pipelined_with_connect)
+{
+  TcpPipelineContext ctx(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  aioObject *client = newSocketIo(gBase, clientSocket);
+
+  address.ipv4 = inet_addr("192.0.2.1");
+  address.port = 9;
+  aioConnect(client, &address, 300000, tcpPipelineConnectCb, &ctx);
+  aioRead(client, ctx.buffer, sizeof(ctx.buffer), afNone, 2000000, tcpPipelineReadCb, &ctx);
+
+  asyncLoop(gBase);
+  deleteAioObject(client);
+
+  if (ctx.connectStatus != aosTimeout)
+    GTEST_SKIP() << "blackhole answered (connect status " << ctx.connectStatus
+                 << "), connect gating cannot be exercised on this network";
+  EXPECT_LT(ctx.connectOrder, ctx.readOrder)
+    << "read completed (status " << ctx.readStatus
+    << ") while the connect was still in flight";
+}
+
+// Operations pushed while an object's combiner is held by another thread are
+// stacked LIFO (Treiber stack, api.h) and the combiner drains the captured
+// chain from its head, newest-first, without reversing it (asyncioImpl.c):
+// two writes submitted back-to-back by one thread land in the socket in
+// swapped order - silent TCP stream corruption. The producer (test main
+// thread) writes strictly increasing 4-byte counters while a server thread
+// floods the client socket with garbage so the loop thread keeps entering
+// the client's combiner for read-readiness; the server verifies that the
+// counter stream it receives back is monotonic.
+struct CombinerOrderContext {
+  asyncBase *base;
+  aioObject *client;
+  std::atomic<int> connected;
+  std::atomic<int> stopFlood;
+  std::atomic<int> serverDone;
+  std::atomic<long> inversions;
+  std::atomic<long> valuesReceived;
+  uint8_t sink[65536];
+  CombinerOrderContext() :
+    base(nullptr), client(nullptr), connected(0), stopFlood(0), serverDone(0),
+    inversions(0), valuesReceived(0) {}
+};
+
+static void combinerOrderFloodReadCb(AsyncOpStatus status, aioObject *object, size_t, void *arg)
+{
+  CombinerOrderContext *ctx = static_cast<CombinerOrderContext*>(arg);
+  if (status == aosSuccess && !ctx->stopFlood.load())
+    aioRead(object, ctx->sink, sizeof(ctx->sink), afNone, 0, combinerOrderFloodReadCb, ctx);
+}
+
+static void combinerOrderConnectCb(AsyncOpStatus status, aioObject *object, void *arg)
+{
+  CombinerOrderContext *ctx = static_cast<CombinerOrderContext*>(arg);
+  if (status == aosSuccess) {
+    aioRead(object, ctx->sink, sizeof(ctx->sink), afNone, 0, combinerOrderFloodReadCb, ctx);
+    ctx->connected.store(1);
+  } else {
+    ctx->connected.store(-1);
+  }
+}
+
+static void combinerOrderServer(socketTy listenSocket, CombinerOrderContext *ctx, uint32_t total)
+{
+  socketTy fd = accept(listenSocket, nullptr, nullptr);
+  if (fd == (socketTy)(-1)) {
+    ctx->serverDone.store(1);
+    return;
+  }
+
+  std::vector<uint8_t> garbage(16384, 0xAA);
+  std::vector<uint8_t> rx(65536);
+  uint8_t tail[4];
+  size_t tailSize = 0;
+  uint32_t expected = 0;
+  long flooded = 0;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (ctx->valuesReceived.load() < (long)total && std::chrono::steady_clock::now() < deadline) {
+    // keep the client's combiner busy on the loop thread, but bounded
+    if (!ctx->stopFlood.load() && flooded < 32*1024*1024) {
+      send(fd, (const char*)garbage.data(), (int)garbage.size(), 0);
+      flooded += (long)garbage.size();
+    }
+
+    int r = (int)recv(fd, (char*)rx.data(), (int)rx.size(), 0);
+    if (r <= 0)
+      break;
+
+    size_t offset = 0;
+    while (offset < (size_t)r) {
+      size_t take = (size_t)4 - tailSize;  // windows.h defines a min() macro, avoid std::min
+      if (take > (size_t)r - offset)
+        take = (size_t)r - offset;
+      memcpy(tail + tailSize, rx.data() + offset, take);
+      tailSize += take;
+      offset += take;
+      if (tailSize == 4) {
+        uint32_t value;
+        memcpy(&value, tail, 4);
+        if (value != expected)
+          ctx->inversions++;
+        expected = value + 1;
+        tailSize = 0;
+        ctx->valuesReceived++;
+      }
+    }
+  }
+
+  ctx->serverDone.store(1);
+  socketClose(fd);
+}
+
+TEST(combiner, write_submission_order)
+{
+  constexpr uint32_t total = 100000;
+
+  CombinerOrderContext ctx;
+  ctx.base = createAsyncBase(amOSDefault);  // own base: MT hammering stays off gBase
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread serverThread(combinerOrderServer, listenSocket, &ctx, total);
+
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  ctx.client = newSocketIo(ctx.base, clientSocket);
+
+  std::thread loopThread([&ctx]() { asyncLoop(ctx.base); });
+
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioConnect(ctx.client, &address, 3000000, combinerOrderConnectCb, &ctx);
+
+  auto connectDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (ctx.connected.load() == 0 && std::chrono::steady_clock::now() < connectDeadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+  if (ctx.connected.load() == 1) {
+    for (uint32_t i = 0; i < total; i++)
+      aioWrite(ctx.client, &i, sizeof(i), afWaitAll, 0, nullptr, nullptr);
+
+    auto verdictDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!ctx.serverDone.load() && std::chrono::steady_clock::now() < verdictDeadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  ctx.stopFlood.store(1);
+  postQuitOperation(ctx.base);
+  loopThread.join();
+  serverThread.join();
+  socketClose(listenSocket);
+  deleteAioObject(ctx.client);
+
+  ASSERT_EQ(ctx.connected.load(), 1);
+  EXPECT_EQ(ctx.valuesReceived.load(), (long)total);
+  EXPECT_EQ(ctx.inversions.load(), 0)
+    << "single-thread submission order was not preserved on the wire";
+}
 
 void test_udp_rw_client_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {

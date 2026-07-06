@@ -580,19 +580,50 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
     while (!__uintptr_atomic_compare_and_swap(&object->Head.data, currentHead.data, stackTop.data))
       currentHead = object->Head;
 
-    // Run dequeued tasks
+    // The captured chain is linked newest to oldest (each push points to the
+    // previous head); running it as is would invert single-thread submission
+    // order. Reverse the operation nodes first. A no-op node (stub or bare
+    // counter tag) has no next field, so it can only be the chain tail; it
+    // keeps running after the operations pushed on top of it.
+    AsyncOpTaggedPtr reversed = taggedAsyncOpNull();
+    AsyncOpTaggedPtr tail = taggedAsyncOpNull();
     while (currentHead.data && currentHead.data != stackTop.data) {
       asyncOpRoot *current;
       AsyncOpActionTy opMethod;
       uint32_t tag;
       taggedAsyncOpDecode(currentHead, &current, &opMethod, &tag);
 
-      if (current == (asyncOpRoot*)stubOp.data)
-        current = 0;
-      AsyncOpTaggedPtr next = current ? current->next : taggedAsyncOpNull();
+      if (current == (asyncOpRoot*)stubOp.data || !current) {
+        tail = currentHead;
+        break;
+      }
+
+      AsyncOpTaggedPtr next = current->next;
+      current->next = reversed;
+      reversed = currentHead;
+      currentHead = next;
+    }
+
+    // Run dequeued tasks in submission order
+    while (reversed.data) {
+      asyncOpRoot *current;
+      AsyncOpActionTy opMethod;
+      uint32_t tag;
+      taggedAsyncOpDecode(reversed, &current, &opMethod, &tag);
+      reversed = current->next;
       combinerTaskHandlerCommon(object, tag);
       combinerTaskHandler(object, current, opMethod);
-      currentHead = next;
+    }
+
+    if (tail.data) {
+      asyncOpRoot *current;
+      AsyncOpActionTy opMethod;
+      uint32_t tag;
+      taggedAsyncOpDecode(tail, &current, &opMethod, &tag);
+      if (current == (asyncOpRoot*)stubOp.data)
+        current = 0;
+      combinerTaskHandlerCommon(object, tag);
+      combinerTaskHandler(object, current, opMethod);
     }
   }
 }
