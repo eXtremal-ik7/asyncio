@@ -294,6 +294,10 @@ void iocpNextFinishedOperation(asyncBase *base)
           } else if (op->info.root.opCode == actReadMsg) {
             struct recvFromData *rf = op->info.internalBuffer;
             sockaddrToHostAddress(&rf->addr, &op->info.host);
+          } else if (op->info.root.opCode == actConnect) {
+            // Put the socket into the regular connected state, otherwise
+            // getpeername/shutdown on it stay broken after ConnectEx
+            setsockopt(object->hSocket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
           }
         } else if (result == aosBufferTooSmall && op->info.root.opCode == actReadMsg) {
           // WSAEMSGSIZE: the buffer holds the first part of the datagram, the

@@ -222,6 +222,7 @@ void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aio
   object->destructorCb = 0;
   object->destructorCbArg = 0;
   object->CancelIoFlag = 0;
+  object->exclusiveOp = 0;
 }
 
 void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg)
@@ -338,9 +339,8 @@ void initAsyncOpRoot(asyncOpRoot *op,
   objectIncrementReference(object, 1);
 }
 
-static void opRun(asyncOpRoot *op, List *list)
+static void opArmTimer(asyncOpRoot *op)
 {
-  eqPushBack(list, op);
   if (op->timeout) {
     asyncBase *base = op->object->base;
     if (op->flags & afRealtime) {
@@ -354,11 +354,122 @@ static void opRun(asyncOpRoot *op, List *list)
   }
 }
 
+static void opRun(asyncOpRoot *op, List *list)
+{
+  eqPushBack(list, op);
+  opArmTimer(op);
+}
+
+// An exclusive operation (afExclusive: connect) does not live in the
+// read/write queues: it occupies the object's exclusiveOp slot, claimed by
+// CAS at submission time, and both queues do not start operations while the
+// slot is busy. Leaving the slot kicks both queues; leaving it with a
+// non-success status also cancels everything queued behind the exclusive
+// with that status.
+static void exclusiveRelease(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
+{
+  aioObjectRoot *object = op->object;
+  if (object->exclusiveOp == (uintptr_t)op)
+    object->exclusiveOp = 0;
+  opRelease(op, status, 0);
+  if (status != aosSuccess) {
+    cancelOperationList(&object->readQueue, status);
+    cancelOperationList(&object->writeQueue, status);
+  }
+  if (needStart)
+    *needStart |= IO_EVENT_READ | IO_EVENT_WRITE;
+}
+
+static void exclusiveTryComplete(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
+{
+  if (status == aosPending) {
+    op->running = arRunning;
+    return;
+  }
+
+  // On a lost status race (operation timed out concurrently) the status
+  // winner has pushed aaCancel, which performs the release
+  if (opSetStatus(op, opGetGeneration(op), status))
+    exclusiveRelease(op, status, needStart);
+}
+
+// Re-drive a parked exclusive operation from a backend event handler
+void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart)
+{
+  asyncOpRoot *op = (asyncOpRoot*)object->exclusiveOp;
+  if (!op || op->running != arRunning)
+    return;
+  exclusiveTryComplete(op, op->executeMethod(op), needStart);
+}
+
+static void cancelExclusiveOp(aioObjectRoot *object, AsyncOpStatus status)
+{
+  asyncOpRoot *op = (asyncOpRoot*)object->exclusiveOp;
+  if (!op)
+    return;
+  if (opSetStatus(op, opGetGeneration(op), status)) {
+    if (op->running == arRunning) {
+      op->running = arCancelling;
+      if (op->cancelMethod(op))
+        exclusiveRelease(op, status, 0);
+    }
+    // arWaiting: aaStart is still queued in the combiner; it will observe the
+    // status and release the slot
+  }
+}
+
 void processAction(asyncOpRoot *opptr, AsyncOpActionTy actionType, uint32_t *needStart)
 {
   List *list = 0;
   uint32_t tag = 0;
   aioObjectRoot *object = opptr->object;
+
+  if (opptr->flags & afExclusive) {
+    switch (actionType) {
+      case aaStart : {
+        if (opGetStatus(opptr) != aosPending) {
+          // cancelled between submission and start (cancelIo sweep); the
+          // sweep does not push aaCancel for a not yet started operation,
+          // releasing is on us
+          exclusiveRelease(opptr, opGetStatus(opptr), needStart);
+          break;
+        }
+        opArmTimer(opptr);
+        exclusiveTryComplete(opptr, opptr->executeMethod(opptr), needStart);
+        break;
+      }
+
+      case aaCancel : {
+        if (opptr->running == arRunning) {
+          opptr->running = arCancelling;
+          if (opptr->cancelMethod(opptr))
+            exclusiveRelease(opptr, opGetStatus(opptr), needStart);
+        } else {
+          exclusiveRelease(opptr, opGetStatus(opptr), needStart);
+        }
+        break;
+      }
+
+      case aaFinish : {
+        exclusiveRelease(opptr, opGetStatus(opptr), needStart);
+        break;
+      }
+
+      case aaContinue : {
+        if (opptr->running == arRunning)
+          exclusiveTryComplete(opptr, opptr->executeMethod(opptr), needStart);
+        else
+          exclusiveRelease(opptr, opGetStatus(opptr), needStart);
+        break;
+      }
+
+      default :
+        break;
+    }
+
+    return;
+  }
+
   if (opptr->opCode & OPCODE_WRITE) {
     list = &object->writeQueue;
     tag = IO_EVENT_WRITE;
@@ -421,6 +532,11 @@ void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList)
 void executeOperationList(List *list)
 {
   asyncOpRoot *op = list->head;
+  // Both queues are frozen while an exclusive operation (connect) is in
+  // flight; they are kicked when it leaves the slot
+  if (op && op->object->exclusiveOp)
+    return;
+
   while (op) {
     asyncOpRoot *next = op->executeQueue.next;
     AsyncOpStatus status = op->executeMethod(op);
@@ -539,11 +655,13 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 {
   if (object->CancelIoFlag) {
     object->CancelIoFlag = 0;
+    cancelExclusiveOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
   }
 
   if (tag & COMBINER_TAG_DELETE) {
+    cancelExclusiveOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
     if (object->destructorCb)

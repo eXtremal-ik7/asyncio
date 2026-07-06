@@ -135,9 +135,21 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   uint32_t readEvents = fdObject ? fdObject->ReadEvents : 0;
   uint32_t writeEvents = fdObject ? fdObject->WriteEvents : 0;
 
+  asyncOpRoot *connectOp = (asyncOpRoot*)object->exclusiveOp;
+  int wasConnecting = connectOp && connectOp->running == arRunning;
   int hasReadOp = object->readQueue.head != 0;
   int hasWriteOp = object->writeQueue.head != 0;
- 
+
+  uint32_t needStart = readEvents | writeEvents;
+
+  // A parked connect (the object's exclusive operation) is driven by fd
+  // events directly, not through a queue; its completion is signaled by
+  // writability or an error. Drive it before the disconnect sweep so that
+  // operations queued behind it are cancelled with the connect status, not
+  // aosDisconnected
+  if (wasConnecting && ((readEvents | writeEvents) & (IO_EVENT_WRITE | IO_EVENT_ERROR)))
+    processExclusiveOp(object, &needStart);
+
   if ((readEvents | writeEvents) & IO_EVENT_ERROR) {
     // EV_EOF mapped to TAG_ERROR, cancel all operations with aosDisconnected status
     int available;
@@ -147,8 +159,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
       cancelOperationList(&object->readQueue, aosDisconnected);
     cancelOperationList(&object->writeQueue, aosDisconnected);
   }
-  
-  uint32_t needStart = readEvents | writeEvents;
+
   if (op)
     processAction(op, opMethod, &needStart);
   if (needStart & IO_EVENT_READ)
@@ -165,15 +176,19 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
       fdObject->WriteEvents = 0;
 
     unsigned readEventActivated = hasReadOp && !(readEvents & IO_EVENT_READ);
-    unsigned writeEventActivated = hasWriteOp && !(writeEvents & IO_EVENT_WRITE);
+    unsigned writeEventActivated = (hasWriteOp || wasConnecting) && !(writeEvents & IO_EVENT_WRITE);
+
+    asyncOpRoot *connectOpNow = (asyncOpRoot*)object->exclusiveOp;
+    int connectingNow = connectOpNow && connectOpNow->running == arRunning;
+    int wantWrite = object->writeQueue.head != 0 || connectingNow;
 
     if (object->readQueue.head && !readEventActivated)
         kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_READ, fd, object);
     if (!object->readQueue.head && readEventActivated)
         kqueueControl(base->kqueueFd, EV_DELETE| EV_ONESHOT | EV_EOF, EVFILT_READ, fd, object);
-    if (object->writeQueue.head && !writeEventActivated)
+    if (wantWrite && !writeEventActivated)
         kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, object);
-    if (!object->writeQueue.head && writeEventActivated)
+    if (!wantWrite && writeEventActivated)
         kqueueControl(base->kqueueFd, EV_DELETE | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, object);
   }
 }

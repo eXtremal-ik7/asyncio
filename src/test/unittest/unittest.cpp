@@ -843,6 +843,120 @@ TEST(basic, test_tcp_read_pipelined_with_connect)
     << ") while the connect was still in flight";
 }
 
+// Connect is an exclusive object operation: it occupies the single
+// aioObjectRoot::exclusiveOp slot. A second connect submitted while the
+// first is still in flight must be rejected immediately instead of queueing
+// or corrupting the slot.
+struct DoubleConnectContext {
+  asyncBase *base;
+  AsyncOpStatus firstStatus;
+  AsyncOpStatus secondStatus;
+  int events;
+  int firstOrder;
+  int secondOrder;
+  DoubleConnectContext(asyncBase *baseArg) :
+    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
+    events(0), firstOrder(-1), secondOrder(-1) {}
+};
+
+static void doubleConnectFirstCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  DoubleConnectContext *ctx = static_cast<DoubleConnectContext*>(arg);
+  ctx->firstStatus = status;
+  ctx->firstOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+static void doubleConnectSecondCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  DoubleConnectContext *ctx = static_cast<DoubleConnectContext*>(arg);
+  ctx->secondStatus = status;
+  ctx->secondOrder = ctx->events++;
+  if (ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+TEST(connect, double_connect_rejected)
+{
+  DoubleConnectContext ctx(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  aioObject *client = newSocketIo(gBase, clientSocket);
+
+  address.ipv4 = inet_addr("192.0.2.1");
+  address.port = 9;
+  aioConnect(client, &address, 300000, doubleConnectFirstCb, &ctx);
+  aioConnect(client, &address, 300000, doubleConnectSecondCb, &ctx);
+
+  asyncLoop(gBase);
+  deleteAioObject(client);
+
+  if (ctx.firstStatus != aosTimeout)
+    GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
+                 << "), exclusive slot contention cannot be exercised on this network";
+  EXPECT_EQ(ctx.secondStatus, aosUnknownError);
+  EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
+    << "the second connect was not rejected while the first was in flight";
+}
+
+// deleteAioObject on an object with a connect in flight: the internal cancelIo
+// sweep must find the operation in the exclusive slot (it is not in the
+// read/write queues anymore), cancel it and let the object die instead of
+// leaking a parked connect and a permanently frozen object.
+struct DeleteWhileConnectingContext {
+  asyncBase *base;
+  AsyncOpStatus status;
+  DeleteWhileConnectingContext(asyncBase *baseArg) : base(baseArg), status(aosUnknown) {}
+};
+
+static void deleteWhileConnectingCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  DeleteWhileConnectingContext *ctx = static_cast<DeleteWhileConnectingContext*>(arg);
+  ctx->status = status;
+  postQuitOperation(ctx->base);
+}
+
+TEST(connect, delete_object_while_connecting)
+{
+  DeleteWhileConnectingContext ctx(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  aioObject *client = newSocketIo(gBase, clientSocket);
+
+  address.ipv4 = inet_addr("192.0.2.1");
+  address.port = 9;
+  aioConnect(client, &address, 3000000, deleteWhileConnectingCb, &ctx);
+
+  std::thread deleter([client]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    deleteAioObject(client);
+  });
+
+  auto started = std::chrono::steady_clock::now();
+  asyncLoop(gBase);
+  deleter.join();
+  auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - started).count();
+
+  if (ctx.status != aosCanceled && ctx.status != aosTimeout)
+    GTEST_SKIP() << "blackhole answered (connect status " << ctx.status
+                 << "), cancellation of an in-flight connect cannot be exercised on this network";
+  EXPECT_EQ(ctx.status, aosCanceled);
+  EXPECT_LT(elapsedMs, 2000)
+    << "connect was not cancelled by deleteAioObject, it ran to its own timeout";
+}
+
 // Operations pushed while an object's combiner is held by another thread are
 // stacked LIFO (Treiber stack, api.h) and the combiner drains the captured
 // chain from its head, newest-first, without reversing it (asyncioImpl.c):

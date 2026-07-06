@@ -67,7 +67,11 @@ typedef enum AsyncFlags {
   afRealtime = 4,
   afActiveOnce = 8,
   afRunning = 16,
-  afCoroutine = 32
+  afCoroutine = 32,
+  // Object-level operation (connect): lives in aioObjectRoot::exclusiveOp
+  // instead of a read/write queue; while it is in flight neither queue starts
+  // operations, its failure cancels everything queued behind it
+  afExclusive = 64
 } AsyncFlags;
 
 typedef enum AsyncOpActionTy {
@@ -210,8 +214,11 @@ struct aioObjectRoot {
   uintptr_t refs;
   List readQueue;
   List writeQueue;
-  
+
   volatile uint32_t CancelIoFlag;
+  // Exclusive operation slot (connect): claimed by CAS at submission time,
+  // cleared under the object's combiner when the operation leaves the slot
+  volatile uintptr_t exclusiveOp;
 
   IoObjectTy type;
   aioObjectDestructor *destructor;
@@ -256,6 +263,7 @@ uintptr_t opEncodeTag(asyncOpRoot *op, uintptr_t tag);
 
 void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList);
 void processAction(asyncOpRoot *opptr, AsyncOpActionTy actionType, uint32_t *needStart);
+void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart);
 void executeOperationList(List *list);
 void cancelOperationList(List *list, AsyncOpStatus status);
 
@@ -351,8 +359,8 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
 
   if (!head.data) {
     // This thread entered a combiner
-    if (queue->head) {
-      // Object has operations in queue
+    if (queue->head || object->exclusiveOp) {
+      // Object has operations in queue or an exclusive operation in flight
       // Put operation to queue end and try exit combiner
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);

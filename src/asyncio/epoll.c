@@ -143,8 +143,21 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   EPollObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (EPollObject*)object : 0;
   uint32_t ioEvents = fdObject ? fdObject->IoEvents : 0;
 
+  asyncOpRoot *connectOp = (asyncOpRoot*)object->exclusiveOp;
+  int wasConnecting = connectOp && connectOp->running == arRunning;
   int hasReadOp = object->readQueue.head != 0;
-  int hasWriteOp = object->writeQueue.head != 0;
+  int hasWriteOp = object->writeQueue.head != 0 || wasConnecting;
+
+  uint32_t needStart = ioEvents;
+
+  // A parked connect (the object's exclusive operation) is driven by fd
+  // events directly, not through a queue; its completion is signaled by
+  // writability or an error. Drive it before the disconnect sweep so that
+  // operations queued behind it are cancelled with the connect status, not
+  // aosDisconnected
+  if (wasConnecting && (ioEvents & (IO_EVENT_WRITE | IO_EVENT_ERROR)))
+    processExclusiveOp(object, &needStart);
+
   if (ioEvents & IO_EVENT_ERROR) {
     // EPOLLRDHUP mapped to TAG_ERROR, cancel all operations with aosDisconnected status
     int available;
@@ -155,7 +168,6 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
     cancelOperationList(&object->writeQueue, aosDisconnected);
   }
 
-  uint32_t needStart = ioEvents;
   if (op)
     processAction(op, opMethod, &needStart);
   if (needStart & IO_EVENT_READ)
@@ -180,9 +192,11 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
     if (fdDeactivated)
       currentEvents = 0;
 
+    asyncOpRoot *connectOpNow = (asyncOpRoot*)object->exclusiveOp;
+    int connectingNow = connectOpNow && connectOpNow->running == arRunning;
     if (object->readQueue.head)
       newEvents |= EPOLLIN;
-    if (object->writeQueue.head)
+    if (object->writeQueue.head || connectingNow)
       newEvents |= EPOLLOUT;
 
     if (ioEvents)
