@@ -131,10 +131,17 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
         return aosSuccess;  
       }
       case ParserResultNeedMoreData : {
-        // copy 'tail' to begin of buffer
         size_t offset = httpDataRemaining(&client->state);
+        if (offset == client->inBufferSize) {
+          // a message element larger than the buffer can never complete;
+          // reading 0 bytes below would spin this loop forever
+          return aosBufferTooSmall;
+        }
+
+        // move 'tail' to begin of buffer; the regions overlap when the parser
+        // consumed less than half of the buffered data
         if (offset)
-          memcpy(client->inBuffer, httpDataPtr(&client->state), offset);
+          memmove(client->inBuffer, httpDataPtr(&client->state), offset);
 
         asyncOpRoot *readOp;
         size_t bytesTransferred = 0;
