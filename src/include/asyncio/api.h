@@ -175,8 +175,45 @@ int eventTryActivate(aioUserEvent *event);
 void eventDeactivate(aioUserEvent *event);
 
 void *alignedMalloc(size_t size, size_t alignment);
+void alignedFree(void *ptr);
 void *__tagged_pointer_make(void *ptr, uintptr_t data);
 void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData);
+
+// Recycling pools for objects. Pooled memory is never returned to the
+// allocator, so a sanitizer sees use-after-destruction as ordinary access
+// to valid memory. With INSTRUMENTED_POOLS (cmake option
+// BUILD_INSTRUMENTED_POOLS) every acquisition misses and objectPoolPut
+// reports "not pooled": the structure lives one malloc/free cycle and the
+// caller frees it with the matching deallocator - the caller, because
+// pooled structures own nested buffers the generic code cannot release.
+// The switch deliberately covers objects only. Operations cannot leave
+// their pools: the timeout grid keeps op pointers past the operation's
+// lifetime and lazily cancels through them when their second arrives -
+// that is safe exactly because recycled operation memory stays type-stable
+// and the generation tag rejects the stale cancel. User events own their
+// platform timer, freeing them would leak the timer descriptor.
+static inline int objectPoolGet(ConcurrentQueue *pool, void **result)
+{
+#ifdef INSTRUMENTED_POOLS
+  (void)pool;
+  *result = 0;
+  return 0;
+#else
+  return concurrentQueuePop(pool, result);
+#endif
+}
+
+static inline int objectPoolPut(ConcurrentQueue *pool, void *object)
+{
+#ifdef INSTRUMENTED_POOLS
+  (void)pool;
+  (void)object;
+  return 0;
+#else
+  concurrentQueuePush(pool, object);
+  return 1;
+#endif
+}
 
 void eqRemove(List *list, asyncOpRoot *op);
 void eqPushBack(List *list, asyncOpRoot *op);

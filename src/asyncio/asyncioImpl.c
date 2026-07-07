@@ -74,6 +74,15 @@ void *alignedMalloc(size_t size, size_t alignment)
 #endif
 }
 
+void alignedFree(void *ptr)
+{
+#ifdef OS_COMMONUNIX
+  free(ptr);
+#else
+  _aligned_free(ptr);
+#endif
+}
+
 void *__tagged_pointer_make(void *ptr, uintptr_t data)
 {
   return (void*)(((intptr_t)ptr) + ((intptr_t)(data & TAGGED_POINTER_DATA_MASK)));
@@ -180,7 +189,7 @@ void eventDeactivate(aioUserEvent *event)
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
 {
   asyncOpListLink *timerLink = 0;
-  if (!concurrentQueuePop(&asyncOpLinkListPool, (void**)&timerLink))
+  if (!objectPoolGet(&asyncOpLinkListPool, (void**)&timerLink))
     timerLink = malloc(sizeof(asyncOpListLink));
   timerLink->op = op;
   timerLink->tag = opGetGeneration(op);
@@ -201,7 +210,8 @@ void processTimeoutQueue(asyncBase *base, time_t currentTime)
     while (link) {
       asyncOpListLink *next = link->next;
       opCancel(link->op, link->tag, aosTimeout);
-      concurrentQueuePush(&asyncOpLinkListPool, link);
+      if (!objectPoolPut(&asyncOpLinkListPool, link))
+        free(link);
       link = next;
     }
   }

@@ -294,7 +294,7 @@ aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
   epollBase *localBase = (epollBase*)base;
   EPollObject *object = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&object)) {
+  if (!objectPoolGet(&objectPool, (void**)&object)) {
     object = alignedMalloc(sizeof(EPollObject), TAGGED_POINTER_ALIGNMENT);
     object->Object.buffer.ptr = 0;
     object->Object.buffer.totalSize = 0;
@@ -354,7 +354,10 @@ void epollDeleteObject(aioObject *object)
       break;
   }
 
-  concurrentQueuePush(&objectPool, object);
+  if (!objectPoolPut(&objectPool, object)) {
+    free(object->buffer.ptr);
+    alignedFree(object);
+  }
 }
 
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)

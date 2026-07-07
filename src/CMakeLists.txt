@@ -27,6 +27,19 @@ if (BUILD_SANITIZE_ADDRESS AND BUILD_SANITIZE_THREAD)
   message(FATAL_ERROR "BUILD_SANITIZE_ADDRESS and BUILD_SANITIZE_THREAD are mutually exclusive")
 endif()
 
+# Recycle aio objects through malloc/free instead of the lock-free pools so
+# a sanitizer can track their lifetime (pooled memory hides use-after-destruction).
+# Defaults to the address sanitizer switch; can be forced on separately.
+if (BUILD_SANITIZE_ADDRESS)
+  set(INSTRUMENTED_POOLS_DEFAULT ON)
+else()
+  set(INSTRUMENTED_POOLS_DEFAULT OFF)
+endif()
+option(BUILD_INSTRUMENTED_POOLS "Bypass object recycling pools with malloc/free for sanitizer runs" ${INSTRUMENTED_POOLS_DEFAULT})
+if (BUILD_INSTRUMENTED_POOLS)
+  add_definitions(-DINSTRUMENTED_POOLS)
+endif()
+
 if (BUILD_SANITIZE_ADDRESS AND NOT CMAKE_C_FLAGS MATCHES "fsanitize=address")
   set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")

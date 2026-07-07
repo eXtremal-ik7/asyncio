@@ -1063,6 +1063,212 @@ TEST(connect, delete_object_while_connecting)
     << "connect was not cancelled by deleteAioObject, it ran to its own timeout";
 }
 
+// The lifetime suite pins the destruction contract that callers rely on to
+// free their own state:
+// - every submitted operation reports exactly once; cancellation delivers
+//   aosCanceled through the regular callback, nothing is silently dropped;
+// - the destructor callback fires exactly once, strictly after the last
+//   operation callback of the object, and no callback fires after it;
+// - cancelIo cancels everything pending but leaves the object usable.
+// Everything here is deterministic on a single loop thread: completions and
+// the delete tag travel through the global queue in submission order, so the
+// destructor is always the last word. The concurrent side of the same
+// contract (destruction racing a combiner held by another thread) has no
+// deterministic interleaving reachable from the public API and is exercised
+// by the lifetimetest stress binary instead.
+struct LifetimeContext {
+  asyncBase *base;
+  unsigned canceledCallbacks = 0;
+  unsigned successCallbacks = 0;
+  unsigned unexpectedCallbacks = 0;
+  unsigned callbacksAfterDestructor = 0;
+  unsigned destructorCalls = 0;
+  unsigned eventFires = 0;
+  AsyncOpStatus connectStatus = aosUnknown;
+  LifetimeContext(asyncBase *baseArg) : base(baseArg) {}
+};
+
+static void lifetimeAccount(LifetimeContext *ctx, AsyncOpStatus status)
+{
+  if (ctx->destructorCalls)
+    ctx->callbacksAfterDestructor++;
+  if (status == aosCanceled)
+    ctx->canceledCallbacks++;
+  else if (status == aosSuccess)
+    ctx->successCallbacks++;
+  else
+    ctx->unexpectedCallbacks++;
+}
+
+static void lifetimeReadMsgCb(AsyncOpStatus status, aioObject*, HostAddress, size_t, void *arg)
+{
+  lifetimeAccount(static_cast<LifetimeContext*>(arg), status);
+}
+
+static void lifetimeIoCb(AsyncOpStatus status, aioObject*, size_t, void *arg)
+{
+  lifetimeAccount(static_cast<LifetimeContext*>(arg), status);
+}
+
+static void lifetimeConnectCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
+  if (ctx->destructorCalls)
+    ctx->callbacksAfterDestructor++;
+  ctx->connectStatus = status;
+}
+
+static void lifetimeDestructorCb(aioObjectRoot*, void *arg)
+{
+  LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
+  ctx->destructorCalls++;
+  postQuitOperation(ctx->base);
+}
+
+TEST(lifetime, delete_with_parked_reads)
+{
+  LifetimeContext context(gBase);
+  aioObject *object = initializeUDPClient(gBase);
+  ASSERT_NE(object, nullptr);
+  objectSetDestructorCb(aioObjectHandle(object), lifetimeDestructorCb, &context);
+
+  // The timeouts protect the test, not the contract: were cancellation to
+  // lose an operation, it would surface as aosTimeout in unexpectedCallbacks
+  // instead of hanging the loop forever
+  constexpr unsigned opsNum = 16;
+  static uint32_t buffers[opsNum];
+  for (unsigned i = 0; i < opsNum; i++)
+    aioReadMsg(object, &buffers[i], sizeof(uint32_t), afNone, 3000000, lifetimeReadMsgCb, &context);
+  deleteAioObject(object);
+
+  asyncLoop(gBase);
+  EXPECT_EQ(context.canceledCallbacks, opsNum);
+  EXPECT_EQ(context.successCallbacks, 0u);
+  EXPECT_EQ(context.unexpectedCallbacks, 0u);
+  EXPECT_EQ(context.destructorCalls, 1u);
+  EXPECT_EQ(context.callbacksAfterDestructor, 0u);
+}
+
+// The successful probe read deletes the object from its own callback, so the
+// destructor ordering is exercised from a loop-thread callback as well
+static void lifetimeProbeReadCb(AsyncOpStatus status, aioObject *socket, HostAddress, size_t transferred, void *arg)
+{
+  LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess)
+    EXPECT_EQ(transferred, sizeof(uint32_t));
+  lifetimeAccount(ctx, status);
+  deleteAioObject(socket);
+}
+
+TEST(lifetime, cancel_io_keeps_object_alive)
+{
+  LifetimeContext context(gBase);
+  aioObject *server = startUDPServer(gBase, nullptr, nullptr, nullptr, 0, gPort);
+  aioObject *client = initializeUDPClient(gBase);
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(client, nullptr);
+  objectSetDestructorCb(aioObjectHandle(server), lifetimeDestructorCb, &context);
+
+  constexpr unsigned opsNum = 8;
+  static uint32_t buffers[opsNum];
+  for (unsigned i = 0; i < opsNum; i++)
+    aioReadMsg(server, &buffers[i], sizeof(uint32_t), afNone, 3000000, lifetimeReadMsgCb, &context);
+  cancelIo(aioObjectHandle(server));
+
+  // Submitted after cancelIo: must survive it and complete with the datagram
+  static uint32_t probeBuffer;
+  aioReadMsg(server, &probeBuffer, sizeof(probeBuffer), afNone, 3000000, lifetimeProbeReadCb, &context);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  uint32_t payload = 0xbaadf00d;
+  aioWriteMsg(client, &address, &payload, sizeof(payload), afNone, 0, nullptr, nullptr);
+
+  asyncLoop(gBase);
+  EXPECT_EQ(context.canceledCallbacks, opsNum);
+  EXPECT_EQ(context.successCallbacks, 1u);
+  EXPECT_EQ(context.unexpectedCallbacks, 0u);
+  EXPECT_EQ(context.destructorCalls, 1u);
+  EXPECT_EQ(context.callbacksAfterDestructor, 0u);
+  EXPECT_EQ(probeBuffer, 0xbaadf00d);
+  deleteAioObject(client);
+}
+
+// Operations submitted behind a connect sit frozen in the read/write queues
+// (the exclusive slot gates them); deleteAioObject must cancel the parked
+// connect and both gated operations, then destruct - one aosCanceled per
+// operation, nothing leaks, nothing outlives the destructor callback. The
+// blackhole address keeps the connect in flight, but no loop iteration runs
+// between the submissions and the delete, so the test does not depend on the
+// network answering or staying silent
+TEST(lifetime, delete_with_connect_in_flight)
+{
+  LifetimeContext context(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_EQ(socketBind(clientSocket, &address), 0);
+  aioObject *client = newSocketIo(gBase, clientSocket);
+  objectSetDestructorCb(aioObjectHandle(client), lifetimeDestructorCb, &context);
+
+  address.ipv4 = inet_addr("192.0.2.1");
+  address.port = 9;
+  aioConnect(client, &address, 3000000, lifetimeConnectCb, &context);
+
+  static char readBuffer[16];
+  static const char writeBuffer[16] = {};
+  aioRead(client, readBuffer, sizeof(readBuffer), afNone, 3000000, lifetimeIoCb, &context);
+  aioWrite(client, writeBuffer, sizeof(writeBuffer), afNone, 3000000, lifetimeIoCb, &context);
+  deleteAioObject(client);
+
+  asyncLoop(gBase);
+  EXPECT_EQ(context.connectStatus, aosCanceled);
+  EXPECT_EQ(context.canceledCallbacks, 2u);
+  EXPECT_EQ(context.successCallbacks, 0u);
+  EXPECT_EQ(context.unexpectedCallbacks, 0u);
+  EXPECT_EQ(context.destructorCalls, 1u);
+  EXPECT_EQ(context.callbacksAfterDestructor, 0u);
+}
+
+// Same contract for user events, which have their own reference mechanics:
+// deleting the event from inside its own callback must still deliver the
+// destructor callback exactly once and nothing may fire afterwards
+static void lifetimeEventCb(aioUserEvent *event, void *arg)
+{
+  LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
+  if (ctx->destructorCalls)
+    ctx->callbacksAfterDestructor++;
+  if (++ctx->eventFires == 3)
+    deleteUserEvent(event);
+}
+
+static void lifetimeEventDestructorCb(aioUserEvent*, void *arg)
+{
+  LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
+  ctx->destructorCalls++;
+  postQuitOperation(ctx->base);
+}
+
+TEST(lifetime, user_event_destructor)
+{
+  LifetimeContext context(gBase);
+  aioUserEvent *event = newUserEvent(gBase, 0, lifetimeEventCb, &context);
+  ASSERT_NE(event, nullptr);
+  eventSetDestructorCb(event, lifetimeEventDestructorCb, &context);
+  userEventStartTimer(event, 1000, 3);
+
+  asyncLoop(gBase);
+  EXPECT_EQ(context.eventFires, 3u);
+  EXPECT_EQ(context.destructorCalls, 1u);
+  EXPECT_EQ(context.callbacksAfterDestructor, 0u);
+}
+
 // Operations pushed while an object's combiner is held by another thread are
 // stacked LIFO (Treiber stack, api.h) and the combiner drains the captured
 // chain from its head, newest-first, without reversing it (asyncioImpl.c):
@@ -1613,6 +1819,119 @@ TEST(basic, test_udp_fire_and_forget_sync_result)
   deleteAioObject(context.clientSocket);
   deleteAioObject(context.serverSocket);
 }
+
+// The kernel reports some socket failures only through the "exceptional"
+// poll state: on Linux EPOLLERR/EPOLLHUP are delivered regardless of the
+// interest mask and can arrive with no readable/writable bit at all. Two
+// natural sources, one per direction:
+// - a connected UDP socket after an ICMP port unreachable for a datagram it
+//   sent: the receive queue is empty, so the wakeup carries only the error
+//   bit, and the parked read must be driven to pick up ECONNREFUSED;
+// - a pipe whose reader closed while the pipe is full: no room to write and
+//   no readers left, so again only the error bit.
+// kqueue delivers both through the armed filter itself (EVFILT_READ fires
+// on so_error, EVFILT_WRITE comes with EV_EOF), IOCP completes the parked
+// overlapped operation with WSAECONNRESET. A backend that drops an
+// error-only event kills the descriptor: the oneshot registration is
+// already consumed, nothing ever rearms it, and the operation dies by its
+// own timeout instead of reporting the error - or hangs forever when it has
+// none. The exact status differs by backend (aosUnknownError from errno on
+// the POSIX paths, aosDisconnected from the EV_EOF/WSAECONNRESET sweeps);
+// the invariant is a prompt completion that is neither success nor timeout.
+struct ErrorWakeupContext {
+  asyncBase *base;
+  AsyncOpStatus status = aosPending;
+  bool callbackFired = false;
+  ErrorWakeupContext(asyncBase *baseArg) : base(baseArg) {}
+};
+
+void test_udp_icmp_error_readcb(AsyncOpStatus status, aioObject*, HostAddress, size_t, void *arg)
+{
+  ErrorWakeupContext *ctx = static_cast<ErrorWakeupContext*>(arg);
+  ctx->status = status;
+  ctx->callbackFired = true;
+  postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_udp_icmp_error_wakes_parked_read)
+{
+  ErrorWakeupContext context(gBase);
+
+  // A guaranteed-closed port: let the kernel assign an ephemeral one, then
+  // release it
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = 0;
+  socketTy probeSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  ASSERT_EQ(socketBind(probeSocket, &address), 0);
+  sockaddr_in closedAddress;
+  memset(&closedAddress, 0, sizeof(closedAddress));
+#ifdef OS_WINDOWS
+  int closedAddressLength = static_cast<int>(sizeof(closedAddress));
+#else
+  socklen_t closedAddressLength = sizeof(closedAddress);
+#endif
+  ASSERT_EQ(getsockname(probeSocket, reinterpret_cast<sockaddr*>(&closedAddress), &closedAddressLength), 0);
+  socketClose(probeSocket);
+
+  // connect() makes the kernel deliver the ICMP error to this socket
+  // (an unconnected one silently drops it)
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  ASSERT_EQ(connect(clientSocket, reinterpret_cast<sockaddr*>(&closedAddress), sizeof(closedAddress)), 0);
+  aioObject *object = newSocketIo(gBase, clientSocket);
+
+  // Park the read before anything is sent: a datagram sent first would
+  // bounce before the submission-time synchronous attempt, which would
+  // consume the error inline and never exercise the event-loop wakeup
+  uint32_t buffer;
+  aioReadMsg(object, &buffer, sizeof(buffer), afNone, 1000000, test_udp_icmp_error_readcb, &context);
+
+  char probe = 'x';
+  EXPECT_EQ(send(clientSocket, &probe, 1, 0), 1);
+
+  asyncLoop(gBase);
+  EXPECT_TRUE(context.callbackFired);
+  EXPECT_NE(context.status, aosSuccess);
+  EXPECT_NE(context.status, aosTimeout) << "the ICMP error did not wake the parked read";
+  deleteAioObject(object);
+}
+
+#ifdef OS_COMMONUNIX
+void test_pipe_reader_close_writecb(AsyncOpStatus status, aioObject*, size_t, void *arg)
+{
+  ErrorWakeupContext *ctx = static_cast<ErrorWakeupContext*>(arg);
+  ctx->status = status;
+  ctx->callbackFired = true;
+  postQuitOperation(ctx->base);
+}
+
+TEST(basic, test_pipe_reader_close_wakes_parked_write)
+{
+  ErrorWakeupContext context(gBase);
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+
+  // Fill the pipe so the write below parks instead of completing inline
+  char chunk[4096];
+  memset(chunk, 0, sizeof(chunk));
+  while (write(unnamedPipe.write, chunk, sizeof(chunk)) > 0)
+    continue;
+  ASSERT_EQ(errno, EAGAIN);
+
+  aioObject *pipeWrite = newDeviceIo(gBase, unnamedPipe.write);
+  char payload = 'x';
+  aioWrite(pipeWrite, &payload, sizeof(payload), afNone, 1000000, test_pipe_reader_close_writecb, &context);
+
+  close(unnamedPipe.read);
+
+  asyncLoop(gBase);
+  EXPECT_TRUE(context.callbackFired);
+  EXPECT_NE(context.status, aosSuccess);
+  EXPECT_NE(context.status, aosTimeout) << "the reader closing did not wake the parked write";
+  deleteAioObject(pipeWrite);
+}
+#endif
 
 void test_timeout_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {

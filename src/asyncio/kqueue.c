@@ -266,7 +266,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
 aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
   KQueueObject *object = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&object)) {
+  if (!objectPoolGet(&objectPool, (void**)&object)) {
     object = alignedMalloc(sizeof(KQueueObject), TAGGED_POINTER_ALIGNMENT);
     object->Object.buffer.ptr = 0;
     object->Object.buffer.totalSize = 0;
@@ -322,8 +322,11 @@ void kqueueDeleteObject(aioObject *object)
     default :
       break;
   }
-  
-  concurrentQueuePush(&objectPool, object);
+
+  if (!objectPoolPut(&objectPool, object)) {
+    free(object->buffer.ptr);
+    alignedFree(object);
+  }
 }
 
 void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op)
