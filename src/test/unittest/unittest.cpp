@@ -1063,6 +1063,160 @@ TEST(connect, delete_object_while_connecting)
     << "connect was not cancelled by deleteAioObject, it ran to its own timeout";
 }
 
+// A connect that resolves synchronously must report right away. The reactor
+// backends do that: connect() failing with anything but EINPROGRESS becomes
+// an immediate error status. The proactor path must match: ConnectEx
+// returning FALSE with a real error (not WSA_IO_PENDING) means no completion
+// packet will ever arrive, and treating it as pending - which is what the
+// WSARecv-style check in iocpAsyncConnect does, reading BOOL FALSE as the
+// WSA*-convention success (AcceptEx in iocpAsyncAccept has the same shape) -
+// parks the operation beyond recovery: the timeout pushes a cancel, the
+// cancel leans on CancelIoEx, but nothing was ever submitted, so no abort
+// packet comes and the operation sits in the exclusive slot forever, holding
+// the object and freezing its queues. A hang, not a late error - hence a
+// death-test child, where the watchdog turns the hang into a verdict.
+// The trigger is a second connect on an already-connected socket (submitted
+// from the first connect's callback: the exclusive slot is released before
+// the finish callback runs). What it reports is per-kernel semantics: macOS
+// gives EISCONN (the TCP layer advances the socket state at handshake time),
+// Linux returns 0 and reports success (the state advances lazily on the next
+// connect() call - SO_ERROR confirmation does not move it, so the retry
+// legitimately completes the first connect), Windows fails ConnectEx
+// synchronously with WSAEISCONN - probed on a real system - with no packet
+// following. So the asserted contract is promptness alone, not the status.
+struct ConnectedReconnectContext {
+  asyncBase *base;
+  aioObject *client;
+  AsyncOpStatus firstStatus;
+  AsyncOpStatus secondStatus;
+};
+
+static void connectedReconnectSecondCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  ConnectedReconnectContext *ctx = static_cast<ConnectedReconnectContext*>(arg);
+  ctx->secondStatus = status;
+  postQuitOperation(ctx->base);
+}
+
+static void connectedReconnectFirstCb(AsyncOpStatus status, aioObject*, void *arg)
+{
+  ConnectedReconnectContext *ctx = static_cast<ConnectedReconnectContext*>(arg);
+  ctx->firstStatus = status;
+  if (status != aosSuccess)
+    exit(2);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioConnect(ctx->client, &address, 1000000, connectedReconnectSecondCb, ctx);
+}
+
+static void connectedReconnectScenario()
+{
+  armDeathTestWatchdog(10);
+
+  ConnectedReconnectContext ctx;
+  ctx.base = createAsyncBase(amOSDefault); // own base: gBase must not be touched after fork()
+  ctx.client = nullptr;
+  ctx.firstStatus = aosUnknown;
+  ctx.secondStatus = aosUnknown;
+
+  // A live listener; accepting is not needed, the loopback handshake
+  // completes through the backlog
+  if (!startTCPServer(ctx.base, nullptr, nullptr, gPort))
+    exit(2);
+  ctx.client = initializeTCPClient(ctx.base, connectedReconnectFirstCb, &ctx, gPort);
+  if (!ctx.client)
+    exit(2);
+
+  asyncLoop(ctx.base);
+  // aosTimeout would mean the synchronous resolution was parked until the
+  // operation timeout; anything else that arrived at all arrived promptly
+  exit(ctx.secondStatus == aosTimeout || ctx.secondStatus == aosUnknown ? 1 : 0);
+}
+
+TEST(ConnectDeathTest, connect_on_connected_socket_reports_promptly)
+{
+  EXPECT_EXIT(connectedReconnectScenario(), ::testing::ExitedWithCode(0), "");
+}
+
+// A client that completes the handshake and dies (abortive close, RST) while
+// still parked in the listen backlog must not fail the accept operation: a
+// flaky or hostile remote peer would otherwise kill the server's pending
+// accept at will.
+// Kernel semantics for this scenario, probed on real systems:
+// - Linux and macOS hand the dead connection out of accept() successfully;
+//   the first read on it reports the reset. Neither prunes the queue nor
+//   returns ECONNABORTED (the BSD classic survives on FreeBSD at most), so
+//   the reactor backends never even see accept() == -1 here and pass as is.
+// - Windows depends on the ordering. An AcceptEx already in flight when the
+//   RST lands grabs the connection and completes with success, like POSIX.
+//   But an AcceptEx posted when the queued connection is already dead - this
+//   test - completes with ERROR_NETNAME_DELETED, which the completion path
+//   maps to aosDisconnected, and the operation dies instead of re-posting
+//   AcceptEx and waiting on.
+// The asserted contract is aosSuccess: either the dead socket itself (POSIX
+// semantics - detecting the reset is the application's job on first I/O) or,
+// once the backend retries, the live client queued behind it.
+struct DeadBacklogAcceptContext {
+  asyncBase *base;
+  AsyncOpStatus status;
+  socketTy acceptedSocket;
+  DeadBacklogAcceptContext(asyncBase *baseArg) : base(baseArg), status(aosUnknown), acceptedSocket(0) {}
+};
+
+static void deadBacklogAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  DeadBacklogAcceptContext *ctx = static_cast<DeadBacklogAcceptContext*>(arg);
+  ctx->status = status;
+  ctx->acceptedSocket = acceptSocket;
+  postQuitOperation(ctx->base);
+}
+
+TEST(accept, client_reset_in_backlog_does_not_fail_accept)
+{
+  DeadBacklogAcceptContext ctx(gBase);
+  aioObject *listener = startTCPServer(gBase, nullptr, nullptr, gPort);
+  ASSERT_TRUE(listener);
+
+  sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = inet_addr("127.0.0.1");
+  address.sin_port = htons(gPort);
+
+  // blocking socket: connect() returning 0 means the handshake completed and
+  // the connection is parked in the backlog
+  socketTy victim = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  ASSERT_EQ(connect(victim, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  linger abortiveClose;
+  abortiveClose.l_onoff = 1;
+  abortiveClose.l_linger = 0;
+  ASSERT_EQ(setsockopt(victim, SOL_SOCKET, SO_LINGER,
+                       reinterpret_cast<const char*>(&abortiveClose), sizeof(abortiveClose)), 0);
+  socketClose(victim);
+  // the RST travels through loopback and is processed in microseconds; the
+  // margin only has to cover scheduling noise
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  aioAccept(listener, 2000000, deadBacklogAcceptCb, &ctx);
+
+  // the live client the accept should end up with once the dead one is dealt
+  // with; queued behind the dead connection before the loop runs
+  socketTy liveClient = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  ASSERT_EQ(connect(liveClient, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.status, aosSuccess)
+    << "a client that died in the backlog must not fail the accept operation";
+  if (ctx.status == aosSuccess)
+    socketClose(ctx.acceptedSocket);
+  socketClose(liveClient);
+  deleteAioObject(listener);
+}
+
 // The lifetime suite pins the destruction contract that callers rely on to
 // free their own state:
 // - every submitted operation reports exactly once; cancellation delivers
@@ -1155,8 +1309,9 @@ static void lifetimeProbeReadCb(AsyncOpStatus status, aioObject *socket, HostAdd
 {
   LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
   EXPECT_EQ(status, aosSuccess);
-  if (status == aosSuccess)
+  if (status == aosSuccess) {
     EXPECT_EQ(transferred, sizeof(uint32_t));
+  }
   lifetimeAccount(ctx, status);
   deleteAioObject(socket);
 }
@@ -2094,6 +2249,69 @@ TEST(coroutine, nested)
   while (!coroutineCall(coro))
     continue;
   ASSERT_EQ(x, 3);
+}
+
+// coroutineCall on a running coroutine does not switch: it records the wakeup
+// in the counter and returns, and the owner consumes the record at the next
+// coroutineYield (which then resumes immediately instead of parking). When the
+// wakeup lands after the final yield, the coroutine finishes with the record
+// still pending, and the caller's re-entry loop (coroutinePosix.c do/while in
+// coroutineCall, same shape in coroutineWin32.c) trusts the counter alone: it
+// switches back into the finished context, where execution falls off the end
+// of fiberEntryPoint - a garbage return address on POSIX, an implicit thread
+// exit with Windows fibers. In production the window opens with several loop
+// threads: one resumes an operation-owning coroutine that is about to return
+// while another delivers a second wakeup for it (a user event, another
+// operation on the same second). The handshake below forces that exact
+// interleaving on every run, no timing involved. The scenario runs in a death
+// test child: today it must die there; with the re-entry loop respecting
+// `finished` it exits through the normal path - coroutineCall reports
+// completion and the finish callback fires exactly once.
+static coroutineTy *coroWakeupRaceCoroutine;
+static std::atomic<int> coroWakeupRacePhase(0);
+static int coroWakeupRaceFinishCalls = 0;
+
+static void coroWakeupRaceFinishCb(void*)
+{
+  coroWakeupRaceFinishCalls++;
+}
+
+static void coroWakeupRaceProc(void*)
+{
+  coroWakeupRacePhase.store(1);
+  while (coroWakeupRacePhase.load() != 2)
+    std::this_thread::yield();
+  // return without yielding: the recorded wakeup is still in the counter
+}
+
+static void coroWakeupRaceChild()
+{
+  // On Windows the broken path silently exits the calling thread instead of
+  // crashing, which would leave the child hanging; turn a hang into a verdict
+  std::thread watchdog([]() {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::_Exit(3);
+  });
+  watchdog.detach();
+
+  coroWakeupRaceCoroutine = coroutineNewWithCb(coroWakeupRaceProc, nullptr, 0x10000, coroWakeupRaceFinishCb, nullptr);
+  std::thread wakeup([]() {
+    while (coroWakeupRacePhase.load() != 1)
+      std::this_thread::yield();
+    coroutineCall(coroWakeupRaceCoroutine); // the coroutine is running: recorded, not switched
+    coroWakeupRacePhase.store(2);
+  });
+
+  int finished = coroutineCall(coroWakeupRaceCoroutine);
+  wakeup.join();
+  // _Exit keeps the verdict to the scenario itself (no atexit, no leak check)
+  std::_Exit(finished == 1 && coroWakeupRaceFinishCalls == 1 ? 42 : 1);
+}
+
+TEST(coroutine, wakeup_racing_finish)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(coroWakeupRaceChild(), testing::ExitedWithCode(42), "");
 }
 
 int main(int argc, char **argv)
