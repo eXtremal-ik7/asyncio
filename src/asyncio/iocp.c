@@ -305,6 +305,17 @@ void iocpNextFinishedOperation(asyncBase *base)
           struct recvFromData *rf = op->info.internalBuffer;
           op->info.bytesTransferred = entry->dwNumberOfBytesTransferred;
           sockaddrToHostAddress(&rf->addr, &op->info.host);
+        } else if (result == aosDisconnected && op->info.root.opCode == actAccept) {
+          // A connection that died in the backlog (RST) completes the parked
+          // AcceptEx with ERROR_NETNAME_DELETED; posix kernels hand out the
+          // dead socket successfully and let the application find out on the
+          // first read. Don't fail the accept operation over a remote-side
+          // event: drop the corpse and re-post AcceptEx for the next
+          // connection (same re-drive as partial read/write above)
+          closesocket(op->info.acceptSocket);
+          op->info.acceptSocket = INVALID_SOCKET;
+          combinerPushOperation(&op->info.root, aaContinue);
+          continue;
         }
 
         opSetStatus(&op->info.root, opGetGeneration(&op->info.root), result);
@@ -459,10 +470,15 @@ AsyncOpStatus iocpAsyncConnect(asyncOpRoot *opptr)
   struct sockaddr_storage sa;
   socklen_t saLen = hostAddressToSockaddr(&op->info.host, &sa);
   memset(&op->overlapped, 0, sizeof(op->overlapped));
+  // ConnectEx is BOOL: nonzero = synchronous success with the completion
+  // packet still queued to the port - park and let it finish there. Zero
+  // with an error other than WSA_IO_PENDING means nothing was submitted:
+  // parking such an operation leaves a zombie no completion or CancelIoEx
+  // packet can ever finish
   int result = localBase->ConnectExPtr(object->hSocket, (const struct sockaddr*)&sa, saLen, NULL, 0, NULL, &op->overlapped);
-  return (result == 0 || WSAGetLastError() == WSA_IO_PENDING) ?
-    aosPending :
-    aosUnknownError;
+  if (result != 0)
+    return aosPending;
+  return WSAGetLastError() == WSA_IO_PENDING ? aosPending : aosUnknownError;
 }
 
 
@@ -499,11 +515,12 @@ AsyncOpStatus iocpAsyncAccept(asyncOpRoot *opptr)
                         NULL,
                         &op->overlapped);
 
-  if (result == 0 || WSAGetLastError() == WSA_IO_PENDING) {
+  // AcceptEx is BOOL like ConnectEx: nonzero = synchronous success (packet
+  // still queued), zero + WSA_IO_PENDING = in flight, anything else was
+  // never submitted and must fail here instead of parking a zombie
+  if (result != 0)
     return aosPending;
-  } else {
-    return aosUnknownError;
-  }
+  return WSAGetLastError() == WSA_IO_PENDING ? aosPending : aosUnknownError;
 }
 
 

@@ -249,6 +249,13 @@ struct aioObjectRoot {
   List writeQueue;
 
   volatile uint32_t CancelIoFlag;
+  // Set by objectDelete, never cleared: the object is dying, every combiner
+  // pass sweeps the queues once more before releasing ownership. A plain
+  // CancelIoFlag pass is positionally sloppy - it runs at the node its tag
+  // landed on, so a submission parked later in the same captured chain
+  // starts after the sweep; with no timeout armed such an operation would
+  // hold its object reference forever and the DELETE tag would never fire
+  volatile uint32_t DeletePending;
   // Exclusive operation slot (connect): claimed by CAS at submission time,
   // cleared under the object's combiner when the operation leaves the slot
   volatile uintptr_t exclusiveOp;

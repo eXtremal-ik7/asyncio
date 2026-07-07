@@ -414,6 +414,12 @@ AsyncOpStatus kqueueAsyncAccept(asyncOpRoot *opptr)
     fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current);
     sockaddrToHostAddress(&clientAddr, &op->host);
     return aosSuccess;
+  } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EPROTO || errno == EINTR) {
+    // The connection can be gone from the backlog by the time accept runs
+    // (stolen by another thread, aborted by the peer): wait for the next one.
+    // Resource exhaustion (EMFILE/ENFILE/ENOBUFS) must NOT retry: the
+    // backlog stays readable and the retry loop would spin hot
+    return aosPending;
   } else {
     return aosUnknownError;
   }

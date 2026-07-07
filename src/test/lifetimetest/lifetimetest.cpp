@@ -43,6 +43,10 @@ struct ObjectCtx {
   std::atomic<unsigned> callbacks{0};
   std::atomic<unsigned> destructors{0};
   std::atomic<unsigned> afterDestructor{0};
+  // Raw handle for the post-mortem dump: a stuck object is alive by
+  // definition (references pin it), so peeking at it from the stalled
+  // verdict path is safe - everything is quiescent by then
+  aioObjectRoot *handle{nullptr};
   char buffer[64];
 };
 
@@ -107,7 +111,8 @@ static void worker(unsigned id, unsigned iterations, unsigned opsPerObject, unsi
 
     aioObject *object = newSocketIo(gBase, fd);
     objectsCreated.fetch_add(1, std::memory_order_relaxed);
-    objectSetDestructorCb(aioObjectHandle(object), lifetimeDestructorCb, ctx);
+    ctx->handle = aioObjectHandle(object);
+    objectSetDestructorCb(ctx->handle, lifetimeDestructorCb, ctx);
 
     for (unsigned k = 0; k < opsPerObject; k++) {
       // A mix of arming modes so the delete races different completion
@@ -222,6 +227,24 @@ int main(int argc, char **argv)
       fprintf(stderr, "  stuck objects: %u with missing callbacks (stranded operations hold references), "
                       "%u with all callbacks (lost delete), %u destroyed but callbacks missing\n",
               stuckWithCallbacksMissing, stuckCallbacksComplete, destroyedCallbacksMissing);
+      unsigned dumped = 0;
+      for (auto &arena : arenas) {
+        for (auto &ctx : arena) {
+          if (ctx.destructors.load() || ctx.callbacks.load() == ctx.expected.load() || !ctx.handle)
+            continue;
+          aioObjectRoot *o = ctx.handle;
+          fprintf(stderr,
+                  "  obj %p: refs=%" PRIuPTR " head=%" PRIxPTR " readQ=%p writeQ=%p"
+                  " cancelIoFlag=%u deletePending=%u exclusive=%" PRIxPTR " missing=%u\n",
+                  (void*)o, o->refs, o->Head.data, (void*)o->readQueue.head, (void*)o->writeQueue.head,
+                  o->CancelIoFlag, o->DeletePending, o->exclusiveOp,
+                  ctx.expected.load() - ctx.callbacks.load());
+          if (++dumped == 16)
+            break;
+        }
+        if (dumped == 16)
+          break;
+      }
       fflush(nullptr);
       std::_Exit(2); // loop threads may be jammed, a clean join is not coming
     }

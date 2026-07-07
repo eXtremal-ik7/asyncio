@@ -203,7 +203,12 @@ int coroutineCall(coroutineTy *coroutine)
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
       switchContext(&coroutine->prev->context, &coroutine->context);
-    } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1);
+      // A wakeup that lands after the last yield leaves the counter above 1
+      // when the coroutine returns; re-entering a finished context would run
+      // off the end of fiberEntryPoint. The pending wakeup is consumed by the
+      // finished path below (free + finishCb), same as a call on a finished
+      // coroutine is a no-op
+    } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1 && !coroutine->finished);
 
     int finished = coroutine->finished;
     if (finished) {

@@ -32,6 +32,11 @@ typedef struct epollBase {
 typedef struct EPollObject {
   aioObject Object;
   uint32_t IoEvents;
+  // Whether the fd is currently in the epoll set. Registration is lazy:
+  // EPOLLERR/EPOLLHUP ignore the requested mask, so an idle object with a
+  // pending error condition would wake every epoll_wait if its fd stayed
+  // in the set with an empty mask. Only touched under the object combiner.
+  uint32_t Registered;
 } EPollObject;
 
 typedef struct aioTimer {
@@ -120,7 +125,10 @@ asyncBase *epollNewAsyncBase()
 
     base->eventObject = epollNewAioObject(&base->B, ioObjectDevice, &base->eventFd);
 
-    epollControl(base->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, base->eventFd, base->eventObject);
+    // The event fd bypasses the combiner re-arm logic (the message loop
+    // re-arms it directly), so register it here explicitly
+    epollControl(base->epollFd, EPOLL_CTL_ADD, EPOLLIN | EPOLLONESHOT, base->eventFd, base->eventObject);
+    ((EPollObject*)base->eventObject)->Registered = 1;
   }
 
   return (asyncBase *)base;
@@ -188,7 +196,8 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
 
     // "Calculate" current epoll_ctl mask because we don't have map<fd, oldMask>
     // EPOLLIN/EPOLLOUT now enabled if read/write queue was not empty and file descriptor not deactivated by EPOLLONESHOT flag
-    int fdDeactivated = (ioEvents & (IO_EVENT_READ | IO_EVENT_WRITE)) != 0;
+    // Any delivered event consumes the EPOLLONESHOT shot, whatever bits it carries
+    int fdDeactivated = ioEvents != 0;
 
     if (hasReadOp)
       currentEvents |= EPOLLIN;
@@ -206,8 +215,21 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
 
     if (ioEvents)
       fdObject->IoEvents = 0;
-    if (currentEvents != newEvents) {
-      epollControl(base->epollFd, EPOLL_CTL_MOD, newEvents ? newEvents | EPOLLONESHOT | EPOLLRDHUP : 0, fd, object);
+    if (newEvents) {
+      if (!fdObject->Registered) {
+        epollControl(base->epollFd, EPOLL_CTL_ADD, newEvents | EPOLLONESHOT | EPOLLRDHUP, fd, object);
+        fdObject->Registered = 1;
+      } else if (currentEvents != newEvents) {
+        epollControl(base->epollFd, EPOLL_CTL_MOD, newEvents | EPOLLONESHOT | EPOLLRDHUP, fd, object);
+      }
+    } else if (currentEvents) {
+      // No operation left on an armed fd: remove it from the set instead of
+      // keeping it with an empty mask - EPOLLERR/EPOLLHUP ignore the mask and
+      // would wake every epoll_wait for as long as the error condition holds.
+      // An fd disarmed by a delivered EPOLLONESHOT shot stays fully silent,
+      // so that state is left in the set as is
+      epollControl(base->epollFd, EPOLL_CTL_DEL, 0, fd, object);
+      fdObject->Registered = 0;
     }
   }
 }
@@ -279,6 +301,13 @@ void epollNextFinishedOperation(asyncBase *base)
           eventMask |= IO_EVENT_WRITE;
         if (events[n].events & EPOLLRDHUP)
           eventMask |= IO_EVENT_ERROR;
+        // EPOLLERR/EPOLLHUP are reported regardless of the requested mask and
+        // consume the EPOLLONESHOT shot like any other event. Wake both queues
+        // so parked operations retry their syscall and report the real errno.
+        // IO_EVENT_ERROR does not fit here: its contract is "peer closed"
+        // (EPOLLRDHUP) and it would misreport e.g. ECONNREFUSED as aosDisconnected
+        if (events[n].events & (EPOLLERR | EPOLLHUP))
+          eventMask |= IO_EVENT_READ | IO_EVENT_WRITE;
 
         if (eventMask) {
           ((EPollObject*)object)->IoEvents = eventMask;
@@ -313,9 +342,9 @@ aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
   }
 
   object->IoEvents = 0;
+  object->Registered = 0;
   object->Object.buffer.offset = 0;
   object->Object.buffer.dataSize = 0;
-  epollControl(localBase->epollFd, EPOLL_CTL_ADD, 0, getFd(object), object);
   return &object->Object;
 }
 
@@ -339,14 +368,17 @@ int epollCancelAsyncOp(asyncOpRoot *opptr)
 void epollDeleteObject(aioObject *object)
 {
   epollBase *localBase = (epollBase*)object->root.base;
+  int registered = ((EPollObject*)object)->Registered;
   switch (object->root.type) {
     case ioObjectDevice :
-      epollControl(localBase->epollFd, EPOLL_CTL_DEL, 0, object->hDevice, 0);
+      if (registered)
+        epollControl(localBase->epollFd, EPOLL_CTL_DEL, 0, object->hDevice, 0);
       close(object->hDevice);
       object->hDevice = -1;
       break;
     case ioObjectSocket :
-      epollControl(localBase->epollFd, EPOLL_CTL_DEL, 0, object->hSocket, 0);
+      if (registered)
+        epollControl(localBase->epollFd, EPOLL_CTL_DEL, 0, object->hSocket, 0);
       close(object->hSocket);
       object->hSocket = -1;
       break;
@@ -452,6 +484,12 @@ AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr)
     fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current);
     sockaddrToHostAddress(&clientAddr, &op->host);
     return aosSuccess;
+  } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EPROTO || errno == EINTR) {
+    // The connection can be gone from the backlog by the time accept runs
+    // (stolen by another thread, aborted by the peer): wait for the next one.
+    // Resource exhaustion (EMFILE/ENFILE/ENOBUFS) must NOT retry: the
+    // backlog stays readable and the retry loop would spin hot
+    return aosPending;
   } else {
     return aosUnknownError;
   }

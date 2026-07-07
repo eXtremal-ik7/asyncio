@@ -88,7 +88,11 @@ int coroutineCall(coroutineTy *coroutine)
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
       SwitchToFiber(coroutine->fiber);
-    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1);
+      // A wakeup that lands after the last yield leaves the counter above 1
+      // when the coroutine returns; re-entering a finished fiber would run
+      // off the end of fiberEntryPoint (which terminates the thread). The
+      // pending wakeup is consumed by the finished path below
+    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1 && !coroutine->finished);
 
     int finished = coroutine->finished;
     if (finished) {

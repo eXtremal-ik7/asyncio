@@ -18,6 +18,14 @@ ConcurrentQueue asyncOpLinkListPool;
 
 void eqRemove(List *list, asyncOpRoot *op)
 {
+  // An operation that lost its status race is detached by the list walker;
+  // the racing party that won still releases it through here later. With
+  // cleared links and not being the head it is provably not a member -
+  // unlinking it anyway would rewrite head/tail through stale pointers and
+  // corrupt whatever the queue (or the memory reuser) holds by now
+  if (op->executeQueue.prev == 0 && op->executeQueue.next == 0 && list->head != op)
+    return;
+
   if (op->executeQueue.prev) {
     op->executeQueue.prev->executeQueue.next = op->executeQueue.next;
   } else {
@@ -33,6 +41,9 @@ void eqRemove(List *list, asyncOpRoot *op)
     if (list->tail == 0)
       list->head = 0;
   }
+
+  op->executeQueue.prev = 0;
+  op->executeQueue.next = 0;
 }
 
 void eqPushBack(List *list, asyncOpRoot *op)
@@ -232,6 +243,7 @@ void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aio
   object->destructorCb = 0;
   object->destructorCbArg = 0;
   object->CancelIoFlag = 0;
+  object->DeletePending = 0;
   object->exclusiveOp = 0;
 }
 
@@ -255,6 +267,8 @@ void cancelIo(aioObjectRoot *object)
 
 void objectDelete(aioObjectRoot *object)
 {
+  // Before the cancelIo push: the pass it triggers must already see the flag
+  object->DeletePending = 1;
   cancelIo(object);
   objectDecrementReference(object, 1);
 }
@@ -565,15 +579,20 @@ void executeOperationList(List *list)
       break;
     }
 
-    if (opSetStatus(op, opGetGeneration(op), status))
+    if (opSetStatus(op, opGetGeneration(op), status)) {
       opRelease(op, status, 0);
-    else
+    } else {
       op->executeQueue.prev = op->executeQueue.next = 0;
+    }
     op = next;
   }
 
   list->head = op;
-  if (!op)
+  if (op)
+    // The dropped prefix was released without unlinking; a stale prev left
+    // here would send a later eqRemove writing into recycled memory
+    op->executeQueue.prev = 0;
+  else
     list->tail = 0;
 }
 
@@ -587,9 +606,18 @@ void cancelOperationList(List *list, AsyncOpStatus status)
         op->running = arCancelling;
         if (op->cancelMethod(op))
           opRelease(op, opGetStatus(op), list);
+        else
+          // Waits for the backend cancel completion (iocp abort packet);
+          // detach cleanly so the completion's release does not unlink a
+          // wiped list through stale pointers
+          eqRemove(list, op);
       } else {
         opRelease(op, opGetStatus(op), list);
       }
+    } else {
+      // Status race lost: the winner releases the operation, this walker
+      // only detaches it so the list stays consistent for both parties
+      eqRemove(list, op);
     }
     op = next;
   }
@@ -711,6 +739,16 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
   for (;;) {
     AsyncOpTaggedPtr currentHead;
     while ( (currentHead.data = object->Head.data) == stackTop.data ) {
+      // A dying object is swept once more at every ownership-release point:
+      // this is the only position that is guaranteed to come after every
+      // action of the captured chains, so a submission that slipped past the
+      // CancelIoFlag pass cannot survive the delete and pin the object
+      // (sticky flag; the sweep is idempotent, re-runs only cost a re-check)
+      if (object->DeletePending) {
+        cancelExclusiveOp(object, aosCanceled);
+        cancelOperationList(&object->readQueue, aosCanceled);
+        cancelOperationList(&object->writeQueue, aosCanceled);
+      }
       if (__uintptr_atomic_compare_and_swap(&object->Head.data, stackTop.data, 0))
         return;
     }
@@ -742,14 +780,20 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       currentHead = next;
     }
 
-    // Run dequeued tasks in submission order
+    // Run dequeued tasks in submission order.
+    // A DELETE tag destroys the object: nothing may touch it afterwards,
+    // including the head CAS of the next loop turn - return immediately.
+    // Nothing gets abandoned by that: the tag is pushed on the refcount
+    // hitting zero, every not-yet-finished operation holds a reference, so
+    // an operation action can never legally sit behind the DELETE tag
     while (reversed.data) {
       asyncOpRoot *current;
       AsyncOpActionTy opMethod;
       uint32_t tag;
       taggedAsyncOpDecode(reversed, &current, &opMethod, &tag);
       reversed = current->next;
-      combinerTaskHandlerCommon(object, tag);
+      if (combinerTaskHandlerCommon(object, tag))
+        return;
       combinerTaskHandler(object, current, opMethod);
     }
 
@@ -760,7 +804,8 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       taggedAsyncOpDecode(tail, &current, &opMethod, &tag);
       if (current == (asyncOpRoot*)stubOp.data)
         current = 0;
-      combinerTaskHandlerCommon(object, tag);
+      if (combinerTaskHandlerCommon(object, tag))
+        return;
       combinerTaskHandler(object, current, opMethod);
     }
   }
