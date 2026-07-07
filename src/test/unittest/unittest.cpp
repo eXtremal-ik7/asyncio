@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 #ifdef OS_COMMONUNIX
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -2085,6 +2086,55 @@ TEST(basic, test_pipe_reader_close_wakes_parked_write)
   EXPECT_NE(context.status, aosSuccess);
   EXPECT_NE(context.status, aosTimeout) << "the reader closing did not wake the parked write";
   deleteAioObject(pipeWrite);
+}
+
+// An idle object must not cost CPU, whatever state its fd is in. epoll
+// registers the fd with an empty event mask right at object creation
+// (epollNewAioObject) and going idle re-arms it with an empty mask, but
+// EPOLLERR/EPOLLHUP cannot be masked out: the kernel reports them for as
+// long as the condition holds. With no operation parked there is nothing to
+// consume the condition, the event translates to an empty mask and is
+// swallowed, so every epoll_wait returns immediately and the loop thread
+// burns a full core until the object is deleted. Probed on the real kernel
+// (scratchpad/acceptprobe/epollstorm.c): an fd registered with events=0
+// floods EPOLLERR every call, while an EPOLLONESHOT-disarmed fd stays fully
+// silent - so a parked operation does not storm and this is specifically
+// about idle objects. A pipe whose reader is gone is the deterministic worst
+// case: the error condition is permanent, nothing can consume it. kqueue
+// registers filters per operation and iocp has no readiness reporting, so
+// the contract holds there as is; the burn is epoll-only.
+// The loop runs in its own thread so it can spin while this thread sleeps
+// and meters the process CPU clock; the idle baseline over the window is
+// microseconds, four orders of magnitude under the threshold.
+TEST(basic, test_error_on_idle_object_keeps_loop_asleep)
+{
+  asyncBase *base = createAsyncBase(amOSDefault);
+  std::thread loopThread([base]() { asyncLoop(base); });
+
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+  aioObject *pipeWrite = newDeviceIo(base, unnamedPipe.write);
+  close(unnamedPipe.read);  // permanent error condition on an idle fd
+
+  // let the loop thread face the condition before metering starts
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  rusage before, after;
+  ASSERT_EQ(getrusage(RUSAGE_SELF, &before), 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  ASSERT_EQ(getrusage(RUSAGE_SELF, &after), 0);
+
+  auto cpuMicroseconds = [](const rusage &usage) {
+    return static_cast<uint64_t>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000 +
+           static_cast<uint64_t>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec);
+  };
+  EXPECT_LT(cpuMicroseconds(after) - cpuMicroseconds(before), 200000u)
+    << "the loop thread spins on the error condition of an idle object";
+
+  deleteAioObject(pipeWrite);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  postQuitOperation(base);
+  loopThread.join();
 }
 #endif
 
