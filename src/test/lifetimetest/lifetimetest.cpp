@@ -9,8 +9,9 @@
 //   - the system drains: a stall means a jammed combiner or a lost wakeup.
 // The actual memory errors (touching a destroyed object from a combiner
 // chain, cross-object corruption through recycled memory) are the address
-// sanitizer's job: configure with -DBUILD_SANITIZE_ADDRESS=ON, which also
-// flips BUILD_INSTRUMENTED_POOLS so recycled objects do not hide them.
+// sanitizer's job: configure with -DBUILD_SANITIZE_ADDRESS=ON - objects
+// parked in the recycling pools are asan-poisoned, so stale touches report
+// use-after-poison while the allocation pattern stays production-like.
 //
 // Usage: lifetimetest [workers] [loopThreads] [iterations] [opsPerObject] [seed]
 
@@ -27,14 +28,6 @@
 #include <random>
 #include <thread>
 #include <vector>
-
-// Instrumented pool recycling deliberately abandons the nested buffers the
-// pools would have reused; leak reports would drown the errors this binary
-// exists to catch
-extern "C" const char *__asan_default_options()
-{
-  return "detect_leaks=0";
-}
 
 static asyncBase *gBase = nullptr;
 

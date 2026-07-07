@@ -335,7 +335,7 @@ aioObject *iocpNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
   iocpBase *localBase = (iocpBase*)base;
   aioObject* object = 0;
-  if (!objectPoolGet(&objectPool, (void**)&object)) {
+  if (!objectPoolGet(&objectPool, (void**)&object, sizeof(aioObject))) {
     object = alignedMalloc(sizeof(aioObject), TAGGED_POINTER_ALIGNMENT);
     object->buffer.ptr = 0;
     object->buffer.totalSize = 0;
@@ -404,10 +404,7 @@ void iocpDeleteObject(aioObject *object)
       break;
   }
 
-  if (!objectPoolPut(&objectPool, object)) {
-    free(object->buffer.ptr);
-    alignedFree(object);
-  }
+  objectPoolPut(&objectPool, object, sizeof(aioObject));
 }
 
 void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)

@@ -214,6 +214,13 @@ asyncBase *createAsyncBase(AsyncMethod method)
   base->timerMapLock = 0;
   base->lastCheckPoint = time(0);
   base->messageLoopThreadCounter = 0;
+  base->graceEpoch = 0;
+  base->graceFrozen = 0;
+  base->graceSlotCount = 0;
+  base->graceLimboLock = 0;
+  base->graceLimbo = 0;
+  for (unsigned i = 0; i < GRACE_LOOP_THREAD_LIMIT; i++)
+    base->graceSeen[i].seen = UINTPTR_MAX;   // empty slots never gate the limbo
   return base;
 }
 

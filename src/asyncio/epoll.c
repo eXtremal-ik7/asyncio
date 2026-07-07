@@ -151,6 +151,15 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   EPollObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (EPollObject*)object : 0;
   uint32_t ioEvents = fdObject ? fdObject->IoEvents : 0;
 
+  // A dying object gets no fd readiness processing: its operations are being
+  // cancelled wholesale anyway, and for a stale batch entry landing here
+  // within the grace period the descriptor is already closed - the error
+  // path ioctl and the rearm epoll_ctl would run on a dead or reused fd
+  if (object->DeletePending && ioEvents) {
+    fdObject->IoEvents = 0;
+    ioEvents = 0;
+  }
+
   asyncOpRoot *connectOp = (asyncOpRoot*)object->exclusiveOp;
   int wasConnecting = connectOp && connectOp->running == arRunning;
   int hasReadOp = object->readQueue.head != 0;
@@ -188,7 +197,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   if (needStart & IO_EVENT_WRITE)
     executeOperationList(&object->writeQueue);
 
-  if (fdObject) {
+  if (fdObject && !object->DeletePending) {
     int fd = getFd(fdObject);
     epollBase *base = (epollBase*)object->base;
     uint32_t currentEvents = 0;
@@ -240,17 +249,25 @@ void epollNextFinishedOperation(asyncBase *base)
   struct epoll_event events[MAX_EVENTS];
   epollBase *localBase = (epollBase *)base;
   messageLoopThreadId = __sync_fetch_and_add(&base->messageLoopThreadCounter, 1);
+  graceThreadEnter(base);
 
   while (1) {
     do {
       if (!executeGlobalQueue(base)) {
-        // Found quit marker
+        // Found quit marker. Stamp the slot out before the counter drops:
+        // once it does, a future loop thread may adopt this id, and a stale
+        // stamp would shield its batches from the grace period. The last
+        // thread out drains the limbo list
+        if (messageLoopThreadId < GRACE_LOOP_THREAD_LIMIT)
+          base->graceSeen[messageLoopThreadId].seen = UINTPTR_MAX;
+        graceReclaim(base);
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 0u-1) - 1;
         if (threadsRunning)
           epollEnqueue(base, 0);
         return;
       }
 
+      graceQuiesce(base);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, 500);
       time_t currentTime = time(0);
       if (currentTime % base->messageLoopThreadCounter == messageLoopThreadId)
@@ -323,7 +340,7 @@ aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
   epollBase *localBase = (epollBase*)base;
   EPollObject *object = 0;
-  if (!objectPoolGet(&objectPool, (void**)&object)) {
+  if (!objectPoolGet(&objectPool, (void**)&object, sizeof(EPollObject))) {
     object = alignedMalloc(sizeof(EPollObject), TAGGED_POINTER_ALIGNMENT);
     object->Object.buffer.ptr = 0;
     object->Object.buffer.totalSize = 0;
@@ -365,6 +382,13 @@ int epollCancelAsyncOp(asyncOpRoot *opptr)
   return 1;
 }
 
+// Memory half of the object destructor, runs via graceRetire once no loop
+// thread can hold the object in an already-harvested event batch
+static void epollReleaseObject(aioObject *object)
+{
+  objectPoolPut(&objectPool, object, sizeof(EPollObject));
+}
+
 void epollDeleteObject(aioObject *object)
 {
   epollBase *localBase = (epollBase*)object->root.base;
@@ -386,10 +410,10 @@ void epollDeleteObject(aioObject *object)
       break;
   }
 
-  if (!objectPoolPut(&objectPool, object)) {
-    free(object->buffer.ptr);
-    alignedFree(object);
-  }
+  // The descriptor is gone from the epoll set: batches harvested from now on
+  // cannot reference the object, batches already in loop thread buffers gate
+  // the memory release through the grace period
+  graceRetire(object->root.base, &object->root, (aioObjectDestructor*)epollReleaseObject);
 }
 
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)

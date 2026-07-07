@@ -180,39 +180,46 @@ void *__tagged_pointer_make(void *ptr, uintptr_t data);
 void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData);
 
 // Recycling pools for objects. Pooled memory is never returned to the
-// allocator, so a sanitizer sees use-after-destruction as ordinary access
-// to valid memory. With INSTRUMENTED_POOLS (cmake option
-// BUILD_INSTRUMENTED_POOLS) every acquisition misses and objectPoolPut
-// reports "not pooled": the structure lives one malloc/free cycle and the
-// caller frees it with the matching deallocator - the caller, because
-// pooled structures own nested buffers the generic code cannot release.
-// The switch deliberately covers objects only. Operations cannot leave
-// their pools: the timeout grid keeps op pointers past the operation's
-// lifetime and lazily cancels through them when their second arrives -
-// that is safe exactly because recycled operation memory stays type-stable
-// and the generation tag rejects the stale cancel. User events own their
-// platform timer, freeing them would leak the timer descriptor.
-static inline int objectPoolGet(ConcurrentQueue *pool, void **result)
-{
-#ifdef INSTRUMENTED_POOLS
-  (void)pool;
-  *result = 0;
-  return 0;
-#else
-  return concurrentQueuePop(pool, result);
+// allocator, in every build: under the address sanitizer a parked object is
+// marked with the manual poisoning API instead, so the allocation pattern
+// stays identical to production while any touch between objectPoolPut and
+// objectPoolGet reports use-after-poison. The put itself runs only after
+// the grace period (graceRetire): kernel event batches hold raw object
+// pointers, and within the grace window their touches are legitimate -
+// poisoning right in the destructor would flag them.
+// The marks deliberately cover objects only. Operations cannot be marked:
+// the timeout grid keeps op pointers past the operation's lifetime and
+// lazily cancels through them when their second arrives - that is safe
+// exactly because recycled operation memory stays type-stable and the
+// generation tag rejects the stale cancel. User events own their platform
+// timer and follow the operation contract.
+#if defined(__has_include)
+#if __has_include(<sanitizer/asan_interface.h>)
+#include <sanitizer/asan_interface.h>  // ASAN_(UN)POISON_MEMORY_REGION expand to no-ops without asan
 #endif
+#endif
+#ifndef ASAN_POISON_MEMORY_REGION
+// Toolchain without the sanitizer interface header (e.g. MSVC without the
+// asan toolset): the marks compile away exactly as in a non-asan build
+#define ASAN_POISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
+#define ASAN_UNPOISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
+#endif
+
+static inline int objectPoolGet(ConcurrentQueue *pool, void **result, size_t size)
+{
+  if (!concurrentQueuePop(pool, result))
+    return 0;
+  ASAN_UNPOISON_MEMORY_REGION(*result, size);
+  return 1;
 }
 
-static inline int objectPoolPut(ConcurrentQueue *pool, void *object)
+static inline int objectPoolPut(ConcurrentQueue *pool, void *object, size_t size)
 {
-#ifdef INSTRUMENTED_POOLS
-  (void)pool;
-  (void)object;
-  return 0;
-#else
+  // Mark before publishing: once the pointer is in the queue another thread
+  // may pop and unmark it, and this mark must not land after that
+  ASAN_POISON_MEMORY_REGION(object, size);
   concurrentQueuePush(pool, object);
   return 1;
-#endif
 }
 
 void eqRemove(List *list, asyncOpRoot *op);
@@ -259,6 +266,13 @@ struct aioObjectRoot {
   // Exclusive operation slot (connect): claimed by CAS at submission time,
   // cleared under the object's combiner when the operation leaves the slot
   volatile uintptr_t exclusiveOp;
+
+  // Grace-period limbo links (graceRetire/graceReclaim): meaningful only
+  // between the destructor and the memory release, while the dead object may
+  // still be referenced by kernel event batches already copied into loop
+  // thread buffers. Nothing else may touch these fields
+  aioObjectRoot *GraceNext;
+  uintptr_t GraceEpoch;
 
   IoObjectTy type;
   aioObjectDestructor *destructor;

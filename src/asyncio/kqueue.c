@@ -135,6 +135,17 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   uint32_t readEvents = fdObject ? fdObject->ReadEvents : 0;
   uint32_t writeEvents = fdObject ? fdObject->WriteEvents : 0;
 
+  // A dying object gets no fd readiness processing: its operations are being
+  // cancelled wholesale anyway, and for a stale batch entry landing here
+  // within the grace period the descriptor is already closed - the error
+  // path ioctl and the rearm kevent would run on a dead or reused fd
+  if (object->DeletePending && (readEvents | writeEvents)) {
+    fdObject->ReadEvents = 0;
+    fdObject->WriteEvents = 0;
+    readEvents = 0;
+    writeEvents = 0;
+  }
+
   asyncOpRoot *connectOp = (asyncOpRoot*)object->exclusiveOp;
   int wasConnecting = connectOp && connectOp->running == arRunning;
   int hasReadOp = object->readQueue.head != 0;
@@ -172,7 +183,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   if (needStart & IO_EVENT_WRITE)
     executeOperationList(&object->writeQueue);
 
-  if (fdObject) {
+  if (fdObject && !object->DeletePending) {
     int fd = getFd((aioObject*)object);
 
     if (readEvents)
@@ -204,11 +215,18 @@ void kqueueNextFinishedOperation(asyncBase *base)
   struct kevent events[MAX_EVENTS];
   kqueueBase *localBase = (kqueueBase *)base;
   messageLoopThreadId = __sync_fetch_and_add(&base->messageLoopThreadCounter, 1);
+  graceThreadEnter(base);
 
   while (1) {
     do {
       if (!executeGlobalQueue(base)) {
-        // Found quit marker
+        // Found quit marker. Stamp the slot out before the counter drops:
+        // once it does, a future loop thread may adopt this id, and a stale
+        // stamp would shield its batches from the grace period. The last
+        // thread out drains the limbo list
+        if (messageLoopThreadId < GRACE_LOOP_THREAD_LIMIT)
+          base->graceSeen[messageLoopThreadId].seen = UINTPTR_MAX;
+        graceReclaim(base);
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 0u-1) - 1;
         if (threadsRunning)
           kqueueEnqueue(base, 0);
@@ -218,6 +236,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
       struct timespec timeout;
       timeout.tv_sec = 1;
       timeout.tv_nsec = 0;
+      graceQuiesce(base);
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, &timeout);
 
       time_t currentTime = time(0);
@@ -266,7 +285,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
 aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
   KQueueObject *object = 0;
-  if (!objectPoolGet(&objectPool, (void**)&object)) {
+  if (!objectPoolGet(&objectPool, (void**)&object, sizeof(KQueueObject))) {
     object = alignedMalloc(sizeof(KQueueObject), TAGGED_POINTER_ALIGNMENT);
     object->Object.buffer.ptr = 0;
     object->Object.buffer.totalSize = 0;
@@ -308,6 +327,13 @@ int kqueueCancelAsyncOp(asyncOpRoot *opptr)
   return 1;
 }
 
+// Memory half of the object destructor, runs via graceRetire once no loop
+// thread can hold the object in an already-harvested event batch
+static void kqueueReleaseObject(aioObject *object)
+{
+  objectPoolPut(&objectPool, object, sizeof(KQueueObject));
+}
+
 void kqueueDeleteObject(aioObject *object)
 {
   switch (object->root.type) {
@@ -323,10 +349,11 @@ void kqueueDeleteObject(aioObject *object)
       break;
   }
 
-  if (!objectPoolPut(&objectPool, object)) {
-    free(object->buffer.ptr);
-    alignedFree(object);
-  }
+  // close() detached the knotes (descriptors are never dup()ed here), so
+  // batches harvested from now on cannot reference the object; batches
+  // already in loop thread buffers gate the memory release through the
+  // grace period
+  graceRetire(object->root.base, &object->root, (aioObjectDestructor*)kqueueReleaseObject);
 }
 
 void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op)

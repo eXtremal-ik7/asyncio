@@ -13,6 +13,18 @@ extern "C" {
 #define TAGGED_POINTER_DATA_MASK (TAGGED_POINTER_ALIGNMENT-1)
 #define TAGGED_POINTER_PTR_MASK (~TAGGED_POINTER_DATA_MASK)
 
+// Upper bound on concurrently running loop threads per base, 64 bytes of
+// asyncBase each; the reclaim scan is bounded by the high-water mark of
+// slots actually claimed, so the headroom costs memory only
+#define GRACE_LOOP_THREAD_LIMIT 256
+
+// One quiescence stamp per loop thread, padded to a cache line so the
+// per-iteration stamps of neighbour threads do not false-share
+typedef struct GraceSlot {
+  volatile uintptr_t seen;
+  uintptr_t pad[7];
+} GraceSlot;
+
 typedef enum IoActionTy {
   actAccept = OPCODE_READ,
   actRead,
@@ -64,6 +76,24 @@ struct asyncBase {
   time_t lastCheckPoint;
   volatile unsigned messageLoopThreadCounter;
   volatile unsigned timerMapLock;
+
+  // Grace-period reclamation for dead aio objects. epoll_wait/kevent batches
+  // hold raw object pointers that cannot be recalled, so releasing the memory
+  // right in the destructor lets a stale batch entry touch the pool's next
+  // incarnation of the object (spurious disconnect, lost event) - a use after
+  // free veiled by the type-stable pool, or a plain one with instrumented
+  // pools. A dead object waits in the limbo list instead until every loop
+  // thread passes the top of its message loop: batches copied before the
+  // retirement are fully dispatched by then. Threads block reclamation for
+  // at most one wait timeout - both backends wake periodically. Windows is
+  // not involved: IOCP packets reference operations, and operation pools are
+  // permanently type-stable.
+  volatile uintptr_t graceEpoch;
+  volatile unsigned graceFrozen;    // slots exhausted or id collision: reclamation is off, the limbo only grows
+  volatile unsigned graceSlotCount; // high-water mark of claimed slots, bounds the reclaim scan
+  unsigned graceLimboLock;
+  aioObjectRoot *graceLimbo;        // newest first, epochs decrease along the list
+  GraceSlot graceSeen[GRACE_LOOP_THREAD_LIMIT];
 
 #ifndef NDEBUG
   int opsCount;
@@ -139,6 +169,21 @@ struct aioUserEvent {
 void pageMapInit(pageMap *map);
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
 void processTimeoutQueue(asyncBase *base, time_t currentTime);
+
+// Grace period (see the asyncBase comment). graceThreadEnter runs once per
+// loop thread right after the messageLoopThreadId assignment and freezes
+// reclamation on slot overflow or on an id collision. graceQuiesce stamps
+// the calling loop thread as quiescent and reclaims ripe limbo objects;
+// call it at the top of the message loop, right before blocking in the
+// kernel wait. graceRetire parks a dead object in the limbo list;
+// memoryRelease is the memory half of its destructor and runs once the
+// grace period elapses. graceReclaim alone is for the loop exit path,
+// after the thread stamped itself out with UINTPTR_MAX: the last thread
+// out drains the list.
+void graceThreadEnter(asyncBase *base);
+void graceQuiesce(asyncBase *base);
+void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *memoryRelease);
+void graceReclaim(asyncBase *base);
 
 int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size);
 #ifdef __cplusplus

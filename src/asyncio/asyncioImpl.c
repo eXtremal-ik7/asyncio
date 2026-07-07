@@ -200,7 +200,7 @@ void eventDeactivate(aioUserEvent *event)
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
 {
   asyncOpListLink *timerLink = 0;
-  if (!objectPoolGet(&asyncOpLinkListPool, (void**)&timerLink))
+  if (!objectPoolGet(&asyncOpLinkListPool, (void**)&timerLink, sizeof(asyncOpListLink)))
     timerLink = malloc(sizeof(asyncOpListLink));
   timerLink->op = op;
   timerLink->tag = opGetGeneration(op);
@@ -221,8 +221,7 @@ void processTimeoutQueue(asyncBase *base, time_t currentTime)
     while (link) {
       asyncOpListLink *next = link->next;
       opCancel(link->op, link->tag, aosTimeout);
-      if (!objectPoolPut(&asyncOpLinkListPool, link))
-        free(link);
+      objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
       link = next;
     }
   }
@@ -698,6 +697,110 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
   }
 }
 
+
+void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *memoryRelease)
+{
+  // The resource half of the destructor already ran; the field is dead from
+  // here on and repurposed to carry the memory half to graceReclaim.
+  // The object is parked unconditionally: with graceFrozen set reclamation
+  // never runs and the limbo only grows. A leak in a pathological thread
+  // configuration is the safe degradation - an immediate release here would
+  // be the original use-after-free while unslotted loop threads still hold
+  // harvested batches
+  object->destructor = memoryRelease;
+  __spinlock_acquire(&base->graceLimboLock);
+  object->GraceEpoch = ++base->graceEpoch;
+  object->GraceNext = base->graceLimbo;
+  base->graceLimbo = object;
+  __spinlock_release(&base->graceLimboLock);
+}
+
+void graceReclaim(asyncBase *base)
+{
+  if (!base->graceLimbo || base->graceFrozen)
+    return;
+
+  // The scan runs under the limbo lock: a thread claims its slot before its
+  // first kernel wait, and the retirement of any object its batches could
+  // reference passes through this very lock afterwards - a scan ordered
+  // after that retirement therefore cannot read the slot as unclaimed.
+  // Slots above the high-water mark were never claimed and gate nothing
+  aioObjectRoot *ripe;
+  __spinlock_acquire(&base->graceLimboLock);
+  uintptr_t minSeen = UINTPTR_MAX;
+  unsigned slots = base->graceSlotCount;
+  unsigned i;
+  for (i = 0; i < slots; i++) {
+    uintptr_t seen = base->graceSeen[i].seen;
+    if (seen < minSeen)
+      minSeen = seen;
+  }
+
+  // Epochs decrease along the list: everything past the first ripe object
+  // is ripe as well. Release outside the lock - pool pushes and frees do
+  // not need it, and a concurrent retire must not wait on them
+  aioObjectRoot **cursor = &base->graceLimbo;
+  while (*cursor && (*cursor)->GraceEpoch > minSeen)
+    cursor = &(*cursor)->GraceNext;
+  ripe = *cursor;
+  *cursor = 0;
+  __spinlock_release(&base->graceLimboLock);
+
+  while (ripe) {
+    aioObjectRoot *next = ripe->GraceNext;
+    ripe->destructor(ripe);
+    ripe = next;
+  }
+}
+
+void graceThreadEnter(asyncBase *base)
+{
+  // Freezing reclamation is the memory-safe degradation for thread
+  // configurations the slots cannot describe: dead objects then stay in
+  // the limbo for the rest of the base's life
+  if (messageLoopThreadId >= GRACE_LOOP_THREAD_LIMIT) {
+    base->graceFrozen = 1;
+    return;
+  }
+
+  // Claim the slot for this thread's lifetime in the loop; entry is a
+  // quiescent point, so the current epoch is a valid first stamp. A failed
+  // claim means the id was adopted while its previous holder is still
+  // inside the message loop (a loop thread started while others were
+  // shutting down): two threads sharing a slot could mask each other's
+  // batches, so reclamation shuts down. A cleanly exited holder leaves
+  // UINTPTR_MAX behind - plain quit-then-restart cycles and mid-run loop
+  // thread additions claim successfully. The claim must happen right at
+  // entry: a check without a reservation would leave a window between the
+  // id assignment and the first stamp where the same id handed out again
+  // goes undetected
+  uintptr_t epoch = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0);
+  if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen, UINTPTR_MAX, epoch)) {
+    base->graceFrozen = 1;
+    return;
+  }
+
+  // High-water mark of claimed slots bounds the reclaim scan, so the slot
+  // array can afford a generous limit. The claim above and this bump are
+  // both ordered before the thread's first kernel wait
+  unsigned needed = messageLoopThreadId + 1;
+  unsigned current = base->graceSlotCount;
+  while (current < needed && !__uint_atomic_compare_and_swap(&base->graceSlotCount, current, needed))
+    current = base->graceSlotCount;
+}
+
+void graceQuiesce(asyncBase *base)
+{
+  if (messageLoopThreadId >= GRACE_LOOP_THREAD_LIMIT)
+    return;
+
+  // The stamp may not become visible before the batch dispatched above it:
+  // the atomic read-modify-write of the epoch is a full barrier in both
+  // implementations, and it cannot drift backwards either
+  base->graceSeen[messageLoopThreadId].seen = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0);
+  if (base->graceLimbo)
+    graceReclaim(base);
+}
 
 static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 {
