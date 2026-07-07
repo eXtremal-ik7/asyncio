@@ -19,7 +19,6 @@ typedef struct recvFromData {
 typedef struct iocpBase {
   asyncBase B;
   HANDLE completionPort;
-  HANDLE timerThread;
   LPFN_CONNECTEX ConnectExPtr;
 } iocpBase;
 
@@ -31,7 +30,17 @@ typedef struct iocpOp {
 typedef struct aioTimer {
   asyncOpRoot *op;
   HANDLE hTimer;
+  PTP_WAIT wait;
+  volatile uintptr_t state;
 } aioTimer;
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+#define IOCP_TIMER_STOPPED 0
+#define IOCP_TIMER_ARMED 1
+#define IOCP_TIMER_CALLBACK 2
 
 void combinerTaskHandler(aioObjectRoot* object, asyncOpRoot* op, AsyncOpActionTy opMethod);
 void iocpEnqueue(asyncBase *base, asyncOpRoot *op);
@@ -80,14 +89,6 @@ static aioObject *getObject(iocpOp *op)
   return (aioObject*)op->info.root.object;
 }
 
-static DWORD WINAPI timerThreadProc(LPVOID lpParameter)
-{
-  __UNUSED(lpParameter);
-  while (1)
-    SleepEx(INFINITE, TRUE);
-  return 0;
-}
-
 static AsyncOpStatus iocpGetOverlappedResult(iocpOp *op)
 {
   DWORD bytesTransferred;
@@ -120,17 +121,32 @@ static AsyncOpStatus iocpGetOverlappedResult(iocpOp *op)
   }
 }
 
-static VOID CALLBACK userEventTimerCb(LPVOID lpArgToCompletionRoutine, DWORD dwTimerLowValue, DWORD dwTimerHighValue)
+static int iocpArmWaitableTimer(aioTimer *timer, uint64_t timeout)
 {
-  __UNUSED(dwTimerLowValue);
-  __UNUSED(dwTimerHighValue);
-  aioTimer *timer;
-  uintptr_t timerTag;
-  __tagged_pointer_decode(lpArgToCompletionRoutine, (void**)&timer, &timerTag);
+  LARGE_INTEGER signalTime;
+  signalTime.QuadPart = -(int64_t)(timeout * 10);
+  SetThreadpoolWait(timer->wait, timer->hTimer, NULL);
+  if (SetWaitableTimer(timer->hTimer, &signalTime, 0, NULL, NULL, FALSE))
+    return 1;
+  SetThreadpoolWait(timer->wait, NULL, NULL);
+  return 0;
+}
 
+static void iocpDisarmWaitableTimer(aioTimer *timer)
+{
+  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
+  CancelWaitableTimer(timer->hTimer);
+  SetThreadpoolWait(timer->wait, NULL, NULL);
+  WaitForThreadpoolWaitCallbacks(timer->wait, TRUE);
+}
+
+static void iocpUserEventTimerCb(aioTimer *timer)
+{
   int needReactivate = 1;
   aioUserEvent *event = (aioUserEvent*)timer->op;
-  iocpBase *localBase = (iocpBase*)event->base;
+
+  if (__uintptr_atomic_load(&timer->state, amoAcquire) != IOCP_TIMER_CALLBACK)
+    return;
 
   if (eventTryActivate(event))
     iocpActivate(event);
@@ -141,23 +157,44 @@ static VOID CALLBACK userEventTimerCb(LPVOID lpArgToCompletionRoutine, DWORD dwT
   }
 
   if (needReactivate) {
-    LARGE_INTEGER signalTime;
-    signalTime.QuadPart = -(int64_t)(event->root.timeout * 10);
-    SetWaitableTimer(timer->hTimer, &signalTime, 0, userEventTimerCb, timer, FALSE);
+    if (__uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_CALLBACK, IOCP_TIMER_ARMED)) {
+      if (!iocpArmWaitableTimer(timer, event->root.timeout)) {
+        __uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_ARMED, IOCP_TIMER_STOPPED);
+      } else if (__uintptr_atomic_load(&timer->state, amoAcquire) == IOCP_TIMER_STOPPED) {
+        CancelWaitableTimer(timer->hTimer);
+        SetThreadpoolWait(timer->wait, NULL, NULL);
+      }
+    }
+  } else {
+    __uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_CALLBACK, IOCP_TIMER_STOPPED);
   }
 }
 
 
-static VOID CALLBACK ioFinishedTimerCb(LPVOID lpArgToCompletionRoutine, DWORD dwTimerLowValue, DWORD dwTimerHighValue)
+static void iocpIoFinishedTimerCb(aioTimer *timer)
 {
-  __UNUSED(dwTimerLowValue);
-  __UNUSED(dwTimerHighValue);
-  aioTimer *timer;
-  uintptr_t timerTag;
-  __tagged_pointer_decode(lpArgToCompletionRoutine, (void**)&timer, &timerTag);
+  asyncOpRoot *op = timer->op;
+  uintptr_t timerTag = opGetGeneration(op);
 
-  if (opSetStatus(timer->op, opEncodeTag(timer->op, timerTag), aosTimeout))
-    combinerPushOperation(timer->op, aaCancel);
+  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
+  if (opSetStatus(op, opEncodeTag(op, timerTag), aosTimeout))
+    combinerPushOperation(op, aaCancel);
+}
+
+static VOID CALLBACK iocpTimerCb(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WAIT wait, TP_WAIT_RESULT waitResult)
+{
+  aioTimer *timer = (aioTimer*)context;
+  __UNUSED(instance);
+  __UNUSED(wait);
+  __UNUSED(waitResult);
+
+  if (!__uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_ARMED, IOCP_TIMER_CALLBACK))
+    return;
+
+  if (timer->op->opCode == actUserEvent)
+    iocpUserEventTimerCb(timer);
+  else
+    iocpIoFinishedTimerCb(timer);
 }
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy opMethod)
@@ -193,11 +230,8 @@ asyncBase *iocpNewAsyncBase()
     DWORD numBytes = 0;
     GUID guid = WSAID_CONNECTEX;
 
-    DWORD tid;
     base->completionPort =
       CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
-    base->timerThread =
-      CreateThread(NULL, 0x10000, timerThreadProc, NULL, THREAD_PRIORITY_NORMAL, &tid);
     base->ConnectExPtr = 0;
     tmpSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     WSAIoctl(tmpSocket,
@@ -349,7 +383,7 @@ aioObject *iocpNewAioObject(asyncBase *base, IoObjectTy type, void *data)
       break;
     case ioObjectSocket:
       object->hSocket = *(socketTy *)data;
-      CreateIoCompletionPort(object->hDevice, localBase->completionPort, 0, 1);
+      CreateIoCompletionPort((HANDLE)object->hSocket, localBase->completionPort, 0, 1);
       break;
     default:
       break;
@@ -412,43 +446,50 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
   __UNUSED(base);
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   timer->op = op;
-  timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
+  timer->state = IOCP_TIMER_STOPPED;
+  timer->hTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (!timer->hTimer)
+    timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
+  timer->wait = timer->hTimer ? CreateThreadpoolWait(iocpTimerCb, timer, NULL) : NULL;
   op->timerId = timer;
-}
-
-static VOID CALLBACK timerStartProc(ULONG_PTR dwParam)
-{
-  asyncOpRoot *op = (asyncOpRoot*)dwParam;
-  PTIMERAPCROUTINE timerCb;
-  LARGE_INTEGER signalTime;
-
-  if (op->opCode == actUserEvent)
-    timerCb = userEventTimerCb;
-  else
-    timerCb = ioFinishedTimerCb;
-
-  aioTimer *timer = (aioTimer*)op->timerId;
-  signalTime.QuadPart = -(int64_t)(op->timeout * 10);
-  SetWaitableTimer(timer->hTimer, &signalTime, 0, timerCb, __tagged_pointer_make(timer, opGetGeneration(op)), FALSE);
 }
 
 void iocpStartTimer(asyncOpRoot *op)
 {
-  iocpBase *base = op->opCode == actUserEvent ?
-    (iocpBase*)(((aioUserEvent*)op)->base) : (iocpBase*)op->object->base;
-  QueueUserAPC(timerStartProc, base->timerThread, (ULONG_PTR)op);
+  aioTimer *timer = (aioTimer*)op->timerId;
+  timer->op = op;
+  if (__uintptr_atomic_load(&timer->state, amoAcquire) != IOCP_TIMER_STOPPED)
+    iocpDisarmWaitableTimer(timer);
+  __uintptr_atomic_store(&timer->state, IOCP_TIMER_ARMED, amoRelease);
+  if (!timer->hTimer || !timer->wait || !iocpArmWaitableTimer(timer, op->timeout)) {
+    __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
+    if (op->opCode == actUserEvent) {
+      aioUserEvent *event = (aioUserEvent*)op;
+      if (eventTryActivate(event))
+        iocpActivate(event);
+    } else if (opSetStatus(op, opGetGeneration(op), aosUnknownError)) {
+      combinerPushOperation(op, aaCancel);
+    }
+  }
 }
 
 
 void iocpStopTimer(asyncOpRoot *op)
 {
-  CancelWaitableTimer(((aioTimer*)op->timerId)->hTimer);
+  aioTimer *timer = (aioTimer*)op->timerId;
+  if (timer->hTimer && timer->wait)
+    iocpDisarmWaitableTimer(timer);
 }
 
 void iocpDeleteTimer(asyncOpRoot *op)
 {
   aioTimer *timer = (aioTimer*)op->timerId;
-  CloseHandle(timer->hTimer);
+  if (timer->hTimer && timer->wait)
+    iocpDisarmWaitableTimer(timer);
+  if (timer->wait)
+    CloseThreadpoolWait(timer->wait);
+  if (timer->hTimer)
+    CloseHandle(timer->hTimer);
   free(timer);
 }
 

@@ -28,8 +28,16 @@ if (BUILD_SANITIZE_ADDRESS AND BUILD_SANITIZE_THREAD)
 endif()
 
 if (BUILD_SANITIZE_ADDRESS AND NOT CMAKE_C_FLAGS MATCHES "fsanitize=address")
-  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+  if (MSVC)
+    # MSVC address sanitizer: /Zi + linker /DEBUG so ASAN symbolizes stacks;
+    # /INCREMENTAL:NO because incremental linking is incompatible with asan
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /fsanitize=address /Zi")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /fsanitize=address /Zi")
+    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG /INCREMENTAL:NO")
+  else()
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+  endif()
 endif()
 
 if (BUILD_SANITIZE_THREAD)
