@@ -81,8 +81,9 @@ static void kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, int fd, 
 {
   struct kevent event;
   EV_SET(&event, fd, filter, flags, 0, 0, ptr);
-  if (kevent(kqueueFd, &event, 1, 0, 0, 0) == -1)
-    fprintf(stderr, "kqueue event error, errno: %s\n", strerror(errno));
+  if (kevent(kqueueFd, &event, 1, 0, 0, 0) == -1) {
+    // fprintf(stderr, "kqueue event error, errno: %s\n", strerror(errno));
+  }
 }
 
 static int getFd(aioObject *object)
@@ -104,7 +105,7 @@ asyncBase *kqueueNewAsyncBase()
     base->B.methodImpl = kqueueImpl;
     base->kqueueFd = kqueue();
     if (base->kqueueFd == -1) {
-      fprintf(stderr, " * kqueueNewAsyncBase: kqueue_create failed\n");
+      // fprintf(stderr, " * kqueueNewAsyncBase: kqueue_create failed\n");
     }
 
     base->timerIdCounter = 1;
@@ -379,8 +380,9 @@ void kqueueStartTimer(asyncOpRoot *op)
          NOTE_USECONDS,
          op->timeout,
          __tagged_pointer_make(timer, opGetGeneration(op)));
-  if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1)
-    fprintf(stderr, "kqueueStartTimer: %s\n", strerror(errno));
+  if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1) {
+    // fprintf(stderr, "kqueueStartTimer: %s\n", strerror(errno));
+  }
 }
 
 
@@ -389,8 +391,9 @@ void kqueueStopTimer(asyncOpRoot *op)
   struct kevent event;
   aioTimer *timer = (aioTimer*)op->timerId;
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
-  if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1)
-    fprintf(stderr, "kqueueStopTimer: %s\n", strerror(errno));
+  if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1) {
+    // fprintf(stderr, "kqueueStopTimer: %s\n", strerror(errno));
+  }
 }
 
 void kqueueDeleteTimer(asyncOpRoot *op)

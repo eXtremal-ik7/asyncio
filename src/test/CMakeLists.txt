@@ -4,5 +4,6 @@ add_subdirectory(queuetest)
 add_subdirectory(lifetimetest)
 
 if (ASYNCIO_ENABLE_ZMTP)
+  add_subdirectory(connectstress)
   add_subdirectory(zmtptest)
 endif()
