@@ -345,7 +345,7 @@ static AsyncOpStatus startZmtpAccept(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -433,7 +433,7 @@ static AsyncOpStatus startZmtpConnect(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -490,7 +490,7 @@ static AsyncOpStatus startZmtpRecv(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -546,7 +546,7 @@ static asyncOpRoot *implZmtpRecvStream(zmtpSocket *socket, zmtpStream &msg, size
     op->type = type;
     op->transferred = transferred;
     childOp->arg = op;
-    combinerPushOperation(childOp, aaStart);
+    combinerPushOperation(childOp);
     return &op->root;
   }
 
@@ -621,7 +621,7 @@ static AsyncOpStatus startZmtpSend(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -685,7 +685,7 @@ asyncOpRoot *implZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserM
     op->stateRw = state;
     op->type = msgType;
     childOp->arg = op;
-    combinerPushOperation(childOp, aaStart);
+    combinerPushOperation(childOp);
     return &op->root;
   }
 
@@ -737,7 +737,7 @@ void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpA
     return;
   }
 
-  combinerPushOperation(op, aaStart);
+  combinerPushOperation(op);
 }
 
 void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags flags, uint64_t timeout, zmtpConnectCb callback, void *arg)
@@ -754,7 +754,7 @@ void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags f
     return;
   }
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 }
 
 ssize_t aioZmtpRecv(zmtpSocket *socket, zmtpStream &msg, size_t limit, AsyncFlags flags, uint64_t timeout, zmtpRecvCb callback, void *arg)
@@ -800,7 +800,7 @@ int ioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout)
     opForceStatus(op, aosUnknownError);
     addToGlobalQueue(op);
   } else {
-    combinerPushOperation(op, aaStart);
+    combinerPushOperation(op);
   }
   coroutineYield();
 
@@ -821,7 +821,7 @@ int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags fla
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
   } else {
-    combinerPushOperation(&op->root, aaStart);
+    combinerPushOperation(&op->root);
   }
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);

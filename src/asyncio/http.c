@@ -115,7 +115,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
       implSslWrite(client->sslSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpsResumeProc, op) :
       implWrite(client->plainSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpResumeProc, op, &bytesTransferred);
     if (childOp) {
-      combinerPushOperation(childOp, aaStart);
+      combinerPushOperation(childOp);
       return aosPending;
     }
     // sync completion — callback not invoked, all bytes sent (afWaitAll)
@@ -166,7 +166,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
 
         client->inBufferOffset = offset;
         if (readOp) {
-          combinerPushOperation(readOp, aaStart);
+          combinerPushOperation(readOp);
           return aosPending;
         } else {
           httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset+bytesTransferred);
@@ -352,7 +352,7 @@ void aioHttpConnect(HTTPClient *client,
     op->dataSize = 0;
   }
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 }
 
 void aioHttpRequest(HTTPClient *client,
@@ -375,7 +375,7 @@ void aioHttpRequest(HTTPClient *client,
     memcpy(op->internalBuffer, request, requestSize);
   }
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 }
 
 
@@ -397,7 +397,7 @@ int ioHttpConnect(HTTPClient *client, const HostAddress *address, const char *tl
     op->dataSize = 0;
   }
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);
@@ -422,7 +422,7 @@ AsyncOpStatus ioHttpRequest(HTTPClient *client,
     memcpy(op->internalBuffer, request, requestSize);
   }
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
   coroutineYield();
 
   AsyncOpStatus status = opGetStatus(&op->root);

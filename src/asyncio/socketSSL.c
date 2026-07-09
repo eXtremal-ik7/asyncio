@@ -263,7 +263,7 @@ static AsyncOpStatus readProc(asyncOpRoot *opptr)
       if (!readOp) {
         BIO_write(socket->bioIn, socket->sslReadBuffer, (int)bytes);
       } else {
-        combinerPushOperation(readOp, aaStart);
+        combinerPushOperation(readOp);
         return aosPending;
       }
     }
@@ -351,7 +351,7 @@ void aioSslConnect(SSLSocket *socket,
   if (tlsextHostName)
     SSL_set_tlsext_host_name(socket->ssl, op->buffer);
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 }
 
 asyncOpRoot *implSslRead(SSLSocket *socket,
@@ -405,7 +405,7 @@ asyncOpRoot *implSslRead(SSLSocket *socket,
         SSLOp *sslOp = (SSLOp*)newReadAsyncOp(&socket->root, flags | afRunning, usTimeout, (void*)callback, arg, sslOpRead, &context);
         sslOp->bytesTransferred = sslBytesTransferred;
         readOp->arg = sslOp;
-        combinerPushOperation(readOp, aaStart);
+        combinerPushOperation(readOp);
         return &sslOp->root;
       }
     }
@@ -470,7 +470,7 @@ static AsyncOpStatus writeProc(asyncOpRoot *opptr)
     size_t writeSize = copyFromOut(socket);
     asyncOpRoot *writeOp = implWrite(socket->object, socket->sslWriteBuffer, writeSize, afWaitAll, 0, sslWriteWriteCb, op, &bytes);
     if (writeOp) {
-      combinerPushOperation(writeOp, aaStart);
+      combinerPushOperation(writeOp);
       return aosPending;
     }
     op->bytesTransferred = op->transactionSize;
@@ -515,7 +515,7 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
     SSLOp *sslOp = (SSLOp*)newWriteAsyncOp(&socket->root, flags | afRunning, usTimeout, (void*)callback, arg, sslOpWrite, &context);
     sslOp->state = sslStProcessing;
     op->arg = sslOp;
-    combinerPushOperation(op, aaStart);
+    combinerPushOperation(op);
     return &sslOp->root;
   }
 }
@@ -554,7 +554,7 @@ int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlse
     SSL_set_connect_state(socket->ssl);
     if (tlsextHostName)
       SSL_set_tlsext_host_name(socket->ssl, op->buffer);
-    combinerPushOperation(&op->root, aaStart);
+    combinerPushOperation(&op->root);
   }
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);

@@ -35,7 +35,7 @@ typedef struct aioTimer {
   asyncOpRoot *op;
 } aioTimer;
 
-void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy opMethod);
+void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op);
 void kqueuePostEmptyOperation(asyncBase *base);
 void kqueueNextFinishedOperation(asyncBase *base);
@@ -129,7 +129,7 @@ void kqueuePostEmptyOperation(asyncBase *base)
   kqueueEnqueue(base, 0);
 }
 
-void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy opMethod)
+void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   kqueueBase *base = (kqueueBase*)object->base;
   KQueueObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (KQueueObject*)object : 0;
@@ -152,22 +152,31 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   int hasReadOp = object->readQueue.head != 0;
   int hasWriteOp = object->writeQueue.head != 0;
 
+  // Fold the reactor readiness side-channel (Read/WriteEvents) and the Head
+  // PROGRESS_* bits into one needStart so each queue is driven exactly once
   uint32_t needStart = readEvents | writeEvents;
+  if (sig & COMBINER_TAG_PROGRESS_READ)  needStart |= IO_EVENT_READ;
+  if (sig & COMBINER_TAG_PROGRESS_WRITE) needStart |= IO_EVENT_WRITE;
 
-  // Process the current action before completing the exclusive connect from
-  // the accumulated fd event: an aaStart delivered together with the event
-  // must enter its queue first, otherwise a failed connect cancels the queues
+  // Start a submitted operation before completing the exclusive connect from
+  // the accumulated fd event: a start delivered together with the event must
+  // enter its queue first, otherwise a failed connect cancels the queues
   // without it and the operation would start on the dead socket afterwards
   if (op)
-    processAction(op, opMethod, &needStart);
+    startOperation(op, &needStart);
 
-  // A parked connect (the object's exclusive operation) is driven by fd
-  // events directly, not through a queue; its completion is signaled by
-  // writability or an error. Drive it before the disconnect sweep so that
-  // operations queued behind it are cancelled with the connect status, not
-  // aosDisconnected
-  if (wasConnecting && ((readEvents | writeEvents) & (IO_EVENT_WRITE | IO_EVENT_ERROR)))
+  // A parked connect (the object's exclusive operation) is driven by fd events
+  // directly, not through a queue; its completion is signaled by writability, an
+  // error, or a child completion (PROGRESS_EXCLUSIVE for a composite parent).
+  // Drive it before the disconnect sweep so that operations queued behind it are
+  // cancelled with the connect status, not aosDisconnected
+  if ((wasConnecting && ((readEvents | writeEvents) & (IO_EVENT_WRITE | IO_EVENT_ERROR))) ||
+      (sig & COMBINER_TAG_PROGRESS_EXCLUSIVE))
     processExclusiveOp(object, &needStart);
+
+  // CANCEL: a timeout/opCancel/cancelIo set the status and asked for a scan
+  if (sig & COMBINER_TAG_CANCEL)
+    reapObject(object, &needStart);
 
   if ((readEvents | writeEvents) & IO_EVENT_ERROR) {
     // EV_EOF mapped to TAG_ERROR, cancel all operations with aosDisconnected status
@@ -272,10 +281,10 @@ void kqueueNextFinishedOperation(asyncBase *base)
         uint32_t eventMask = (events[n].flags & EV_EOF) ? IO_EVENT_ERROR : 0;
         if (events[n].filter == EVFILT_READ) {
           ((KQueueObject*)object)->ReadEvents = eventMask | IO_EVENT_READ;
-          combinerPushCounter(object, COMBINER_TAG_ACCESS);
+          combinerPushCounter(object, COMBINER_TAG_PROGRESS_READ);
         } else if (events[n].filter == EVFILT_WRITE) {
           ((KQueueObject*)object)->WriteEvents = eventMask | IO_EVENT_WRITE;
-          combinerPushCounter(object, COMBINER_TAG_ACCESS);
+          combinerPushCounter(object, COMBINER_TAG_PROGRESS_WRITE);
         }
       }
     }

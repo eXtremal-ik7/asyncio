@@ -46,7 +46,7 @@ typedef struct aioTimer {
 } aioTimer;
 __NO_PADDING_END
 
-void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy opMethod);
+void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void epollEnqueue(asyncBase *base, asyncOpRoot *op);
 void epollPostEmptyOperation(asyncBase *base);
 void epollNextFinishedOperation(asyncBase *base);
@@ -146,7 +146,7 @@ void epollPostEmptyOperation(asyncBase *base)
   epollEnqueue(base, 0);
 }
 
-void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy opMethod)
+void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   EPollObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (EPollObject*)object : 0;
   uint32_t ioEvents = fdObject ? fdObject->IoEvents : 0;
@@ -165,22 +165,31 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy
   int hasReadOp = object->readQueue.head != 0;
   int hasWriteOp = object->writeQueue.head != 0 || wasConnecting;
 
+  // Fold the reactor readiness side-channel (IoEvents) and the Head PROGRESS_*
+  // bits into one needStart so each queue is driven exactly once
   uint32_t needStart = ioEvents;
+  if (sig & COMBINER_TAG_PROGRESS_READ)  needStart |= IO_EVENT_READ;
+  if (sig & COMBINER_TAG_PROGRESS_WRITE) needStart |= IO_EVENT_WRITE;
 
-  // Process the current action before completing the exclusive connect from
-  // the accumulated fd event: an aaStart delivered together with the event
-  // must enter its queue first, otherwise a failed connect cancels the queues
+  // Start a submitted operation before completing the exclusive connect from
+  // the accumulated fd event: a start delivered together with the event must
+  // enter its queue first, otherwise a failed connect cancels the queues
   // without it and the operation would start on the dead socket afterwards
   if (op)
-    processAction(op, opMethod, &needStart);
+    startOperation(op, &needStart);
 
-  // A parked connect (the object's exclusive operation) is driven by fd
-  // events directly, not through a queue; its completion is signaled by
-  // writability or an error. Drive it before the disconnect sweep so that
-  // operations queued behind it are cancelled with the connect status, not
-  // aosDisconnected
-  if (wasConnecting && (ioEvents & (IO_EVENT_WRITE | IO_EVENT_ERROR)))
+  // A parked connect (the object's exclusive operation) is driven by fd events
+  // directly, not through a queue; its completion is signaled by writability, an
+  // error, or a child completion (PROGRESS_EXCLUSIVE for a composite parent).
+  // Drive it before the disconnect sweep so that operations queued behind it are
+  // cancelled with the connect status, not aosDisconnected
+  if ((wasConnecting && (ioEvents & (IO_EVENT_WRITE | IO_EVENT_ERROR))) ||
+      (sig & COMBINER_TAG_PROGRESS_EXCLUSIVE))
     processExclusiveOp(object, &needStart);
+
+  // CANCEL: a timeout/opCancel/cancelIo set the status and asked for a scan
+  if (sig & COMBINER_TAG_CANCEL)
+    reapObject(object, &needStart);
 
   if (ioEvents & IO_EVENT_ERROR) {
     // EPOLLRDHUP mapped to TAG_ERROR, cancel all operations with aosDisconnected status
@@ -327,8 +336,15 @@ void epollNextFinishedOperation(asyncBase *base)
           eventMask |= IO_EVENT_READ | IO_EVENT_WRITE;
 
         if (eventMask) {
+          uint32_t bits = 0;
+          if (eventMask & IO_EVENT_READ)  bits |= COMBINER_TAG_PROGRESS_READ;
+          if (eventMask & IO_EVENT_WRITE) bits |= COMBINER_TAG_PROGRESS_WRITE;
+          // EPOLLRDHUP alone carries no read/write bit; wake both queues so the
+          // disconnect sweep runs (the real signal travels in IoEvents, the bit
+          // only has to be nonzero to enter the combiner)
+          if (eventMask & IO_EVENT_ERROR) bits |= COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
           ((EPollObject*)object)->IoEvents = eventMask;
-          combinerPushCounter(object, COMBINER_TAG_ACCESS);
+          combinerPushCounter(object, bits);
         }
       }
     }

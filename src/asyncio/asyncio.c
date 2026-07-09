@@ -472,7 +472,7 @@ void aioConnect(aioObject *object,
     return;
   }
 
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 }
 
 
@@ -489,7 +489,7 @@ void aioAccept(aioObject *object,
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.accept, acceptFinish, 0, 0);
   asyncOpRoot *op = newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actAccept, &context);
-  combinerPushOperation(op, aaStart);
+  combinerPushOperation(op);
 }
 
 static void makeResult(void *contextPtr)
@@ -596,7 +596,7 @@ ssize_t aioReadMsg(aioObject *object,
     }
   } else {
     asyncOpRoot *op = newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-    combinerPushOperation(op, aaStart);
+    combinerPushOperation(op);
   }
 
   return -(ssize_t)aosPending;
@@ -638,7 +638,7 @@ ssize_t aioWriteMsg(aioObject *object,
   } else {
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
     op->host = *address;
-    combinerPushOperation(&op->root, aaStart);
+    combinerPushOperation(&op->root);
   }
 
   return -(ssize_t)aosPending;
@@ -656,7 +656,7 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
   } else {
-    combinerPushOperation(&op->root, aaStart);
+    combinerPushOperation(&op->root);
   }
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
@@ -675,7 +675,7 @@ socketTy ioAccept(aioObject *object, uint64_t usTimeout)
   struct Context context;
   fillContext(&context, object->root.base->methodImpl.accept, acceptFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actAccept, &context);
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
@@ -757,7 +757,7 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
   }
 
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
   coroutineYield();
   return coroutineRwFinish(op, object);
 }
@@ -791,7 +791,7 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
 
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actWriteMsg, &context);
   op->host = *address;
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
   coroutineYield();
   return coroutineRwFinish(op, object);
 }

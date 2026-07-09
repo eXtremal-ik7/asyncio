@@ -269,7 +269,7 @@ static AsyncOpStatus startBtcRecv(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -320,7 +320,7 @@ asyncOpRoot *implBtcRecv(BTCSocket *socket,
     btcOp *op = reinterpret_cast<btcOp*>(newReadAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, btcOpRecv, &context));
     op->state = state;
     childOp->arg = op;
-    combinerPushOperation(childOp, aaStart);
+    combinerPushOperation(childOp);
     return &op->root;
   }
 
@@ -379,7 +379,7 @@ static AsyncOpStatus startBtcSend(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -421,7 +421,7 @@ asyncOpRoot *implBtcSend(BTCSocket *socket,
     btcOp *op = reinterpret_cast<btcOp*>(newWriteAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, btcOpSend, &context));
     op->state = state;
     childOp->arg = op;
-    combinerPushOperation(childOp, aaStart);
+    combinerPushOperation(childOp);
     return &op->root;
   }
 

@@ -42,7 +42,7 @@ typedef struct aioTimer {
 #define IOCP_TIMER_ARMED 1
 #define IOCP_TIMER_CALLBACK 2
 
-void combinerTaskHandler(aioObjectRoot* object, asyncOpRoot* op, AsyncOpActionTy opMethod);
+void combinerTaskHandler(aioObjectRoot* object, asyncOpRoot* op, uint32_t sig);
 void iocpEnqueue(asyncBase *base, asyncOpRoot *op);
 void postEmptyOperation(asyncBase *base);
 void iocpNextFinishedOperation(asyncBase *base);
@@ -178,7 +178,7 @@ static void iocpIoFinishedTimerCb(aioTimer *timer)
 
   __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
   if (opSetStatus(op, opEncodeTag(op, timerTag), aosTimeout))
-    combinerPushOperation(op, aaCancel);
+    combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
 }
 
 static VOID CALLBACK iocpTimerCb(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WAIT wait, TP_WAIT_RESULT waitResult)
@@ -197,16 +197,27 @@ static VOID CALLBACK iocpTimerCb(PTP_CALLBACK_INSTANCE instance, PVOID context, 
     iocpIoFinishedTimerCb(timer);
 }
 
-void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, AsyncOpActionTy opMethod)
+void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   uint32_t needStart = 0;
-  if (op) {
-    processAction(op, opMethod, &needStart);
-    if (needStart & IO_EVENT_READ)
-      executeOperationList(&object->readQueue);
-    if (needStart & IO_EVENT_WRITE)
-      executeOperationList(&object->writeQueue);
-  }
+
+  // Start a submitted operation, then reconcile the signal for this node by
+  // status. The proactor has no readiness side-channel: continue/finish/release
+  // all arrive as PROGRESS_*, cancellation as CANCEL.
+  if (op)
+    startOperation(op, &needStart);
+
+  if (sig & COMBINER_TAG_PROGRESS_READ)  needStart |= IO_EVENT_READ;
+  if (sig & COMBINER_TAG_PROGRESS_WRITE) needStart |= IO_EVENT_WRITE;
+  if (sig & COMBINER_TAG_PROGRESS_EXCLUSIVE)
+    processExclusiveOp(object, &needStart);
+  if (sig & COMBINER_TAG_CANCEL)
+    reapObject(object, &needStart);
+
+  if (needStart & IO_EVENT_READ)
+    executeOperationList(&object->readQueue);
+  if (needStart & IO_EVENT_WRITE)
+    executeOperationList(&object->writeQueue);
 }
 
 
@@ -322,7 +333,7 @@ void iocpNextFinishedOperation(asyncBase *base)
             }
           } else if (op->info.root.opCode == actRead || op->info.root.opCode == actWrite) {
             if (isBuffered || ((op->info.root.flags & afWaitAll) && op->info.bytesTransferred < op->info.transactionSize)) {
-              combinerPushOperation(&op->info.root, aaContinue);
+              combinerPushProgress(&op->info.root);
               continue;
             }
           } else if (op->info.root.opCode == actReadMsg) {
@@ -348,12 +359,12 @@ void iocpNextFinishedOperation(asyncBase *base)
           // connection (same re-drive as partial read/write above)
           closesocket(op->info.acceptSocket);
           op->info.acceptSocket = INVALID_SOCKET;
-          combinerPushOperation(&op->info.root, aaContinue);
+          combinerPushProgress(&op->info.root);
           continue;
         }
 
         opSetStatus(&op->info.root, opGetGeneration(&op->info.root), result);
-        combinerPushOperation(&op->info.root, aaFinish);
+        combinerPushProgress(&op->info.root);
       } else {
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, -1) - 1;
         if (threadsRunning)
@@ -468,7 +479,7 @@ void iocpStartTimer(asyncOpRoot *op)
       if (eventTryActivate(event))
         iocpActivate(event);
     } else if (opSetStatus(op, opGetGeneration(op), aosUnknownError)) {
-      combinerPushOperation(op, aaCancel);
+      combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
     }
   }
 }

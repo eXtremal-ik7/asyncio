@@ -138,7 +138,7 @@ static AsyncOpStatus startRlpxConnect(asyncOpRoot *opptr)
     }
   }
 
-  combinerPushOperation(childOp, aaStart);
+  combinerPushOperation(childOp);
   return aosPending;
 }
 
@@ -178,7 +178,7 @@ void aioRlpxAccept(rlpxSocket *socket, AsyncFlags flags, uint64_t timeout, rlpxA
 {
   RlpxOperation *op =
     initOp(startRlpxAccept, acceptFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpAccept);
-  combinerPushOperation(&op->root, aaStart);
+  combinerPushOperation(&op->root);
 }
 
 void aioRlpxConnect(rlpxSocket *socket, HostAddress address, AsyncFlags flags, uint64_t timeout, rlpxConnectCb callback, void *arg)

@@ -313,7 +313,17 @@ int main(int argc, char **argv)
     thread.join();
 
   gStop.store(true, std::memory_order_relaxed);
-  socketClose(gListener); // unblock the responders' accept()
+  // Closing the listener wakes a thread blocked in accept() on macOS/BSD but not
+  // on Linux, so nudge each responder with a throwaway loopback connection: it
+  // returns from accept(), observes gStop and exits. Then close and join.
+  for (unsigned i = 0; i < 32; i++) {
+    socketTy w = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+    if (w != kBadSocket) {
+      connect(w, reinterpret_cast<struct sockaddr*>(&self), selfLen);
+      socketClose(w);
+    }
+  }
+  socketClose(gListener);
   for (auto &thread : responders)
     thread.join();
 

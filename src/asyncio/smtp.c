@@ -538,13 +538,13 @@ void aioSmtpConnect(SMTPClient *client, HostAddress address, uint64_t usTimeout,
 {
   SMTPOp *op = allocSmtpOp(smtpConnectStart, connectFinish, client, SmtpOpConnect, (void*)callback, arg, afNone, usTimeout);
   op->Address = address;
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
 }
 
 void aioSmtpStartTls(SMTPClient *client, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg)
 {
   SMTPOp *op = allocSmtpOp(smtpStartTlsStart, commandFinish, client, SmtpOpStartTls, (void*)callback, arg, flags, usTimeout);
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
 }
 
 void aioSmtpLogin(SMTPClient *client, const char *login, const char *password, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg)
@@ -554,7 +554,7 @@ void aioSmtpLogin(SMTPClient *client, const char *login, const char *password, A
   size_t passwordOffset = putBase64(&op->Buffer, password, &op->passwordSize);
   op->login = (char*)op->Buffer.data + loginOffset;
   op->password = (char*)op->Buffer.data + passwordOffset;
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
 }
 
 void aioSmtpCommand(SMTPClient *client, const char *command, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg)
@@ -562,14 +562,14 @@ void aioSmtpCommand(SMTPClient *client, const char *command, AsyncFlags flags, u
   SMTPOp *op = allocSmtpOp(smtpCommandStart, commandFinish, client, SmtpOpCommand, (void*)callback, arg, flags, usTimeout);
   dynamicBufferWriteString(&op->Buffer, command);
   dynamicBufferWriteString(&op->Buffer, "\r\n");
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
 }
 
 int ioSmtpConnect(SMTPClient *client, HostAddress address, uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpConnectStart, connectFinish, client, SmtpOpConnect, 0, 0, afCoroutine, usTimeout);
   op->Address = address;
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->Root);
   releaseAsyncOp(&op->Root);
@@ -579,7 +579,7 @@ int ioSmtpConnect(SMTPClient *client, HostAddress address, uint64_t usTimeout)
 int ioSmtpStartTls(SMTPClient *client, AsyncFlags flags, uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpStartTlsStart, commandFinish, client, SmtpOpStartTls, 0, 0, flags | afCoroutine, usTimeout);
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->Root);
   releaseAsyncOp(&op->Root);
@@ -593,7 +593,7 @@ int ioSmtpLogin(SMTPClient *client, const char *login, const char *password, Asy
   size_t passwordOffset = putBase64(&op->Buffer, password, &op->passwordSize);
   op->login = (char*)op->Buffer.data + loginOffset;
   op->password = (char*)op->Buffer.data + passwordOffset;
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->Root);
   releaseAsyncOp(&op->Root);
@@ -605,7 +605,7 @@ int ioSmtpCommand(SMTPClient *client, const char *command, AsyncFlags flags, uin
   SMTPOp *op = allocSmtpOp(smtpCommandStart, commandFinish, client, SmtpOpCommand, 0, 0, flags | afCoroutine, usTimeout);
   dynamicBufferWriteString(&op->Buffer, command);
   dynamicBufferWriteString(&op->Buffer, "\r\n");
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->Root);
   releaseAsyncOp(&op->Root);
@@ -685,7 +685,7 @@ void aioSmtpSendMail(SMTPClient *client,
   op->text = (char*)op->Buffer.data + textOffset;
   op->startTls = startTls;
 
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
 }
 
 int ioSmtpSendMail(SMTPClient *client,
@@ -759,7 +759,7 @@ int ioSmtpSendMail(SMTPClient *client,
   op->text = (char*)op->Buffer.data + textOffset;
   op->startTls = startTls;
 
-  combinerPushOperation(&op->Root, aaStart);
+  combinerPushOperation(&op->Root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->Root);
   releaseAsyncOp(&op->Root);

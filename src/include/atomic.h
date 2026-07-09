@@ -36,6 +36,19 @@ static inline uintptr_t __uintptr_atomic_fetch_and_add(uintptr_t volatile *ptr, 
 #endif
 }
 
+static inline uintptr_t __uintptr_atomic_fetch_or(uintptr_t volatile *ptr, uintptr_t value)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __sync_fetch_and_or(ptr, value);
+#else
+#ifdef OS_32
+  return (uintptr_t)InterlockedOr((volatile LONG*)ptr, (LONG)value);
+#else
+  return (uintptr_t)InterlockedOr64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+#endif
+}
+
 static inline int __uintptr_atomic_compare_and_swap(uintptr_t volatile *ptr, uintptr_t v1, uintptr_t v2)
 {
 #ifndef _MSC_VER // Not Microsoft compiler

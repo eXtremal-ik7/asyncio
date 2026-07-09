@@ -35,7 +35,10 @@ typedef enum IoActionTy {
   actUserEvent = OPCODE_OTHER,
 } IoActionTy;
 
-typedef void combinerTaskHandlerTy(aioObjectRoot*, asyncOpRoot*, AsyncOpActionTy);
+// (object, startOp, sig): startOp != 0 is an op-node to start; sig is the
+// accumulated signal bits (COMBINER_TAG_MOVE_*/CANCEL) to reconcile for this
+// node. Either may be empty.
+typedef void combinerTaskHandlerTy(aioObjectRoot*, asyncOpRoot*, uint32_t);
 typedef void enqueueOperationTy(asyncBase*, asyncOpRoot*);
 typedef void postEmptyOperationTy(asyncBase*);
 typedef void nextFinishedOperationTy(asyncBase*);

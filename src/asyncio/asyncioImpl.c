@@ -261,7 +261,7 @@ void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, v
 void cancelIo(aioObjectRoot *object)
 {
   if (__uint_atomic_fetch_and_add(&object->CancelIoFlag, 1) == 0)
-    combinerPushCounter(object, COMBINER_TAG_ACCESS);
+    combinerPushCounter(object, COMBINER_TAG_CANCEL);
 }
 
 void objectDelete(aioObjectRoot *object)
@@ -411,23 +411,31 @@ static void exclusiveTryComplete(asyncOpRoot *op, AsyncOpStatus status, uint32_t
     return;
   }
 
-  // On a lost status race (operation timed out concurrently) the status
-  // winner has pushed aaCancel, which performs the release. The state
-  // machine has already consumed its child operations, so a cancelMethod
-  // that aborts children (SSL/zmtp connect) would find nothing and nobody
-  // would ever finish the operation - mark it not running so the pending
-  // aaCancel releases it directly instead of cancelling
-  if (opSetStatus(op, opGetGeneration(op), status))
-    exclusiveRelease(op, status, needStart);
-  else
-    op->running = arCancelling;
+  // Terminal: the operation (connect / composite handshake) is done - a progress
+  // signal brought us here, so the result stands even if a concurrent timeout
+  // won the status race. Adopt our status if we win, otherwise keep the winner's
+  // terminal status, and release now: nothing else will complete it (its child
+  // operations are already consumed, so a late cancelMethod would find nothing).
+  opSetStatus(op, opGetGeneration(op), status);
+  exclusiveRelease(op, opGetStatus(op), needStart);
 }
 
-// Re-drive a parked exclusive operation from a backend event handler
+// Re-drive a parked exclusive operation from a backend event handler / progress
+// signal (PROGRESS_EXCLUSIVE).
 void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart)
 {
   asyncOpRoot *op = (asyncOpRoot*)object->exclusiveOp;
-  if (!op || op->running != arRunning)
+  if (!op)
+    return;
+  if (op->running == arCancelling) {
+    // Late completion after a timeout/cancel armed cancelMethod (which returns 0
+    // on a proactor - the kernel owned the operation until now). The I/O is done,
+    // release with the terminal status the canceller set. This replaces the old
+    // aaContinue/aaFinish node that used to release an arCancelling exclusive op.
+    exclusiveRelease(op, opGetStatus(op), needStart);
+    return;
+  }
+  if (op->running != arRunning)
     return;
   exclusiveTryComplete(op, op->executeMethod(op), needStart);
 }
@@ -448,62 +456,31 @@ static void cancelExclusiveOp(aioObjectRoot *object, AsyncOpStatus status)
   }
 }
 
-void processAction(asyncOpRoot *opptr, AsyncOpActionTy actionType, uint32_t *needStart)
+// Start an op-node captured by the combiner (submission). The former
+// processAction(aaStart): the exclusive-slot owner is armed and driven in place,
+// an ordinary operation is queued; the combiner reconciles the rest by status.
+void startOperation(asyncOpRoot *op, uint32_t *needStart)
 {
-  List *list = 0;
-  uint32_t tag = 0;
-  aioObjectRoot *object = opptr->object;
+  aioObjectRoot *object = op->object;
 
   // Ownership of the exclusive slot (claimed by CAS at submission, e.g. in
-  // aioConnect) is what routes an operation to the exclusive path; there is
-  // no flag to spoof, any other operation goes to its read/write queue
-  if (object->exclusiveOp == (uintptr_t)opptr) {
-    switch (actionType) {
-      case aaStart : {
-        if (opGetStatus(opptr) != aosPending) {
-          // cancelled between submission and start (cancelIo sweep); the
-          // sweep does not push aaCancel for a not yet started operation,
-          // releasing is on us
-          exclusiveRelease(opptr, opGetStatus(opptr), needStart);
-          break;
-        }
-        opArmTimer(opptr);
-        exclusiveTryComplete(opptr, opptr->executeMethod(opptr), needStart);
-        break;
-      }
-
-      case aaCancel : {
-        if (opptr->running == arRunning) {
-          opptr->running = arCancelling;
-          if (opptr->cancelMethod(opptr))
-            exclusiveRelease(opptr, opGetStatus(opptr), needStart);
-        } else {
-          exclusiveRelease(opptr, opGetStatus(opptr), needStart);
-        }
-        break;
-      }
-
-      case aaFinish : {
-        exclusiveRelease(opptr, opGetStatus(opptr), needStart);
-        break;
-      }
-
-      case aaContinue : {
-        if (opptr->running == arRunning)
-          exclusiveTryComplete(opptr, opptr->executeMethod(opptr), needStart);
-        else
-          exclusiveRelease(opptr, opGetStatus(opptr), needStart);
-        break;
-      }
-
-      default :
-        break;
+  // aioConnect) routes an operation to the exclusive path; there is no flag to
+  // spoof, any other operation goes to its read/write queue.
+  if (object->exclusiveOp == (uintptr_t)op) {
+    if (opGetStatus(op) != aosPending) {
+      // Cancelled between submission and start (a cancelIo sweep): the sweep
+      // does not reach a not-yet-started operation, releasing the slot is on us
+      exclusiveRelease(op, opGetStatus(op), needStart);
+      return;
     }
-
+    opArmTimer(op);
+    exclusiveTryComplete(op, op->executeMethod(op), needStart);
     return;
   }
 
-  if (opptr->opCode & OPCODE_WRITE) {
+  List *list;
+  uint32_t tag;
+  if (op->opCode & OPCODE_WRITE) {
     list = &object->writeQueue;
     tag = IO_EVENT_WRITE;
   } else {
@@ -511,41 +488,75 @@ void processAction(asyncOpRoot *opptr, AsyncOpActionTy actionType, uint32_t *nee
     tag = IO_EVENT_READ;
   }
 
-  switch (actionType) {
-    case aaStart : {
-      opRun(opptr, list);
-      break;
-    }
+  opRun(op, list);
+  *needStart |= (list->head && list->head->running == arWaiting) ? tag : 0;
+}
 
-    case aaCancel : {
-      if (opptr->running == arRunning) {
-        opptr->running = arCancelling;
-        if (opptr->cancelMethod(opptr))
-          opRelease(opptr, opGetStatus(opptr), list);
-      } else {
-        opRelease(opptr, opGetStatus(opptr), list);
-      }
-      break;
-    }
-
-    case aaFinish : {
-      opRelease(opptr, opGetStatus(opptr), list);
-      break;
-    }
-
-    case aaContinue : {
-      if (opptr->running == arRunning)
-        opptr->running = arWaiting;
+// Reap terminal operations from one queue positionally: release the ones with no
+// I/O in flight, hold an in-flight op (cancelMethod == 0) on its head until its
+// late completion. Pending operations are left untouched. The queue is rebuilt
+// from survivors; if the new head is a ready-to-start operation, ask for a kick.
+static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
+{
+  asyncOpRoot *op = list->head;
+  asyncOpRoot *keptHead = 0, *keptTail = 0;
+  while (op) {
+    asyncOpRoot *next = op->executeQueue.next;
+    int keep = 0, release = 0;
+    AsyncOpStatus status = opGetStatus(op);
+    if (status == aosPending) {
+      keep = 1;
+    } else if (op->running == arRunning) {
+      op->running = arCancelling;
+      if (op->cancelMethod(op))
+        release = 1;
       else
-        opRelease(opptr, opGetStatus(opptr), list);
-      break;
+        keep = 1;   // in-flight: hold positional for the late completion
+    } else if (op->running == arWaiting) {
+      release = 1;
+    } else {
+      keep = 1;     // arCancelling: in-flight, wait for the completion
     }
 
-    default :
-      break;
+    op->executeQueue.prev = op->executeQueue.next = 0;
+    if (keep) {
+      op->executeQueue.prev = keptTail;
+      if (keptTail)
+        keptTail->executeQueue.next = op;
+      else
+        keptHead = op;
+      keptTail = op;
+    } else if (release) {
+      opRelease(op, status, 0);
+    }
+    op = next;
   }
 
-  *needStart |= (list->head && list->head->running == arWaiting) ? tag : 0;
+  list->head = keptHead;
+  list->tail = keptTail;
+  if (keptHead && keptHead->running == arWaiting)
+    *needStart |= tag;
+}
+
+// CANCEL reconcile: a cancel source (timeout/opCancel/cancelIo) has already set
+// the terminal status (winner-takes) and asked the combiner to scan. Reap the
+// terminals it left behind, positionally, across the exclusive slot and both
+// queues.
+void reapObject(aioObjectRoot *object, uint32_t *needStart)
+{
+  asyncOpRoot *ex = (asyncOpRoot*)object->exclusiveOp;
+  if (ex && opGetStatus(ex) != aosPending) {
+    if (ex->running == arRunning) {
+      ex->running = arCancelling;
+      if (ex->cancelMethod(ex))
+        exclusiveRelease(ex, opGetStatus(ex), needStart);
+    } else if (ex->running == arWaiting) {
+      exclusiveRelease(ex, opGetStatus(ex), needStart);
+    }
+    // arCancelling: in-flight, wait for the completion's PROGRESS_EXCLUSIVE
+  }
+  reapQueue(&object->readQueue, IO_EVENT_READ, needStart);
+  reapQueue(&object->writeQueue, IO_EVENT_WRITE, needStart);
 }
 
 void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList)
@@ -572,7 +583,18 @@ void executeOperationList(List *list)
 
   while (op) {
     asyncOpRoot *next = op->executeQueue.next;
-    AsyncOpStatus status = op->executeMethod(op);
+    AsyncOpStatus status = opGetStatus(op);
+    if (status != aosPending) {
+      // Already terminal - a progress completion set it (a PROGRESS_* signal
+      // brought us here, so the I/O is done) or it was cancelled while queued.
+      // Finish without re-issuing: re-running executeMethod on a proactor would
+      // post a fresh overlapped I/O for a completed operation.
+      opRelease(op, status, 0);
+      op = next;
+      continue;
+    }
+
+    status = op->executeMethod(op);
     if (status == aosPending) {
       op->running = arRunning;
       break;
@@ -597,48 +619,73 @@ void executeOperationList(List *list)
 
 void cancelOperationList(List *list, AsyncOpStatus status)
 {
+  // Positional-aware bulk cancel (CancelIoFlag / DeletePending / disconnect /
+  // connect-fail cascade). An in-flight operation whose cancelMethod returns 0
+  // (a proactor abort request the kernel owns until its completion arrives) must
+  // stay on its head so the late positional PROGRESS_* signal still finds and
+  // releases it - dropping it would strand the operation and, on objectDelete,
+  // leak the object whose reference it holds. By the one-in-flight invariant at
+  // most the head survives; the queue is rebuilt from the survivors rather than
+  // wiped.
   asyncOpRoot *op = list->head;
+  asyncOpRoot *keptHead = 0, *keptTail = 0;
   while (op) {
     asyncOpRoot *next = op->executeQueue.next;
+    int keep = 0, release = 0;
     if (opSetStatus(op, opGetGeneration(op), status)) {
       if (op->running == arRunning) {
         op->running = arCancelling;
         if (op->cancelMethod(op))
-          opRelease(op, opGetStatus(op), list);
+          release = 1;
         else
-          // Waits for the backend cancel completion (iocp abort packet);
-          // detach cleanly so the completion's release does not unlink a
-          // wiped list through stale pointers
-          eqRemove(list, op);
+          keep = 1;   // in-flight: hold positional for the late completion
       } else {
-        opRelease(op, opGetStatus(op), list);
+        release = 1;  // queued, not started: no I/O in flight, release now
       }
     } else {
-      // Status race lost: the winner releases the operation, this walker
-      // only detaches it so the list stays consistent for both parties
-      eqRemove(list, op);
+      // Status race lost: the winner (a concurrent completion/timeout) drives
+      // the release through its own reconcile scan. Leave the operation in the
+      // queue - the signal no longer carries the op pointer, so the queue is the
+      // only way that scan can still find it.
+      keep = 1;
+    }
+
+    op->executeQueue.prev = op->executeQueue.next = 0;
+    if (keep) {
+      op->executeQueue.prev = keptTail;
+      if (keptTail)
+        keptTail->executeQueue.next = op;
+      else
+        keptHead = op;
+      keptTail = op;
+    } else if (release) {
+      opRelease(op, status, 0);
     }
     op = next;
   }
 
-  list->head = 0;
-  list->tail = 0;
+  list->head = keptHead;
+  list->tail = keptTail;
 }
 
 void opCancel(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status)
 {
+  // Cancel signal, gated on winning the terminal status (the loser is redundant,
+  // the winner drives the cancel). The combiner scans and reaps positionally;
+  // an in-flight op stays on its head until its late completion releases it.
   if (opSetStatus(op, generation, status))
-    combinerPushOperation(op, aaCancel);
+    combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
 }
 
 void resumeParent(asyncOpRoot *op, AsyncOpStatus status)
 {
-  if (status == aosSuccess) {
-    combinerPushOperation(op, aaContinue);
-  } else {
+  // Progress from a child completion: always signal the parent, best-effort
+  // status on failure. Never gate the signal on the status CAS - a child
+  // completion must still release a parent a concurrent timeout put into
+  // arCancelling (invariant 1/5).
+  if (status != aosSuccess)
     opSetStatus(op, opGetGeneration(op), status);
-    combinerPushOperation(op, aaFinish);
-  }
+  combinerPushProgress(op);
 }
 
 void addToGlobalQueue(asyncOpRoot *op)
@@ -831,12 +878,11 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
 
   if (forRun.data) {
     asyncOpRoot *op;
-    AsyncOpActionTy opMethod;
     uint32_t tag;
-    taggedAsyncOpDecode(forRun, &op, &opMethod, &tag);
+    taggedAsyncOpDecode(forRun, &op, &tag);
     if (combinerTaskHandlerCommon(object, tag))
       return;
-    combinerTaskHandler(object, op, opMethod);
+    combinerTaskHandler(object, op, tag);
   }
 
   for (;;) {
@@ -868,9 +914,8 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
     AsyncOpTaggedPtr tail = taggedAsyncOpNull();
     while (currentHead.data && currentHead.data != stackTop.data) {
       asyncOpRoot *current;
-      AsyncOpActionTy opMethod;
       uint32_t tag;
-      taggedAsyncOpDecode(currentHead, &current, &opMethod, &tag);
+      taggedAsyncOpDecode(currentHead, &current, &tag);
 
       if (current == (asyncOpRoot*)stubOp.data || !current) {
         tail = currentHead;
@@ -891,25 +936,23 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
     // an operation action can never legally sit behind the DELETE tag
     while (reversed.data) {
       asyncOpRoot *current;
-      AsyncOpActionTy opMethod;
       uint32_t tag;
-      taggedAsyncOpDecode(reversed, &current, &opMethod, &tag);
+      taggedAsyncOpDecode(reversed, &current, &tag);
       reversed = current->next;
       if (combinerTaskHandlerCommon(object, tag))
         return;
-      combinerTaskHandler(object, current, opMethod);
+      combinerTaskHandler(object, current, tag);
     }
 
     if (tail.data) {
       asyncOpRoot *current;
-      AsyncOpActionTy opMethod;
       uint32_t tag;
-      taggedAsyncOpDecode(tail, &current, &opMethod, &tag);
+      taggedAsyncOpDecode(tail, &current, &tag);
       if (current == (asyncOpRoot*)stubOp.data)
         current = 0;
       if (combinerTaskHandlerCommon(object, tag))
         return;
-      combinerTaskHandler(object, current, opMethod);
+      combinerTaskHandler(object, current, tag);
     }
   }
 }

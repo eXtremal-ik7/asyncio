@@ -70,14 +70,6 @@ typedef enum AsyncFlags {
   afCoroutine = 32
 } AsyncFlags;
 
-typedef enum AsyncOpActionTy {
-  aaNone = 0,
-  aaStart = 0,
-  aaCancel,
-  aaFinish,
-  aaContinue
-} AsyncOpActionTy;
-
 typedef enum AsyncOpRunningTy {
   arWaiting = 0,
   arRunning,
@@ -97,7 +89,6 @@ typedef struct asyncBase asyncBase;
 typedef struct aioObjectRoot aioObjectRoot;
 typedef struct asyncOpRoot asyncOpRoot;
 typedef struct asyncOpListLink asyncOpListLink;
-typedef struct asyncOpAction asyncOpAction;
 typedef struct coroutineTy coroutineTy;
 
 typedef struct aioObject aioObject;
@@ -134,9 +125,21 @@ extern __tls unsigned messageLoopThreadId;
 #define TAG_STATUS_MASK ((STATIC_CAST(uintptr_t, 1) << TAG_STATUS_SIZE)-1)
 #define TAG_GENERATION_MASK (~TAG_STATUS_MASK)
 
-#define COMBINER_TAG_SIZE     5
-#define COMBINER_TAG_ACCESS   (1u)
-#define COMBINER_TAG_DELETE   (1u << 2)
+// Signal bits carried in the low COMBINER_TAG_SIZE bits of Head (op aligned to
+// 1<<COMBINER_TAG_SIZE). Progress bits ask the combiner to re-check one queue /
+// the exclusive slot positionally (a completion/readiness advanced it); CANCEL
+// asks it to scan for terminals; DELETE destroys the object. All are idempotent
+// (OR-ed into Head), so a re-pushed signal can neither be lost nor
+// double-counted - the action is derived from the operation status, not carried
+// in the node. PROGRESS and CANCEL are the two signal families (invariant 1):
+// progress is always emitted, cancel only by the status-race winner.
+#define COMBINER_TAG_SIZE               5
+#define COMBINER_TAG_PROGRESS_READ      (1u << 0)
+#define COMBINER_TAG_PROGRESS_WRITE     (1u << 1)
+#define COMBINER_TAG_DELETE             (1u << 2)
+#define COMBINER_TAG_PROGRESS_EXCLUSIVE (1u << 3)
+#define COMBINER_TAG_CANCEL             (1u << 4)
+#define COMBINER_TAG_PROGRESS_MASK      (COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE | COMBINER_TAG_PROGRESS_EXCLUSIVE)
 
 typedef struct AsyncOpTaggedPtr {
   uintptr_t data;
@@ -231,12 +234,6 @@ typedef struct asyncOpListLink {
   asyncOpListLink *next;
 } asyncOpListLink;
 
-typedef struct asyncOpAction {
-  asyncOpRoot *op;
-  AsyncOpActionTy actionType;
-  asyncOpAction *next;
-} asyncOpAction;
-
 typedef struct ListImpl {
   asyncOpRoot *prev;
   asyncOpRoot *next;
@@ -316,7 +313,13 @@ void opForceStatus(asyncOpRoot *op, AsyncOpStatus status);
 uintptr_t opEncodeTag(asyncOpRoot *op, uintptr_t tag);
 
 void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList);
-void processAction(asyncOpRoot *opptr, AsyncOpActionTy actionType, uint32_t *needStart);
+// Start an op-node captured by the combiner (submission): enqueue/arm or drive
+// the exclusive slot. The former processAction(aaStart).
+void startOperation(asyncOpRoot *op, uint32_t *needStart);
+// CANCEL reconcile: scan read/write queues and the exclusive slot for terminal
+// operations and reap them positionally (an in-flight op whose cancelMethod
+// returns 0 stays on its head until its late completion moves it).
+void reapObject(aioObjectRoot *object, uint32_t *needStart);
 void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart);
 void executeOperationList(List *list);
 void cancelOperationList(List *list, AsyncOpStatus status);
@@ -366,24 +369,22 @@ static inline AsyncOpTaggedPtr taggedAsyncOpStub()
   return result;
 }
 
-static inline AsyncOpTaggedPtr taggedAsyncOpMake(asyncOpRoot *op, AsyncOpActionTy opMethod, uint32_t tag)
+static inline AsyncOpTaggedPtr taggedAsyncOpMake(asyncOpRoot *op, uint32_t tag)
 {
   AsyncOpTaggedPtr result;
-  result.data = REINTERPRET_CAST(uintptr_t, op) | (opMethod << 3) | tag;
+  result.data = REINTERPRET_CAST(uintptr_t, op) | tag;
   return result;
 }
 
-static inline void taggedAsyncOpDecode(AsyncOpTaggedPtr ptr, asyncOpRoot **op, AsyncOpActionTy *opMethod, uint32_t *tag)
+static inline void taggedAsyncOpDecode(AsyncOpTaggedPtr ptr, asyncOpRoot **op, uint32_t *tag)
 {
   uintptr_t COMBINER_TAG_MASK = (STATIC_CAST(uintptr_t, 1) << COMBINER_TAG_SIZE) - 1;
   *op = (asyncOpRoot*)(ptr.data & (~COMBINER_TAG_MASK));
-  *opMethod = STATIC_CAST(AsyncOpActionTy, (ptr.data >> 3) & 0x3);
-  *tag = ptr.data & 0x7;
+  *tag = STATIC_CAST(uint32_t, ptr.data & COMBINER_TAG_MASK);
 }
 
 static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
                                            List *queue,
-                                           AsyncOpActionTy actionType,
                                            CreateAsyncOpProc *newAsyncOp,
                                            AsyncFlags flags,
                                            uint64_t usTimeout,
@@ -401,7 +402,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
     if (head.data) {
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
-        allocatedTagged = taggedAsyncOpMake(allocated, actionType, 0);
+        allocatedTagged = taggedAsyncOpMake(allocated, 0);
       }
 
       allocated->next = head;
@@ -418,7 +419,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
       // Put operation to queue end and try exit combiner
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
-        allocatedTagged = taggedAsyncOpMake(allocated, actionType, 0);
+        allocatedTagged = taggedAsyncOpMake(allocated, 0);
       }
 
       combiner(object, taggedAsyncOpStub(), allocatedTagged);
@@ -433,10 +434,15 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
   }
 }
 
-static inline void combinerPushOperation(asyncOpRoot *op, AsyncOpActionTy actionType)
+// Start push: the single op-node push over an operation's lifetime (submission).
+// The node carries no action - "start" is implied by being an op-node; movement
+// and cancellation are signals (combinerPushCounter/Move) that never touch the
+// node, so op->next is written by exactly one thread and the Treiber-stack
+// double-push is impossible by construction.
+static inline void combinerPushOperation(asyncOpRoot *op)
 {
   aioObjectRoot *object = op->object;
-  AsyncOpTaggedPtr opTagged = taggedAsyncOpMake(op, actionType, 0);
+  AsyncOpTaggedPtr opTagged = taggedAsyncOpMake(op, 0);
   AsyncOpTaggedPtr newOp;
   AsyncOpTaggedPtr head;
   do {
@@ -453,9 +459,30 @@ static inline void combinerPushOperation(asyncOpRoot *op, AsyncOpActionTy action
     combiner(object, taggedAsyncOpStub(), opTagged);
 }
 
+// Signal push: OR an idempotent tag into Head, wait-free. Ownership is the
+// 0->nonzero transition, exactly as for the op push, so at most one thread
+// enters the combiner. When Head was 0 this thread owns it and drains the bit
+// itself (stackTop = stub, no forRun - the bit sits in Head and is caught by
+// the drain). A re-pushed bit can never be lost: the release target is the stub
+// (clean low bits), so any OR moves Head off it and defeats the release CAS.
 static inline void combinerPushCounter(aioObjectRoot *object, uint32_t tag) {
-  if (__uintptr_atomic_fetch_and_add(&object->Head.data, tag) == 0)
-    combiner(object, taggedAsyncOpMake(0, aaNone, tag), taggedAsyncOpMake(0, aaNone, tag));
+  if (__uintptr_atomic_fetch_or(&object->Head.data, tag) == 0)
+    combiner(object, taggedAsyncOpStub(), taggedAsyncOpNull());
+}
+
+// Progress signal for one operation: re-check the queue/slot it occupies. The
+// exclusive-slot owner routes to PROGRESS_EXCLUSIVE, everything else by opcode.
+// Progress sources (proactor completions, resumeParent) always emit this; the
+// combiner reconciles finish/continue/release from the operation status.
+static inline void combinerPushProgress(asyncOpRoot *op)
+{
+  aioObjectRoot *object = op->object;
+  uint32_t bit;
+  if (object->exclusiveOp == REINTERPRET_CAST(uintptr_t, op))
+    bit = COMBINER_TAG_PROGRESS_EXCLUSIVE;
+  else
+    bit = (op->opCode & OPCODE_WRITE) ? COMBINER_TAG_PROGRESS_WRITE : COMBINER_TAG_PROGRESS_READ;
+  combinerPushCounter(object, bit);
 }
 
 static inline void runAioOperation(aioObjectRoot *object,
@@ -470,7 +497,7 @@ static inline void runAioOperation(aioObjectRoot *object,
                                    int opCode,
                                    void *contextPtr)
 {
-  if (!combinerAcquire(object, !(opCode & OPCODE_WRITE) ? &object->readQueue : &object->writeQueue, aaStart, createAsyncOp, flags, usTimeout, callback, arg, opCode, contextPtr)) {
+  if (!combinerAcquire(object, !(opCode & OPCODE_WRITE) ? &object->readQueue : &object->writeQueue, createAsyncOp, flags, usTimeout, callback, arg, opCode, contextPtr)) {
     // Object locked by current operation
     AsyncOpTaggedPtr forRun = taggedAsyncOpNull();
     asyncOpRoot *op = syncImpl(object, flags, usTimeout, callback, arg, contextPtr);
@@ -497,7 +524,7 @@ static inline void runAioOperation(aioObjectRoot *object,
       // Operation finished already
       addToGlobalQueue(op);
     } else {
-      forRun = taggedAsyncOpMake(op, aaStart, 0);
+      forRun = taggedAsyncOpMake(op, 0);
     }
 
     combiner(object, taggedAsyncOpStub(), forRun);
@@ -514,7 +541,7 @@ static inline asyncOpRoot *runIoOperation(aioObjectRoot *object,
                                           void *contextPtr)
 {
   assert(!coroutineIsMain() && "Trying to run 'io' operation from main coroutine");
-  asyncOpRoot *op = combinerAcquire(object, !(opCode & OPCODE_WRITE) ? &object->readQueue : &object->writeQueue, aaStart, createAsyncOp, flags | afCoroutine, usTimeout, 0, 0, opCode, contextPtr);
+  asyncOpRoot *op = combinerAcquire(object, !(opCode & OPCODE_WRITE) ? &object->readQueue : &object->writeQueue, createAsyncOp, flags | afCoroutine, usTimeout, 0, 0, opCode, contextPtr);
   if (!op) {
     // Object locked by current operation
     AsyncOpTaggedPtr forRun = taggedAsyncOpNull();
@@ -530,7 +557,7 @@ static inline asyncOpRoot *runIoOperation(aioObjectRoot *object,
       // Operation finished already
       addToGlobalQueue(op);
     } else {
-      forRun = taggedAsyncOpMake(op, aaStart, 0);
+      forRun = taggedAsyncOpMake(op, 0);
     }
 
     combiner(object, taggedAsyncOpStub(), forRun);
