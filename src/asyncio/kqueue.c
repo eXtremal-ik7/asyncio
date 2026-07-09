@@ -249,7 +249,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
       graceQuiesce(base);
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, &timeout);
 
-      time_t currentTime = time(0);
+      uint64_t currentTime = getMonotonicSeconds();
       if (currentTime % base->messageLoopThreadCounter == messageLoopThreadId)
         processTimeoutQueue(base, currentTime);
     } while (nfds <= 0 && errno == EINTR);

@@ -208,14 +208,30 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   op->timerId = timerLink;
 }
 
-void processTimeoutQueue(asyncBase *base, time_t currentTime)
+// Monotonic seconds for the timeout grid. Deliberately not derived from the
+// wall clock (time(0)): a backward NTP/manual step would stall the grid (the
+// checkpoint would sit ahead of "now" and the sweep would early-return below),
+// and a forward step would fire pending timeouts early. A monotonic source
+// advances with true elapsed time regardless of any system-date change. All
+// grid sites (arm, sweep, checkpoint init) must share this one clock.
+uint64_t getMonotonicSeconds(void)
 {
-  // TODO: handle system date change
+#if defined(OS_WINDOWS)
+  return (uint64_t)(GetTickCount64() / 1000ULL);
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec;
+#endif
+}
+
+void processTimeoutQueue(asyncBase *base, uint64_t currentTime)
+{
   if (base->lastCheckPoint >= currentTime || !__spinlock_try_acquire(&base->timerMapLock))
     return;
 
   // check timeout queue
-  time_t begin = base->lastCheckPoint;
+  uint64_t begin = base->lastCheckPoint;
   for (; begin < currentTime; begin++) {
     asyncOpListLink *link = pageMapExtractAll(&base->timerMap, (uint64_t)begin);
     while (link) {
@@ -371,7 +387,7 @@ static void opArmTimer(asyncOpRoot *op)
       base->methodImpl.startTimer(op);
     } else {
       // add operation to timeout grid
-      op->endTime = ((uint64_t)time(0)) * 1000000ULL + op->timeout;
+      op->endTime = getMonotonicSeconds() * 1000000ULL + op->timeout;
       addToTimeoutQueue(base, op);
     }
   }

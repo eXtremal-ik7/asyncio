@@ -212,7 +212,7 @@ asyncBase *createAsyncBase(AsyncMethod method)
   pageMapInit(&base->timerMap);
   memset(&base->globalQueue, 0, sizeof(base->globalQueue));
   base->timerMapLock = 0;
-  base->lastCheckPoint = time(0);
+  base->lastCheckPoint = getMonotonicSeconds();
   base->messageLoopThreadCounter = 0;
   base->graceEpoch = 0;
   base->graceFrozen = 0;

@@ -278,7 +278,7 @@ void epollNextFinishedOperation(asyncBase *base)
 
       graceQuiesce(base);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, 500);
-      time_t currentTime = time(0);
+      uint64_t currentTime = getMonotonicSeconds();
       if (currentTime % base->messageLoopThreadCounter == messageLoopThreadId)
         processTimeoutQueue(base, currentTime);
     } while (nfds <= 0 && errno == EINTR);
@@ -438,7 +438,7 @@ void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   timer->root.base = base;
   timer->root.type = ioObjectTimer;
-  timer->fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+  timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
   timer->op = op;
   epollControl(localBase->epollFd, EPOLL_CTL_ADD, 0, timer->fd, timer);
   op->timerId = timer;

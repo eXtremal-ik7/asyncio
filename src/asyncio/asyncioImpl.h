@@ -76,7 +76,7 @@ struct asyncBase {
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
   struct pageMap timerMap;
-  time_t lastCheckPoint;
+  uint64_t lastCheckPoint;
   volatile unsigned messageLoopThreadCounter;
   volatile unsigned timerMapLock;
 
@@ -171,7 +171,13 @@ struct aioUserEvent {
 
 void pageMapInit(pageMap *map);
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
-void processTimeoutQueue(asyncBase *base, time_t currentTime);
+void processTimeoutQueue(asyncBase *base, uint64_t currentTime);
+
+// Monotonic (wall-clock-independent) seconds for the timeout grid; see the
+// definition in asyncioImpl.c for why the grid must not use time(0). Returns an
+// unsigned 64-bit tick count, not calendar time, so it is intentionally not a
+// time_t (whose width is platform-dependent and which connotes wall time).
+uint64_t getMonotonicSeconds(void);
 
 // Grace period (see the asyncBase comment). graceThreadEnter runs once per
 // loop thread right after the messageLoopThreadId assignment and freezes
