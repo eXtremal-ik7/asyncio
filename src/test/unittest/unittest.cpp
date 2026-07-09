@@ -586,6 +586,72 @@ TEST(SslDeathTest, connect_plain_garbage_flood)
   EXPECT_EXIT(sslConnectGarbageScenario(1), ::testing::ExitedWithCode(0), "");
 }
 
+// A peer that accepts the TCP connection and drops it without ever speaking
+// TLS. This is NOT connect_plain_garbage: garbage makes SSL_connect() fail
+// fatally (a terminal SSL error -> the operation is released), but a bare
+// disconnect keeps SSL_connect() in SSL_ERROR_WANT_READ - it never saw a
+// ServerHello. The handshake read completes with aosDisconnected and
+// resumeParent() sets that terminal status on the parent connect op, so the
+// exclusive-slot handler must RELEASE on the terminal status instead of
+// re-running the connect state machine. Re-executing connectProc() calls
+// SSL_connect() again, gets WANT_READ again, and re-posts the handshake read on
+// the dead socket - forever: the connect never completes, its exclusive slot
+// stays pinned, the object leaks. There is no rescue timeout by design -
+// resumeParent() already set a terminal status, so a timer's opSetStatus()
+// loses the CAS and the timer is a no-op; the live-lock cannot be broken from
+// outside. The watchdog turns the hang into a verdict.
+static void sslConnectPeerDropAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  __UNUSED(arg);
+  if (status != aosSuccess)
+    exit(2);
+  socketClose(acceptSocket);  // FIN before a single TLS byte: the client's handshake read fails
+}
+
+static void sslConnectPeerDropConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  __UNUSED(arg);
+  // a peer that never completes the handshake must surface as an error, not hang
+  exit(status == aosSuccess ? 1 : 0);
+}
+
+static void sslConnectPeerDropScenario()
+{
+  armDeathTestWatchdog(15);
+
+  SslGarbageContext ctx;
+  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.client = nullptr;
+  ctx.serverConn = nullptr;
+  ctx.flood = 0;
+
+  if (!startTCPServer(ctx.base, sslConnectPeerDropAcceptCb, &ctx, gPort))
+    exit(2);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  if (socketBind(clientSocket, &address) != 0)
+    exit(2);
+
+  ctx.client = sslSocketNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  // no timeout: releasing on the child's terminal status is the contract (and a
+  // rescue timer could not break the live-lock anyway, see above)
+  aioSslConnect(ctx.client, &address, nullptr, 0, sslConnectPeerDropConnectCb, &ctx);
+
+  asyncLoop(ctx.base);
+  exit(3);  // event loop drained without the connect callback
+}
+
+TEST(SslDeathTest, connect_peer_disconnect_during_handshake)
+{
+  EXPECT_EXIT(sslConnectPeerDropScenario(), ::testing::ExitedWithCode(0), "");
+}
+
 // The same garbage after a completed handshake exercises the read path,
 // which never calls SSL_get_error. The server does a genuine TLS handshake
 // (self-signed cert, blocking OpenSSL in a helper thread), then the wire

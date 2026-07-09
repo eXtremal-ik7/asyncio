@@ -437,6 +437,15 @@ void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart)
   }
   if (op->running != arRunning)
     return;
+  if (opGetStatus(op) != aosPending) {
+    // A child completion set a terminal status (e.g. resumeParent on a failed
+    // handshake child): finish without re-running executeMethod, which would
+    // re-issue I/O on a dead socket (SSL_connect stuck in WANT_READ) and pin
+    // the slot forever. This is the former aaFinish; the queue path mirrors it
+    // in executeOperationList().
+    exclusiveRelease(op, opGetStatus(op), needStart);
+    return;
+  }
   exclusiveTryComplete(op, op->executeMethod(op), needStart);
 }
 
