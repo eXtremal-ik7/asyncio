@@ -3,11 +3,10 @@
 // NTP correction on a server whose clock ran fast) must not freeze the timeout
 // grid; a forward step must not fire timeouts prematurely.
 //
-// This test MUTATES THE SYSTEM CLOCK, so it is triple-gated:
-//   1. built only with -DASYNCIO_ENABLE_CLOCKSTEP_TEST=ON,
-//   2. skipped unless env ASYNCIO_CLOCKSTEP_ALLOW=1 (opt-in; running as root
-//      inside a CI container is common, so privilege alone is not a guard),
-//   3. skipped unless the process can actually set the clock (root / admin).
+// This test MUTATES THE SYSTEM CLOCK, so it is gated twice:
+//   1. the whole suite is named DISABLED_clock_step and requires the explicit
+//      gtest flag --gtest_also_run_disabled_tests,
+//   2. it is skipped unless the process can actually set the clock (root / admin).
 // The clock is restored on every exit path: normal return, watchdog, fatal
 // signal and atexit. Elapsed time is measured with a monotonic steady_clock,
 // which our stepping does not perturb.
@@ -21,9 +20,9 @@
 //   CLOCK_MONOTONIC fix, GREEN after. realtime_* on kqueue (macOS/BSD) is GREEN
 //   even before the fix, because EVFILT_TIMER already runs off a monotonic base.
 
-#include <asyncio/asyncio.h>
+#include "unittest.h"
+
 #include <asyncio/socket.h>
-#include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
@@ -31,8 +30,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <string>
 #include <thread>
 
 #if defined(OS_WINDOWS)
@@ -255,11 +252,10 @@ static constexpr int     kLoopGuardMs = 10000;   // hard cap on a single loop ru
 static constexpr int64_t kBandLowMs  = 1500; // catches premature fire (< 2 s timeout)
 static constexpr int64_t kBandHighMs = 4500; // catches a freeze (> 2 s + quantization)
 
-// One shared base for every test, created in main(). asyncio has no
+// One shared base for every test, created by unittest's main(). asyncio has no
 // deleteAsyncBase and its op pools (opPool/opTimerPool/eventPool) are process
 // globals, so spinning up a fresh base per test leaks cross-test state that can
 // stall a later run — unittest shares a single base for exactly this reason.
-static asyncBase *gClockBase = nullptr;
 
 // Arms a timer for kTimeoutUs, steps the wall clock by stepUs (signed) while the
 // timer is pending, runs the loop until it fires, restores the clock, and
@@ -267,7 +263,7 @@ static asyncBase *gClockBase = nullptr;
 static StepResult measureUnderStep(TimerKind kind, int64_t stepUs)
 {
   StepResult result{-1, false};
-  asyncBase *base = gClockBase;
+  asyncBase *base = gBase;
   TimerProbe probe;
   probe.base = base;
 
@@ -323,25 +319,30 @@ static StepResult measureUnderStep(TimerKind kind, int64_t stepUs)
 
 // ---- gate + tests ----------------------------------------------------------
 
-static bool clockStepAllowed(std::string &why)
+static void installClockRestoreGuards()
 {
-  const char *opt = std::getenv("ASYNCIO_CLOCKSTEP_ALLOW");
-  if (!opt || std::strcmp(opt, "1") != 0) {
-    why = "opt-in required: set ASYNCIO_CLOCKSTEP_ALLOW=1 (this test steps the system clock)";
-    return false;
-  }
-  if (!haveClockPrivilege()) {
-    why = "insufficient privileges: run as root / elevated administrator to set the system clock";
-    return false;
-  }
-  return true;
+  static const bool installed = []() {
+    std::atexit(clockRestore);
+    std::signal(SIGINT,  clockStepSignalHandler);
+    std::signal(SIGTERM, clockStepSignalHandler);
+    std::signal(SIGSEGV, clockStepSignalHandler);
+    std::signal(SIGABRT, clockStepSignalHandler);
+    std::signal(SIGFPE,  clockStepSignalHandler);
+    std::signal(SIGILL,  clockStepSignalHandler);
+#if defined(SIGBUS)
+    std::signal(SIGBUS, clockStepSignalHandler);
+#endif
+    return true;
+  }();
+  (void)installed;
 }
 
 static void runClockStepTest(TimerKind kind, int64_t stepUs)
 {
-  std::string why;
-  if (!clockStepAllowed(why))
-    GTEST_SKIP() << why;
+  if (!haveClockPrivilege())
+    GTEST_SKIP() << "insufficient privileges: run as root / elevated administrator to set the system clock";
+
+  installClockRestoreGuards();
 
   StepResult r = measureUnderStep(kind, stepUs);
   if (!r.stepApplied)
@@ -354,27 +355,7 @@ static void runClockStepTest(TimerKind kind, int64_t stepUs)
       << "timer froze or never fired under a wall-clock step (queue stalled); elapsed=" << elapsedMs << "ms";
 }
 
-TEST(ClockStep, grid_backward)     { runClockStepTest(TimerKind::Grid,     -kStepUs); }
-TEST(ClockStep, grid_forward)      { runClockStepTest(TimerKind::Grid,      kStepUs); }
-TEST(ClockStep, realtime_backward) { runClockStepTest(TimerKind::Realtime, -kStepUs); }
-TEST(ClockStep, realtime_forward)  { runClockStepTest(TimerKind::Realtime,  kStepUs); }
-
-int main(int argc, char **argv)
-{
-  initializeAsyncIo(aiNone);
-  gClockBase = createAsyncBase(amOSDefault);
-
-  std::atexit(clockRestore);
-  std::signal(SIGINT,  clockStepSignalHandler);
-  std::signal(SIGTERM, clockStepSignalHandler);
-  std::signal(SIGSEGV, clockStepSignalHandler);
-  std::signal(SIGABRT, clockStepSignalHandler);
-  std::signal(SIGFPE,  clockStepSignalHandler);
-  std::signal(SIGILL,  clockStepSignalHandler);
-#if defined(SIGBUS)
-  std::signal(SIGBUS,  clockStepSignalHandler);
-#endif
-
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}
+TEST(DISABLED_clock_step, grid_backward)     { runClockStepTest(TimerKind::Grid,     -kStepUs); }
+TEST(DISABLED_clock_step, grid_forward)      { runClockStepTest(TimerKind::Grid,      kStepUs); }
+TEST(DISABLED_clock_step, realtime_backward) { runClockStepTest(TimerKind::Realtime, -kStepUs); }
+TEST(DISABLED_clock_step, realtime_forward)  { runClockStepTest(TimerKind::Realtime,  kStepUs); }

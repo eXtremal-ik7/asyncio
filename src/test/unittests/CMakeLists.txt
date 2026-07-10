@@ -18,7 +18,9 @@ set(
   uriparsetest.cpp
   httpparsetest.cpp
   coretest.cpp
+  clocksteptest.cpp
 )
+
 set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2putils ${GTEST_LIBRARIES})
 include_directories(${GTEST_INCLUDE_DIRS})
 
