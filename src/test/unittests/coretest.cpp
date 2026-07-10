@@ -8,6 +8,12 @@
 
 namespace {
 
+static_assert(COMBINER_TAG_PROGRESS_READ == IO_EVENT_READ, "READ tag must map directly to backend events");
+static_assert(COMBINER_TAG_PROGRESS_WRITE == IO_EVENT_WRITE, "WRITE tag must map directly to backend events");
+static_assert(COMBINER_TAG_ERROR == IO_EVENT_ERROR, "ERROR tag must map directly to backend events");
+static_assert(COMBINER_TAG_CANCEL == (1u << 3), "CANCEL must precede DELETE");
+static_assert(COMBINER_TAG_DELETE == (1u << 4), "DELETE must remain the final Head tag");
+
 void cancelAndDrain(TestBackend &backend, TestObject &object)
 {
   cancelIo(&object.root);
@@ -18,6 +24,65 @@ void deleteOwner(TestBackend &backend, TestObject &object)
 {
   objectDelete(&object.root);
   backend.drainCompletions();
+}
+
+TEST(core_decision, active_io_event_selection_covers_complete_boolean_table)
+{
+  for (int hasInitialization = 0; hasInitialization <= 1; ++hasInitialization) {
+    for (int running = arWaiting; running <= arCancelling; ++running) {
+      for (int initializationIsWrite = 0; initializationIsWrite <= 1; ++initializationIsWrite) {
+        for (int hasReadQueue = 0; hasReadQueue <= 1; ++hasReadQueue) {
+          for (int hasWriteQueue = 0; hasWriteQueue <= 1; ++hasWriteQueue) {
+            SCOPED_TRACE(::testing::Message()
+                         << "initialization=" << hasInitialization
+                         << " running=" << running
+                         << " initWrite=" << initializationIsWrite
+                         << " readQueue=" << hasReadQueue
+                         << " writeQueue=" << hasWriteQueue);
+            uint32_t expected = hasInitialization
+              ? (running == arRunning
+                   ? (initializationIsWrite ? IO_EVENT_WRITE : IO_EVENT_READ)
+                   : 0)
+              : (hasReadQueue ? IO_EVENT_READ : 0) |
+                (hasWriteQueue ? IO_EVENT_WRITE : 0);
+            EXPECT_EQ(combinerSelectActiveIoEvents(hasInitialization,
+                                                   static_cast<AsyncOpRunningTy>(running),
+                                                   initializationIsWrite,
+                                                   hasReadQueue,
+                                                   hasWriteQueue),
+                      expected);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(core_decision, operation_state_selectors_cover_all_running_states)
+{
+  struct Case {
+    AsyncOpRunningTy running;
+    AsyncOpStatus status;
+    CombinerInitializationAction initialization;
+    CombinerReapAction reap;
+  };
+  const Case cases[] = {
+    {arWaiting,    aosPending, ciaNone,    craKeep},
+    {arRunning,    aosPending, ciaExecute, craKeep},
+    {arCancelling, aosPending, ciaRelease, craKeep},
+    {arWaiting,    aosSuccess, ciaNone,    craRelease},
+    {arRunning,    aosSuccess, ciaRelease, craCancel},
+    {arCancelling, aosSuccess, ciaRelease, craKeep},
+  };
+
+  for (const Case &test : cases) {
+    SCOPED_TRACE(::testing::Message()
+                 << "running=" << test.running
+                 << " status=" << test.status);
+    EXPECT_EQ(combinerSelectInitializationAction(test.running, test.status),
+              test.initialization);
+    EXPECT_EQ(combinerSelectReapAction(test.running, test.status), test.reap);
+  }
 }
 
 TEST(core_queue, push_and_remove_preserve_bidirectional_links)
@@ -381,14 +446,14 @@ TEST(core_cancel, repeated_request_while_flag_is_set_does_not_push_second_signal
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, pending_operation_freezes_ordinary_queues_until_success)
+TEST(core_initialization, pending_operation_freezes_ordinary_queues_until_success)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp connect(object, OPCODE_WRITE), read(object);
   connect.setResults({aosPending, aosSuccess});
   read.setResults({aosSuccess});
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&connect.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
 
   combinerPushOperation(&connect.root);
   combinerPushOperation(&read.root);
@@ -398,7 +463,7 @@ TEST(core_exclusive, pending_operation_freezes_ordinary_queues_until_success)
 
   combinerPushProgress(&connect.root);
 
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
   EXPECT_EQ(connect.executeCalls, 2u);
   EXPECT_EQ(read.executeCalls, 1u);
   EXPECT_EQ(connect.releaseCalls, 1u);
@@ -409,13 +474,40 @@ TEST(core_exclusive, pending_operation_freezes_ordinary_queues_until_success)
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, failure_cancels_operations_queued_behind_it)
+TEST(core_initialization, read_direction_progress_drives_handshake_slot)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp handshake(object, OPCODE_READ), write(object, OPCODE_WRITE);
+  handshake.setResults({aosPending, aosSuccess});
+  write.setResults({aosSuccess});
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&handshake.root);
+
+  combinerPushOperation(&handshake.root);
+  combinerPushOperation(&write.root);
+  ASSERT_EQ(handshake.root.running, arRunning);
+  ASSERT_EQ(write.executeCalls, 0u);
+
+  combinerPushProgress(&handshake.root);
+
+  EXPECT_EQ(handshake.executeCalls, 2u);
+  EXPECT_EQ(write.executeCalls, 1u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_NE(std::find(backend.handledSignals.begin(),
+                      backend.handledSignals.end(),
+                      COMBINER_TAG_PROGRESS_READ),
+            backend.handledSignals.end());
+  backend.drainCompletions();
+  deleteOwner(backend, object);
+}
+
+TEST(core_initialization, failure_cancels_operations_queued_behind_it)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp connect(object, OPCODE_WRITE), read(object), write(object, OPCODE_WRITE);
   connect.setResults({aosPending, aosDisconnected});
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&connect.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   combinerPushOperation(&connect.root);
   combinerPushOperation(&read.root);
   combinerPushOperation(&write.root);
@@ -433,56 +525,56 @@ TEST(core_exclusive, failure_cancels_operations_queued_behind_it)
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, proactor_cancel_waits_for_late_completion)
+TEST(core_initialization, proactor_cancel_waits_for_late_completion)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp connect(object, OPCODE_WRITE);
   connect.cancelResult = 0;
   connect.setResults({aosPending});
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&connect.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   combinerPushOperation(&connect.root);
 
   cancelIo(&object.root);
 
   EXPECT_EQ(connect.root.running, arCancelling);
   EXPECT_EQ(connect.releaseCalls, 0u);
-  EXPECT_EQ(object.root.exclusiveOp, reinterpret_cast<uintptr_t>(&connect.root));
+  EXPECT_EQ(object.root.initializationOp, reinterpret_cast<uintptr_t>(&connect.root));
 
   combinerPushProgress(&connect.root);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
   backend.drainCompletions();
   EXPECT_EQ(connect.callbackStatus, aosCanceled);
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, synchronous_cancel_releases_immediately)
+TEST(core_initialization, synchronous_cancel_releases_immediately)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp connect(object, OPCODE_WRITE);
   connect.cancelResult = 1;
   connect.setResults({aosPending});
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&connect.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   combinerPushOperation(&connect.root);
 
   cancelIo(&object.root);
 
   EXPECT_EQ(connect.cancelCalls, 1u);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
   backend.drainCompletions();
   EXPECT_EQ(connect.callbackStatus, aosCanceled);
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, direct_reap_handles_running_and_waiting_terminal_states)
+TEST(core_initialization, direct_reap_handles_running_and_waiting_terminal_states)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp running(object, OPCODE_WRITE), waiting(object, OPCODE_WRITE);
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&running.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&running.root);
   running.root.running = arRunning;
   ASSERT_TRUE(opSetStatus(&running.root, opGetGeneration(&running.root), aosTimeout));
   uint32_t needStart = 0;
@@ -490,15 +582,15 @@ TEST(core_exclusive, direct_reap_handles_running_and_waiting_terminal_states)
   reapObject(&object.root, &needStart);
   EXPECT_EQ(running.cancelCalls, 1u);
   EXPECT_EQ(running.releaseCalls, 1u);
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
 
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&waiting.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&waiting.root);
   waiting.root.running = arWaiting;
   ASSERT_TRUE(opSetStatus(&waiting.root, opGetGeneration(&waiting.root), aosCanceled));
   reapObject(&object.root, &needStart);
   EXPECT_EQ(waiting.cancelCalls, 0u);
   EXPECT_EQ(waiting.releaseCalls, 1u);
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
   EXPECT_EQ(needStart & (IO_EVENT_READ | IO_EVENT_WRITE),
             IO_EVENT_READ | IO_EVENT_WRITE);
 
@@ -506,61 +598,61 @@ TEST(core_exclusive, direct_reap_handles_running_and_waiting_terminal_states)
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, process_is_noop_without_running_slot)
+TEST(core_initialization, process_is_noop_without_running_slot)
 {
   TestBackend backend;
   TestObject object(backend);
   uint32_t needStart = 0;
-  processExclusiveOp(&object.root, &needStart);
+  processInitializationOp(&object.root, &needStart);
   EXPECT_EQ(needStart, 0u);
 
   TestOp waiting(object, OPCODE_WRITE);
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&waiting.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&waiting.root);
   waiting.root.running = arWaiting;
-  processExclusiveOp(&object.root, &needStart);
+  processInitializationOp(&object.root, &needStart);
   EXPECT_EQ(waiting.executeCalls, 0u);
   EXPECT_EQ(waiting.releaseCalls, 0u);
 
-  object.root.exclusiveOp = 0;
+  object.root.initializationOp = 0;
   objectDecrementReference(&object.root, 1);
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, terminal_status_from_child_releases_without_reexecution)
+TEST(core_initialization, terminal_status_from_child_releases_without_reexecution)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp connect(object, OPCODE_WRITE);
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&connect.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   connect.root.running = arRunning;
   ASSERT_TRUE(opSetStatus(&connect.root,
                           opGetGeneration(&connect.root),
                           aosUnknownError));
   uint32_t needStart = 0;
 
-  processExclusiveOp(&object.root, &needStart);
+  processInitializationOp(&object.root, &needStart);
 
   EXPECT_EQ(connect.executeCalls, 0u);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
   backend.drainCompletions();
   EXPECT_EQ(connect.callbackStatus, aosUnknownError);
   deleteOwner(backend, object);
 }
 
-TEST(core_exclusive, operation_cancelled_before_start_is_never_executed)
+TEST(core_initialization, operation_cancelled_before_start_is_never_executed)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp connect(object, OPCODE_WRITE);
-  object.root.exclusiveOp = reinterpret_cast<uintptr_t>(&connect.root);
+  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   ASSERT_TRUE(opSetStatus(&connect.root, opGetGeneration(&connect.root), aosCanceled));
 
   combinerPushOperation(&connect.root);
 
   EXPECT_EQ(connect.executeCalls, 0u);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.exclusiveOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, 0u);
   backend.drainCompletions();
   deleteOwner(backend, object);
 }

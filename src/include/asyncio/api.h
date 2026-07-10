@@ -126,20 +126,20 @@ extern __tls unsigned messageLoopThreadId;
 #define TAG_GENERATION_MASK (~TAG_STATUS_MASK)
 
 // Signal bits carried in the low COMBINER_TAG_SIZE bits of Head (op aligned to
-// 1<<COMBINER_TAG_SIZE). Progress bits ask the combiner to re-check one queue /
-// the exclusive slot positionally (a completion/readiness advanced it); CANCEL
-// asks it to scan for terminals; DELETE destroys the object. All are idempotent
-// (OR-ed into Head), so a re-pushed signal can neither be lost nor
-// double-counted - the action is derived from the operation status, not carried
-// in the node. PROGRESS and CANCEL are the two signal families (invariant 1):
-// progress is always emitted, cancel only by the status-race winner.
-#define COMBINER_TAG_SIZE               5
-#define COMBINER_TAG_PROGRESS_READ      (1u << 0)
-#define COMBINER_TAG_PROGRESS_WRITE     (1u << 1)
-#define COMBINER_TAG_DELETE             (1u << 2)
-#define COMBINER_TAG_PROGRESS_EXCLUSIVE (1u << 3)
-#define COMBINER_TAG_CANCEL             (1u << 4)
-#define COMBINER_TAG_PROGRESS_MASK      (COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE | COMBINER_TAG_PROGRESS_EXCLUSIVE)
+// 1<<COMBINER_TAG_SIZE). READ/WRITE ask the combiner to re-check the matching
+// queue, or the one-shot initialization operation while it occupies its slot.
+// ERROR carries peer-close readiness from a reactor, CANCEL asks for a terminal
+// scan, and DELETE destroys the object. All are idempotent (OR-ed into Head),
+// so a re-pushed signal can neither be lost nor double-counted - the action is
+// derived from object/operation state, not carried in the node. Progress is
+// always emitted; cancel only by the status-race winner (invariant 1).
+#define COMBINER_TAG_SIZE           5
+#define COMBINER_TAG_PROGRESS_READ  (1u << 0)
+#define COMBINER_TAG_PROGRESS_WRITE (1u << 1)
+#define COMBINER_TAG_ERROR          (1u << 2)
+#define COMBINER_TAG_CANCEL         (1u << 3)
+#define COMBINER_TAG_DELETE         (1u << 4)
+#define COMBINER_TAG_PROGRESS_MASK  (COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE)
 
 typedef struct AsyncOpTaggedPtr {
   uintptr_t data;
@@ -260,9 +260,12 @@ struct aioObjectRoot {
   // starts after the sweep; with no timeout armed such an operation would
   // hold its object reference forever and the DELETE tag would never fire
   volatile uint32_t DeletePending;
-  // Exclusive operation slot (connect): claimed by CAS at submission time,
-  // cleared under the object's combiner when the operation leaves the slot
-  volatile uintptr_t exclusiveOp;
+  // Optional one-shot transport initialization (TCP connect, SSL/ZMTP
+  // handshake). It must be submitted before ordinary I/O; operations submitted
+  // afterwards may wait in the read/write queues until initialization ends.
+  // Objects already ready for I/O (accepted/UDP sockets, devices) never use it.
+  // Claimed once by CAS at submission and cleared by the object's combiner.
+  volatile uintptr_t initializationOp;
 
   // Grace-period limbo links (graceRetire/graceReclaim): meaningful only
   // between the destructor and the memory release, while the dead object may
@@ -314,13 +317,13 @@ uintptr_t opEncodeTag(asyncOpRoot *op, uintptr_t tag);
 
 void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList);
 // Start an op-node captured by the combiner (submission): enqueue/arm or drive
-// the exclusive slot. The former processAction(aaStart).
+// the initialization slot. The former processAction(aaStart).
 void startOperation(asyncOpRoot *op, uint32_t *needStart);
-// CANCEL reconcile: scan read/write queues and the exclusive slot for terminal
-// operations and reap them positionally (an in-flight op whose cancelMethod
+// CANCEL reconcile: scan read/write queues and the initialization slot for
+// terminal operations and reap them positionally (an in-flight op whose cancelMethod
 // returns 0 stays on its head until its late completion moves it).
 void reapObject(aioObjectRoot *object, uint32_t *needStart);
-void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart);
+void processInitializationOp(aioObjectRoot *object, uint32_t *needStart);
 void executeOperationList(List *list);
 void cancelOperationList(List *list, AsyncOpStatus status);
 
@@ -398,7 +401,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
   asyncOpRoot *allocated = 0;
 
   do {
-    head = object->Head;
+    head.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
     if (head.data) {
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
@@ -414,8 +417,8 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
 
   if (!head.data) {
     // This thread entered a combiner
-    if (queue->head || object->exclusiveOp) {
-      // Object has operations in queue or an exclusive operation in flight
+    if (queue->head || __uintptr_atomic_load(&object->initializationOp, amoRelaxed)) {
+      // Object has operations in queue or initialization in flight
       // Put operation to queue end and try exit combiner
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
@@ -446,7 +449,7 @@ static inline void combinerPushOperation(asyncOpRoot *op)
   AsyncOpTaggedPtr newOp;
   AsyncOpTaggedPtr head;
   do {
-    head = object->Head;
+    head.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
     if (head.data) {
       newOp = opTagged;
       op->next = head;
@@ -470,19 +473,17 @@ static inline void combinerPushCounter(aioObjectRoot *object, uint32_t tag) {
     combiner(object, taggedAsyncOpStub(), taggedAsyncOpNull());
 }
 
-// Progress signal for one operation: re-check the queue/slot it occupies. The
-// exclusive-slot owner routes to PROGRESS_EXCLUSIVE, everything else by opcode.
-// Progress sources (proactor completions, resumeParent) always emit this; the
-// combiner reconciles finish/continue/release from the operation status.
+// Progress signal for one operation: re-check its positional direction.
+// While initializationOp is occupied, its one-shot contract guarantees that
+// no ordinary queue operation is running, so the backend routes either progress
+// bit to initialization without a dedicated tag. This also keeps the producer
+// independent of mutable object state. Proactor completions and resumeParent
+// always emit progress; the combiner reconciles finish/continue/release from the
+// operation status.
 static inline void combinerPushProgress(asyncOpRoot *op)
 {
-  aioObjectRoot *object = op->object;
-  uint32_t bit;
-  if (object->exclusiveOp == REINTERPRET_CAST(uintptr_t, op))
-    bit = COMBINER_TAG_PROGRESS_EXCLUSIVE;
-  else
-    bit = (op->opCode & OPCODE_WRITE) ? COMBINER_TAG_PROGRESS_WRITE : COMBINER_TAG_PROGRESS_READ;
-  combinerPushCounter(object, bit);
+  uint32_t bit = (op->opCode & OPCODE_WRITE) ? COMBINER_TAG_PROGRESS_WRITE : COMBINER_TAG_PROGRESS_READ;
+  combinerPushCounter(op->object, bit);
 }
 
 static inline void runAioOperation(aioObjectRoot *object,

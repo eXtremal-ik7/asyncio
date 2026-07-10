@@ -312,8 +312,8 @@ TEST(socket, test_tcp_read_pipelined_with_connect)
     << ") while the connect was still in flight";
 }
 
-// Connect is an exclusive object operation: it occupies the single
-// aioObjectRoot::exclusiveOp slot. A second connect submitted while the
+// Connect is the object's one-shot initialization: it occupies the single
+// aioObjectRoot::initializationOp slot. A second connect submitted while the
 // first is still in flight must be rejected immediately instead of queueing
 // or corrupting the slot.
 struct DoubleConnectContext {
@@ -368,14 +368,14 @@ TEST(socket, double_connect_rejected)
 
   if (ctx.firstStatus != aosTimeout)
     GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
-                 << "), exclusive slot contention cannot be exercised on this network";
+                 << "), initialization slot contention cannot be exercised on this network";
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
   EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
     << "the second connect was not rejected while the first was in flight";
 }
 
 // deleteAioObject on an object with a connect in flight: the internal cancelIo
-// sweep must find the operation in the exclusive slot (it is not in the
+// sweep must find the operation in the initialization slot (it is not in the
 // read/write queues anymore), cancel it and let the object die instead of
 // leaking a parked connect and a permanently frozen object.
 struct DeleteWhileConnectingContext {
@@ -435,11 +435,11 @@ TEST(socket, delete_object_while_connecting)
 // WSA*-convention success (AcceptEx in iocpAsyncAccept has the same shape) -
 // parks the operation beyond recovery: the timeout pushes a cancel, the
 // cancel leans on CancelIoEx, but nothing was ever submitted, so no abort
-// packet comes and the operation sits in the exclusive slot forever, holding
+// packet comes and the operation sits in the initialization slot forever, holding
 // the object and freezing its queues. A hang, not a late error - hence a
 // death-test child, where the watchdog turns the hang into a verdict.
 // The trigger is a second connect on an already-connected socket (submitted
-// from the first connect's callback: the exclusive slot is released before
+// from the first connect's callback: the initialization slot is released before
 // the finish callback runs). What it reports is per-kernel semantics: macOS
 // gives EISCONN (the TCP layer advances the socket state at handshake time),
 // Linux returns 0 and reports success (the state advances lazily on the next

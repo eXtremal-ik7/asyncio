@@ -124,6 +124,87 @@ struct aioObject {
   int needSigpipeGuard;
 };
 
+// Pure decision kernel for the readiness backends. During one-shot transport
+// initialization ordinary queues may already contain later submissions, but
+// they are not active yet. Keeping this selection separate from epoll/kqueue
+// syscalls makes the state table explicit and exhaustively unit-testable.
+static inline uint32_t combinerSelectActiveIoEvents(int hasInitialization,
+                                                    AsyncOpRunningTy initializationState,
+                                                    int initializationIsWrite,
+                                                    int hasReadQueue,
+                                                    int hasWriteQueue)
+{
+  if (hasInitialization)
+    return initializationState == arRunning
+      ? (initializationIsWrite ? IO_EVENT_WRITE : IO_EVENT_READ)
+      : 0;
+
+  return (hasReadQueue ? IO_EVENT_READ : 0) |
+         (hasWriteQueue ? IO_EVENT_WRITE : 0);
+}
+
+static inline uint32_t combinerActiveIoEvents(aioObjectRoot *object)
+{
+  asyncOpRoot *initialization = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
+  if (initialization)
+    return combinerSelectActiveIoEvents(1,
+                                        initialization->running,
+                                        initialization->opCode & OPCODE_WRITE,
+                                        0,
+                                        0);
+
+  return combinerSelectActiveIoEvents(0,
+                                      arWaiting,
+                                      0,
+                                      object->readQueue.head != 0,
+                                      object->writeQueue.head != 0);
+}
+
+typedef enum CombinerInitializationAction {
+  ciaNone,
+  ciaExecute,
+  ciaRelease
+} CombinerInitializationAction;
+
+// Status and position select one mutually exclusive initialization action;
+// execution itself remains outside this pure function.
+static inline CombinerInitializationAction combinerSelectInitializationAction(AsyncOpRunningTy running,
+                                                                               AsyncOpStatus status)
+{
+  switch (running) {
+    case arRunning:
+      return status == aosPending ? ciaExecute : ciaRelease;
+    case arCancelling:
+      return ciaRelease;
+    case arWaiting:
+    default:
+      return ciaNone;
+  }
+}
+
+typedef enum CombinerReapAction {
+  craKeep,
+  craCancel,
+  craRelease
+} CombinerReapAction;
+
+static inline CombinerReapAction combinerSelectReapAction(AsyncOpRunningTy running,
+                                                           AsyncOpStatus status)
+{
+  if (status == aosPending)
+    return craKeep;
+
+  switch (running) {
+    case arRunning:
+      return craCancel;
+    case arWaiting:
+      return craRelease;
+    case arCancelling:
+    default:
+      return craKeep;
+  }
+}
+
 #ifndef OS_WINDOWS
 // Set once by initializeAsyncIo(aiIgnoreSigpipe); write paths then skip the
 // SIGPIPE masking below.

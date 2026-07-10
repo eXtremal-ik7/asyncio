@@ -169,18 +169,15 @@ struct TestBackend : asyncBase {
   {
     TestBackend &backend = from(object->base);
     backend.handledSignals.push_back(signals);
-    uint32_t needStart = 0;
+    uint32_t progress = signals & COMBINER_TAG_PROGRESS_MASK;
+    uint32_t needStart = progress;
 
     if (op) {
       backend.started.push_back(op);
       startOperation(op, &needStart);
     }
-    if (signals & COMBINER_TAG_PROGRESS_READ)
-      needStart |= IO_EVENT_READ;
-    if (signals & COMBINER_TAG_PROGRESS_WRITE)
-      needStart |= IO_EVENT_WRITE;
-    if (signals & COMBINER_TAG_PROGRESS_EXCLUSIVE)
-      processExclusiveOp(object, &needStart);
+    if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
+      processInitializationOp(object, &needStart);
     if (signals & COMBINER_TAG_CANCEL)
       reapObject(object, &needStart);
 

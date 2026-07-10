@@ -97,10 +97,10 @@ TEST(SslDeathTest, connect_plain_garbage_flood)
 // disconnect keeps SSL_connect() in SSL_ERROR_WANT_READ - it never saw a
 // ServerHello. The handshake read completes with aosDisconnected and
 // resumeParent() sets that terminal status on the parent connect op, so the
-// exclusive-slot handler must RELEASE on the terminal status instead of
+// initialization-slot handler must RELEASE on the terminal status instead of
 // re-running the connect state machine. Re-executing connectProc() calls
 // SSL_connect() again, gets WANT_READ again, and re-posts the handshake read on
-// the dead socket - forever: the connect never completes, its exclusive slot
+// the dead socket - forever: the connect never completes, its initialization slot
 // stays pinned, the object leaks. There is no rescue timeout by design -
 // resumeParent() already set a terminal status, so a timer's opSetStatus()
 // loses the CAS and the timer is a no-op; the live-lock cannot be broken from
@@ -390,7 +390,7 @@ TEST(ssl, write_without_connect)
   sslSocketDelete(client);
 }
 
-// The SSL connect claims its object's exclusive slot the same way the plain
+// The SSL connect claims its object's initialization slot the same way the plain
 // TCP connect does: a second handshake submitted while the first is still in
 // flight must be rejected immediately, without touching the shared SSL state
 // machine.
@@ -446,7 +446,7 @@ TEST(ssl, double_connect_rejected)
 
   if (ctx.firstStatus != aosTimeout)
     GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
-                 << "), exclusive slot contention cannot be exercised on this network";
+                 << "), initialization slot contention cannot be exercised on this network";
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
   EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
     << "the second SSL connect was not rejected while the first was in flight";

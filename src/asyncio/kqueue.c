@@ -23,12 +23,6 @@ typedef struct kqueueBase {
   intptr_t timerIdCounter;
 } kqueueBase;
 
-typedef struct KQueueObject {
-  aioObject Object;
-  uint32_t ReadEvents;
-  uint32_t WriteEvents;
-} KQueueObject;
-
 typedef struct aioTimer {
   aioObjectRoot root;
   intptr_t fd;
@@ -132,53 +126,43 @@ void kqueuePostEmptyOperation(asyncBase *base)
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   kqueueBase *base = (kqueueBase*)object->base;
-  KQueueObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (KQueueObject*)object : 0;
-  uint32_t readEvents = fdObject ? fdObject->ReadEvents : 0;
-  uint32_t writeEvents = fdObject ? fdObject->WriteEvents : 0;
+  aioObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (aioObject*)object : 0;
+  uint32_t oldIoEvents = fdObject ? combinerActiveIoEvents(object) : 0;
+  uint32_t progress = sig & COMBINER_TAG_PROGRESS_MASK;
+  uint32_t ioEvents = fdObject
+    ? progress | ((sig & COMBINER_TAG_ERROR) ? IO_EVENT_ERROR : 0)
+    : 0;
 
   // A dying object gets no fd readiness processing: its operations are being
   // cancelled wholesale anyway, and for a stale batch entry landing here
   // within the grace period the descriptor is already closed - the error
   // path ioctl and the rearm kevent would run on a dead or reused fd
-  if (object->DeletePending && (readEvents | writeEvents)) {
-    fdObject->ReadEvents = 0;
-    fdObject->WriteEvents = 0;
-    readEvents = 0;
-    writeEvents = 0;
+  if (fdObject && object->DeletePending) {
+    ioEvents = 0;
+    progress = 0;
   }
 
-  asyncOpRoot *connectOp = (asyncOpRoot*)object->exclusiveOp;
-  int wasConnecting = connectOp && connectOp->running == arRunning;
-  int hasReadOp = object->readQueue.head != 0;
-  int hasWriteOp = object->writeQueue.head != 0;
+  // READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE.
+  uint32_t needStart = progress;
 
-  // Fold the reactor readiness side-channel (Read/WriteEvents) and the Head
-  // PROGRESS_* bits into one needStart so each queue is driven exactly once
-  uint32_t needStart = readEvents | writeEvents;
-  if (sig & COMBINER_TAG_PROGRESS_READ)  needStart |= IO_EVENT_READ;
-  if (sig & COMBINER_TAG_PROGRESS_WRITE) needStart |= IO_EVENT_WRITE;
-
-  // Start a submitted operation before completing the exclusive connect from
-  // the accumulated fd event: a start delivered together with the event must
+  // Start a submitted operation before completing initialization from the
+  // accumulated event: a start delivered together with the event must
   // enter its queue first, otherwise a failed connect cancels the queues
   // without it and the operation would start on the dead socket afterwards
   if (op)
     startOperation(op, &needStart);
 
-  // A parked connect (the object's exclusive operation) is driven by fd events
-  // directly, not through a queue; its completion is signaled by writability, an
-  // error, or a child completion (PROGRESS_EXCLUSIVE for a composite parent).
-  // Drive it before the disconnect sweep so that operations queued behind it are
-  // cancelled with the connect status, not aosDisconnected
-  if ((wasConnecting && ((readEvents | writeEvents) & (IO_EVENT_WRITE | IO_EVENT_ERROR))) ||
-      (sig & COMBINER_TAG_PROGRESS_EXCLUSIVE))
-    processExclusiveOp(object, &needStart);
+  // By contract initialization precedes ordinary I/O, so any progress while
+  // its slot is occupied belongs to it. Drive it before the disconnect sweep
+  // so queued operations inherit a connect failure, not aosDisconnected.
+  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
+    processInitializationOp(object, &needStart);
 
   // CANCEL: a timeout/opCancel/cancelIo set the status and asked for a scan
   if (sig & COMBINER_TAG_CANCEL)
     reapObject(object, &needStart);
 
-  if ((readEvents | writeEvents) & IO_EVENT_ERROR) {
+  if (ioEvents & IO_EVENT_ERROR) {
     // EV_EOF mapped to TAG_ERROR, cancel all operations with aosDisconnected status
     int available;
     int fd = getFd((aioObject*)object);
@@ -194,27 +178,18 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
     executeOperationList(&object->writeQueue);
 
   if (fdObject && !object->DeletePending) {
-    int fd = getFd((aioObject*)object);
+    int fd = getFd(fdObject);
+    uint32_t newIoEvents = combinerActiveIoEvents(object);
+    unsigned readEventActivated = (oldIoEvents & IO_EVENT_READ) && !(ioEvents & IO_EVENT_READ);
+    unsigned writeEventActivated = (oldIoEvents & IO_EVENT_WRITE) && !(ioEvents & IO_EVENT_WRITE);
 
-    if (readEvents)
-      fdObject->ReadEvents = 0;
-    if (writeEvents)
-      fdObject->WriteEvents = 0;
-
-    unsigned readEventActivated = hasReadOp && !(readEvents & IO_EVENT_READ);
-    unsigned writeEventActivated = (hasWriteOp || wasConnecting) && !(writeEvents & IO_EVENT_WRITE);
-
-    asyncOpRoot *connectOpNow = (asyncOpRoot*)object->exclusiveOp;
-    int connectingNow = connectOpNow && connectOpNow->running == arRunning;
-    int wantWrite = object->writeQueue.head != 0 || connectingNow;
-
-    if (object->readQueue.head && !readEventActivated)
+    if ((newIoEvents & IO_EVENT_READ) && !readEventActivated)
         kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_READ, fd, object);
-    if (!object->readQueue.head && readEventActivated)
+    if (!(newIoEvents & IO_EVENT_READ) && readEventActivated)
         kqueueControl(base->kqueueFd, EV_DELETE| EV_ONESHOT | EV_EOF, EVFILT_READ, fd, object);
-    if (wantWrite && !writeEventActivated)
+    if ((newIoEvents & IO_EVENT_WRITE) && !writeEventActivated)
         kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, object);
-    if (!wantWrite && writeEventActivated)
+    if (!(newIoEvents & IO_EVENT_WRITE) && writeEventActivated)
         kqueueControl(base->kqueueFd, EV_DELETE | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, object);
   }
 }
@@ -278,14 +253,14 @@ void kqueueNextFinishedOperation(asyncBase *base)
           opCancel(op, opEncodeTag(op, timerId), aosTimeout);
         }
       } else {
-        uint32_t eventMask = (events[n].flags & EV_EOF) ? IO_EVENT_ERROR : 0;
+        uint32_t bits = (events[n].flags & EV_EOF) ? COMBINER_TAG_ERROR : 0;
         if (events[n].filter == EVFILT_READ) {
-          ((KQueueObject*)object)->ReadEvents = eventMask | IO_EVENT_READ;
-          combinerPushCounter(object, COMBINER_TAG_PROGRESS_READ);
+          bits |= COMBINER_TAG_PROGRESS_READ;
         } else if (events[n].filter == EVFILT_WRITE) {
-          ((KQueueObject*)object)->WriteEvents = eventMask | IO_EVENT_WRITE;
-          combinerPushCounter(object, COMBINER_TAG_PROGRESS_WRITE);
+          bits |= COMBINER_TAG_PROGRESS_WRITE;
         }
+        if (bits & COMBINER_TAG_PROGRESS_MASK)
+          combinerPushCounter(object, bits);
       }
     }
   }
@@ -294,30 +269,28 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
 aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
-  KQueueObject *object = 0;
-  if (!objectPoolGet(&objectPool, (void**)&object, sizeof(KQueueObject))) {
-    object = alignedMalloc(sizeof(KQueueObject), TAGGED_POINTER_ALIGNMENT);
-    object->Object.buffer.ptr = 0;
-    object->Object.buffer.totalSize = 0;
+  aioObject *object = 0;
+  if (!objectPoolGet(&objectPool, (void**)&object, sizeof(aioObject))) {
+    object = alignedMalloc(sizeof(aioObject), TAGGED_POINTER_ALIGNMENT);
+    object->buffer.ptr = 0;
+    object->buffer.totalSize = 0;
   }
 
-  initObjectRoot(&object->Object.root, base, type, (aioObjectDestructor*)kqueueDeleteObject);
+  initObjectRoot(&object->root, base, type, (aioObjectDestructor*)kqueueDeleteObject);
   switch (type) {
     case ioObjectDevice :
-      object->Object.hDevice = *(iodevTy *)data;
+      object->hDevice = *(iodevTy *)data;
       break;
     case ioObjectSocket :
-      object->Object.hSocket = *(socketTy *)data;
+      object->hSocket = *(socketTy *)data;
       break;
     default :
       break;
   }
 
-  object->ReadEvents = 0;
-  object->WriteEvents = 0;
-  object->Object.buffer.offset = 0;
-  object->Object.buffer.dataSize = 0;
-  return &object->Object;
+  object->buffer.offset = 0;
+  object->buffer.dataSize = 0;
+  return object;
 }
 
 asyncOpRoot *kqueueNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool)
@@ -341,7 +314,7 @@ int kqueueCancelAsyncOp(asyncOpRoot *opptr)
 // thread can hold the object in an already-harvested event batch
 static void kqueueReleaseObject(aioObject *object)
 {
-  objectPoolPut(&objectPool, object, sizeof(KQueueObject));
+  objectPoolPut(&objectPool, object, sizeof(aioObject));
 }
 
 void kqueueDeleteObject(aioObject *object)

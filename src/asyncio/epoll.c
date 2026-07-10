@@ -31,7 +31,6 @@ typedef struct epollBase {
 
 typedef struct EPollObject {
   aioObject Object;
-  uint32_t IoEvents;
   // Whether the fd is currently in the epoll set. Registration is lazy:
   // EPOLLERR/EPOLLHUP ignore the requested mask, so an idle object with a
   // pending error condition would wake every epoll_wait if its fd stayed
@@ -112,6 +111,16 @@ static int getFd(EPollObject *object)
   }
 }
 
+static uint32_t epollEvents(uint32_t ioEvents)
+{
+  uint32_t events = 0;
+  if (ioEvents & IO_EVENT_READ)
+    events |= EPOLLIN;
+  if (ioEvents & IO_EVENT_WRITE)
+    events |= EPOLLOUT;
+  return events;
+}
+
 asyncBase *epollNewAsyncBase()
 {
   epollBase *base = malloc(sizeof(epollBase));
@@ -149,43 +158,36 @@ void epollPostEmptyOperation(asyncBase *base)
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   EPollObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (EPollObject*)object : 0;
-  uint32_t ioEvents = fdObject ? fdObject->IoEvents : 0;
+  uint32_t oldIoEvents = fdObject ? combinerActiveIoEvents(object) : 0;
+  uint32_t progress = sig & COMBINER_TAG_PROGRESS_MASK;
+  uint32_t ioEvents = fdObject
+    ? progress | ((sig & COMBINER_TAG_ERROR) ? IO_EVENT_ERROR : 0)
+    : 0;
 
   // A dying object gets no fd readiness processing: its operations are being
   // cancelled wholesale anyway, and for a stale batch entry landing here
   // within the grace period the descriptor is already closed - the error
   // path ioctl and the rearm epoll_ctl would run on a dead or reused fd
-  if (object->DeletePending && ioEvents) {
-    fdObject->IoEvents = 0;
+  if (fdObject && object->DeletePending) {
     ioEvents = 0;
+    progress = 0;
   }
 
-  asyncOpRoot *connectOp = (asyncOpRoot*)object->exclusiveOp;
-  int wasConnecting = connectOp && connectOp->running == arRunning;
-  int hasReadOp = object->readQueue.head != 0;
-  int hasWriteOp = object->writeQueue.head != 0 || wasConnecting;
+  // READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE.
+  uint32_t needStart = progress;
 
-  // Fold the reactor readiness side-channel (IoEvents) and the Head PROGRESS_*
-  // bits into one needStart so each queue is driven exactly once
-  uint32_t needStart = ioEvents;
-  if (sig & COMBINER_TAG_PROGRESS_READ)  needStart |= IO_EVENT_READ;
-  if (sig & COMBINER_TAG_PROGRESS_WRITE) needStart |= IO_EVENT_WRITE;
-
-  // Start a submitted operation before completing the exclusive connect from
-  // the accumulated fd event: a start delivered together with the event must
+  // Start a submitted operation before completing initialization from the
+  // accumulated event: a start delivered together with the event must
   // enter its queue first, otherwise a failed connect cancels the queues
   // without it and the operation would start on the dead socket afterwards
   if (op)
     startOperation(op, &needStart);
 
-  // A parked connect (the object's exclusive operation) is driven by fd events
-  // directly, not through a queue; its completion is signaled by writability, an
-  // error, or a child completion (PROGRESS_EXCLUSIVE for a composite parent).
-  // Drive it before the disconnect sweep so that operations queued behind it are
-  // cancelled with the connect status, not aosDisconnected
-  if ((wasConnecting && (ioEvents & (IO_EVENT_WRITE | IO_EVENT_ERROR))) ||
-      (sig & COMBINER_TAG_PROGRESS_EXCLUSIVE))
-    processExclusiveOp(object, &needStart);
+  // By contract initialization precedes ordinary I/O, so any progress while
+  // its slot is occupied belongs to it. Drive it before the disconnect sweep
+  // so queued operations inherit a connect failure, not aosDisconnected.
+  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
+    processInitializationOp(object, &needStart);
 
   // CANCEL: a timeout/opCancel/cancelIo set the status and asked for a scan
   if (sig & COMBINER_TAG_CANCEL)
@@ -209,30 +211,16 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   if (fdObject && !object->DeletePending) {
     int fd = getFd(fdObject);
     epollBase *base = (epollBase*)object->base;
-    uint32_t currentEvents = 0;
-    uint32_t newEvents = 0;
+    uint32_t currentEvents = epollEvents(oldIoEvents);
+    uint32_t newEvents;
 
-    // "Calculate" current epoll_ctl mask because we don't have map<fd, oldMask>
-    // EPOLLIN/EPOLLOUT now enabled if read/write queue was not empty and file descriptor not deactivated by EPOLLONESHOT flag
-    // Any delivered event consumes the EPOLLONESHOT shot, whatever bits it carries
-    int fdDeactivated = ioEvents != 0;
-
-    if (hasReadOp)
-      currentEvents |= EPOLLIN;
-    if (hasWriteOp)
-      currentEvents |= EPOLLOUT;
-    if (fdDeactivated)
+    // Calculate the current mask because no fd->mask map is kept. Any delivered
+    // event consumes the EPOLLONESHOT shot, whatever direction it carries.
+    if (ioEvents)
       currentEvents = 0;
 
-    asyncOpRoot *connectOpNow = (asyncOpRoot*)object->exclusiveOp;
-    int connectingNow = connectOpNow && connectOpNow->running == arRunning;
-    if (object->readQueue.head)
-      newEvents |= EPOLLIN;
-    if (object->writeQueue.head || connectingNow)
-      newEvents |= EPOLLOUT;
+    newEvents = epollEvents(combinerActiveIoEvents(object));
 
-    if (ioEvents)
-      fdObject->IoEvents = 0;
     if (newEvents) {
       if (!fdObject->Registered) {
         epollControl(base->epollFd, EPOLL_CTL_ADD, newEvents | EPOLLONESHOT | EPOLLRDHUP, fd, object);
@@ -339,11 +327,10 @@ void epollNextFinishedOperation(asyncBase *base)
           uint32_t bits = 0;
           if (eventMask & IO_EVENT_READ)  bits |= COMBINER_TAG_PROGRESS_READ;
           if (eventMask & IO_EVENT_WRITE) bits |= COMBINER_TAG_PROGRESS_WRITE;
-          // EPOLLRDHUP alone carries no read/write bit; wake both queues so the
-          // disconnect sweep runs (the real signal travels in IoEvents, the bit
-          // only has to be nonzero to enter the combiner)
-          if (eventMask & IO_EVENT_ERROR) bits |= COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
-          ((EPollObject*)object)->IoEvents = eventMask;
+          // EPOLLRDHUP alone carries no direction. ERROR is passed in Head with
+          // the readiness bits, so no object-side mailbox is needed.
+          if (eventMask & IO_EVENT_ERROR)
+            bits |= COMBINER_TAG_ERROR | COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
           combinerPushCounter(object, bits);
         }
       }
@@ -374,7 +361,6 @@ aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
       break;
   }
 
-  object->IoEvents = 0;
   object->Registered = 0;
   object->Object.buffer.offset = 0;
   object->Object.buffer.dataSize = 0;

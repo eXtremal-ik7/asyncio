@@ -228,9 +228,9 @@ int main(int argc, char **argv)
           aioObjectRoot *o = ctx.handle;
           fprintf(stderr,
                   "  obj %p: refs=%" PRIuPTR " head=%" PRIxPTR " readQ=%p writeQ=%p"
-                  " cancelIoFlag=%u deletePending=%u exclusive=%" PRIxPTR " missing=%u\n",
+                  " cancelIoFlag=%u deletePending=%u initialization=%" PRIxPTR " missing=%u\n",
                   (void*)o, o->refs, o->Head.data, (void*)o->readQueue.head, (void*)o->writeQueue.head,
-                  o->CancelIoFlag, o->DeletePending, o->exclusiveOp,
+                  o->CancelIoFlag, o->DeletePending, o->initializationOp,
                   ctx.expected.load() - ctx.callbacks.load());
           if (++dumped == 16)
             break;

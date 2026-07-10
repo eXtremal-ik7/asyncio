@@ -338,14 +338,14 @@ void aioSslConnect(SSLSocket *socket,
   else
     op->state = sslStProcessing;
 
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
-    // Another exclusive operation is in flight: one connect per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, (uintptr_t)&op->root)) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
     return;
   }
 
-  // The SSL state machine belongs to the slot owner: after a lost CAS a
+  // The SSL state machine belongs to the initialization owner: after a lost CAS a
   // handshake may be running on it right now, so it must not be touched
   SSL_set_connect_state(socket->ssl);
   if (tlsextHostName)
@@ -546,8 +546,8 @@ int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlse
   fillContext(&context, connectProc, 0, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afCoroutine, usTimeout, 0, 0, sslOpConnect, &context);
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
-    // Another exclusive operation is in flight: one connect per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, (uintptr_t)&op->root)) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
   } else {

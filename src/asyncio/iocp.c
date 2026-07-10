@@ -199,7 +199,9 @@ static VOID CALLBACK iocpTimerCb(PTP_CALLBACK_INSTANCE instance, PVOID context, 
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
-  uint32_t needStart = 0;
+  uint32_t progress = sig & COMBINER_TAG_PROGRESS_MASK;
+  // READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE.
+  uint32_t needStart = progress;
 
   // Start a submitted operation, then reconcile the signal for this node by
   // status. The proactor has no readiness side-channel: continue/finish/release
@@ -207,10 +209,8 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   if (op)
     startOperation(op, &needStart);
 
-  if (sig & COMBINER_TAG_PROGRESS_READ)  needStart |= IO_EVENT_READ;
-  if (sig & COMBINER_TAG_PROGRESS_WRITE) needStart |= IO_EVENT_WRITE;
-  if (sig & COMBINER_TAG_PROGRESS_EXCLUSIVE)
-    processExclusiveOp(object, &needStart);
+  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
+    processInitializationOp(object, &needStart);
   if (sig & COMBINER_TAG_CANCEL)
     reapObject(object, &needStart);
 

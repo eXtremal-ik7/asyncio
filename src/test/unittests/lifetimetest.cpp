@@ -142,7 +142,7 @@ TEST(lifetime, cancel_io_keeps_object_alive)
 }
 
 // Operations submitted behind a connect sit frozen in the read/write queues
-// (the exclusive slot gates them); deleteAioObject must cancel the parked
+// (the initialization slot gates them); deleteAioObject must cancel the parked
 // connect and both gated operations, then destruct - one aosCanceled per
 // operation, nothing leaks, nothing outlives the destructor callback. The
 // blackhole address keeps the connect in flight, but no loop iteration runs

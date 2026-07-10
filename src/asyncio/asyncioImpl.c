@@ -259,7 +259,7 @@ void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aio
   object->destructorCbArg = 0;
   object->CancelIoFlag = 0;
   object->DeletePending = 0;
-  object->exclusiveOp = 0;
+  __uintptr_atomic_store(&object->initializationOp, 0, amoRelaxed);
 }
 
 void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg)
@@ -399,18 +399,17 @@ static void opRun(asyncOpRoot *op, List *list)
   opArmTimer(op);
 }
 
-// An exclusive operation (connect) does not live in the read/write queues:
-// it occupies the object's exclusiveOp slot, claimed by CAS at submission
-// time — the ownership itself routes it to the exclusive path, there is no
-// dedicated flag. Both queues do not start operations while the slot is
-// busy. Leaving the slot kicks both queues; leaving it with a non-success
-// status also cancels everything queued behind the exclusive with that
-// status.
-static void exclusiveRelease(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
+// One-shot transport initialization does not live in the read/write queues.
+// Its slot is claimed before submission; ordinary operations submitted after
+// it may queue, but cannot start until initialization leaves the slot. This
+// ordering is an API contract: an object is not reinitialized, and no ordinary
+// I/O may precede its initialization. Leaving the slot kicks both queues; a
+// failure also cancels everything queued behind it with the same status.
+static void initializationRelease(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
 {
   aioObjectRoot *object = op->object;
-  if (object->exclusiveOp == (uintptr_t)op)
-    object->exclusiveOp = 0;
+  if (__uintptr_atomic_load(&object->initializationOp, amoRelaxed) == (uintptr_t)op)
+    __uintptr_atomic_store(&object->initializationOp, 0, amoRelaxed);
   opRelease(op, status, 0);
   if (status != aosSuccess) {
     cancelOperationList(&object->readQueue, status);
@@ -420,7 +419,7 @@ static void exclusiveRelease(asyncOpRoot *op, AsyncOpStatus status, uint32_t *ne
     *needStart |= IO_EVENT_READ | IO_EVENT_WRITE;
 }
 
-static void exclusiveTryComplete(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
+static void initializationTryComplete(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
 {
   if (status == aosPending) {
     op->running = arRunning;
@@ -433,48 +432,45 @@ static void exclusiveTryComplete(asyncOpRoot *op, AsyncOpStatus status, uint32_t
   // terminal status, and release now: nothing else will complete it (its child
   // operations are already consumed, so a late cancelMethod would find nothing).
   opSetStatus(op, opGetGeneration(op), status);
-  exclusiveRelease(op, opGetStatus(op), needStart);
+  initializationRelease(op, opGetStatus(op), needStart);
 }
 
-// Re-drive a parked exclusive operation from a backend event handler / progress
-// signal (PROGRESS_EXCLUSIVE).
-void processExclusiveOp(aioObjectRoot *object, uint32_t *needStart)
+// Re-drive the parked initialization operation from backend READ/WRITE
+// progress. Its one-shot-before-I/O contract makes either positional bit
+// unambiguous while the slot is occupied.
+void processInitializationOp(aioObjectRoot *object, uint32_t *needStart)
 {
-  asyncOpRoot *op = (asyncOpRoot*)object->exclusiveOp;
+  asyncOpRoot *op = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
   if (!op)
     return;
-  if (op->running == arCancelling) {
-    // Late completion after a timeout/cancel armed cancelMethod (which returns 0
-    // on a proactor - the kernel owned the operation until now). The I/O is done,
-    // release with the terminal status the canceller set. This replaces the old
-    // aaContinue/aaFinish node that used to release an arCancelling exclusive op.
-    exclusiveRelease(op, opGetStatus(op), needStart);
-    return;
+  AsyncOpStatus status = opGetStatus(op);
+  switch (combinerSelectInitializationAction(op->running, status)) {
+    case ciaNone:
+      return;
+
+    case ciaRelease:
+      // Either a proactor completion arrived after cancellation, or a child
+      // completion made a composite handshake terminal. In both cases the I/O
+      // which owned the slot is done; do not re-run executeMethod.
+      initializationRelease(op, status, needStart);
+      return;
+
+    case ciaExecute:
+      initializationTryComplete(op, op->executeMethod(op), needStart);
+      return;
   }
-  if (op->running != arRunning)
-    return;
-  if (opGetStatus(op) != aosPending) {
-    // A child completion set a terminal status (e.g. resumeParent on a failed
-    // handshake child): finish without re-running executeMethod, which would
-    // re-issue I/O on a dead socket (SSL_connect stuck in WANT_READ) and pin
-    // the slot forever. This is the former aaFinish; the queue path mirrors it
-    // in executeOperationList().
-    exclusiveRelease(op, opGetStatus(op), needStart);
-    return;
-  }
-  exclusiveTryComplete(op, op->executeMethod(op), needStart);
 }
 
-static void cancelExclusiveOp(aioObjectRoot *object, AsyncOpStatus status)
+static void cancelInitializationOp(aioObjectRoot *object, AsyncOpStatus status)
 {
-  asyncOpRoot *op = (asyncOpRoot*)object->exclusiveOp;
+  asyncOpRoot *op = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
   if (!op)
     return;
   if (opSetStatus(op, opGetGeneration(op), status)) {
     if (op->running == arRunning) {
       op->running = arCancelling;
       if (op->cancelMethod(op))
-        exclusiveRelease(op, status, 0);
+        initializationRelease(op, status, 0);
     }
     // arWaiting: aaStart is still queued in the combiner; it will observe the
     // status and release the slot
@@ -482,24 +478,24 @@ static void cancelExclusiveOp(aioObjectRoot *object, AsyncOpStatus status)
 }
 
 // Start an op-node captured by the combiner (submission). The former
-// processAction(aaStart): the exclusive-slot owner is armed and driven in place,
+// processAction(aaStart): the initialization-slot owner is armed and driven in place,
 // an ordinary operation is queued; the combiner reconciles the rest by status.
 void startOperation(asyncOpRoot *op, uint32_t *needStart)
 {
   aioObjectRoot *object = op->object;
 
-  // Ownership of the exclusive slot (claimed by CAS at submission, e.g. in
-  // aioConnect) routes an operation to the exclusive path; there is no flag to
+  // Ownership of the initialization slot (claimed by CAS at submission, e.g.
+  // in aioConnect) routes an operation to the initialization path; there is no flag to
   // spoof, any other operation goes to its read/write queue.
-  if (object->exclusiveOp == (uintptr_t)op) {
+  if (__uintptr_atomic_load(&object->initializationOp, amoRelaxed) == (uintptr_t)op) {
     if (opGetStatus(op) != aosPending) {
       // Cancelled between submission and start (a cancelIo sweep): the sweep
       // does not reach a not-yet-started operation, releasing the slot is on us
-      exclusiveRelease(op, opGetStatus(op), needStart);
+      initializationRelease(op, opGetStatus(op), needStart);
       return;
     }
     opArmTimer(op);
-    exclusiveTryComplete(op, op->executeMethod(op), needStart);
+    initializationTryComplete(op, op->executeMethod(op), needStart);
     return;
   }
 
@@ -529,18 +525,22 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
     asyncOpRoot *next = op->executeQueue.next;
     int keep = 0, release = 0;
     AsyncOpStatus status = opGetStatus(op);
-    if (status == aosPending) {
-      keep = 1;
-    } else if (op->running == arRunning) {
-      op->running = arCancelling;
-      if (op->cancelMethod(op))
+    switch (combinerSelectReapAction(op->running, status)) {
+      case craKeep:
+        keep = 1;
+        break;
+
+      case craCancel:
+        op->running = arCancelling;
+        if (op->cancelMethod(op))
+          release = 1;
+        else
+          keep = 1;   // in-flight: hold positional for the late completion
+        break;
+
+      case craRelease:
         release = 1;
-      else
-        keep = 1;   // in-flight: hold positional for the late completion
-    } else if (op->running == arWaiting) {
-      release = 1;
-    } else {
-      keep = 1;     // arCancelling: in-flight, wait for the completion
+        break;
     }
 
     op->executeQueue.prev = op->executeQueue.next = 0;
@@ -565,20 +565,29 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
 
 // CANCEL reconcile: a cancel source (timeout/opCancel/cancelIo) has already set
 // the terminal status (winner-takes) and asked the combiner to scan. Reap the
-// terminals it left behind, positionally, across the exclusive slot and both
+// terminals it left behind, positionally, across the initialization slot and both
 // queues.
 void reapObject(aioObjectRoot *object, uint32_t *needStart)
 {
-  asyncOpRoot *ex = (asyncOpRoot*)object->exclusiveOp;
-  if (ex && opGetStatus(ex) != aosPending) {
-    if (ex->running == arRunning) {
-      ex->running = arCancelling;
-      if (ex->cancelMethod(ex))
-        exclusiveRelease(ex, opGetStatus(ex), needStart);
-    } else if (ex->running == arWaiting) {
-      exclusiveRelease(ex, opGetStatus(ex), needStart);
+  asyncOpRoot *ex = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
+  if (ex) {
+    AsyncOpStatus status = opGetStatus(ex);
+    switch (combinerSelectReapAction(ex->running, status)) {
+      case craCancel:
+        ex->running = arCancelling;
+        if (ex->cancelMethod(ex))
+          initializationRelease(ex, status, needStart);
+        break;
+
+      case craRelease:
+        initializationRelease(ex, status, needStart);
+        break;
+
+      case craKeep:
+        // Pending, or already cancelling an in-flight operation: wait for its
+        // normal/late READ or WRITE progress.
+        break;
     }
-    // arCancelling: in-flight, wait for the completion's PROGRESS_EXCLUSIVE
   }
   reapQueue(&object->readQueue, IO_EVENT_READ, needStart);
   reapQueue(&object->writeQueue, IO_EVENT_WRITE, needStart);
@@ -601,9 +610,9 @@ void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList)
 void executeOperationList(List *list)
 {
   asyncOpRoot *op = list->head;
-  // Both queues are frozen while an exclusive operation (connect) is in
-  // flight; they are kicked when it leaves the slot
-  if (op && op->object->exclusiveOp)
+  // Both queues are frozen while transport initialization is in flight; they
+  // are kicked when it leaves the slot.
+  if (op && __uintptr_atomic_load(&op->object->initializationOp, amoRelaxed))
     return;
 
   while (op) {
@@ -625,11 +634,12 @@ void executeOperationList(List *list)
       break;
     }
 
-    if (opSetStatus(op, opGetGeneration(op), status)) {
-      opRelease(op, status, 0);
-    } else {
-      op->executeQueue.prev = op->executeQueue.next = 0;
-    }
+    // The syscall has completed, so this position is ours to release even if
+    // a concurrent timeout/cancel won the terminal status CAS. Its signal is
+    // positional and cannot release the operation after we advance the queue;
+    // preserve the winner's status, but never drop the completed operation.
+    opSetStatus(op, opGetGeneration(op), status);
+    opRelease(op, opGetStatus(op), 0);
     op = next;
   }
 
@@ -878,13 +888,13 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 {
   if (object->CancelIoFlag) {
     object->CancelIoFlag = 0;
-    cancelExclusiveOp(object, aosCanceled);
+    cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
   }
 
   if (tag & COMBINER_TAG_DELETE) {
-    cancelExclusiveOp(object, aosCanceled);
+    cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
     if (object->destructorCb)
@@ -912,14 +922,14 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
 
   for (;;) {
     AsyncOpTaggedPtr currentHead;
-    while ( (currentHead.data = object->Head.data) == stackTop.data ) {
+    while ( (currentHead.data = __uintptr_atomic_load(&object->Head.data, amoAcquire)) == stackTop.data ) {
       // A dying object is swept once more at every ownership-release point:
       // this is the only position that is guaranteed to come after every
       // action of the captured chains, so a submission that slipped past the
       // CancelIoFlag pass cannot survive the delete and pin the object
       // (sticky flag; the sweep is idempotent, re-runs only cost a re-check)
       if (object->DeletePending) {
-        cancelExclusiveOp(object, aosCanceled);
+        cancelInitializationOp(object, aosCanceled);
         cancelOperationList(&object->readQueue, aosCanceled);
         cancelOperationList(&object->writeQueue, aosCanceled);
       }
@@ -928,7 +938,7 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
     }
 
     while (!__uintptr_atomic_compare_and_swap(&object->Head.data, currentHead.data, stackTop.data))
-      currentHead = object->Head;
+      currentHead.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
 
     // The captured chain is linked newest to oldest (each push points to the
     // previous head); running it as is would invert single-thread submission

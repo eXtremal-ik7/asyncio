@@ -729,9 +729,8 @@ void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpA
 {
   Context context(startZmtpAccept, acceptFinish, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpAccept, &context);
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(op))) {
-    // Another exclusive operation is in flight: one handshake (connect or
-    // accept) per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, reinterpret_cast<uintptr_t>(op))) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(op, aosUnknownError);
     addToGlobalQueue(op);
     return;
@@ -746,9 +745,8 @@ void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags f
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpConnect, &context));
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(&op->root))) {
-    // Another exclusive operation is in flight: one handshake (connect or
-    // accept) per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, reinterpret_cast<uintptr_t>(&op->root))) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
     return;
@@ -794,9 +792,8 @@ int ioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout)
 {
   Context context(startZmtpAccept, 0, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpAccept, &context);
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(op))) {
-    // Another exclusive operation is in flight: one handshake (connect or
-    // accept) per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, reinterpret_cast<uintptr_t>(op))) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(op, aosUnknownError);
     addToGlobalQueue(op);
   } else {
@@ -815,9 +812,8 @@ int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags fla
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpConnect, &context));
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.exclusiveOp, 0, reinterpret_cast<uintptr_t>(&op->root))) {
-    // Another exclusive operation is in flight: one handshake (connect or
-    // accept) per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, reinterpret_cast<uintptr_t>(&op->root))) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
   } else {

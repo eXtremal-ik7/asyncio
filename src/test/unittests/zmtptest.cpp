@@ -1063,8 +1063,8 @@ TEST(zmtp, aio_rep_coro)
   ASSERT_EQ(context.serverState, 4);
 }
 
-// The ZMTP handshake operations (connect and accept) are exclusive: they
-// claim the object's exclusiveOp slot, and recv/send submitted behind them
+// The ZMTP handshake operations (connect and accept) initialize the transport:
+// they claim the object's initializationOp slot, and recv/send submitted behind them
 // stay frozen in the object queues until the handshake outcome. Without the
 // slot the opposite lane is open: connect lives in the write queue, so a
 // pipelined recv used to take the inline fast path and read on the plain
@@ -1297,7 +1297,7 @@ TEST(zmtp, double_connect_rejected)
 
   if (ctx.firstStatus != aosTimeout)
     GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
-                 << "), exclusive slot contention cannot be exercised on this network";
+                 << "), initialization slot contention cannot be exercised on this network";
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
   EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
     << "the second zmtp connect was not rejected while the first was in flight";

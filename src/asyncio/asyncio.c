@@ -465,8 +465,8 @@ void aioConnect(aioObject *object,
   fillContext(&context, object->root.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afNone, usTimeout, (void*)callback, arg, actConnect, &context);
   op->host = *address;
-  if (!__uintptr_atomic_compare_and_swap(&object->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
-    // Another exclusive operation is in flight: one connect per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp, 0, (uintptr_t)&op->root)) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
     return;
@@ -651,8 +651,8 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
   fillContext(&context, object->root.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afCoroutine, usTimeout, 0, 0, actConnect, &context);
   op->host = *address;
-  if (!__uintptr_atomic_compare_and_swap(&object->root.exclusiveOp, 0, (uintptr_t)&op->root)) {
-    // Another exclusive operation is in flight: one connect per object at a time
+  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp, 0, (uintptr_t)&op->root)) {
+    // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
   } else {
