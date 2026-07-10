@@ -4,6 +4,14 @@
 #include "asyncio/coroutine.h"
 #include "asyncioconfig.h"
 
+#ifdef BUILD_SANITIZE_ADDRESS
+#include <sanitizer/asan_interface.h>
+#include <sanitizer/common_interface_defs.h>
+#endif
+#ifdef BUILD_SANITIZE_THREAD
+#include <sanitizer/tsan_interface.h>
+#endif
+
 typedef struct contextTy {
 #if defined(ARCH_X86)
 #define CTX_EIP_INDEX 0
@@ -64,6 +72,15 @@ typedef struct coroutineTy {
   void *finishArg;
   int finished;
   int counter;
+#ifdef BUILD_SANITIZE_ADDRESS
+  void *asanFakeStack;
+  const void *asanStackBottom;
+  size_t asanStackSize;
+  struct coroutineTy *asanPrevious;
+#endif
+#ifdef BUILD_SANITIZE_THREAD
+  void *tsanFiber;
+#endif
 } coroutineTy;
 
 static __thread coroutineTy *mainCoroutine;
@@ -72,14 +89,113 @@ static __thread coroutineTy *currentCoroutine;
 void switchContext(contextTy *from, contextTy *to);
 void initFPU(contextTy *context);
 
+#ifdef BUILD_SANITIZE_ADDRESS
+static inline __attribute__((always_inline))
+void sanitizerFinishSwitch(coroutineTy *destination, coroutineTy *source)
+{
+  const void *sourceStackBottom;
+  size_t sourceStackSize;
+  __sanitizer_finish_switch_fiber(destination->asanFakeStack,
+                                  &sourceStackBottom,
+                                  &sourceStackSize);
+  destination->asanFakeStack = 0;
+  if (!source->asanStackBottom) {
+    source->asanStackBottom = sourceStackBottom;
+    source->asanStackSize = sourceStackSize;
+  }
+}
+#endif
+
+static inline __attribute__((always_inline))
+void coroutineSwitchContext(coroutineTy *from, coroutineTy *to, int finalSwitch)
+{
+#ifdef BUILD_SANITIZE_ADDRESS
+  to->asanPrevious = from;
+  __sanitizer_start_switch_fiber(finalSwitch ? 0 : &from->asanFakeStack,
+                                  to->asanStackBottom,
+                                  to->asanStackSize);
+#else
+  (void)finalSwitch;
+#endif
+#ifdef BUILD_SANITIZE_THREAD
+  // Control is transferred, not run concurrently, so the destination observes
+  // everything sequenced before this switch. Calls of an already active
+  // coroutine return before reaching here and therefore add no false ordering.
+  __tsan_switch_to_fiber(to->tsanFiber, 0);
+#endif
+  switchContext(&from->context, &to->context);
+
+  // This invocation resumes when another context switches back to `from`.
+  // asanPrevious is assigned by that incoming switch, which also covers a
+  // coroutine resuming on a different OS thread. A new coroutine has no
+  // suspended invocation and completes its first switch in fiberEntryPoint.
+#ifdef BUILD_SANITIZE_ADDRESS
+  sanitizerFinishSwitch(from, from->asanPrevious);
+#endif
+}
+
+#ifdef BUILD_SANITIZE_ADDRESS
+static __attribute__((no_sanitize_address))
+void asanDestroyFakeStack(void *fakeStack)
+{
+  // A suspended coroutine cannot execute the normal final switch which asks
+  // ASan to destroy its fake stack. Temporarily install it as the current fake
+  // stack, destroy it, then restore the actual current stack state. From the
+  // first finish_switch below until the next start_switch the thread runs with
+  // [0,0) stack bounds and a foreign fake stack (both are committed by
+  // finish_switch), so no instrumented code may execute in between - keep this
+  // helper uninstrumented and free of calls.
+  void *currentFakeStack;
+  const void *currentStackBottom;
+  size_t currentStackSize;
+  __sanitizer_start_switch_fiber(&currentFakeStack, 0, 0);
+  __sanitizer_finish_switch_fiber(fakeStack,
+                                  &currentStackBottom,
+                                  &currentStackSize);
+  __sanitizer_start_switch_fiber(0, currentStackBottom, currentStackSize);
+  __sanitizer_finish_switch_fiber(currentFakeStack, 0, 0);
+}
+#endif
+
+static inline __attribute__((always_inline))
+void sanitizerDestroyCoroutine(coroutineTy *coroutine)
+{
+  (void)coroutine;
+#ifdef BUILD_SANITIZE_ADDRESS
+  if (coroutine->asanFakeStack) {
+    asanDestroyFakeStack(coroutine->asanFakeStack);
+    coroutine->asanFakeStack = 0;
+  }
+  __asan_unpoison_memory_region(coroutine->stack, coroutine->asanStackSize);
+#endif
+#ifdef BUILD_SANITIZE_THREAD
+  __tsan_destroy_fiber(coroutine->tsanFiber);
+#endif
+}
+
+static inline __attribute__((always_inline))
+void ensureCurrentCoroutine(void)
+{
+  if (!currentCoroutine)
+    mainCoroutine = currentCoroutine = (coroutineTy*)calloc(sizeof(coroutineTy), 1);
+#ifdef BUILD_SANITIZE_THREAD
+  if (!currentCoroutine->tsanFiber)
+    currentCoroutine->tsanFiber = __tsan_get_current_fiber();
+#endif
+}
+
 static void fiberEntryPoint(coroutineTy *coroutine)
 {
+#ifdef BUILD_SANITIZE_ADDRESS
+  sanitizerFinishSwitch(coroutine, coroutine->asanPrevious);
+#endif
   coroutine->entryPoint(coroutine->arg);
   coroutine->finished = 1;
   __sync_fetch_and_add(&coroutine->counter, -1);
   currentCoroutine = currentCoroutine->prev;
   assert(currentCoroutine && "Try exit from main coroutine");
-  switchContext(&coroutine->context, &currentCoroutine->context);
+  coroutineSwitchContext(coroutine, currentCoroutine, 1);
+  abort();
 }
 
 static int fiberInit(coroutineTy *coroutine, size_t stackSize)
@@ -151,8 +267,7 @@ int coroutineFinished(coroutineTy *coroutine)
 coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
 {
   // Create main fiber if it not exists
-  if (currentCoroutine == 0)
-    mainCoroutine = currentCoroutine = (coroutineTy*)calloc(sizeof(coroutineTy), 1);
+  ensureCurrentCoroutine();
 
   coroutineTy *coroutine;
   if (posix_memalign((void**)&coroutine, 8, sizeof(coroutineTy)) == 0) {
@@ -164,8 +279,18 @@ coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
       coroutine->counter = 0;
       coroutine->finishCb = 0;
       coroutine->finishArg = 0;
+#ifdef BUILD_SANITIZE_ADDRESS
+      coroutine->asanFakeStack = 0;
+      coroutine->asanStackBottom = coroutine->stack;
+      coroutine->asanStackSize = stackSize;
+      coroutine->asanPrevious = 0;
+#endif
+#ifdef BUILD_SANITIZE_THREAD
+      coroutine->tsanFiber = __tsan_create_fiber(0);
+#endif
       return coroutine;
     }
+    free(coroutine);
   } else {
     return 0;
   }
@@ -176,6 +301,8 @@ coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
 coroutineTy *coroutineNewWithCb(coroutineProcTy entry, void *arg, unsigned stackSize, coroutineCbTy finishCb, void *finishArg)
 {
   coroutineTy *coroutine = coroutineNew(entry, arg, stackSize);
+  if (!coroutine)
+    return 0;
   coroutine->finishCb = finishCb;
   coroutine->finishArg = finishArg;
   return coroutine;
@@ -183,6 +310,7 @@ coroutineTy *coroutineNewWithCb(coroutineProcTy entry, void *arg, unsigned stack
 
 void coroutineDelete(coroutineTy *coroutine)
 {
+  sanitizerDestroyCoroutine(coroutine);
   free(coroutine->stack);
   free(coroutine);
 }
@@ -196,13 +324,12 @@ int coroutineCall(coroutineTy *coroutine)
     }
 
     // Create main fiber if it not exists
-    if (currentCoroutine == 0)
-      mainCoroutine = currentCoroutine = (coroutineTy*)calloc(sizeof(coroutineTy), 1);
+    ensureCurrentCoroutine();
 
     do {
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
-      switchContext(&coroutine->prev->context, &coroutine->context);
+      coroutineSwitchContext(coroutine->prev, coroutine, 0);
       // A wakeup that lands after the last yield leaves the counter above 1
       // when the coroutine returns; re-entering a finished context would run
       // off the end of fiberEntryPoint. The pending wakeup is consumed by the
@@ -214,6 +341,7 @@ int coroutineCall(coroutineTy *coroutine)
     if (finished) {
       coroutineCbTy *finishCb = coroutine->finishCb;
       void *finishArg = coroutine->finishArg;
+      sanitizerDestroyCoroutine(coroutine);
       free(coroutine->stack);
       free(coroutine);
       if (finishCb)
@@ -240,6 +368,6 @@ void coroutineYield()
 
 
     currentCoroutine = currentCoroutine->prev;
-    switchContext(&old->context, &currentCoroutine->context);
+    coroutineSwitchContext(old, currentCoroutine, 0);
   }
 }

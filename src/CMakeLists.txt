@@ -32,7 +32,9 @@ if (BUILD_SANITIZE_ADDRESS AND NOT CMAKE_C_FLAGS MATCHES "fsanitize=address")
     # MSVC address sanitizer: /Zi + linker /DEBUG so ASAN symbolizes stacks;
     # /INCREMENTAL:NO because incremental linking is incompatible with asan
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /fsanitize=address /Zi")
-    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /fsanitize=address /Zi")
+    # STL container annotations must match across all linked objects (LNK2038);
+    # cxx-pm packages (zeromq etc.) are built without asan, so disable them here
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /fsanitize=address /Zi /D_DISABLE_STRING_ANNOTATION /D_DISABLE_VECTOR_ANNOTATION")
     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG /INCREMENTAL:NO")
   else()
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
@@ -70,6 +72,11 @@ if (WIN32)
   if(MSVC)
     SET (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/msvc/include)
+    if (MSVC_VERSION LESS 1800)
+      # inttypes.h/stdint.h appeared in VS2013; older compilers use bundled shims,
+      # for newer ones the shims must not shadow the system headers
+      include_directories(${CMAKE_CURRENT_SOURCE_DIR}/msvc/include/c99)
+    endif()
   endif(MSVC)
   set(OS_WINDOWS 1)
   add_definitions(

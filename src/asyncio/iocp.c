@@ -276,7 +276,8 @@ void iocpNextFinishedOperation(asyncBase *base)
     BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N, 500, FALSE);
 
     uint64_t currentTime = getMonotonicSeconds();
-    if (currentTime % base->messageLoopThreadCounter == messageLoopThreadId)
+    unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
+    if (currentTime % loopThreadCount == messageLoopThreadId)
       processTimeoutQueue(base, currentTime);
 
     // ignore false status

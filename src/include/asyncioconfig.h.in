@@ -23,4 +23,7 @@ inline bool is_bigendian() {
 #cmakedefine ARCH_X86_64
 #cmakedefine ARCH_AARCH64
 
+#cmakedefine BUILD_SANITIZE_ADDRESS
+#cmakedefine BUILD_SANITIZE_THREAD
+
 #endif //__CONFIG_H_

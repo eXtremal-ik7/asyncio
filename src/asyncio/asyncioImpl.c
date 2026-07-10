@@ -117,7 +117,8 @@ asyncOpListLink *pageMapExtractAll(pageMap *map, uint64_t tm)
   uint32_t lo;
   uint32_t hi;
   pageMapKeys(tm, &lo, &hi);
-  asyncOpListLink **p1 = map->map[hi];
+  asyncOpListLink **p1 = (asyncOpListLink**)__pointer_atomic_load(
+    (void* volatile*)&map->map[hi], amoAcquire);
   return p1 ? __pointer_atomic_exchange((void* volatile*)&p1[lo], 0) : 0;
 }
 
@@ -126,18 +127,21 @@ void pageMapAdd(pageMap *map, asyncOpListLink *link)
   uint32_t lo;
   uint32_t hi;
   pageMapKeys(getPt(link->op->endTime), &lo, &hi);
-  asyncOpListLink **p1 = map->map[hi];
+  asyncOpListLink **p1 = (asyncOpListLink**)__pointer_atomic_load(
+    (void* volatile*)&map->map[hi], amoAcquire);
   if (!p1) {
     p1 = (asyncOpListLink**)pageMapAlloc();
     if (!__pointer_atomic_compare_and_swap((void* volatile*)&map->map[hi], 0, p1)) {
       free(p1);
-      p1 = map->map[hi];
+      p1 = (asyncOpListLink**)__pointer_atomic_load(
+        (void* volatile*)&map->map[hi], amoAcquire);
     }
   }
 
   asyncOpListLink *current;
   do {
-    current = link->next = p1[lo];
+    current = link->next = (asyncOpListLink*)__pointer_atomic_load(
+      (void* volatile*)&p1[lo], amoAcquire);
   } while (!__pointer_atomic_compare_and_swap((void* volatile*)&p1[lo], current, link));
 }
 
@@ -810,10 +814,10 @@ void graceReclaim(asyncBase *base)
   aioObjectRoot *ripe;
   __spinlock_acquire(&base->graceLimboLock);
   uintptr_t minSeen = UINTPTR_MAX;
-  unsigned slots = base->graceSlotCount;
+  unsigned slots = __uint_atomic_load(&base->graceSlotCount, amoAcquire);
   unsigned i;
   for (i = 0; i < slots; i++) {
-    uintptr_t seen = base->graceSeen[i].seen;
+    uintptr_t seen = __uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire);
     if (seen < minSeen)
       minSeen = seen;
   }
@@ -866,9 +870,9 @@ void graceThreadEnter(asyncBase *base)
   // array can afford a generous limit. The claim above and this bump are
   // both ordered before the thread's first kernel wait
   unsigned needed = messageLoopThreadId + 1;
-  unsigned current = base->graceSlotCount;
+  unsigned current = __uint_atomic_load(&base->graceSlotCount, amoRelaxed);
   while (current < needed && !__uint_atomic_compare_and_swap(&base->graceSlotCount, current, needed))
-    current = base->graceSlotCount;
+    current = __uint_atomic_load(&base->graceSlotCount, amoRelaxed);
 }
 
 void graceQuiesce(asyncBase *base)
@@ -879,7 +883,9 @@ void graceQuiesce(asyncBase *base)
   // The stamp may not become visible before the batch dispatched above it:
   // the atomic read-modify-write of the epoch is a full barrier in both
   // implementations, and it cannot drift backwards either
-  base->graceSeen[messageLoopThreadId].seen = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0);
+  __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
+                         __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0),
+                         amoRelease);
   if (base->graceLimbo)
     graceReclaim(base);
 }

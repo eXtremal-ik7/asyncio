@@ -65,6 +65,79 @@ TEST(coroutine, nested)
   ASSERT_EQ(x, 3);
 }
 
+struct CoroutineSwitchContext {
+  unsigned switches;
+  unsigned checksum;
+};
+
+static void coroutine_many_switches_proc(void *arg)
+{
+  CoroutineSwitchContext *context = static_cast<CoroutineSwitchContext*>(arg);
+  for (unsigned i = 0; i < context->switches; i++) {
+    context->checksum += i ^ 0x5a5aU;
+    coroutineYield();
+  }
+}
+
+TEST(coroutine, many_yield_resume_cycles)
+{
+  CoroutineSwitchContext context = {100000, 0};
+  unsigned expectedChecksum = 0;
+  for (unsigned i = 0; i < context.switches; i++)
+    expectedChecksum += i ^ 0x5a5aU;
+
+  coroutineTy *coro = coroutineNew(coroutine_many_switches_proc, &context, 0x10000);
+  while (!coroutineCall(coro))
+    continue;
+
+  EXPECT_EQ(context.checksum, expectedChecksum);
+}
+
+static void coroutine_migrate_proc(void *arg)
+{
+  int *steps = static_cast<int*>(arg);
+  ++*steps;
+  coroutineYield();
+  ++*steps;
+}
+
+TEST(coroutine, resume_on_another_thread)
+{
+  int steps = 0;
+  coroutineTy *coro = coroutineNew(coroutine_migrate_proc, &steps, 0x10000);
+  ASSERT_EQ(coroutineCall(coro), 0);
+  ASSERT_EQ(steps, 1);
+
+  int finished = 0;
+  std::thread resumeThread([&]() { finished = coroutineCall(coro); });
+  resumeThread.join();
+
+  EXPECT_EQ(finished, 1);
+  EXPECT_EQ(steps, 2);
+}
+
+static volatile unsigned char *coroutineSuspendedStackAddress;
+
+static void coroutine_suspended_proc(void*)
+{
+  unsigned char stackData[256] = {};
+  stackData[0] = 0x5a;
+  coroutineSuspendedStackAddress = stackData;
+  coroutineYield();
+}
+
+TEST(coroutine, delete_suspended_coroutine)
+{
+  coroutineSuspendedStackAddress = nullptr;
+  coroutineTy *coro = coroutineNew(coroutine_suspended_proc, nullptr, 0x10000);
+  ASSERT_EQ(coroutineCall(coro), 0);
+  ASSERT_NE(coroutineSuspendedStackAddress, nullptr);
+  ASSERT_EQ(*coroutineSuspendedStackAddress, 0x5a);
+
+  coroutineDelete(coro);
+  coroutineSuspendedStackAddress = nullptr;
+}
+
 // coroutineCall on a running coroutine does not switch: it records the wakeup
 // in the counter and returns, and the owner consumes the record at the next
 // coroutineYield (which then resumes immediately instead of parking). When the

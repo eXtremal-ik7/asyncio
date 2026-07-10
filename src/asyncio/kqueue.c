@@ -210,7 +210,9 @@ void kqueueNextFinishedOperation(asyncBase *base)
         // stamp would shield its batches from the grace period. The last
         // thread out drains the limbo list
         if (messageLoopThreadId < GRACE_LOOP_THREAD_LIMIT)
-          base->graceSeen[messageLoopThreadId].seen = UINTPTR_MAX;
+          __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
+                                 UINTPTR_MAX,
+                                 amoRelease);
         graceReclaim(base);
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 0u-1) - 1;
         if (threadsRunning)
@@ -225,7 +227,8 @@ void kqueueNextFinishedOperation(asyncBase *base)
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, &timeout);
 
       uint64_t currentTime = getMonotonicSeconds();
-      if (currentTime % base->messageLoopThreadCounter == messageLoopThreadId)
+      unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
+      if (currentTime % loopThreadCount == messageLoopThreadId)
         processTimeoutQueue(base, currentTime);
     } while (nfds <= 0 && errno == EINTR);
 

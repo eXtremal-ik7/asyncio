@@ -1,7 +1,17 @@
 #include "unittest.h"
+#include "asyncioconfig.h"
 
 #include <cstdio>
 #include <cstring>
+
+#ifdef BUILD_SANITIZE_ADDRESS
+extern "C" const char *__asan_default_options()
+{
+  // Exercise suspended-coroutine fake-stack cleanup in every ASan unit run.
+  // ASAN_OPTIONS may still override this default when investigating a failure.
+  return "detect_stack_use_after_return=1";
+}
+#endif
 
 asyncBase *gBase = nullptr;
 
