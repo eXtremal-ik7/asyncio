@@ -29,6 +29,14 @@ struct repStruct {
   uint64_t c;
 };
 
+struct ErrorWakeupContext {
+  asyncBase *base;
+  AsyncOpStatus status = aosPending;
+  bool callbackFired = false;
+
+  explicit ErrorWakeupContext(asyncBase *baseArg) : base(baseArg) {}
+};
+
 __NO_PADDING_END
 
 
@@ -36,3 +44,4 @@ aioObject *startTCPServer(asyncBase *base, aioAcceptCb callback, void *arg, uint
 aioObject *startUDPServer(asyncBase *base, aioReadMsgCb callback, void *arg, void *buffer, size_t size, uint16_t port);
 aioObject *initializeTCPClient(asyncBase *base, aioConnectCb callback, void *arg, uint16_t port);
 aioObject *initializeUDPClient(asyncBase *base);
+void armDeathTestWatchdog(unsigned seconds);

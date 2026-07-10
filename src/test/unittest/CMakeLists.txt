@@ -5,7 +5,20 @@ if(MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_SILENCE_TR1_NAMESPACE_DEPRECATION_WARNING")
 endif(MSVC)
 
-set(SOURCES unittest.cpp uriparsetest.cpp httpparsetest.cpp)
+set(
+  SOURCES
+  unittest.cpp
+  testsupport.cpp
+  pipetest.cpp
+  sockettest.cpp
+  ssltest.cpp
+  httptest.cpp
+  lifetimetest.cpp
+  coroutinetest.cpp
+  uriparsetest.cpp
+  httpparsetest.cpp
+  coretest.cpp
+)
 set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2putils ${GTEST_LIBRARIES})
 include_directories(${GTEST_INCLUDE_DIRS})
 
@@ -36,4 +49,9 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif()
 
 add_executable(unittest ${SOURCES})
+target_include_directories(
+  unittest
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../asyncio
+)
 target_link_libraries(unittest ${LIBRARIES})
