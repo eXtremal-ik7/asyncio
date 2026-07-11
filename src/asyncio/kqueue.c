@@ -226,7 +226,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
       graceQuiesce(base);
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, &timeout);
 
-      uint64_t currentTime = getMonotonicSeconds();
+      uint64_t currentTime = getMonotonicTicks();
       unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
       if (currentTime % loopThreadCount == messageLoopThreadId)
         processTimeoutQueue(base, currentTime);

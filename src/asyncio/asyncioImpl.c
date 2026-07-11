@@ -9,8 +9,6 @@
 #include <signal.h>
 #endif
 
-#define PAGE_MAP_SIZE (1u << 16)
-
 __tls unsigned currentFinishedSync;
 __tls unsigned messageLoopThreadId;
 // Set only by a successful slot claim in graceThreadEnter: with an elastic
@@ -18,8 +16,6 @@ __tls unsigned messageLoopThreadId;
 // be adopted while its previous holder is still inside the message loop.
 // Thread-local, so plain loads/stores suffice
 static __tls unsigned graceSlotOwned;
-
-ConcurrentQueue asyncOpLinkListPool;
 
 void eqRemove(List *list, asyncOpRoot *op)
 {
@@ -63,23 +59,6 @@ void eqPushBack(List *list, asyncOpRoot *op)
   }
 }
 
-static inline uint64_t getPt(uint64_t endTime)
-{
-  return (endTime / 1000000) + (endTime % 1000000 != 0);
-}
-
-static inline void pageMapKeys(uint64_t tm, uint32_t *lo, uint32_t *hi)
-{
-  uint32_t ltm = (uint32_t)tm;
-  *hi = ltm >> 16;
-  *lo = ltm & 0xFFFF;
-}
-
-static inline void *pageMapAlloc()
-{
-  return calloc(PAGE_MAP_SIZE, sizeof(void*));
-}
-
 void *alignedMalloc(size_t size, size_t alignment)
 {
 #ifdef OS_COMMONUNIX
@@ -109,45 +88,6 @@ void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData)
   intptr_t p = (intptr_t)ptr;
   *outPtr = (void*)(p & TAGGED_POINTER_PTR_MASK);
   *outData = p & TAGGED_POINTER_DATA_MASK;
-}
-
-void pageMapInit(pageMap *map)
-{
-  map->map = (asyncOpListLink***)pageMapAlloc();
-  map->lock = 0;
-}
-
-asyncOpListLink *pageMapExtractAll(pageMap *map, uint64_t tm)
-{
-  uint32_t lo;
-  uint32_t hi;
-  pageMapKeys(tm, &lo, &hi);
-  asyncOpListLink **p1 = (asyncOpListLink**)__pointer_atomic_load(
-    (void* volatile*)&map->map[hi], amoAcquire);
-  return p1 ? __pointer_atomic_exchange((void* volatile*)&p1[lo], 0) : 0;
-}
-
-void pageMapAdd(pageMap *map, asyncOpListLink *link)
-{
-  uint32_t lo;
-  uint32_t hi;
-  pageMapKeys(getPt(link->op->endTime), &lo, &hi);
-  asyncOpListLink **p1 = (asyncOpListLink**)__pointer_atomic_load(
-    (void* volatile*)&map->map[hi], amoAcquire);
-  if (!p1) {
-    p1 = (asyncOpListLink**)pageMapAlloc();
-    if (!__pointer_atomic_compare_and_swap((void* volatile*)&map->map[hi], 0, p1)) {
-      free(p1);
-      p1 = (asyncOpListLink**)__pointer_atomic_load(
-        (void* volatile*)&map->map[hi], amoAcquire);
-    }
-  }
-
-  asyncOpListLink *current;
-  do {
-    current = link->next = (asyncOpListLink*)__pointer_atomic_load(
-      (void* volatile*)&p1[lo], amoAcquire);
-  } while (!__pointer_atomic_compare_and_swap((void* volatile*)&p1[lo], current, link));
 }
 
 uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count)
@@ -204,59 +144,6 @@ void eventDeactivate(aioUserEvent *event)
 {
   if (!event->isSemaphore)
     __uintptr_atomic_fetch_and_add(&event->tag, (uintptr_t)0-TAG_EVENT_OP);
-}
-
-void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
-{
-  asyncOpListLink *timerLink = 0;
-  if (!objectPoolGet(&asyncOpLinkListPool, (void**)&timerLink, sizeof(asyncOpListLink)))
-    timerLink = malloc(sizeof(asyncOpListLink));
-  timerLink->op = op;
-  timerLink->tag = opGetGeneration(op);
-  pageMapAdd(&base->timerMap, timerLink);
-  op->timerId = timerLink;
-}
-
-// Monotonic seconds for the timeout grid. Deliberately not derived from the
-// wall clock (time(0)): a backward NTP/manual step would stall the grid (the
-// checkpoint would sit ahead of "now" and the sweep would early-return below),
-// and a forward step would fire pending timeouts early. A monotonic source
-// advances with true elapsed time regardless of any system-date change. All
-// grid sites (arm, sweep, checkpoint init) must share this one clock.
-uint64_t getMonotonicSeconds(void)
-{
-#if defined(OS_WINDOWS)
-  return (uint64_t)(GetTickCount64() / 1000ULL);
-#else
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec;
-#endif
-}
-
-void processTimeoutQueue(asyncBase *base, uint64_t currentTime)
-{
-  // The lock-free fast check races with the update below only formally: a
-  // stale (smaller) value just leads to taking the lock and sweeping an
-  // empty range, the checkpoint itself is only advanced under the lock
-  if (__uintptr_atomic_load(&base->lastCheckPoint, amoRelaxed) >= currentTime ||
-      !__spinlock_try_acquire(&base->timerMapLock))
-    return;
-
-  // check timeout queue
-  uint64_t begin = base->lastCheckPoint;
-  for (; begin < currentTime; begin++) {
-    asyncOpListLink *link = pageMapExtractAll(&base->timerMap, (uint64_t)begin);
-    while (link) {
-      asyncOpListLink *next = link->next;
-      opCancel(link->op, link->tag, aosTimeout);
-      objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
-      link = next;
-    }
-  }
-
-  __uintptr_atomic_store(&base->lastCheckPoint, (uintptr_t)currentTime, amoRelaxed);
-  __spinlock_release(&base->timerMapLock);
 }
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor)
@@ -416,7 +303,7 @@ static void opArmTimer(asyncOpRoot *op)
       base->methodImpl.startTimer(op);
     } else {
       // add operation to timeout grid
-      op->endTime = getMonotonicSeconds() * 1000000ULL + op->timeout;
+      op->endTime = getMonotonicTicks() * TIMER_TICK_MICROSECONDS + op->timeout;
       addToTimeoutQueue(base, op);
     }
   }

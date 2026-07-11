@@ -6,6 +6,7 @@ endif()
 set(Sources
   asyncio.c
   asyncioImpl.c
+  timerWheel.c
   dynamicBuffer.c
   ringBuffer.c
   timer.c
@@ -39,6 +40,25 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" O
 endif ()
 
 add_library(asyncio-0.5 STATIC ${Sources})
+
+# Build-time proof that the atomic128 layer stayed inline (nm/objdump over a
+# dedicated anchor object). MSVC intrinsics cannot silently become library
+# calls, and there is no binutils there to inspect the result with.
+if (NOT MSVC)
+  add_library(atomic128guard STATIC atomic128guard.c)
+  add_custom_command(
+    TARGET atomic128guard POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+      -DBINARY=$<TARGET_FILE:atomic128guard>
+      -DNM=${CMAKE_NM}
+      -DOBJDUMP=${CMAKE_OBJDUMP}
+      -DARCH=${ARCH_NAME}
+      -DTSAN=${BUILD_SANITIZE_THREAD}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/atomic128-guard.cmake
+    COMMENT "atomic128 guard: checking for inline DWCAS"
+    VERBATIM
+  )
+endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
   target_link_libraries(asyncio-0.5 rt)

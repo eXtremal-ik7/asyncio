@@ -233,21 +233,21 @@ static inline int objectPoolPut(ConcurrentQueue *pool, void *object, size_t size
 void eqRemove(List *list, asyncOpRoot *op);
 void eqPushBack(List *list, asyncOpRoot *op);
 
+// Timeout-grid link. The deadline lives here, not in the operation: after
+// publication the operation may complete and be recycled at any moment, and
+// until a generation CAS wins nothing beyond op->tag may be read. 32 bytes,
+// pooled in asyncOpLinkListPool.
 typedef struct asyncOpListLink {
   asyncOpRoot *op;
-  uintptr_t tag;
+  uintptr_t generation;
   asyncOpListLink *next;
+  uint64_t deadlineTick;
 } asyncOpListLink;
 
 typedef struct ListImpl {
   asyncOpRoot *prev;
   asyncOpRoot *next;
 } ListImpl;
-
-typedef struct pageMap {
-  asyncOpListLink ***map;
-  unsigned lock;
-} pageMap;
 
 
 struct aioObjectRoot {

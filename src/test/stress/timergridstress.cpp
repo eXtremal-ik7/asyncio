@@ -1,25 +1,25 @@
-// Timeout-grid late-insertion stress.
+// Timeout-wheel late-insertion stress.
 //
-// The timeout grid currently sweeps a bucket with exchange(head, NULL). A
-// producer that resumes after that sweep can publish into the reopened NULL
-// head even though the global checkpoint has already passed the bucket. The
-// timer is then stranded until the 32-bit second key wraps.
+// The wheel drains and reopens a slot with one DWCAS, so a producer that
+// resumes after the sweep publishes into the reopened incarnation: the link
+// is not lost, but it fires a full rotation late instead of expiring
+// immediately. This stress repeats that legal ordering over unique absolute
+// ticks:
 //
-// This stress repeats that legal ordering over unique absolute buckets:
+//   sweeper:  drain the deadline slot (conceptually publish the checkpoint)
+//   producer: timerWheelInsert(link for the already swept tick)
+//   verifier: drain the slot again to diagnose/recover the late link
 //
-//   sweeper:  extract(empty bucket), conceptually publish checkpoint
-//   producer: pageMapAdd(link for the already swept bucket)
-//   verifier: inspect the bucket only to diagnose/recover a stranded link
-//
-// Producers run concurrently so page publication and bucket insertion are also
-// contended, while a reusable barrier makes the logical race deterministic.
-// A correct terminal-bucket implementation rejects every late insertion, so
-// the verifier finds zero links. The current OPEN -> NULL implementation is
-// expected to fail; this is the red stage of the timer-grid TDD change.
+// Producers run concurrently so slot publication is contended, while a
+// reusable barrier makes the logical race deterministic. A correct terminal
+// window protocol rejects every late insertion (producer observes a foreign
+// baseTick and expires the link), so the verifier finds zero links. The
+// current publish-into-observed-incarnation stage is expected to fail; this
+// is the red stage of the timer-wheel TDD change.
 //
 // Usage: timergridstress [producers] [rounds] [itemsPerProducer]
 
-#include "asyncio/api.h"
+#include "asyncioImpl.h"
 
 #include <atomic>
 #include <cinttypes>
@@ -30,15 +30,7 @@
 #include <thread>
 #include <vector>
 
-extern "C" {
-void pageMapInit(pageMap *map);
-asyncOpListLink *pageMapExtractAll(pageMap *map, uint64_t tm);
-void pageMapAdd(pageMap *map, asyncOpListLink *link);
-}
-
 namespace {
-
-constexpr size_t kPageMapSize = size_t{1} << 16;
 
 class ReusableBarrier {
 public:
@@ -68,14 +60,21 @@ struct TimerSlot {
   asyncOpListLink link{};
 };
 
-void destroyPageMap(pageMap *map)
+// Detach a level-0 slot's list without delivering or reopening it: the
+// verifier owns recovered links, and baseTick is left alone so producers keep
+// attaching to a stable incarnation across rounds.
+asyncOpListLink *drainLevel0Slot(asyncBase *base, uint64_t tick)
 {
-  if (!map->map)
-    return;
-  for (size_t i = 0; i < kPageMapSize; ++i)
-    free(map->map[i]);
-  free(map->map);
-  map->map = nullptr;
+  volatile uint128Pair *slot = &base->timerWheel.slots[0][tick % TIMER_WHEEL_SLOTS];
+  uint128Pair observed = __uint128_atomic_load(slot);
+  uint128Pair desired;
+  do {
+    if (observed.low == 0)
+      return nullptr;
+    desired.low = 0;
+    desired.high = observed.high;
+  } while (!__uint128_atomic_compare_and_swap(slot, &observed, desired));
+  return reinterpret_cast<asyncOpListLink*>(static_cast<uintptr_t>(observed.low));
 }
 
 uint64_t parseArgument(const char *value, const char *name)
@@ -99,7 +98,7 @@ int main(int argc, char **argv)
 
   if (argc > 1) {
     uint64_t parsedProducers = parseArgument(argv[1], "producers");
-    if (parsedProducers >= std::numeric_limits<unsigned>::max()) {
+    if (parsedProducers >= (std::numeric_limits<unsigned>::max)()) {
       fprintf(stderr, "producers exceeds the supported thread count\n");
       return 2;
     }
@@ -115,14 +114,14 @@ int main(int argc, char **argv)
   }
 
   if (producers == 0 ||
-      itemsPerProducer > std::numeric_limits<uint64_t>::max() / producers) {
+      itemsPerProducer > (std::numeric_limits<uint64_t>::max)() / producers) {
     fprintf(stderr, "configuration exceeds the stress counter range\n");
     return 2;
   }
   uint64_t itemsPerRound = static_cast<uint64_t>(producers) * itemsPerProducer;
-  if (itemsPerRound > std::numeric_limits<size_t>::max() / sizeof(TimerSlot) ||
-      rounds > (UINT32_MAX - 1ULL) / itemsPerRound) {
-    fprintf(stderr, "configuration exceeds the timeout grid's 32-bit key range\n");
+  if (itemsPerRound > (std::numeric_limits<size_t>::max)() / sizeof(TimerSlot) ||
+      rounds > (std::numeric_limits<uint64_t>::max)() / itemsPerRound - 1) {
+    fprintf(stderr, "configuration exceeds the tick counter range\n");
     return 2;
   }
 
@@ -130,15 +129,16 @@ int main(int argc, char **argv)
          " round(s), %" PRIu64 " timer(s)/producer/round\n",
          producers, rounds, itemsPerProducer);
 
-  pageMap map{};
-  pageMapInit(&map);
+  // Only the wheel part of the base is exercised; no loop threads exist
+  std::unique_ptr<asyncBase> base(new asyncBase{});
+  timerWheelInit(base.get(), 0);
   std::unique_ptr<TimerSlot[]> slots(new TimerSlot[static_cast<size_t>(itemsPerRound)]);
   ReusableBarrier barrier(producers + 1);
   uint64_t unexpectedlyPresentBeforeAdd = 0;
   uint64_t stranded = 0;
   uint64_t corrupt = 0;
 
-  auto bucketFor = [itemsPerRound](uint64_t round, uint64_t index) {
+  auto tickFor = [itemsPerRound](uint64_t round, uint64_t index) {
     return 1 + round * itemsPerRound + index;
   };
 
@@ -151,53 +151,65 @@ int main(int argc, char **argv)
       for (uint64_t round = 0; round < rounds; ++round) {
         for (uint64_t index = first; index < last; ++index) {
           TimerSlot &slot = slots[static_cast<size_t>(index)];
-          uint64_t bucket = bucketFor(round, index);
-          slot.op.endTime = bucket * 1000000ULL;
+          uint64_t tick = tickFor(round, index);
           slot.link.op = &slot.op;
-          slot.link.tag = 1;
+          slot.link.generation = 1;
           slot.link.next = nullptr;
+          slot.link.deadlineTick = tick;
         }
 
         // All links are producer-owned but deliberately not published yet.
         barrier.wait();
-        // The sweeper closes/extracts every target bucket before this opens.
+        // The sweeper drains every target slot before this opens.
         barrier.wait();
 
-        for (uint64_t index = first; index < last; ++index)
-          pageMapAdd(&map, &slots[static_cast<size_t>(index)].link);
+        // The post-sweep cursor routes every deadline to its level-0 slot.
+        for (uint64_t index = first; index < last; ++index) {
+          TimerSlot &slot = slots[static_cast<size_t>(index)];
+          timerWheelInsert(base.get(), &slot.link, slot.link.deadlineTick);
+        }
 
         barrier.wait();
         // Do not reuse slot storage until the verifier has detached any link
-        // incorrectly accepted by the old implementation.
+        // accepted by the publish-into-observed implementation.
         barrier.wait();
       }
     });
   }
 
+  // Consecutive ticks of one round share physical level-0 slots modulo the
+  // wheel size, so both drains walk each distinct slot once and inspect the
+  // whole detached chain.
+  uint64_t distinctSlots = itemsPerRound < TIMER_WHEEL_SLOTS ? itemsPerRound : TIMER_WHEEL_SLOTS;
+
   for (uint64_t round = 0; round < rounds; ++round) {
+    uint64_t roundBase = tickFor(round, 0);
     barrier.wait();
 
     // This is the real sweep. In production the checkpoint is published after
-    // these extracts, before the delayed producers resume.
-    for (uint64_t index = 0; index < itemsPerRound; ++index) {
-      uint64_t bucket = bucketFor(round, index);
-      if (pageMapExtractAll(&map, bucket))
+    // these drains, before the delayed producers resume.
+    for (uint64_t s = 0; s < distinctSlots; ++s) {
+      for (asyncOpListLink *link = drainLevel0Slot(base.get(), roundBase + s); link;
+           link = link->next)
         unexpectedlyPresentBeforeAdd++;
     }
 
     barrier.wait();
     barrier.wait();
 
-    // Diagnostic second extract: any returned link was accepted after the only
-    // production sweep and would otherwise remain stranded behind checkpoint.
-    for (uint64_t index = 0; index < itemsPerRound; ++index) {
-      asyncOpListLink *head = pageMapExtractAll(&map, bucketFor(round, index));
-      if (!head)
-        continue;
-      stranded++;
-      TimerSlot &expected = slots[static_cast<size_t>(index)];
-      if (head != &expected.link || head->next)
-        corrupt++;
+    // Diagnostic second drain: any returned link was accepted after the only
+    // production sweep and would otherwise fire a rotation late (or, with a
+    // terminal-window protocol, must have been expired by the producer).
+    for (uint64_t s = 0; s < distinctSlots; ++s) {
+      for (asyncOpListLink *link = drainLevel0Slot(base.get(), roundBase + s); link;
+           link = link->next) {
+        stranded++;
+        uint64_t offset = link->deadlineTick - roundBase;
+        if (offset >= itemsPerRound ||
+            link != &slots[static_cast<size_t>(offset)].link ||
+            link->deadlineTick % TIMER_WHEEL_SLOTS != (roundBase + s) % TIMER_WHEEL_SLOTS)
+          corrupt++;
+      }
     }
 
     barrier.wait();
@@ -213,12 +225,10 @@ int main(int argc, char **argv)
          ", corrupt: %" PRIu64 "\n",
          total, unexpectedlyPresentBeforeAdd, stranded, corrupt);
 
-  destroyPageMap(&map);
-
   if (unexpectedlyPresentBeforeAdd || corrupt || stranded) {
     fprintf(stderr,
-            "FAILED: timeout grid accepted %" PRIu64
-            " timer(s) after their deadline buckets were swept\n",
+            "FAILED: timeout wheel accepted %" PRIu64
+            " timer(s) after their deadline windows were swept\n",
             stranded);
     return 1;
   }

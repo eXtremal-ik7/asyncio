@@ -266,7 +266,7 @@ void epollNextFinishedOperation(asyncBase *base)
 
       graceQuiesce(base);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, 500);
-      uint64_t currentTime = getMonotonicSeconds();
+      uint64_t currentTime = getMonotonicTicks();
       unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
       if (currentTime % loopThreadCount == messageLoopThreadId)
         processTimeoutQueue(base, currentTime);

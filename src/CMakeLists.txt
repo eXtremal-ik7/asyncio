@@ -126,6 +126,14 @@ elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
   set(OS_32 1)
 endif()
 
+# atomic128.h: cmpxchg16b must be inlined (GCC/clang do not enable it by
+# default on x86-64; MSVC needs no flag). Every 64-bit x86 CPU since ~2006
+# has cx16, Windows 8.1+ refuses to boot without it.
+if (ARCH_X86_64 AND NOT MSVC)
+  set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcx16")
+  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcx16")
+endif()
+
 if(MSVC)
   add_definitions(
     -D_CRT_SECURE_NO_DEPRECATE

@@ -7,6 +7,7 @@ extern "C" {
 
 #include "asyncio/api.h"
 #include "asyncio/ringBuffer.h"
+#include "atomic128.h"
 #ifndef OS_WINDOWS
 #include <signal.h>
 #endif
@@ -15,6 +16,26 @@ extern "C" {
 #define TAGGED_POINTER_ALIGNMENT (((intptr_t)1) << TAGGED_POINTER_DATA_SIZE)
 #define TAGGED_POINTER_DATA_MASK (TAGGED_POINTER_ALIGNMENT-1)
 #define TAGGED_POINTER_PTR_MASK (~TAGGED_POINTER_DATA_MASK)
+
+// Timeout grid: an exact cascading hierarchical timer wheel. The tick is a
+// compile-time constant: changing the resolution later renumbers deadlines
+// but does not touch the architecture.
+#define TIMER_TICK_MICROSECONDS 125000
+#define TIMER_WHEEL_LEVEL_BITS 10
+#define TIMER_WHEEL_SLOTS (1u << TIMER_WHEEL_LEVEL_BITS)
+#define TIMER_WHEEL_LEVELS 4
+
+// Slot = atomic {head, baseTick} pair changed only by DWCAS: drain and reopen
+// are one transition, and a link can never be published into a foreign slot
+// incarnation unnoticed - the pair CAS validates baseTick together with the
+// head. head is an intrusive LIFO of asyncOpListLink (low word), baseTick is
+// the absolute tick starting the slot's current window (high word); baseTick
+// only grows, in steps of the level's rotation period, which kills ABA for
+// the whole 64-bit range. Level L covers windows of 2^(10L) ticks; deadlines
+// beyond level 3 clamp into its farthest slot and re-cascade on visit.
+typedef struct timerWheel {
+  uint128Pair slots[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS];
+} timerWheel;
 
 // One quiescence stamp per loop thread, padded to a cache line so the
 // per-iteration stamps of neighbour threads do not false-share; the padding
@@ -75,11 +96,11 @@ struct asyncBase {
   enum AsyncMethod method;
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
-  struct pageMap timerMap;
-  // Monotonic seconds of the last timeout-grid sweep. uintptr_t so the
-  // lock-free fast check in processTimeoutQueue can use the plain atomic
-  // helpers on 32-bit targets too (2^32 seconds of uptime is out of scope);
-  // updates happen under timerMapLock
+  struct timerWheel timerWheel;
+  // First monotonic tick whose sweep is not confirmed yet. uintptr_t matches
+  // the plain atomic helpers; the wheel already requires a 64-bit target
+  // (atomic128.h), so the full 64-bit tick range is available and wrap is out
+  // of scope. Updates happen under timerMapLock
   uintptr_t lastCheckPoint;
   volatile unsigned messageLoopThreadCounter;
   volatile unsigned timerMapLock;
@@ -257,15 +278,36 @@ struct aioUserEvent {
   void *destructorCbArg;
 };
 
-void pageMapInit(pageMap *map);
-void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
-void processTimeoutQueue(asyncBase *base, uint64_t currentTime);
+// Single-threaded wheel lifecycle. Init may run on zeroed or reused storage
+// and seeds every slot's baseTick for the given cursor; teardown recycles
+// whatever links are still parked in the slots into the global link pool
+// without delivering them - the loop threads must already be stopped.
+void timerWheelInit(asyncBase *base, uint64_t currentTick);
+void timerWheelTeardown(asyncBase *base);
 
-// Monotonic (wall-clock-independent) seconds for the timeout grid; see the
-// definition in asyncioImpl.c for why the grid must not use time(0). Returns an
-// unsigned 64-bit tick count, not calendar time, so it is intentionally not a
-// time_t (whose width is platform-dependent and which connotes wall time).
-uint64_t getMonotonicSeconds(void);
+// Publish a link into the wheel; the routing cursor is only a placement hint
+// (a stale cursor routes the link to a slot whose visit re-cascades it), the
+// publication itself is validated by the slot pair CAS.
+void timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor);
+
+void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
+void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
+
+// Monotonic (wall-clock-independent) 125 ms ticks for the timeout grid; see
+// the definition in asyncioImpl.c for why the grid must not use time(0).
+// Returns an unsigned 64-bit tick count, not calendar time, so it is
+// intentionally not a time_t (whose width is platform-dependent and which
+// connotes wall time).
+uint64_t getMonotonicTicks(void);
+
+// Deadline in grid ticks: rounds the microsecond endTime up so a timeout
+// never fires before its deadline.
+__NO_UNUSED_FUNCTION_BEGIN
+static inline uint64_t timerDeadlineTick(uint64_t endTime)
+{
+  return endTime / TIMER_TICK_MICROSECONDS + (endTime % TIMER_TICK_MICROSECONDS != 0);
+}
+__NO_UNUSED_FUNCTION_END
 
 // Grace period (see the asyncBase comment). graceThreadEnter runs once per
 // loop thread right after the messageLoopThreadId assignment and freezes

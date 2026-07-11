@@ -12,13 +12,7 @@
 #include <utility>
 #include <vector>
 
-extern "C" {
-asyncOpListLink *pageMapExtractAll(pageMap *map, uint64_t tm);
-void pageMapAdd(pageMap *map, asyncOpListLink *link);
-}
-
 constexpr size_t kCombinerAlignment = size_t{1} << COMBINER_TAG_SIZE;
-constexpr size_t kPageMapSize = size_t{1} << 16;
 
 inline void destroyConcurrentQueue(ConcurrentQueue *queue)
 {
@@ -104,6 +98,9 @@ struct TestBackend : asyncBase {
 
   TestBackend() : asyncBase{}, base(*this)
   {
+    // Cursor 0 keeps the wheel's first rotation aligned with the small
+    // absolute ticks the tests use as checkpoints
+    timerWheelInit(&base, 0);
     base.methodImpl.combinerTaskHandler = taskHandler;
     base.methodImpl.enqueue = enqueue;
     base.methodImpl.initializeTimer = initializeTimer;
@@ -125,23 +122,7 @@ struct TestBackend : asyncBase {
       ADD_FAILURE() << completions.size() << " completion(s) were not drained by the test";
     destroyConcurrentQueue(&operationPool);
     destroyConcurrentQueue(&base.globalQueue);
-    destroyPageMap();
-  }
-
-  void initializePageMap()
-  {
-    if (!base.timerMap.map)
-      pageMapInit(&base.timerMap);
-  }
-
-  void destroyPageMap()
-  {
-    if (!base.timerMap.map)
-      return;
-    for (size_t i = 0; i < kPageMapSize; ++i)
-      free(base.timerMap.map[i]);
-    free(base.timerMap.map);
-    base.timerMap.map = nullptr;
+    timerWheelTeardown(&base);
   }
 
   void drainCompletions()

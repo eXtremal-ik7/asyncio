@@ -1090,10 +1090,10 @@ TEST(core_global_queue, user_event_branch_deactivates_and_returns_when_empty)
   EXPECT_EQ(event.tag, 1u);
 }
 
-TEST(core_clock, monotonic_seconds_is_non_decreasing)
+TEST(core_clock, monotonic_ticks_are_non_decreasing)
 {
-  uint64_t first = getMonotonicSeconds();
-  uint64_t second = getMonotonicSeconds();
+  uint64_t first = getMonotonicTicks();
+  uint64_t second = getMonotonicTicks();
   EXPECT_LE(first, second);
 }
 
@@ -1736,39 +1736,77 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
 }
 
 
-TEST(core_timeout_map, rounds_deadlines_up_and_extracts_each_bucket_once)
+inline uint128Pair peekWheelSlot(TestBackend &backend, unsigned level, unsigned index)
+{
+  return __uint128_atomic_load(&backend.base.timerWheel.slots[level][index]);
+}
+
+// Detach a slot's list without delivering it: diagnostic recovery for tests
+// that deliberately leave a link behind the checkpoint
+inline asyncOpListLink *drainWheelSlot(TestBackend &backend, unsigned level, unsigned index)
+{
+  volatile uint128Pair *slot = &backend.base.timerWheel.slots[level][index];
+  uint128Pair observed = __uint128_atomic_load(slot);
+  uint128Pair desired;
+  do {
+    desired.low = 0;
+    desired.high = observed.high;
+  } while (!__uint128_atomic_compare_and_swap(slot, &observed, desired));
+  return reinterpret_cast<asyncOpListLink*>(static_cast<uintptr_t>(observed.low));
+}
+
+TEST(core_timeout_grid, rounds_deadlines_up_and_delivers_each_window_once)
 {
   TestBackend backend;
-  backend.initializePageMap();
   TestObject object(backend);
-  TestOp first(object), second(object);
+  TestOp first(object), second(object), third(object);
+  // 125 ms ticks: 1000001 us rounds up to tick 9, both others to tick 16
   first.root.endTime = 1000001;
   second.root.endTime = 1999999;
-  asyncOpListLink firstLink{&first.root, opGetGeneration(&first.root), nullptr};
-  asyncOpListLink secondLink{&second.root, opGetGeneration(&second.root), nullptr};
+  third.root.endTime = 2000000;
 
-  pageMapAdd(&backend.base.timerMap, &firstLink);
-  pageMapAdd(&backend.base.timerMap, &secondLink);
+  addToTimeoutQueue(&backend.base, &first.root);
+  addToTimeoutQueue(&backend.base, &second.root);
+  addToTimeoutQueue(&backend.base, &third.root);
 
-  EXPECT_EQ(pageMapExtractAll(&backend.base.timerMap, uint64_t{1} << 16), nullptr);
-  EXPECT_EQ(pageMapExtractAll(&backend.base.timerMap, 1), nullptr);
-  asyncOpListLink *head = pageMapExtractAll(&backend.base.timerMap, 2);
-  ASSERT_EQ(head, &secondLink);
-  EXPECT_EQ(head->next, &firstLink);
-  EXPECT_EQ(pageMapExtractAll(&backend.base.timerMap, 2), nullptr);
+  auto *firstLink = static_cast<asyncOpListLink*>(first.root.timerId);
+  auto *secondLink = static_cast<asyncOpListLink*>(second.root.timerId);
+  auto *thirdLink = static_cast<asyncOpListLink*>(third.root.timerId);
+  ASSERT_NE(firstLink, nullptr);
+  EXPECT_EQ(firstLink->deadlineTick, 9u);
+  EXPECT_EQ(secondLink->deadlineTick, 16u);
+  EXPECT_EQ(thirdLink->deadlineTick, 16u);
 
-  objectDecrementReference(&object.root, 2);
+  // Level-0 routing, same-window links stack LIFO
+  EXPECT_EQ(peekWheelSlot(backend, 0, 9).low, reinterpret_cast<uint64_t>(firstLink));
+  ASSERT_EQ(peekWheelSlot(backend, 0, 16).low, reinterpret_cast<uint64_t>(thirdLink));
+  EXPECT_EQ(thirdLink->next, secondLink);
+
+  // The sweep to tick 10 delivers only the tick-9 window; a repeated sweep is
+  // a checkpoint no-op and cannot deliver the same window twice
+  processTimeoutQueue(&backend.base, 10);
+  EXPECT_EQ(opGetStatus(&first.root), aosTimeout);
+  EXPECT_EQ(opGetStatus(&second.root), aosPending);
+  processTimeoutQueue(&backend.base, 10);
+  EXPECT_EQ(opGetStatus(&second.root), aosPending);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 9).low, 0u);
+
+  processTimeoutQueue(&backend.base, 17);
+  EXPECT_EQ(opGetStatus(&second.root), aosTimeout);
+  EXPECT_EQ(opGetStatus(&third.root), aosTimeout);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 16).low, 0u);
+
+  objectDecrementReference(&object.root, 3);
   objectDelete(&object.root);
 }
 
 TEST(core_timeout_grid, expiration_cancels_and_releases_waiting_operation)
 {
   TestBackend backend;
-  backend.initializePageMap();
   backend.base.lastCheckPoint = 100;
   TestObject object(backend);
   TestOp op(object);
-  op.root.endTime = 100000000;
+  op.root.endTime = 100 * TIMER_TICK_MICROSECONDS;
   eqPushBack(&object.root.readQueue, &op.root);
   addToTimeoutQueue(&backend.base, &op.root);
 
@@ -1783,21 +1821,20 @@ TEST(core_timeout_grid, expiration_cancels_and_releases_waiting_operation)
   objectDelete(&object.root);
 }
 
-// TDD regression for the legal producer/sweeper ordering that the current
-// OPEN -> NULL bucket protocol cannot represent. No test hook is needed:
-// processTimeoutQueue() completes the empty sweep and publishes checkpoint 101,
-// then the producer resumes with a deadline in bucket 100. A correct terminal
-// bucket protocol must reject that publication and expire the operation
-// immediately. The current implementation leaves timerId behind checkpoint 101,
-// so both expectations below are intentionally red until the grid is fixed.
+// TDD regression for the legal producer/sweeper ordering the wheel does not
+// reject yet: the sweep reopens window 100 and publishes checkpoint 101, then
+// the producer resumes and publishes a deadline-100 link into the reopened
+// slot (next rotation). A correct terminal-window protocol must refuse the
+// publication and expire the operation immediately instead of delivering it
+// one rotation late. Both expectations below stay red until the producer
+// validates the observed baseTick (the published/expired protocol stage).
 TEST(core_timeout_grid, late_arm_after_swept_checkpoint_expires_instead_of_being_stranded)
 {
   TestBackend backend;
-  backend.initializePageMap();
   backend.base.lastCheckPoint = 100;
   TestObject object(backend);
   TestOp op(object);
-  op.root.endTime = 100000000;
+  op.root.endTime = 100 * TIMER_TICK_MICROSECONDS;
   eqPushBack(&object.root.readQueue, &op.root);
 
   processTimeoutQueue(&backend.base, 101);
@@ -1805,14 +1842,14 @@ TEST(core_timeout_grid, late_arm_after_swept_checkpoint_expires_instead_of_being
   addToTimeoutQueue(&backend.base, &op.root);
 
   AsyncOpStatus statusAfterArm = opGetStatus(&op.root);
-  asyncOpListLink *stranded = pageMapExtractAll(&backend.base.timerMap, 100);
+  asyncOpListLink *stranded = drainWheelSlot(backend, 0, 100);
   EXPECT_EQ(statusAfterArm, aosTimeout)
-    << "a timer armed after its bucket was swept was not expired immediately";
+    << "a timer armed after its window was swept was not expired immediately";
   EXPECT_EQ(stranded, nullptr)
-    << "the late timer was published behind the checkpoint and will never be revisited";
+    << "the late timer was published into the reopened slot and will fire a rotation late";
 
-  // Keep the known-red test hygienic on the old implementation. The diagnostic
-  // extract above recovered ownership of the stranded physical link; it must
+  // Keep the known-red test hygienic on the current implementation. The
+  // diagnostic drain above recovered ownership of the physical link; it must
   // not remain in the global link pool with a pointer to this stack operation.
   if (stranded) {
     op.root.timerId = nullptr;
@@ -1827,7 +1864,6 @@ TEST(core_timeout_grid, late_arm_after_swept_checkpoint_expires_instead_of_being
 TEST(core_timeout_grid, current_or_locked_checkpoint_is_a_noop)
 {
   TestBackend backend;
-  backend.initializePageMap();
   backend.base.lastCheckPoint = 10;
 
   processTimeoutQueue(&backend.base, 10);
@@ -1843,20 +1879,19 @@ TEST(core_timeout_grid, current_or_locked_checkpoint_is_a_noop)
 TEST(core_timeout_grid, stale_generation_link_does_not_cancel_reused_operation)
 {
   TestBackend backend;
-  backend.initializePageMap();
   backend.base.lastCheckPoint = 7;
   TestObject object(backend);
   TestOp op(object);
   uintptr_t staleGeneration = opGetGeneration(&op.root);
   op.root.tag = ((staleGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
-  op.root.endTime = 7000000;
   // Heap link: the sweep recycles it into the global link pool, so a stack
   // instance would leave a dangling pointer for a later addToTimeoutQueue
   auto *link = static_cast<asyncOpListLink*>(malloc(sizeof(asyncOpListLink)));
   link->op = &op.root;
-  link->tag = staleGeneration;
+  link->generation = staleGeneration;
   link->next = nullptr;
-  pageMapAdd(&backend.base.timerMap, link);
+  link->deadlineTick = 7;
+  timerWheelInsert(&backend.base, link, 7);
 
   processTimeoutQueue(&backend.base, 8);
 
@@ -1869,7 +1904,6 @@ TEST(core_timeout_grid, stale_generation_link_does_not_cancel_reused_operation)
 TEST(core_timeout_grid, ordinary_operation_arms_monotonic_grid_timer)
 {
   TestBackend backend;
-  backend.initializePageMap();
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afNone, 1);
   op.setResults({aosPending});
@@ -1882,9 +1916,8 @@ TEST(core_timeout_grid, ordinary_operation_arms_monotonic_grid_timer)
 
   cancelIo(&object.root);
   backend.drainCompletions();
-  uint64_t bucket = (op.root.endTime / 1000000) + (op.root.endTime % 1000000 != 0);
-  backend.base.lastCheckPoint = bucket;
-  processTimeoutQueue(&backend.base, bucket + 1);
+  // The armed link stays parked in the wheel with a now-stale generation; the
+  // TestBackend teardown recycles it without touching this stack operation
   objectDelete(&object.root);
 }
 

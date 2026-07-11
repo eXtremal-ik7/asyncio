@@ -15,6 +15,7 @@ add_executable(lifetimetest lifetimetest.cpp)
 target_link_libraries(lifetimetest asyncio-0.5 ${PLATFORM_LIBRARIES})
 
 add_executable(timergridstress timergridstress.cpp)
+target_include_directories(timergridstress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../asyncio)
 target_link_libraries(timergridstress asyncio-0.5 ${PLATFORM_LIBRARIES})
 
 if (ASYNCIO_ENABLE_ZMTP)

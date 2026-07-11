@@ -212,10 +212,8 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
 #ifndef NDEBUG
   base->opsCount = 0;
 #endif
-  pageMapInit(&base->timerMap);
+  timerWheelInit(base, getMonotonicTicks());
   memset(&base->globalQueue, 0, sizeof(base->globalQueue));
-  base->timerMapLock = 0;
-  base->lastCheckPoint = getMonotonicSeconds();
   base->messageLoopThreadCounter = 0;
   base->graceFrozen = 0;
   base->graceSlotCount = 0;
