@@ -330,6 +330,7 @@ int coroutineCall(coroutineTy *coroutine)
     // Create main fiber if it not exists
     ensureCurrentCoroutine();
 
+    unsigned finished;
     do {
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
@@ -338,11 +339,14 @@ int coroutineCall(coroutineTy *coroutine)
       // when the coroutine returns; re-entering a finished context would run
       // off the end of fiberEntryPoint. The pending wakeup is consumed by the
       // finished path below (free + finishCb), same as a call on a finished
-      // coroutine is a no-op
-    } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1 &&
-             !__uint_atomic_load(&coroutine->finished, amoAcquire));
+      // coroutine is a no-op.
+      // The flag is captured before the decrement: the decrement that drains
+      // the counter hands ownership away, another thread may become the
+      // runner, finish the coroutine and free it - nothing may be read from
+      // the coroutine after our last decrement
+      finished = __uint_atomic_load(&coroutine->finished, amoAcquire);
+    } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1 && !finished);
 
-    int finished = (int)__uint_atomic_load(&coroutine->finished, amoAcquire);
     if (finished) {
       coroutineCbTy *finishCb = coroutine->finishCb;
       void *finishArg = coroutine->finishArg;

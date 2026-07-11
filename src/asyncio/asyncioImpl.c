@@ -256,7 +256,11 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTime)
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor)
 {
-  object->Head = taggedAsyncOpNull();
+  // Atomic store: a stale kernel event for the storage's previous incarnation
+  // may concurrently fetch_or readiness bits into Head; the RMW must not mix
+  // with a plain write. The stale bits themselves are harmless - they only
+  // wake the queues, and the woken side re-checks actual readiness
+  __uintptr_atomic_store(&object->Head.data, taggedAsyncOpNull().data, amoRelaxed);
   object->readQueue.head = object->readQueue.tail = 0;
   object->writeQueue.head = object->writeQueue.tail = 0;
   object->base = base;
@@ -372,9 +376,6 @@ void initAsyncOpRoot(asyncOpRoot *op,
                      int opCode,
                      uint64_t timeout)
 {
-  // Atomic store: a stale timeout-grid link may concurrently CAS the tag of
-  // this recycled storage; bumping the generation is what invalidates it
-  __uintptr_atomic_store(&op->tag, ((opGetGeneration(op)+1) << TAG_STATUS_SIZE) | aosPending, amoRelaxed);
   op->executeMethod = startMethod;
   op->cancelMethod = cancelMethod;
   // TODO: better type control
@@ -391,6 +392,15 @@ void initAsyncOpRoot(asyncOpRoot *op,
   op->timeout = timeout;
   op->running = (flags & afRunning) ? arRunning : arWaiting;
   objectIncrementReference(object, 1);
+  // Publish the tag last, with release ordering. Until this store lands the
+  // tag still holds the previous incarnation's terminal status, so any stale
+  // CAS (kernel timer event, timeout-grid link) loses by status and never
+  // reads the fields above mid-initialization. Whoever later wins a
+  // generation-CAS on the tag acquires this store and therefore observes
+  // every field written above — this is the only synchronization edge for
+  // consumers whose op pointer travelled through the kernel (kevent udata /
+  // epoll_data), a path the memory model knows nothing about.
+  __uintptr_atomic_store(&op->tag, ((opGetGeneration(op)+1) << TAG_STATUS_SIZE) | aosPending, amoRelease);
 }
 
 static void opArmTimer(asyncOpRoot *op)

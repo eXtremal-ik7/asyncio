@@ -40,7 +40,11 @@ struct ObjectCtx {
   // definition (references pin it), so peeking at it from the stalled
   // verdict path is safe - everything is quiescent by then
   aioObjectRoot *handle{nullptr};
-  char buffer[64];
+  // Every submission gets its own slot: concurrent reads into one shared
+  // buffer would be a data race between the sync fast path and a parked
+  // operation executed by the combiner - a race of the test, not the library
+  std::atomic<unsigned> bufferSlot{0};
+  char buffer[64 * sizeof(uint32_t)];
 };
 
 static std::atomic<unsigned> objectsCreated(0);
@@ -71,7 +75,8 @@ static void submitRead(aioObject *object, ObjectCtx *ctx, AsyncFlags flags, uint
 {
   ctx->expected.fetch_add(1, std::memory_order_relaxed);
   opsSubmitted.fetch_add(1, std::memory_order_relaxed);
-  aioReadMsg(object, ctx->buffer, sizeof(uint32_t), flags, usTimeout, lifetimeReadCb, ctx);
+  unsigned slot = ctx->bufferSlot.fetch_add(1, std::memory_order_relaxed) % 64;
+  aioReadMsg(object, ctx->buffer + slot * sizeof(uint32_t), sizeof(uint32_t), flags, usTimeout, lifetimeReadCb, ctx);
 }
 
 static void worker(unsigned id, unsigned iterations, unsigned opsPerObject, unsigned seed, std::deque<ObjectCtx> *arena)

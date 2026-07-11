@@ -1725,16 +1725,16 @@ TEST(core_realtime_timer, stale_event_does_not_match_after_generation_wrap)
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object);
-  uintptr_t oldGeneration = opGetGeneration(&op.root);
-  uintptr_t oldEventTag = oldGeneration & TAGGED_POINTER_DATA_MASK;
-  uintptr_t wrappedGeneration = oldGeneration + TAGGED_POINTER_ALIGNMENT;
+  // The timer stores the full generation at arm time (aioTimer::tag); a stale
+  // event re-delivered after the op storage was reused 64 times (the aliasing
+  // period of the former 6-bit udata tag) brings that full value back.
+  uintptr_t staleGeneration = opGetGeneration(&op.root);
+  uintptr_t wrappedGeneration = staleGeneration + TAGGED_POINTER_ALIGNMENT;
   op.root.tag = (wrappedGeneration << TAG_STATUS_SIZE) | aosPending;
 
-  uintptr_t decodedStaleGeneration = opEncodeTag(&op.root, oldEventTag);
-
-  EXPECT_NE(decodedStaleGeneration, wrappedGeneration)
+  EXPECT_NE(staleGeneration, wrappedGeneration)
     << "the realtime timer generation tag aliases after 64 operation reuses";
-  EXPECT_FALSE(opSetStatus(&op.root, decodedStaleGeneration, aosTimeout));
+  EXPECT_FALSE(opSetStatus(&op.root, staleGeneration, aosTimeout));
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);

@@ -226,6 +226,7 @@ int coroutineCall(coroutineTy *coroutine)
 
     ensureCurrentCoroutine();
 
+    unsigned finished;
     do {
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
@@ -233,11 +234,14 @@ int coroutineCall(coroutineTy *coroutine)
       // A wakeup that lands after the last yield leaves the counter above 1
       // when the coroutine returns; re-entering a finished fiber would run
       // off the end of fiberEntryPoint (which terminates the thread). The
-      // pending wakeup is consumed by the finished path below
-    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1 &&
-             !__uint_atomic_load(&coroutine->finished, amoAcquire));
+      // pending wakeup is consumed by the finished path below.
+      // The flag is captured before the decrement: the decrement that drains
+      // the counter hands ownership away, another thread may become the
+      // runner, finish the coroutine and free it - nothing may be read from
+      // the coroutine after our last decrement
+      finished = __uint_atomic_load(&coroutine->finished, amoAcquire);
+    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1 && !finished);
 
-    int finished = (int)__uint_atomic_load(&coroutine->finished, amoAcquire);
     if (finished) {
       coroutineCbTy *finishCb = coroutine->finishCb;
       void *finishArg = coroutine->finishArg;
