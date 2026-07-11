@@ -540,6 +540,23 @@ ssize_t aioReadMsg(aioObject *object,
                    aioReadMsgCb callback,
                    void *arg)
 {
+  // Datagram fast path runs the syscall without entering the combiner, so
+  // the sticky delete sweep cannot stop it - gate here: a call after
+  // objectDelete must be rejected without touching the socket, otherwise an
+  // incoming flood keeps this path succeeding and teardown never finishes
+  if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed)) {
+    if (callback == 0)
+      return -(ssize_t)aosCanceled;
+    struct Context context;
+    fillContext(&context, object->root.base->methodImpl.readMsg, readMsgFinish, buffer, size);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
+    op->bytesTransferred = 0;
+    memset(&op->host, 0, sizeof(op->host));
+    opForceStatus(&op->root, aosCanceled);
+    addToGlobalQueue(&op->root);
+    return -(ssize_t)aosPending;
+  }
+
   struct sockaddr_storage source;
   int truncated;
 #ifdef OS_WINDOWS
@@ -613,6 +630,19 @@ ssize_t aioWriteMsg(aioObject *object,
                     aioCb callback,
                     void *arg)
 {
+  // See aioReadMsg: reject a closing object before the syscall
+  if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed)) {
+    if (callback == 0)
+      return -(ssize_t)aosCanceled;
+    struct Context context;
+    fillContext(&context, object->root.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
+    op->bytesTransferred = 0;
+    opForceStatus(&op->root, aosCanceled);
+    addToGlobalQueue(&op->root);
+    return -(ssize_t)aosPending;
+  }
+
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage remoteAddress;
   socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
@@ -704,6 +734,10 @@ ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags f
 
 ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
+  // See aioReadMsg: reject a closing object before the syscall
+  if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed))
+    return -(ssize_t)aosCanceled;
+
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage source;
   int truncated;
@@ -764,6 +798,10 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
 
 ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
+  // See aioReadMsg: reject a closing object before the syscall
+  if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed))
+    return -(ssize_t)aosCanceled;
+
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage remoteAddress;
   socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);

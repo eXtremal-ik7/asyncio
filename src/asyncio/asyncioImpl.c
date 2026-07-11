@@ -327,11 +327,6 @@ void opForceStatus(asyncOpRoot *op, AsyncOpStatus status)
                          amoRelaxed);
 }
 
-uintptr_t opEncodeTag(asyncOpRoot *op, uintptr_t tag)
-{
-  return ((__uintptr_atomic_load(&op->tag, amoRelaxed) >> TAG_STATUS_SIZE) & ~((uintptr_t)TAGGED_POINTER_DATA_MASK)) | (tag & (uintptr_t)TAGGED_POINTER_DATA_MASK);
-}
-
 int asyncOpAlloc(asyncBase *base,
                  size_t size,
                  int isRealTime,
@@ -594,6 +589,21 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
 // queues.
 void reapObject(aioObjectRoot *object, uint32_t *needStart)
 {
+  // cancelIo sweep, positional: the CANCEL bit was OR-ed onto the chain entry
+  // that was the head at cancelIo() time, and the backend starts that entry's
+  // operation before calling here - so everything submitted before the cancel
+  // is already in the queues and gets swept, while entries pushed after it sit
+  // above the bit and survive. Cheap relaxed load keeps the hot path free of
+  // RMW; consuming the counter before the sweep (not after) means a cancelIo
+  // racing with the sweep sees 0, increments and pushes a fresh CANCEL pass -
+  // a coalesced request cannot be lost
+  if (__uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
+      __uint_atomic_exchange(&object->CancelIoFlag, 0) != 0) {
+    cancelInitializationOp(object, aosCanceled);
+    cancelOperationList(&object->readQueue, aosCanceled);
+    cancelOperationList(&object->writeQueue, aosCanceled);
+  }
+
   asyncOpRoot *ex = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
   if (ex) {
     AsyncOpStatus status = opGetStatus(ex);
@@ -927,17 +937,10 @@ void graceQuiesce(asyncBase *base)
 
 static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 {
-  // Cheap relaxed load keeps the hot path free of RMW; the exchange runs only
-  // when a cancel is actually pending. Consuming the counter before the sweep
-  // (not after) means a cancelIo racing with the sweep sees 0, increments and
-  // pushes a fresh CANCEL pass - a coalesced request cannot be lost
-  if (__uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
-      __uint_atomic_exchange(&object->CancelIoFlag, 0) != 0) {
-    cancelInitializationOp(object, aosCanceled);
-    cancelOperationList(&object->readQueue, aosCanceled);
-    cancelOperationList(&object->writeQueue, aosCanceled);
-  }
-
+  // The cancelIo sweep lives in reapObject(), driven by the position of the
+  // CANCEL bit in the captured chain - an eager sweep here would run before
+  // the captured submissions are started and let an operation submitted
+  // before the cancelIo() call escape it
   if (tag & COMBINER_TAG_DELETE) {
     cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
@@ -1008,28 +1011,31 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       currentHead = next;
     }
 
-    // Run dequeued tasks in submission order.
+    // Run dequeued tasks in submission order. The tail (a stub or a bare
+    // counter tag with no next field) is the oldest entry of the chain, so
+    // its tags run before the operations pushed on top of it - a CANCEL bit
+    // OR-ed onto it must not sweep submissions that arrived after the cancel.
     // A DELETE tag destroys the object: nothing may touch it afterwards,
     // including the head CAS of the next loop turn - return immediately.
     // Nothing gets abandoned by that: the tag is pushed on the refcount
     // hitting zero, every not-yet-finished operation holds a reference, so
     // an operation action can never legally sit behind the DELETE tag
-    while (reversed.data) {
-      asyncOpRoot *current;
-      uint32_t tag;
-      taggedAsyncOpDecode(reversed, &current, &tag);
-      reversed = current->next;
-      if (combinerTaskHandlerCommon(object, tag))
-        return;
-      combinerTaskHandler(object, current, tag);
-    }
-
     if (tail.data) {
       asyncOpRoot *current;
       uint32_t tag;
       taggedAsyncOpDecode(tail, &current, &tag);
       if (current == (asyncOpRoot*)stubOp.data)
         current = 0;
+      if (combinerTaskHandlerCommon(object, tag))
+        return;
+      combinerTaskHandler(object, current, tag);
+    }
+
+    while (reversed.data) {
+      asyncOpRoot *current;
+      uint32_t tag;
+      taggedAsyncOpDecode(reversed, &current, &tag);
+      reversed = current->next;
       if (combinerTaskHandlerCommon(object, tag))
         return;
       combinerTaskHandler(object, current, tag);

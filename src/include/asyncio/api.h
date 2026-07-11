@@ -321,7 +321,6 @@ uintptr_t opGetGeneration(asyncOpRoot *op);
 AsyncOpStatus opGetStatus(asyncOpRoot *op);
 int opSetStatus(asyncOpRoot *op, uintptr_t tag, AsyncOpStatus status);
 void opForceStatus(asyncOpRoot *op, AsyncOpStatus status);
-uintptr_t opEncodeTag(asyncOpRoot *op, uintptr_t tag);
 
 void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList);
 // Start an op-node captured by the combiner (submission): enqueue/arm or drive
@@ -425,8 +424,15 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
 
   if (!head.data) {
     // This thread entered a combiner
-    if (queue->head || __uintptr_atomic_load(&object->initializationOp, amoRelaxed)) {
-      // Object has operations in queue or initialization in flight
+    if (queue->head ||
+        __uintptr_atomic_load(&object->initializationOp, amoRelaxed) ||
+        __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
+      // Object has operations in queue, initialization in flight, or is
+      // closing. A closing object must not reach syncImpl: route the
+      // operation through the combiner, where the sticky delete sweep at
+      // the ownership-release point cancels it - the sync path after
+      // objectDelete would otherwise keep succeeding forever and an
+      // incoming flood could block teardown
       // Put operation to queue end and try exit combiner
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
@@ -557,7 +563,11 @@ static inline asyncOpRoot *runIoOperation(aioObjectRoot *object,
     op = syncImpl(object, flags | afCoroutine, usTimeout, 0, 0, contextPtr);
     if (!op) {
       if (!(++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
-        op = createAsyncOp(object, afCoroutine, usTimeout, 0, 0, opCode, contextPtr);
+        // The fairness fallback re-queues the completed sync result; the
+        // operation must keep the caller's flags (afRealtime, afWaitAll, ...)
+        // and the inline window restarts, same as in runAioOperation
+        currentFinishedSync = 0;
+        op = createAsyncOp(object, flags | afCoroutine, usTimeout, 0, 0, opCode, contextPtr);
         initOp(op, contextPtr);
         opForceStatus(op, aosSuccess);
         addToGlobalQueue(op);

@@ -174,10 +174,16 @@ static void iocpUserEventTimerCb(aioTimer *timer)
 static void iocpIoFinishedTimerCb(aioTimer *timer)
 {
   asyncOpRoot *op = timer->op;
-  uintptr_t timerTag = opGetGeneration(op);
+  // The generation is read from the operation itself: unlike the reactor
+  // backends nothing generation-like travels through the kernel here, and the
+  // stop/delete rendezvous (WaitForThreadpoolWaitCallbacks) guarantees the
+  // operation cannot be recycled while this callback runs - the ARMED->CALLBACK
+  // CAS is the stale-fire gate, the status CAS below settles the race against
+  // a concurrent completion
+  uintptr_t generation = opGetGeneration(op);
 
   __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
-  if (opSetStatus(op, opEncodeTag(op, timerTag), aosTimeout))
+  if (opSetStatus(op, generation, aosTimeout))
     combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
 }
 

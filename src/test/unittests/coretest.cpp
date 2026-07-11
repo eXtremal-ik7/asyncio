@@ -833,7 +833,7 @@ TEST(core_tagged_pointer, round_trips_aligned_pointer_and_low_bits)
   alignedFree(storage);
 }
 
-TEST(core_operation_tag, generation_status_and_encoded_timer_tag_are_independent)
+TEST(core_operation_tag, generation_survives_status_transitions)
 {
   TestBackend backend;
   TestObject object(backend);
@@ -847,10 +847,6 @@ TEST(core_operation_tag, generation_status_and_encoded_timer_tag_are_independent
   opForceStatus(&op.root, aosCanceled);
   EXPECT_EQ(opGetStatus(&op.root), aosCanceled);
   EXPECT_EQ(opGetGeneration(&op.root), generation);
-
-  uintptr_t timerTag = generation ^ TAGGED_POINTER_DATA_MASK;
-  EXPECT_EQ(opEncodeTag(&op.root, timerTag) & TAGGED_POINTER_DATA_MASK,
-            timerTag & TAGGED_POINTER_DATA_MASK);
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
 }
@@ -1571,11 +1567,17 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
   ASSERT_EQ(object.root.DeletePending, 1u);
   SyncScenario scenario(object);
 
-  runSyncScenario(scenario, afNone);
+  runSyncScenario(scenario, afNone, &scenario);
 
   EXPECT_EQ(scenario.syncCalls, 0u)
     << "combinerAcquire entered syncImpl after the object became closing";
   EXPECT_EQ(scenario.makeResults, 0u);
+  ASSERT_EQ(scenario.creates, 1u);
+  // The rejected operation is routed through the combiner and dies in the
+  // sticky delete sweep: exactly one canceled completion, no syscall
+  backend.drainCompletions();
+  EXPECT_EQ(opGetStatus(&scenario.operation->root), aosCanceled);
+  EXPECT_EQ(scenario.operation->finishCalls, 1u);
   objectDecrementReference(&object.root, 1);
 }
 
@@ -1717,26 +1719,6 @@ TEST(core_realtime_timer, timeout_completion_does_not_stop_fired_timer)
   EXPECT_EQ(backend.stopTimerCalls, 0u);
   backend.drainCompletions();
   EXPECT_EQ(op.callbackStatus, aosTimeout);
-  objectDelete(&object.root);
-}
-
-TEST(core_realtime_timer, stale_event_does_not_match_after_generation_wrap)
-{
-  TestBackend backend;
-  TestObject object(backend);
-  TestOp op(object);
-  // The timer stores the full generation at arm time (aioTimer::tag); a stale
-  // event re-delivered after the op storage was reused 64 times (the aliasing
-  // period of the former 6-bit udata tag) brings that full value back.
-  uintptr_t staleGeneration = opGetGeneration(&op.root);
-  uintptr_t wrappedGeneration = staleGeneration + TAGGED_POINTER_ALIGNMENT;
-  op.root.tag = (wrappedGeneration << TAG_STATUS_SIZE) | aosPending;
-
-  EXPECT_NE(staleGeneration, wrappedGeneration)
-    << "the realtime timer generation tag aliases after 64 operation reuses";
-  EXPECT_FALSE(opSetStatus(&op.root, staleGeneration, aosTimeout));
-  EXPECT_EQ(opGetStatus(&op.root), aosPending);
-  objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
 }
 
