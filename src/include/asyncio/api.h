@@ -272,9 +272,6 @@ struct aioObjectRoot {
   // still be referenced by kernel event batches already copied into loop
   // thread buffers. Nothing else may touch these fields
   aioObjectRoot *GraceNext;
-  // Retirement sequence token: it publishes no object data, batch completion
-  // is synchronized through release/acquire accesses to graceSeen
-  uintptr_t GraceEpoch;
 
   IoObjectTy type;
   aioObjectDestructor *destructor;

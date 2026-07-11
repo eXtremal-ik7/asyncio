@@ -1,4 +1,5 @@
 #include "asyncioImpl.h"
+#include "reactorTimer.h"
 #include "atomic.h"
 #include "asyncio/ringBuffer.h"
 
@@ -22,28 +23,6 @@ typedef struct kqueueBase {
   int kqueueFd;
   intptr_t timerIdCounter;
 } kqueueBase;
-
-// Discriminator bits carried in the udata pointer tag. The event decode path
-// runs concurrently with the owning thread initializing the pointed-to object
-// (the kernel round-trip is not an ordering edge), so the branch decision must
-// not read the object's memory: fd objects carry no bits, timers are marked
-// explicitly, user-event timers additionally so
-enum {
-  udataTimer = 1,
-  udataUserEvent = 2
-};
-
-typedef struct aioTimer {
-  aioObjectRoot root;
-  // Full generation of the armed operation; 0 = disarmed. Written with release
-  // at arm time, read with acquire at event delivery: the kernel round-trip
-  // carries no memory ordering, this field is the synchronization edge. A stale
-  // event delivered after stop/rearm reads either 0 or a generation that loses
-  // the status CAS in opCancel().
-  uintptr_t tag;
-  intptr_t fd;
-  asyncOpRoot *op;
-} aioTimer;
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op);
@@ -221,15 +200,9 @@ void kqueueNextFinishedOperation(asyncBase *base)
   while (1) {
     do {
       if (!executeGlobalQueue(base)) {
-        // Found quit marker. Stamp the slot out before the counter drops:
-        // once it does, a future loop thread may adopt this id, and a stale
-        // stamp would shield its batches from the grace period. The last
-        // thread out drains the limbo list
-        if (messageLoopThreadId < base->graceSlotLimit)
-          __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
-                                 UINTPTR_MAX,
-                                 amoRelease);
-        graceReclaim(base);
+        // Found quit marker: stamp the grace slot out and drain, strictly
+        // before the loop thread counter drops
+        graceThreadExit(base);
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 0u-1) - 1;
         if (threadsRunning)
           kqueueEnqueue(base, 0);
@@ -255,28 +228,29 @@ void kqueueNextFinishedOperation(asyncBase *base)
       if (object == 0) {
         // EVFILT_USER with EV_CLEAR stays registered, no re-add needed
       } else if (timerId & udataTimer) {
-        // The acquire load pairs with the release store in kqueueStartTimer and
-        // is the only ordering edge with the arming thread; timer->op and the
-        // fields behind it may only be read after it. 0 = a stale doorbell
-        // delivered after stop, nothing may be touched. The user-event bit
-        // rides in the udata tag: op->opCode belongs to the operation and
-        // cannot be read before its generation is validated by the status CAS
         aioTimer *timer = (aioTimer*)object;
-        uintptr_t armedTag = __uintptr_atomic_load(&timer->tag, amoAcquire);
-        if (armedTag == 0) {
-          // stale doorbell, timer disarmed
-        } else if (timerId & udataUserEvent) {
-          aioUserEvent *event = (aioUserEvent*)timer->op;
-          if (eventTryActivate(event)) {
-            if (event->counter > 0 && --event->counter == 0)
-              kqueueStopTimer(&event->root);
+        uintptr_t armedGeneration = 0;
+        switch (reactorTimerDecodeEvent(timer, timerId, &armedGeneration)) {
+          case rteIgnore:
+            // stale doorbell, timer disarmed
+            break;
 
-            eventDeactivate(event);
-            event->root.finishMethod(&event->root);
-            eventDecrementReference(event, 1);
+          case rteUserEvent: {
+            aioUserEvent *event = (aioUserEvent*)timer->op;
+            if (eventTryActivate(event)) {
+              if (event->counter > 0 && --event->counter == 0)
+                kqueueStopTimer(&event->root);
+
+              eventDeactivate(event);
+              event->root.finishMethod(&event->root);
+              eventDecrementReference(event, 1);
+            }
+            break;
           }
-        } else {
-          opCancel(timer->op, armedTag, aosTimeout);
+
+          case rteExpireOperation:
+            opCancel(timer->op, armedGeneration, aosTimeout);
+            break;
         }
       } else {
         uint32_t bits = (events[n].flags & EV_EOF) ? COMBINER_TAG_ERROR : 0;
@@ -382,14 +356,14 @@ void kqueueStartTimer(asyncOpRoot *op)
   struct kevent event;
   int periodic = op->opCode == actUserEvent;
   aioTimer *timer = (aioTimer*)op->timerId;
-  __uintptr_atomic_store(&timer->tag, opGetGeneration(op), amoRelease);
+  void *udata = reactorTimerArm(timer, op);
   EV_SET(&event,
          timer->fd,
          EVFILT_TIMER,
          EV_ADD | EV_ENABLE | (periodic ? 0 : EV_ONESHOT),
          NOTE_USECONDS,
          op->timeout,
-         __tagged_pointer_make(timer, udataTimer | (periodic ? udataUserEvent : 0)));
+         udata);
   if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1) {
     // fprintf(stderr, "kqueueStartTimer: %s\n", strerror(errno));
   }
@@ -400,7 +374,7 @@ void kqueueStopTimer(asyncOpRoot *op)
 {
   struct kevent event;
   aioTimer *timer = (aioTimer*)op->timerId;
-  __uintptr_atomic_store(&timer->tag, 0, amoRelaxed);
+  reactorTimerDisarm(timer);
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
   if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1) {
     // fprintf(stderr, "kqueueStopTimer: %s\n", strerror(errno));

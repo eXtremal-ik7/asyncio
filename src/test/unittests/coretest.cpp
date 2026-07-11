@@ -1,5 +1,10 @@
 #include "coretest.h"
 
+#include "reactorTimer.h"
+
+#include "asyncio/asyncio.h"
+#include "asyncio/socket.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -428,6 +433,53 @@ TEST(core_cancel, submission_after_cancel_boundary_survives)
   EXPECT_EQ(opGetStatus(&afterBoundary.root), aosPending);
   EXPECT_EQ(afterBoundary.executeCalls, 1u);
   cancelAndDrain(backend, object);
+  deleteOwner(backend, object);
+}
+
+// TDD regression: the object-global CancelIoFlag is consumed by
+// the reapObject sweep at the EARLIEST captured-chain position carrying a
+// CANCEL bit. When an older positional CANCEL (a grid timeout) precedes the
+// cancelIo() bit, the flag-driven sweep runs before the operations submitted
+// between the two positions have started, and the cancelIo() position itself
+// finds the flag already zero - operations submitted BEFORE cancelIo()
+// survive it, breaking the documented "everything submitted before the
+// cancel gets swept" invariant. The first/second expectations are
+// intentionally red until the sweep honors the cancelIo() position.
+TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submitted_before_cancel_io)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp active(object), timedOut(object), first(object), second(object);
+  active.setResults({aosPending});
+  timedOut.setResults({aosPending});
+  first.setResults({aosPending});
+  second.setResults({aosPending});
+  active.executeHook = [&](TestOp &op) {
+    if (op.executeCalls != 1)
+      return;
+    // A grid timeout fires while the combiner is busy: its CANCEL bit lands
+    // on the chain position of the moment...
+    combinerPushOperation(&timedOut.root);
+    opCancel(&timedOut.root, opGetGeneration(&timedOut.root), aosTimeout);
+    // ...then the user submits two more operations and only afterwards
+    // cancels everything submitted so far
+    combinerPushOperation(&first.root);
+    combinerPushOperation(&second.root);
+    cancelIo(&object.root);
+  };
+
+  combinerPushOperation(&active.root);
+  backend.drainCompletions();
+
+  EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
+  EXPECT_EQ(opGetStatus(&timedOut.root), aosTimeout);
+  EXPECT_EQ(opGetStatus(&first.root), aosCanceled)
+    << "the early grid-timeout position consumed the flag and exempted a pre-cancel submission";
+  EXPECT_EQ(opGetStatus(&second.root), aosCanceled)
+    << "the cancelIo position found the flag already consumed by the earlier CANCEL position";
+
+  if (opGetStatus(&first.root) == aosPending || opGetStatus(&second.root) == aosPending)
+    cancelAndDrain(backend, object);
   deleteOwner(backend, object);
 }
 
@@ -1062,7 +1114,7 @@ TEST(core_buffer, copy_handles_complete_and_partial_source_ranges)
   EXPECT_EQ(destination[1], 6u);
 }
 
-TEST(core_grace_period, active_thread_holds_retired_objects_until_quiescence)
+TEST(core_grace_period, active_thread_holds_retired_batch_until_quiescence)
 {
   TestBackend backend;
   TestObject first(backend), second(backend);
@@ -1071,18 +1123,63 @@ TEST(core_grace_period, active_thread_holds_retired_objects_until_quiescence)
 
   graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
   graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
-  EXPECT_EQ(first.root.GraceEpoch, 1u);
-  EXPECT_EQ(second.root.GraceEpoch, 2u);
 
-  backend.base.graceSeen[0].seen = 1;
+  // First pass captures the batch against the unmoved counter: nothing frees
   graceReclaim(&backend.base);
-  EXPECT_EQ(first.memoryReleases, 1u);
+  EXPECT_EQ(first.memoryReleases, 0u);
   EXPECT_EQ(second.memoryReleases, 0u);
+  EXPECT_EQ(backend.base.graceLimbo, nullptr);
+  EXPECT_EQ(backend.base.gracePending, &second.root);
 
+  // The quiescent tick ripens the whole batch at once
   messageLoopThreadId = 0;
   graceQuiesce(&backend.base);
+  EXPECT_EQ(first.memoryReleases, 1u);
   EXPECT_EQ(second.memoryReleases, 1u);
-  EXPECT_EQ(backend.base.graceLimbo, nullptr);
+  EXPECT_EQ(backend.base.gracePending, nullptr);
+}
+
+TEST(core_grace_period, objects_retired_after_capture_wait_for_the_next_batch)
+{
+  TestBackend backend;
+  TestObject first(backend), second(backend);
+  backend.base.graceSlotCount = 1;
+  backend.base.graceSeen[0].seen = 0;
+  messageLoopThreadId = 0;
+
+  graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
+  graceReclaim(&backend.base);            // captures batch {first}
+  graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
+
+  // The tick ripens the captured batch only; second was pushed after the
+  // capture and needs a full grace period of its own
+  graceQuiesce(&backend.base);
+  EXPECT_EQ(first.memoryReleases, 1u);
+  EXPECT_EQ(second.memoryReleases, 0u);
+  EXPECT_EQ(backend.base.gracePending, &second.root);
+
+  graceQuiesce(&backend.base);
+  EXPECT_EQ(second.memoryReleases, 1u);
+  EXPECT_EQ(backend.base.gracePending, nullptr);
+}
+
+TEST(core_grace_period, exited_slot_does_not_gate_the_pending_batch)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  backend.base.graceSlotCount = 2;
+  backend.base.graceSeen[0].seen = 0;
+  backend.base.graceSeen[1].seen = 5;
+
+  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
+  graceReclaim(&backend.base);            // captured against {0, 5}
+  EXPECT_EQ(object.memoryReleases, 0u);
+
+  // Slot 1 exits (quit path stamp), slot 0 ticks: the batch ripens
+  backend.base.graceSeen[1].seen = UINTPTR_MAX;
+  messageLoopThreadId = 0;
+  graceQuiesce(&backend.base);
+  EXPECT_EQ(object.memoryReleases, 1u);
 }
 
 TEST(core_grace_period, frozen_reclamation_keeps_limbo_intact)
@@ -1102,16 +1199,68 @@ TEST(core_grace_period, frozen_reclamation_keeps_limbo_intact)
 TEST(core_grace_period, slot_claim_tracks_high_water_and_collision_freezes)
 {
   TestBackend backend;
-  backend.base.graceEpoch = 9;
   messageLoopThreadId = 3;
 
   graceThreadEnter(&backend.base);
-  EXPECT_EQ(backend.base.graceSeen[3].seen, 9u);
+  EXPECT_EQ(backend.base.graceSeen[3].seen, 0u);   // counters start at zero
   EXPECT_EQ(backend.base.graceSlotCount, 4u);
   EXPECT_EQ(backend.base.graceFrozen, 0u);
 
   graceThreadEnter(&backend.base);
   EXPECT_EQ(backend.base.graceFrozen, 1u);
+}
+
+// TDD regression: graceQuiesce gates only on the slot limit,
+// not on whether THIS thread's claim in graceThreadEnter succeeded. A loop
+// thread that adopted an id whose slot is still owned by a live thread
+// (elastic pool: an exiting thread decremented the counter while an older
+// thread still runs) freezes reclamation but keeps ticking the owner's
+// single-writer counter every loop turn - and stamps UINTPTR_MAX into it on
+// exit - forging the owner's quiescence for any scanner still holding a
+// captured batch: the exact use-after-free the freeze exists to prevent.
+// Intentionally red until the tick (and the backend exit stamp) require a
+// successful claim.
+TEST(core_grace_period, failed_slot_claim_must_not_tick_the_owners_counter)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  messageLoopThreadId = 3;
+  graceThreadEnter(&backend.base);              // the owner claims slot 3
+  ASSERT_EQ(backend.base.graceSeen[3].seen, 0u);
+  ASSERT_EQ(backend.base.graceFrozen, 0u);
+
+  graceThreadEnter(&backend.base);              // adopted id, owner still live
+  ASSERT_EQ(backend.base.graceFrozen, 1u);
+
+  // Something must be parked, or the tick fast path returns before writing
+  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
+  graceQuiesce(&backend.base);                  // the loser's loop tick
+
+  EXPECT_EQ(backend.base.graceSeen[3].seen, 0u)
+    << "a thread that failed its slot claim forged the owner's quiescence counter";
+  EXPECT_EQ(object.memoryReleases, 0u);
+  backend.base.graceLimbo = nullptr;            // parked object lives on the test stack
+}
+
+// TDD regression, exit-path half of the failed-claim defect: the stamp is gated only by the
+// slot limit, not by claim ownership - a thread whose claim failed stamps
+// UINTPTR_MAX into the live owner's slot on its way out, marking the owner
+// exited: from then on the owner's kernel batches stop gating reclamation at
+// all and every captured batch ripens under its feet. Intentionally red until
+// the stamp requires a successful claim.
+TEST(core_grace_period, failed_slot_claim_must_not_stamp_the_owners_slot_on_exit)
+{
+  TestBackend backend;
+  messageLoopThreadId = 3;
+  graceThreadEnter(&backend.base);              // the owner claims slot 3
+  ASSERT_EQ(backend.base.graceSeen[3].seen, 0u);
+  graceThreadEnter(&backend.base);              // adopted id, owner still live
+  ASSERT_EQ(backend.base.graceFrozen, 1u);
+
+  graceThreadExit(&backend.base);               // the loser leaves the loop
+
+  EXPECT_EQ(backend.base.graceSeen[3].seen, 0u)
+    << "an exiting thread that never owned the slot stamped the live owner out";
 }
 
 TEST(core_grace_period, out_of_range_thread_freezes_without_touching_slots)
@@ -1582,6 +1731,39 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
 }
 
 
+// TDD regression: once the last reference is gone the DELETE
+// tag has already run the destructor and parked the object for the grace
+// period; nothing may touch it again. Yet the DeletePending gates
+// (combinerAcquire and the datagram fast paths in aioReadMsg/aioWriteMsg)
+// route a late submission through newAsyncOp -> objectIncrementReference,
+// resurrecting the dead object's reference count from zero (debug builds
+// abort on the "Removed object access" assert instead) and parking the
+// operation forever on the poisoned Head - the release then re-runs the
+// repurposed destructor: double release. Intentionally red until the gates
+// reject a submission to a dead object without touching it.
+TEST(core_delete_lifecycle, late_submission_after_final_release_does_not_touch_the_dead_object)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  objectDelete(&object.root);
+  ASSERT_EQ(object.root.refs, 0u);
+  ASSERT_EQ(object.destructorCallbacks, 1u);
+  ASSERT_EQ(object.resourceDestructors, 1u);
+  SyncScenario scenario(object);
+
+  runSyncScenario(scenario, afNone, &scenario);
+  backend.drainCompletions();
+
+  EXPECT_EQ(object.root.refs, 0u)
+    << "a late submission resurrected the dead object's reference count";
+  EXPECT_EQ(object.destructorCallbacks, 1u);
+  EXPECT_EQ(object.resourceDestructors, 1u);
+  if (scenario.operation) {
+    EXPECT_NE(opGetStatus(&scenario.operation->root), aosPending)
+      << "the late submission was parked forever on the dead object's combiner";
+  }
+}
+
 TEST(core_timeout_map, rounds_deadlines_up_and_extracts_each_bucket_once)
 {
   TestBackend backend;
@@ -1696,8 +1878,13 @@ TEST(core_timeout_grid, stale_generation_link_does_not_cancel_reused_operation)
   uintptr_t staleGeneration = opGetGeneration(&op.root);
   op.root.tag = ((staleGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
   op.root.endTime = 7000000;
-  asyncOpListLink link{&op.root, staleGeneration, nullptr};
-  pageMapAdd(&backend.base.timerMap, &link);
+  // Heap link: the sweep recycles it into the global link pool, so a stack
+  // instance would leave a dangling pointer for a later addToTimeoutQueue
+  auto *link = static_cast<asyncOpListLink*>(malloc(sizeof(asyncOpListLink)));
+  link->op = &op.root;
+  link->tag = staleGeneration;
+  link->next = nullptr;
+  pageMapAdd(&backend.base.timerMap, link);
 
   processTimeoutQueue(&backend.base, 8);
 
@@ -1761,6 +1948,217 @@ TEST(core_realtime_timer, timeout_completion_does_not_stop_fired_timer)
   backend.drainCompletions();
   EXPECT_EQ(op.callbackStatus, aosTimeout);
   objectDelete(&object.root);
+}
+
+// TDD regression: the delivery side reads the generation from
+// the LIVE timer->tag instead of an identity captured by the arming the event
+// belongs to. A stale doorbell - harvested into another loop thread's batch,
+// then processed after the operation completed, its storage got recycled and
+// re-armed - adopts the NEW incarnation's generation and wins the status CAS:
+// the fresh operation is expired the moment it starts. The base commit
+// rejected this by the truncated generation bits carried in udata
+// (opEncodeTag). Intentionally red until the delivered event again carries
+// the identity of its own arming.
+TEST(core_reactor_timer, stale_doorbell_must_not_expire_a_rearmed_operation)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object, OPCODE_READ, afRealtime, 10);
+  aioTimer timer{};
+  timer.root.base = &backend.base;
+  timer.root.type = ioObjectTimer;
+  timer.op = &op.root;
+  timer.fd = 1;
+  op.root.timerId = &timer;
+
+  // The first incarnation arms its realtime timer; the kernel doorbell keeps
+  // the udata of this arming while it waits in a harvested batch
+  void *udata = reactorTimerArm(&timer, &op.root);
+  void *decodedTimer = nullptr;
+  uintptr_t staleBits = 0;
+  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
+  ASSERT_EQ(decodedTimer, &timer);
+
+  // The operation completes; its storage is recycled and re-armed for a new
+  // submission with a fresh deadline before the doorbell gets processed
+  uintptr_t firstGeneration = opGetGeneration(&op.root);
+  op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
+  reactorTimerArm(&timer, &op.root);
+
+  // Another loop thread finally processes the stale doorbell
+  uintptr_t armedGeneration = 0;
+  if (reactorTimerDecodeEvent(&timer, staleBits, &armedGeneration) == rteExpireOperation)
+    opCancel(timer.op, armedGeneration, aosTimeout);
+
+  EXPECT_EQ(opGetStatus(&op.root), aosPending)
+    << "a stale doorbell adopted the new arming's generation and expired the re-armed operation";
+
+  reactorTimerDisarm(&timer);
+  objectDecrementReference(&object.root, 1);
+  deleteOwner(backend, object);
+}
+
+// TDD regression: for user events the delivery gate only
+// distinguishes armed (tag != 0) from stopped - not WHICH arming the doorbell
+// belongs to. A doorbell of a previous arming, delivered after
+// userEventStopTimer + userEventStartTimer of the same event (same operation
+// generation!), passes the gate and activates the event early, consuming one
+// of its counted ticks. Intentionally red until the arming identity
+// distinguishes restarts (the old "compare timer and event tag" TODO).
+TEST(core_reactor_timer, stale_doorbell_must_not_activate_a_restarted_user_event)
+{
+  aioUserEvent event{};
+  event.root.opCode = actUserEvent;
+  event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;  // generation 1, stable across restarts
+  event.tag = 1;
+  event.counter = 5;
+  aioTimer timer{};
+  timer.op = &event.root;
+  timer.fd = 2;
+  event.root.timerId = &timer;
+
+  void *udata = reactorTimerArm(&timer, &event.root);   // first arming
+  void *decodedTimer = nullptr;
+  uintptr_t staleBits = 0;
+  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
+
+  reactorTimerDisarm(&timer);                           // userEventStopTimer
+  reactorTimerArm(&timer, &event.root);                 // userEventStartTimer again
+
+  uintptr_t armedGeneration = 0;
+  EXPECT_EQ(reactorTimerDecodeEvent(&timer, staleBits, &armedGeneration), rteIgnore)
+    << "a doorbell of the previous arming would activate the restarted user event and consume its tick";
+}
+
+// TDD regression: the "tag == 0 means disarmed" sentinel collides
+// with a legally wrapped generation. On a 32-bit target the generation field
+// is 24 bits wide: after 2^24 recycles of one operation slot initAsyncOpRoot
+// wraps it to zero and the arming publishes tag 0 - every delivery then reads
+// "stale doorbell" and the timeout is dropped forever (the operation hangs).
+// The protocol requirement on the seam: an arming must never be
+// indistinguishable from the disarmed state, whatever generation it carries.
+// Intentionally red until the armed encoding is disjoint from the sentinel.
+TEST(core_reactor_timer, arming_a_wrapped_generation_must_not_publish_the_disarmed_sentinel)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object, OPCODE_READ, afRealtime, 10);
+  aioTimer timer{};
+  timer.op = &op.root;
+  timer.fd = 3;
+  op.root.timerId = &timer;
+
+  // The slot's generation legally wraps around to zero (2^24 recycles on a
+  // 32-bit target)
+  op.root.tag = (uintptr_t{0} << TAG_STATUS_SIZE) | aosPending;
+  void *udata = reactorTimerArm(&timer, &op.root);
+  void *decodedTimer = nullptr;
+  uintptr_t udataBits = 0;
+  __tagged_pointer_decode(udata, &decodedTimer, &udataBits);
+
+  uintptr_t armedGeneration = 0;
+  EXPECT_NE(reactorTimerDecodeEvent(&timer, udataBits, &armedGeneration), rteIgnore)
+    << "an armed timer with generation 0 is indistinguishable from a disarmed one: its timeout is lost";
+
+  objectDecrementReference(&object.root, 1);
+  deleteOwner(backend, object);
+}
+
+struct DatagramGateContext {
+  unsigned readCallbacks = 0;
+  unsigned writeCallbacks = 0;
+  unsigned destructorCallbacks = 0;
+};
+
+void datagramGateReadCb(AsyncOpStatus, aioObject*, HostAddress, size_t, void *arg)
+{
+  static_cast<DatagramGateContext*>(arg)->readCallbacks++;
+}
+
+void datagramGateWriteCb(AsyncOpStatus, aioObject*, size_t, void *arg)
+{
+  static_cast<DatagramGateContext*>(arg)->writeCallbacks++;
+}
+
+void datagramGateDestructorCb(aioObjectRoot*, void *arg)
+{
+  static_cast<DatagramGateContext*>(arg)->destructorCallbacks++;
+}
+
+// Build the dead-object precondition on a real backend: a datagram object whose
+// last reference is already gone. With no operations in flight deleteAioObject
+// drops the final reference right here - the DELETE tag runs in this thread,
+// the resource destructor fires and the object parks in the grace limbo, where
+// its memory stays valid (type-stable pools) but nothing may touch it again.
+aioObject *makeDeadDatagramObject(asyncBase *base, DatagramGateContext &context)
+{
+  socketTy udpSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  aioObject *object = newSocketIo(base, udpSocket);
+  if (!object)
+    return nullptr;
+  objectSetDestructorCb(&object->root, datagramGateDestructorCb, &context);
+  deleteAioObject(object);
+  return object;
+}
+
+// TDD regression: the datagram DeletePending gate in aioReadMsg,
+// with a callback supplied, routes the rejection through newAsyncOp ->
+// objectIncrementReference - resurrecting a dead object's reference count
+// from zero and queueing a completion whose release would drop the count back
+// to zero and run the repurposed destructor a second time. Intentionally red
+// until the gate rejects a dead object without touching it.
+// The private base is deliberately abandoned without draining: in the red
+// state delivering the parked canceled completion would run the second DELETE
+// and push the limbo-parked object into the backend's global recycling pool,
+// poisoning every later test in this process.
+TEST(core_datagram_gate, read_after_final_release_must_be_rejected_without_touching_the_dead_object)
+{
+  asyncBase *base = createAsyncBase(amOSDefault, 1);
+  ASSERT_NE(base, nullptr);
+  DatagramGateContext context;
+  aioObject *object = makeDeadDatagramObject(base, context);
+  ASSERT_NE(object, nullptr);
+  ASSERT_EQ(context.destructorCallbacks, 1u);
+  ASSERT_EQ(object->root.refs, 0u);
+  ASSERT_EQ(object->root.DeletePending, 1u);
+
+  char buffer[16];
+  ssize_t result = aioReadMsg(object, buffer, sizeof(buffer), afNone, 0,
+                              datagramGateReadCb, &context);
+
+  EXPECT_EQ(result, -(ssize_t)aosCanceled)
+    << "a read submitted after the final release was not rejected outright";
+  EXPECT_EQ(object->root.refs, 0u)
+    << "the aioReadMsg DeletePending gate resurrected the dead object's reference count";
+  EXPECT_EQ(context.destructorCallbacks, 1u);
+  EXPECT_EQ(context.readCallbacks, 0u);
+}
+
+// TDD regression: same for the aioWriteMsg gate. See the read
+// test above for why the base is abandoned without draining.
+TEST(core_datagram_gate, write_after_final_release_must_be_rejected_without_touching_the_dead_object)
+{
+  asyncBase *base = createAsyncBase(amOSDefault, 1);
+  ASSERT_NE(base, nullptr);
+  DatagramGateContext context;
+  aioObject *object = makeDeadDatagramObject(base, context);
+  ASSERT_NE(object, nullptr);
+  ASSERT_EQ(context.destructorCallbacks, 1u);
+  ASSERT_EQ(object->root.refs, 0u);
+
+  HostAddress address;
+  ASSERT_EQ(hostAddressFromAscii("127.0.0.1", &address), 1);
+  address.port = 1;
+  char buffer[16] = {};
+  ssize_t result = aioWriteMsg(object, &address, buffer, sizeof(buffer), afNone, 0,
+                               datagramGateWriteCb, &context);
+
+  EXPECT_EQ(result, -(ssize_t)aosCanceled)
+    << "a write submitted after the final release was not rejected outright";
+  EXPECT_EQ(object->root.refs, 0u)
+    << "the aioWriteMsg DeletePending gate resurrected the dead object's reference count";
+  EXPECT_EQ(context.destructorCallbacks, 1u);
+  EXPECT_EQ(context.writeCallbacks, 0u);
 }
 
 } // namespace

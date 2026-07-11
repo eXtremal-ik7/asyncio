@@ -214,12 +214,14 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   base->timerMapLock = 0;
   base->lastCheckPoint = getMonotonicSeconds();
   base->messageLoopThreadCounter = 0;
-  base->graceEpoch = 0;
   base->graceFrozen = 0;
   base->graceSlotCount = 0;
   base->graceSlotLimit = loopThreads ? loopThreads : 1;
-  base->graceLimboLock = 0;
+  base->graceScanning = 0;
   base->graceLimbo = 0;
+  base->gracePending = 0;
+  base->gracePendingSlots = 0;
+  base->gracePendingSeen = (uintptr_t*)malloc(sizeof(uintptr_t) * base->graceSlotLimit);
   base->graceSeen = (GraceSlot*)alignedMalloc(sizeof(GraceSlot) * base->graceSlotLimit, GRACE_SLOT_ALIGNMENT);
   for (unsigned i = 0; i < base->graceSlotLimit; i++)
     base->graceSeen[i].seen = UINTPTR_MAX;   // empty slots never gate the limbo

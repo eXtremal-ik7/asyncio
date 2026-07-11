@@ -825,88 +825,147 @@ void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *me
   // be the original use-after-free while unslotted loop threads still hold
   // harvested batches
   object->destructor = memoryRelease;
-  __spinlock_acquire(&base->graceLimboLock);
-  // The write is serialized by the lock, but loop threads read the epoch
-  // concurrently; the full-barrier RMW also keeps the epoch advance ordered
-  // after the object's logical detachment from the backend
-  object->GraceEpoch = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 1) + 1;
-  // The list head is also read lock-free by the fast checks in graceReclaim
-  // and graceQuiesce, so its writes must be atomic; relaxed is enough, the
-  // readers only test it against NULL before taking this very lock
-  object->GraceNext = base->graceLimbo;
-  __pointer_atomic_store((void *volatile*)&base->graceLimbo, object, amoRelaxed);
-  __spinlock_release(&base->graceLimboLock);
+  // Lock-free push. Until the CAS succeeds the object is published to nobody,
+  // so rewriting GraceNext on a retry is fine; after it the producer never
+  // touches the grace fields again. The full-barrier CAS both releases
+  // destructor/GraceNext to the scanner's exchange and keeps the publication
+  // ordered after the object's logical detachment from the backend. ABA on
+  // the head is harmless for push-only producers: a stale head value is only
+  // ever written into GraceNext, never dereferenced (this rests on the pools
+  // being type-stable - storage never returns to the allocator)
+  aioObjectRoot *head;
+  do {
+    head = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed);
+    object->GraceNext = head;
+  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo, head, object));
+}
+
+// Cold path: return a detached chain to the limbo stack (frozen discovered
+// after the detach). One CAS publishes the whole chain
+static void gracePushList(asyncBase *base, aioObjectRoot *first)
+{
+  aioObjectRoot *last = first;
+  while (last->GraceNext)
+    last = last->GraceNext;
+  aioObjectRoot *head;
+  do {
+    head = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed);
+    last->GraceNext = head;
+  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo, head, first));
+}
+
+// The pending batch is ripe when every slot active at its capture has either
+// ticked its counter past the captured value or exited (the UINTPTR_MAX
+// stamp differs from any captured live counter). Counters move only at
+// quiescent points, so an unchanged counter marks a thread that may still
+// hold a kernel batch copied before the retirements. Threads that claimed a
+// slot after the capture gate nothing: their first kernel wait started after
+// the batch's objects were already detached from the backend, so it cannot
+// return their events
+static int gracePendingRipe(asyncBase *base)
+{
+  for (unsigned i = 0; i < base->gracePendingSlots; i++) {
+    uintptr_t captured = base->gracePendingSeen[i];
+    if (captured == UINTPTR_MAX)
+      continue;
+    if (__uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire) == captured)
+      return 0;
+  }
+  return 1;
 }
 
 void graceReclaim(asyncBase *base)
 {
-  if (!__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed) ||
-      __uint_atomic_load(&base->graceFrozen, amoRelaxed))
+  if (__uint_atomic_load(&base->graceFrozen, amoRelaxed))
+    return;
+  // Non-blocking single-scanner gate: the loser leaves instead of waiting, a
+  // preempted owner only delays memory, never producers. One scanner at a
+  // time keeps the pending batch single-owned, so its fields need no locks
+  if (!__uint_atomic_compare_and_swap(&base->graceScanning, 0, 1))
     return;
 
-  // The scan runs under the limbo lock: a thread claims its slot before its
-  // first kernel wait, and the retirement of any object its batches could
-  // reference passes through this very lock afterwards - a scan ordered
-  // after that retirement therefore cannot read the slot as unclaimed.
-  // Slots above the high-water mark were never claimed and gate nothing
-  aioObjectRoot *ripe;
-  __spinlock_acquire(&base->graceLimboLock);
-  uintptr_t minSeen = UINTPTR_MAX;
-  unsigned slots = __uint_atomic_load(&base->graceSlotCount, amoAcquire);
-  unsigned i;
-  for (i = 0; i < slots; i++) {
-    uintptr_t seen = __uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire);
-    if (seen < minSeen)
-      minSeen = seen;
+  for (;;) {
+    if (base->gracePending) {
+      if (!gracePendingRipe(base))
+        break;
+      // Freeing after a later freeze is still safe: the pending batch was
+      // detached while the authoritative frozen check below read 0, so the
+      // freeze linearized after the detach - an untracked thread's first
+      // kernel wait started after these objects left the backend and its
+      // batches cannot reference them
+      aioObjectRoot *ripe = base->gracePending;
+      __pointer_atomic_store((void *volatile*)&base->gracePending, 0, amoRelaxed);
+      while (ripe) {
+        aioObjectRoot *next = ripe->GraceNext;
+        ripe->destructor(ripe);
+        ripe = next;
+      }
+    }
+
+    // The full-barrier exchange takes the whole visible stack and pairs with
+    // the producers' release CAS: destructor and GraceNext of every node are
+    // visible past this point
+    aioObjectRoot *batch = (aioObjectRoot*)__pointer_atomic_exchange((void *volatile*)&base->graceLimbo, 0);
+    if (!batch)
+      break;
+
+    // Authoritative frozen check after the detach. An unslotted thread
+    // stores graceFrozen seq-cst before its first kernel wait; reading 0
+    // here linearizes this detach before that wait. Reading 1 means this
+    // batch may already be visible to an untracked thread - push it back
+    // and stop, the relaxed check above (and a repeated seq-cst read on a
+    // racing pass) keeps it parked forever
+    if (__uint_atomic_load(&base->graceFrozen, amoSeqCst)) {
+      gracePushList(base, batch);
+      break;
+    }
+
+    // Capture the quiescence counters of every slot claimed so far. The
+    // capture must follow the exchange: a claim (full-barrier CAS) precedes
+    // the thread's first kernel wait, a batch it harvested precedes the
+    // objects' backend detachment, which precedes the retirements and this
+    // exchange - so any thread whose buffers can reference this batch is
+    // visible to this scan, both in graceSlotCount and in its slot value
+    unsigned slots = __uint_atomic_load(&base->graceSlotCount, amoAcquire);
+    for (unsigned i = 0; i < slots; i++)
+      base->gracePendingSeen[i] = __uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire);
+    base->gracePendingSlots = slots;
+    __pointer_atomic_store((void *volatile*)&base->gracePending, batch, amoRelaxed);
+    // Loop: on the exit path every captured slot is already stamped out, the
+    // fresh batch is ripe immediately and the next pass drains it
   }
 
-  // Epochs decrease along the list: everything past the first ripe object
-  // is ripe as well. Release outside the lock - pool pushes and frees do
-  // not need it, and a concurrent retire must not wait on them
-  aioObjectRoot *prev = 0;
-  aioObjectRoot *cur = base->graceLimbo;
-  while (cur && cur->GraceEpoch > minSeen) {
-    prev = cur;
-    cur = cur->GraceNext;
-  }
-  ripe = cur;
-  if (prev)
-    prev->GraceNext = 0;
-  else
-    __pointer_atomic_store((void *volatile*)&base->graceLimbo, 0, amoRelaxed);
-  __spinlock_release(&base->graceLimboLock);
-
-  while (ripe) {
-    aioObjectRoot *next = ripe->GraceNext;
-    ripe->destructor(ripe);
-    ripe = next;
-  }
+  __uint_atomic_store(&base->graceScanning, 0, amoRelease);
 }
 
 void graceThreadEnter(asyncBase *base)
 {
   // Freezing reclamation is the memory-safe degradation for thread
   // configurations the slots cannot describe: dead objects then stay in
-  // the limbo for the rest of the base's life
+  // the limbo for the rest of the base's life. The store must be seq-cst
+  // and precede this thread's first kernel wait: graceReclaim's
+  // authoritative check after a detach reads the flag seq-cst, and reading
+  // 0 there must linearize the detach before this thread's first batch
   if (messageLoopThreadId >= base->graceSlotLimit) {
-    __uint_atomic_store(&base->graceFrozen, 1, amoRelaxed);
+    __uint_atomic_store(&base->graceFrozen, 1, amoSeqCst);
     return;
   }
 
-  // Claim the slot for this thread's lifetime in the loop; entry is a
-  // quiescent point, so the current epoch is a valid first stamp. A failed
-  // claim means the id was adopted while its previous holder is still
-  // inside the message loop (a loop thread started while others were
-  // shutting down): two threads sharing a slot could mask each other's
-  // batches, so reclamation shuts down. A cleanly exited holder leaves
-  // UINTPTR_MAX behind - plain quit-then-restart cycles and mid-run loop
-  // thread additions claim successfully. The claim must happen right at
-  // entry: a check without a reservation would leave a window between the
-  // id assignment and the first stamp where the same id handed out again
-  // goes undetected
-  uintptr_t epoch = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0);
-  if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen, UINTPTR_MAX, epoch)) {
-    __uint_atomic_store(&base->graceFrozen, 1, amoRelaxed);
+  // Claim the slot for this thread's lifetime in the loop; the quiescence
+  // counter starts at zero, UINTPTR_MAX marks a free slot. A failed claim
+  // means the id was adopted while its previous holder is still inside the
+  // message loop (a loop thread started while others were shutting down):
+  // two threads sharing a slot could mask each other's batches, so
+  // reclamation shuts down. A cleanly exited holder leaves UINTPTR_MAX
+  // behind - plain quit-then-restart cycles and mid-run loop thread
+  // additions claim successfully. The claim must happen right at entry: a
+  // check without a reservation would leave a window between the id
+  // assignment and the first tick where the same id handed out again goes
+  // undetected. The full-barrier CAS also orders the claim before the
+  // thread's first kernel wait - the batch capture in graceReclaim relies
+  // on that to never miss a thread whose buffers could hold its objects
+  if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen, UINTPTR_MAX, 0)) {
+    __uint_atomic_store(&base->graceFrozen, 1, amoSeqCst);  // see the seq-cst note above
     return;
   }
 
@@ -924,26 +983,40 @@ void graceQuiesce(asyncBase *base)
   if (messageLoopThreadId >= base->graceSlotLimit)
     return;
 
-  // With no published limbo the stamp has no reader, so the whole quiescent
-  // point reduces to one relaxed load and a branch. A stale NULL only delays
-  // reclamation: if the stamp is behind the object's epoch other reclaimers
-  // keep waiting for this thread, and if it is already at or past it, this
-  // thread published it at an earlier quiescent point - a wait started after
-  // the logical detach cannot return an event for the dead registration.
-  // A retire between the epoch increment and the list push is the same case:
-  // the object waits for this thread's next wakeup
-  if (!__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed))
+  // With nothing parked anywhere a tick has no reader, so the whole
+  // quiescent point reduces to two relaxed loads and a branch. Skipping the
+  // tick can only delay reclamation, never unblock it: freeing requires the
+  // counter to move past the captured value, and an unticked counter stays
+  // put. A retire racing with these loads just waits for the next wakeup
+  if (!__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed) &&
+      !__pointer_atomic_load((void *volatile*)&base->gracePending, amoRelaxed))
     return;
 
-  // Publishing the stamp with release orders all processing of the preceding
-  // kernel batch before the reclaimer's acquire load. graceEpoch is only a
-  // sequence token: a relaxed load is sufficient, and a stale value merely
-  // delays reclamation. Every retirement takes a fresh epoch, so one store of
-  // E covers all objects with epochs up to E - repeating an unchanged stamp
-  // buys nothing, and the slot is this thread's own line to read
-  uintptr_t epoch = __uintptr_atomic_load(&base->graceEpoch, amoRelaxed);
-  if (__uintptr_atomic_load(&base->graceSeen[messageLoopThreadId].seen, amoRelaxed) != epoch)
-    __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen, epoch, amoRelease);
+  // Single-writer counter: only this thread advances its slot, so a plain
+  // read of the previous value is fine. The release store publishes all
+  // processing of the preceding kernel batch to the scanner's acquire load.
+  // UINTPTR_MAX is the free/exited sentinel, step over it on wrap
+  GraceSlot *slot = &base->graceSeen[messageLoopThreadId];
+  uintptr_t next = slot->seen + 1;
+  if (next == UINTPTR_MAX)
+    next = 0;
+  __uintptr_atomic_store(&slot->seen, next, amoRelease);
+  graceReclaim(base);
+}
+
+void graceThreadExit(asyncBase *base)
+{
+  // Stamp the slot out with the free/exited sentinel; the release store
+  // publishes all processing of the thread's final kernel batches to the
+  // scanner's acquire load. The caller must not have dropped the loop thread
+  // counter yet: once it does, a future loop thread may adopt this id, and a
+  // stale live stamp would shield its batches from the grace period. The
+  // last thread out drains the limbo: with every slot stamped, a captured
+  // batch is immediately ripe
+  if (messageLoopThreadId < base->graceSlotLimit)
+    __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
+                           UINTPTR_MAX,
+                           amoRelease);
   graceReclaim(base);
 }
 

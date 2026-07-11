@@ -1,4 +1,5 @@
 #include "asyncioImpl.h"
+#include "reactorTimer.h"
 #include "asyncio/coroutine.h"
 #include "atomic.h"
 
@@ -37,28 +38,6 @@ typedef struct EPollObject {
   // in the set with an empty mask. Only touched under the object combiner.
   uint32_t Registered;
 } EPollObject;
-
-// Discriminator bits carried in the epoll_data pointer tag. The event decode
-// path runs concurrently with the owning thread initializing the pointed-to
-// object (the kernel round-trip is not an ordering edge), so the branch
-// decision must not read the object's memory: fd objects carry no bits, timers
-// are marked explicitly, user-event timers additionally so
-enum {
-  udataTimer = 1,
-  udataUserEvent = 2
-};
-
-typedef struct aioTimer {
-  aioObjectRoot root;
-  // Full generation of the armed operation; 0 = disarmed. Written with release
-  // at arm time, read with acquire at event delivery: the kernel round-trip
-  // carries no memory ordering, this field is the synchronization edge. A stale
-  // event delivered after stop/rearm reads either 0 or a generation that loses
-  // the status CAS in opCancel().
-  uintptr_t tag;
-  int fd;
-  asyncOpRoot *op;
-} aioTimer;
 __NO_PADDING_END
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
@@ -267,15 +246,9 @@ void epollNextFinishedOperation(asyncBase *base)
   while (1) {
     do {
       if (!executeGlobalQueue(base)) {
-        // Found quit marker. Stamp the slot out before the counter drops:
-        // once it does, a future loop thread may adopt this id, and a stale
-        // stamp would shield its batches from the grace period. The last
-        // thread out drains the limbo list
-        if (messageLoopThreadId < base->graceSlotLimit)
-          __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
-                                 UINTPTR_MAX,
-                                 amoRelease);
-        graceReclaim(base);
+        // Found quit marker: stamp the grace slot out and drain, strictly
+        // before the loop thread counter drops
+        graceThreadExit(base);
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 0u-1) - 1;
         if (threadsRunning)
           epollEnqueue(base, 0);
@@ -299,38 +272,39 @@ void epollNextFinishedOperation(asyncBase *base)
         eventfd_read(localBase->eventFd, &eventValue);
         epollControl(localBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, localBase->eventFd, object);
       } else if (timerId & udataTimer) {
-        // The acquire load pairs with the release store in epollStartTimer and
-        // is the only ordering edge with the arming thread; timer->op and the
-        // fields behind it may only be read after it. 0 = a stale doorbell
-        // delivered after stop, nothing may be touched. The user-event bit
-        // rides in the epoll_data tag: op->opCode belongs to the operation and
-        // cannot be read before its generation is validated by the status CAS
         uint64_t data;
         aioTimer *timer = (aioTimer*)object;
-        if (read(timer->fd, &data, sizeof(data))) {
-          uintptr_t armedTag = __uintptr_atomic_load(&timer->tag, amoAcquire);
-          if (armedTag == 0) {
-            // stale doorbell, timer disarmed
-          } else if (timerId & udataUserEvent) {
-            aioUserEvent *event = (aioUserEvent*)timer->op;
-            if (eventTryActivate(event)) {
-              if (event->counter > 0 && --event->counter == 0) {
-                epollStopTimer(&event->root);
-              } else {
-                // We need rearm epoll for timer
-                epollControl(localBase->epollFd,
-                             EPOLL_CTL_MOD,
-                             EPOLLIN | EPOLLONESHOT,
-                             timer->fd,
-                             __tagged_pointer_make(timer, udataTimer | udataUserEvent));
-              }
+        if (read((int)timer->fd, &data, sizeof(data))) {
+          uintptr_t armedGeneration = 0;
+          switch (reactorTimerDecodeEvent(timer, timerId, &armedGeneration)) {
+            case rteIgnore:
+              // stale doorbell, timer disarmed
+              break;
 
-              eventDeactivate(event);
-              event->root.finishMethod(&event->root);
-              eventDecrementReference(event, 1);
+            case rteUserEvent: {
+              aioUserEvent *event = (aioUserEvent*)timer->op;
+              if (eventTryActivate(event)) {
+                if (event->counter > 0 && --event->counter == 0) {
+                  epollStopTimer(&event->root);
+                } else {
+                  // We need rearm epoll for timer
+                  epollControl(localBase->epollFd,
+                               EPOLL_CTL_MOD,
+                               EPOLLIN | EPOLLONESHOT,
+                               (int)timer->fd,
+                               __tagged_pointer_make(timer, udataTimer | udataUserEvent));
+                }
+
+                eventDeactivate(event);
+                event->root.finishMethod(&event->root);
+                eventDecrementReference(event, 1);
+              }
+              break;
             }
-          } else {
-            opCancel(timer->op, armedTag, aosTimeout);
+
+            case rteExpireOperation:
+              opCancel(timer->op, armedGeneration, aosTimeout);
+              break;
           }
         }
       } else {
@@ -452,7 +426,7 @@ void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
   timer->tag = 0;
   timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
   timer->op = op;
-  epollControl(localBase->epollFd, EPOLL_CTL_ADD, 0, timer->fd, timer);
+  epollControl(localBase->epollFd, EPOLL_CTL_ADD, 0, (int)timer->fd, timer);
   op->timerId = timer;
 }
 
@@ -466,13 +440,13 @@ void epollStartTimer(asyncOpRoot *op)
   its.it_interval.tv_nsec = periodic ? its.it_value.tv_nsec : 0;
 
   aioTimer *timer = (aioTimer*)op->timerId;
-  __uintptr_atomic_store(&timer->tag, opGetGeneration(op), amoRelease);
-  timerfd_settime(timer->fd, 0, &its, 0);
+  void *udata = reactorTimerArm(timer, op);
+  timerfd_settime((int)timer->fd, 0, &its, 0);
   epollControl(((epollBase*)timer->root.base)->epollFd,
                EPOLL_CTL_MOD,
                EPOLLIN | EPOLLONESHOT,
-               timer->fd,
-               __tagged_pointer_make(timer, udataTimer | (periodic ? udataUserEvent : 0)));
+               (int)timer->fd,
+               udata);
 }
 
 
@@ -482,10 +456,10 @@ void epollStopTimer(asyncOpRoot *op)
   struct itimerspec its;
   memset(&its, 0, sizeof(its));
   aioTimer *timer = (aioTimer*)op->timerId;
-  __uintptr_atomic_store(&timer->tag, 0, amoRelaxed);
-  timerfd_settime(timer->fd, 0, &its, 0);
-  epollControl(((epollBase*)timer->root.base)->epollFd, EPOLL_CTL_MOD, 0, timer->fd, &timer->root);
-  while (read(timer->fd, &data, sizeof(data)) > 0)
+  reactorTimerDisarm(timer);
+  timerfd_settime((int)timer->fd, 0, &its, 0);
+  epollControl(((epollBase*)timer->root.base)->epollFd, EPOLL_CTL_MOD, 0, (int)timer->fd, &timer->root);
+  while (read((int)timer->fd, &data, sizeof(data)) > 0)
     continue;
 }
 
@@ -500,7 +474,7 @@ static void epollReleaseTimer(aioObjectRoot *object)
 void epollDeleteTimer(asyncOpRoot *op)
 {
   aioTimer *timer = (aioTimer*)op->timerId;
-  close(timer->fd);
+  close((int)timer->fd);
   graceRetire(timer->root.base, &timer->root, epollReleaseTimer);
 }
 

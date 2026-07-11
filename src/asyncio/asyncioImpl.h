@@ -1,3 +1,6 @@
+#ifndef __ASYNCIO_ASYNCIOIMPL_H_
+#define __ASYNCIO_ASYNCIOIMPL_H_
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -92,12 +95,14 @@ struct asyncBase {
   // at most one wait timeout - both backends wake periodically. Windows is
   // not involved: IOCP packets reference operations, and operation pools are
   // permanently type-stable.
-  volatile uintptr_t graceEpoch;
   volatile unsigned graceFrozen;    // slots exhausted or id collision: reclamation is off, the limbo only grows
-  volatile unsigned graceSlotCount; // high-water mark of claimed slots, bounds the reclaim scan
+  volatile unsigned graceSlotCount; // high-water mark of claimed slots, bounds the batch capture
   unsigned graceSlotLimit;          // slot array capacity, from the createAsyncBase loopThreads argument
-  unsigned graceLimboLock;
-  aioObjectRoot *graceLimbo;        // newest first, epochs decrease along the list
+  volatile unsigned graceScanning;  // non-blocking single-scanner gate: losers leave, nobody waits
+  aioObjectRoot *graceLimbo;        // lock-free intrusive stack of fresh retirements (CAS push, exchange detach)
+  aioObjectRoot *gracePending;      // scanner-owned batch waiting out its grace period; read-only NULL check elsewhere
+  unsigned gracePendingSlots;       // slot high-water captured together with the pending batch
+  uintptr_t *gracePendingSeen;      // per-slot counters captured together with the pending batch, scanner-owned
   GraceSlot *graceSeen;             // cache-line aligned, graceSlotLimit entries; alignedFree with the base (0.6 teardown)
 
 #ifndef NDEBUG
@@ -264,16 +269,21 @@ uint64_t getMonotonicSeconds(void);
 
 // Grace period (see the asyncBase comment). graceThreadEnter runs once per
 // loop thread right after the messageLoopThreadId assignment and freezes
-// reclamation on slot overflow or on an id collision. graceQuiesce stamps
-// the calling loop thread as quiescent and reclaims ripe limbo objects;
-// call it at the top of the message loop, right before blocking in the
-// kernel wait. graceRetire parks a dead object in the limbo list;
-// memoryRelease is the memory half of its destructor and runs once the
-// grace period elapses. graceReclaim alone is for the loop exit path,
-// after the thread stamped itself out with UINTPTR_MAX: the last thread
-// out drains the list.
+// reclamation on slot overflow or on an id collision. graceQuiesce ticks
+// the calling thread's quiescence counter and drives reclamation; call it
+// at the top of the message loop, right before blocking in the kernel
+// wait. graceRetire parks a dead object in the limbo stack; memoryRelease
+// is the memory half of its destructor and runs once every loop thread
+// active at the batch capture has passed a quiescent point.
+// graceThreadExit is the loop exit path: it stamps the slot out with
+// UINTPTR_MAX and drains via graceReclaim - the last thread out drains both
+// the pending batch and the stack. Call it BEFORE decrementing the loop
+// thread counter: once the counter drops, a future loop thread may adopt
+// this id, and a stale live stamp would shield its batches from the grace
+// period.
 void graceThreadEnter(asyncBase *base);
 void graceQuiesce(asyncBase *base);
+void graceThreadExit(asyncBase *base);
 void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *memoryRelease);
 void graceReclaim(asyncBase *base);
 
@@ -282,3 +292,5 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
 }
 
 #endif
+
+#endif //__ASYNCIO_ASYNCIOIMPL_H_
