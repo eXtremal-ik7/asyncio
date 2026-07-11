@@ -76,7 +76,7 @@ static void writeTwiceAfterPipeReaderClosed(AsyncInitFlags initFlags)
   ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
   close(unnamedPipe.read);
 
-  aioObject *object = newDeviceIo(createAsyncBase(amOSDefault), unnamedPipe.write);
+  aioObject *object = newDeviceIo(createAsyncBase(amOSDefault, 1), unnamedPipe.write);
   const char payload[] = "ping";
   aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
   aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
@@ -149,7 +149,7 @@ TEST(pipe, test_pipe_reader_close_wakes_parked_write)
 // microseconds, four orders of magnitude under the threshold.
 TEST(pipe, test_error_on_idle_object_keeps_loop_asleep)
 {
-  asyncBase *base = createAsyncBase(amOSDefault);
+  asyncBase *base = createAsyncBase(amOSDefault, 1);
   std::thread loopThread([base]() { asyncLoop(base); });
 
   pipeTy unnamedPipe;

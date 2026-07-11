@@ -20,7 +20,12 @@ aioObjectRoot *aioObjectHandle(aioObject *object);
 // Replaces initializeSocketSubsystem().
 void initializeAsyncIo(AsyncInitFlags flags);
 
-asyncBase *createAsyncBase(AsyncMethod method);
+// loopThreads is the maximum number of threads that will run asyncLoop() on
+// this base concurrently (0 is treated as 1). It sizes the grace-period slot
+// array - one cache line per thread. Exceeding it is memory-safe but disables
+// reclamation of dead objects for the rest of the base's life, so err on the
+// high side when the count is not exact.
+asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads);
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket);
 aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice);
 void deleteAioObject(aioObject *object);

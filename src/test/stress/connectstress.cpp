@@ -214,7 +214,7 @@ int main(int argc, char **argv)
 #endif
 
   initializeAsyncIo(aiNone);
-  gBase = createAsyncBase(amOSDefault);
+  gBase = createAsyncBase(amOSDefault, loopThreads);
 
   // Blocking loopback listener on an ephemeral port
   gListener = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);

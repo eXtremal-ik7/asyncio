@@ -54,7 +54,7 @@ static void httpOversizedHeaderScenario()
   armDeathTestWatchdog(30);
 
   HttpOversizedHeaderContext ctx;
-  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.requestStatus = aosUnknown;
   // status line, then one header the client can never buffer entirely

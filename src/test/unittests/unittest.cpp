@@ -34,7 +34,7 @@ int main(int argc, char **argv)
 
   initializeAsyncIo(aiNone);
 
-  gBase = createAsyncBase(method);
+  gBase = createAsyncBase(method, 4);
 
   ::testing::InitGoogleTest(&argc, argv);
 //  rlpxSocketNew(nullptr, nullptr, nullptr, nullptr);

@@ -179,7 +179,7 @@ void test_aio_writecb(AsyncOpStatus status, aioObject *object, size_t transferre
 void *test_aio_sender(void *arg)
 {
   SenderCtx *senderCtx = static_cast<SenderCtx*>(arg);
-  asyncBase *localBase = createAsyncBase(amOSDefault);
+  asyncBase *localBase = createAsyncBase(amOSDefault, 1);
 
   senderCtx->localBase = localBase;
   senderCtx->client = newSocketIo(localBase, senderCtx->clientSocket);  
@@ -213,7 +213,7 @@ void test_coroutine_sender_coro(void *arg)
 
 void *test_coroutine_sender(void *arg)
 {
-  asyncBase *localBase = createAsyncBase(amOSDefault); 
+  asyncBase *localBase = createAsyncBase(amOSDefault, 1); 
   
   SenderCtx *senderCtx = static_cast<SenderCtx*>(arg);
   senderCtx->localBase = localBase;
@@ -477,7 +477,7 @@ void test_aio(unsigned senderThreads, unsigned receiverThreads, uint16_t port, A
     return;
   }
 
-  asyncBase *base = receiverTy == aioReceiverBlocking ? nullptr : createAsyncBase(amOSDefault);
+  asyncBase *base = receiverTy == aioReceiverBlocking ? nullptr : createAsyncBase(amOSDefault, receiverThreads);
   receiverControl.base = base;
 
   timeMark pt = getTimeMark();

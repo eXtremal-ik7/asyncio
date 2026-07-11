@@ -149,7 +149,7 @@ int main(int argc, char **argv)
 
 
   initializeAsyncIo(aiNone);
-  asyncBase *base = createAsyncBase(amOSDefault);
+  asyncBase *base = createAsyncBase(amOSDefault, 1);
 
   HostAddress localHost;
   localHost.ipv4 = INADDR_ANY;

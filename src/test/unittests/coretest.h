@@ -97,6 +97,8 @@ struct TestBackend : asyncBase {
   unsigned initializeTimerCalls = 0;
   unsigned deleteTimerCalls = 0;
   uintptr_t nextTimerTag = 1;
+  // Backs base.graceSeen: production bases get the array from createAsyncBase
+  alignas(GRACE_SLOT_ALIGNMENT) std::array<GraceSlot, 8> graceSlots{};
 
   TestBackend() : asyncBase{}, base(*this)
   {
@@ -106,7 +108,9 @@ struct TestBackend : asyncBase {
     base.methodImpl.startTimer = startTimer;
     base.methodImpl.stopTimer = stopTimer;
     base.methodImpl.deleteTimer = deleteTimer;
-    for (GraceSlot &slot : base.graceSeen)
+    base.graceSeen = graceSlots.data();
+    base.graceSlotLimit = static_cast<unsigned>(graceSlots.size());
+    for (GraceSlot &slot : graceSlots)
       slot.seen = UINTPTR_MAX;
     currentFinishedSync = 0;
     messageLoopThreadId = 0;

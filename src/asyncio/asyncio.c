@@ -175,7 +175,7 @@ void initializeAsyncIo(AsyncInitFlags flags)
 #endif
 }
 
-asyncBase *createAsyncBase(AsyncMethod method)
+asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
 {
   asyncBase *base = 0;
   switch (method) {
@@ -217,9 +217,11 @@ asyncBase *createAsyncBase(AsyncMethod method)
   base->graceEpoch = 0;
   base->graceFrozen = 0;
   base->graceSlotCount = 0;
+  base->graceSlotLimit = loopThreads ? loopThreads : 1;
   base->graceLimboLock = 0;
   base->graceLimbo = 0;
-  for (unsigned i = 0; i < GRACE_LOOP_THREAD_LIMIT; i++)
+  base->graceSeen = (GraceSlot*)alignedMalloc(sizeof(GraceSlot) * base->graceSlotLimit, GRACE_SLOT_ALIGNMENT);
+  for (unsigned i = 0; i < base->graceSlotLimit; i++)
     base->graceSeen[i].seen = UINTPTR_MAX;   // empty slots never gate the limbo
   return base;
 }

@@ -193,7 +193,7 @@ static void senderAsyncConnectCb(AsyncOpStatus status, zmtpSocket *client, void 
 
 void senderAsync(SenderContext *ctx)
 {
-  ctx->base = createAsyncBase(amOSDefault);
+  ctx->base = createAsyncBase(amOSDefault, 1);
 
   HostAddress address;
   address.family = AF_INET;
@@ -262,7 +262,7 @@ void senderCoroutineProc(void *arg)
 
 void senderCoroutine(SenderContext *ctx)
 {
-  ctx->base = createAsyncBase(amOSDefault);
+  ctx->base = createAsyncBase(amOSDefault, 1);
 
   HostAddress address;
   address.family = AF_INET;
@@ -342,7 +342,7 @@ void senderRawProc(void *arg)
 
 void senderRaw(SenderContext *ctx)
 {
-  ctx->base = createAsyncBase(amOSDefault);
+  ctx->base = createAsyncBase(amOSDefault, 1);
 
   HostAddress address;
   address.family = AF_INET;
@@ -559,7 +559,7 @@ void runBenchmark(SenderTy senderType, ReceiverTy receiverType, uint16_t port)
   cfg.port = port;
   SenderContext senderCtx(&cfg);
   ReceiverContext receiverCtx(&cfg);
-  receiverCtx.base = createAsyncBase(amOSDefault);
+  receiverCtx.base = createAsyncBase(amOSDefault, 1);
 
   std::thread *receiver = nullptr;
   std::thread *sender = nullptr;

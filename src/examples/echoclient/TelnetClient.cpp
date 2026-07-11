@@ -124,7 +124,7 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  asyncBase *base = createAsyncBase(method);
+  asyncBase *base = createAsyncBase(method, 1);
   
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;

@@ -328,7 +328,7 @@ int main(int argc, char **argv)
   client.data.icmp_code = 0;
   client.data.icmp_seq = 0;
 
-  asyncBase *base = createAsyncBase(amOSDefault);
+  asyncBase *base = createAsyncBase(amOSDefault, 1);
   client.base = base;
   aioUserEvent *pingTimer = newUserEvent(base, 0, pingTimerCb, &client);
   aioUserEvent *printTimer = newUserEvent(base, 0, printTimerCb, &client);

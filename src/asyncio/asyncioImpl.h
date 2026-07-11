@@ -13,16 +13,13 @@ extern "C" {
 #define TAGGED_POINTER_DATA_MASK (TAGGED_POINTER_ALIGNMENT-1)
 #define TAGGED_POINTER_PTR_MASK (~TAGGED_POINTER_DATA_MASK)
 
-// Upper bound on concurrently running loop threads per base, 64 bytes of
-// asyncBase each; the reclaim scan is bounded by the high-water mark of
-// slots actually claimed, so the headroom costs memory only
-#define GRACE_LOOP_THREAD_LIMIT 256
-
 // One quiescence stamp per loop thread, padded to a cache line so the
-// per-iteration stamps of neighbour threads do not false-share
+// per-iteration stamps of neighbour threads do not false-share; the padding
+// is byte-sized so 32-bit targets get the full line too
+#define GRACE_SLOT_ALIGNMENT 64
 typedef struct GraceSlot {
   volatile uintptr_t seen;
-  uintptr_t pad[7];
+  uint8_t pad[GRACE_SLOT_ALIGNMENT - sizeof(uintptr_t)];
 } GraceSlot;
 
 typedef enum IoActionTy {
@@ -98,9 +95,10 @@ struct asyncBase {
   volatile uintptr_t graceEpoch;
   volatile unsigned graceFrozen;    // slots exhausted or id collision: reclamation is off, the limbo only grows
   volatile unsigned graceSlotCount; // high-water mark of claimed slots, bounds the reclaim scan
+  unsigned graceSlotLimit;          // slot array capacity, from the createAsyncBase loopThreads argument
   unsigned graceLimboLock;
   aioObjectRoot *graceLimbo;        // newest first, epochs decrease along the list
-  GraceSlot graceSeen[GRACE_LOOP_THREAD_LIMIT];
+  GraceSlot *graceSeen;             // cache-line aligned, graceSlotLimit entries; alignedFree with the base (0.6 teardown)
 
 #ifndef NDEBUG
   int opsCount;

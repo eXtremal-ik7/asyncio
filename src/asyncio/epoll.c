@@ -271,7 +271,7 @@ void epollNextFinishedOperation(asyncBase *base)
         // once it does, a future loop thread may adopt this id, and a stale
         // stamp would shield its batches from the grace period. The last
         // thread out drains the limbo list
-        if (messageLoopThreadId < GRACE_LOOP_THREAD_LIMIT)
+        if (messageLoopThreadId < base->graceSlotLimit)
           __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
                                  UINTPTR_MAX,
                                  amoRelease);

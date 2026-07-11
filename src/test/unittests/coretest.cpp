@@ -1117,7 +1117,7 @@ TEST(core_grace_period, slot_claim_tracks_high_water_and_collision_freezes)
 TEST(core_grace_period, out_of_range_thread_freezes_without_touching_slots)
 {
   TestBackend backend;
-  messageLoopThreadId = GRACE_LOOP_THREAD_LIMIT;
+  messageLoopThreadId = backend.base.graceSlotLimit;
 
   graceThreadEnter(&backend.base);
   graceQuiesce(&backend.base);
@@ -1626,6 +1626,47 @@ TEST(core_timeout_grid, expiration_cancels_and_releases_waiting_operation)
   EXPECT_EQ(object.root.readQueue.head, nullptr);
   backend.drainCompletions();
   EXPECT_EQ(op.callbackStatus, aosTimeout);
+  objectDelete(&object.root);
+}
+
+// TDD regression for the legal producer/sweeper ordering that the current
+// OPEN -> NULL bucket protocol cannot represent. No test hook is needed:
+// processTimeoutQueue() completes the empty sweep and publishes checkpoint 101,
+// then the producer resumes with a deadline in bucket 100. A correct terminal
+// bucket protocol must reject that publication and expire the operation
+// immediately. The current implementation leaves timerId behind checkpoint 101,
+// so both expectations below are intentionally red until the grid is fixed.
+TEST(core_timeout_grid, late_arm_after_swept_checkpoint_expires_instead_of_being_stranded)
+{
+  TestBackend backend;
+  backend.initializePageMap();
+  backend.base.lastCheckPoint = 100;
+  TestObject object(backend);
+  TestOp op(object);
+  op.root.endTime = 100000000;
+  eqPushBack(&object.root.readQueue, &op.root);
+
+  processTimeoutQueue(&backend.base, 101);
+  ASSERT_EQ(backend.base.lastCheckPoint, 101u);
+  addToTimeoutQueue(&backend.base, &op.root);
+
+  AsyncOpStatus statusAfterArm = opGetStatus(&op.root);
+  asyncOpListLink *stranded = pageMapExtractAll(&backend.base.timerMap, 100);
+  EXPECT_EQ(statusAfterArm, aosTimeout)
+    << "a timer armed after its bucket was swept was not expired immediately";
+  EXPECT_EQ(stranded, nullptr)
+    << "the late timer was published behind the checkpoint and will never be revisited";
+
+  // Keep the known-red test hygienic on the old implementation. The diagnostic
+  // extract above recovered ownership of the stranded physical link; it must
+  // not remain in the global link pool with a pointer to this stack operation.
+  if (stranded) {
+    op.root.timerId = nullptr;
+    free(stranded);
+    cancelAndDrain(backend, object);
+  } else {
+    backend.drainCompletions();
+  }
   objectDelete(&object.root);
 }
 

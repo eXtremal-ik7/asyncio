@@ -78,7 +78,7 @@ int main(int argc, char **argv)
     exit(1);
   }
 
-  asyncBase *base = createAsyncBase(method);
+  asyncBase *base = createAsyncBase(method, 1);
   aioObject *socketOp = newSocketIo(base, hSocket);
 
   aioAccept(socketOp, 0, acceptCb, nullptr);

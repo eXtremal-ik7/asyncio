@@ -888,7 +888,7 @@ void graceThreadEnter(asyncBase *base)
   // Freezing reclamation is the memory-safe degradation for thread
   // configurations the slots cannot describe: dead objects then stay in
   // the limbo for the rest of the base's life
-  if (messageLoopThreadId >= GRACE_LOOP_THREAD_LIMIT) {
+  if (messageLoopThreadId >= base->graceSlotLimit) {
     __uint_atomic_store(&base->graceFrozen, 1, amoRelaxed);
     return;
   }
@@ -921,18 +921,30 @@ void graceThreadEnter(asyncBase *base)
 
 void graceQuiesce(asyncBase *base)
 {
-  if (messageLoopThreadId >= GRACE_LOOP_THREAD_LIMIT)
+  if (messageLoopThreadId >= base->graceSlotLimit)
+    return;
+
+  // With no published limbo the stamp has no reader, so the whole quiescent
+  // point reduces to one relaxed load and a branch. A stale NULL only delays
+  // reclamation: if the stamp is behind the object's epoch other reclaimers
+  // keep waiting for this thread, and if it is already at or past it, this
+  // thread published it at an earlier quiescent point - a wait started after
+  // the logical detach cannot return an event for the dead registration.
+  // A retire between the epoch increment and the list push is the same case:
+  // the object waits for this thread's next wakeup
+  if (!__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed))
     return;
 
   // Publishing the stamp with release orders all processing of the preceding
   // kernel batch before the reclaimer's acquire load. graceEpoch is only a
   // sequence token: a relaxed load is sufficient, and a stale value merely
-  // delays reclamation
-  __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
-                         __uintptr_atomic_load(&base->graceEpoch, amoRelaxed),
-                         amoRelease);
-  if (__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed))
-    graceReclaim(base);
+  // delays reclamation. Every retirement takes a fresh epoch, so one store of
+  // E covers all objects with epochs up to E - repeating an unchanged stamp
+  // buys nothing, and the slot is this thread's own line to read
+  uintptr_t epoch = __uintptr_atomic_load(&base->graceEpoch, amoRelaxed);
+  if (__uintptr_atomic_load(&base->graceSeen[messageLoopThreadId].seen, amoRelaxed) != epoch)
+    __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen, epoch, amoRelease);
+  graceReclaim(base);
 }
 
 static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)

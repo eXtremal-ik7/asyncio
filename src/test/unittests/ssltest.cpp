@@ -55,7 +55,7 @@ static void sslConnectGarbageScenario(int flood)
   armDeathTestWatchdog(30);
 
   SslGarbageContext ctx;
-  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.serverConn = nullptr;
   ctx.flood = flood;
@@ -125,7 +125,7 @@ static void sslConnectPeerDropScenario()
   armDeathTestWatchdog(15);
 
   SslGarbageContext ctx;
-  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.serverConn = nullptr;
   ctx.flood = 0;
@@ -219,7 +219,7 @@ static void sslReadGarbageScenario(int flood)
   armDeathTestWatchdog(30);
 
   SslGarbageContext ctx;
-  ctx.base = createAsyncBase(amOSDefault);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.serverConn = nullptr;
   ctx.flood = flood;

@@ -230,7 +230,7 @@ static void writeTwiceAfterPeerReset()
   ASSERT_EQ(recv(clientSocket, &c, 1, 0), -1);
   ASSERT_EQ(errno, ECONNRESET);
 
-  aioObject *object = newSocketIo(createAsyncBase(amOSDefault), clientSocket);
+  aioObject *object = newSocketIo(createAsyncBase(amOSDefault, 1), clientSocket);
   const char payload[] = "ping";
   aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
   aioWrite(object, payload, sizeof(payload), afNone, 0, nullptr, nullptr);
@@ -480,7 +480,7 @@ static void connectedReconnectScenario()
   armDeathTestWatchdog(10);
 
   ConnectedReconnectContext ctx;
-  ctx.base = createAsyncBase(amOSDefault); // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1); // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.firstStatus = aosUnknown;
   ctx.secondStatus = aosUnknown;
@@ -675,7 +675,7 @@ TEST(socket, write_submission_order)
   constexpr uint32_t total = 100000;
 
   CombinerOrderContext ctx;
-  ctx.base = createAsyncBase(amOSDefault);  // own base: MT hammering stays off gBase
+  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: MT hammering stays off gBase
 
   HostAddress address;
   address.family = AF_INET;

@@ -178,7 +178,7 @@ int main(int argc, char **argv)
   }
 
   initializeAsyncIo(aiNone);
-  gBase = createAsyncBase(amOSDefault);
+  gBase = createAsyncBase(amOSDefault, loopThreads);
 
   std::vector<std::thread> loops;
   for (unsigned i = 0; i < loopThreads; i++)
