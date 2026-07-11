@@ -217,8 +217,10 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 
   if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
     processInitializationOp(object, &needStart);
-  if (sig & COMBINER_TAG_CANCEL)
-    reapObject(object, &needStart);
+  // CANCEL/CANCELIO: the CANCELIO position additionally drives the
+  // CancelIoFlag sweep
+  if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
+    reapObject(object, sig, &needStart);
 
   if (needStart & IO_EVENT_READ)
     executeOperationList(&object->readQueue);

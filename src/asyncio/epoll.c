@@ -184,9 +184,10 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
     processInitializationOp(object, &needStart);
 
-  // CANCEL: a timeout/opCancel/cancelIo set the status and asked for a scan
-  if (sig & COMBINER_TAG_CANCEL)
-    reapObject(object, &needStart);
+  // CANCEL/CANCELIO: a timeout/opCancel/cancelIo set the status and asked for
+  // a scan; the CANCELIO position additionally drives the CancelIoFlag sweep
+  if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
+    reapObject(object, sig, &needStart);
 
   if (ioEvents & IO_EVENT_ERROR) {
     // EPOLLRDHUP mapped to TAG_ERROR, cancel all operations with aosDisconnected status
@@ -272,40 +273,53 @@ void epollNextFinishedOperation(asyncBase *base)
         eventfd_read(localBase->eventFd, &eventValue);
         epollControl(localBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, localBase->eventFd, object);
       } else if (timerId & udataTimer) {
-        uint64_t data;
         aioTimer *timer = (aioTimer*)object;
-        if (read((int)timer->fd, &data, sizeof(data))) {
-          uintptr_t armedGeneration = 0;
-          switch (reactorTimerDecodeEvent(timer, timerId, &armedGeneration)) {
-            case rteIgnore:
-              // stale doorbell, timer disarmed
-              break;
+        // Armed gate strictly before the read: a doorbell of a stopped timer
+        // must not drain the fd - the count belongs to whatever arming comes
+        // next, and the stop path owns the drain. The read result is the
+        // oracle: settime at arm time reset the counter, so a positive count
+        // proves the CURRENT arming expired, EAGAIN marks a stale doorbell
+        // of a re-armed timer
+        uintptr_t armedTag = reactorTimerArmedCountTag(timer);
+        uint64_t expirations = 0;
+        if (armedTag != 0) {
+          uint64_t data;
+          if (read((int)timer->fd, &data, sizeof(data)) == sizeof(data))
+            expirations = data;
+        }
+        uintptr_t armedGeneration = 0;
+        switch (reactorTimerDecodeCount(armedTag, timerId, expirations, &armedGeneration)) {
+          case rteIgnore:
+            // stale doorbell: timer disarmed, or re-armed with its deadline ahead
+            break;
 
-            case rteUserEvent: {
-              aioUserEvent *event = (aioUserEvent*)timer->op;
-              if (eventTryActivate(event)) {
-                if (event->counter > 0 && --event->counter == 0) {
-                  epollStopTimer(&event->root);
-                } else {
-                  // We need rearm epoll for timer
-                  epollControl(localBase->epollFd,
-                               EPOLL_CTL_MOD,
-                               EPOLLIN | EPOLLONESHOT,
-                               (int)timer->fd,
-                               __tagged_pointer_make(timer, udataTimer | udataUserEvent));
-                }
-
-                eventDeactivate(event);
-                event->root.finishMethod(&event->root);
-                eventDecrementReference(event, 1);
-              }
-              break;
+          case rteUserEvent: {
+            aioUserEvent *event = (aioUserEvent*)timer->op;
+            int activated = eventTryActivate(event);
+            int counterExhausted = activated && event->counter > 0 && --event->counter == 0;
+            // Every delivery consumes the EPOLLONESHOT registration: the plan
+            // re-arms it even for a dropped tick (activation collided with
+            // userEventActivate), or the periodic timer goes silent forever
+            ReactorUserEventTickPlan plan = reactorTimerUserEventTick(activated, counterExhausted, 1);
+            if (plan.stopTimer)
+              epollStopTimer(&event->root);
+            if (plan.rearm)
+              epollControl(localBase->epollFd,
+                           EPOLL_CTL_MOD,
+                           EPOLLIN | EPOLLONESHOT,
+                           (int)timer->fd,
+                           reactorTimerUdata(timer, 1));
+            if (plan.activate) {
+              eventDeactivate(event);
+              event->root.finishMethod(&event->root);
+              eventDecrementReference(event, 1);
             }
-
-            case rteExpireOperation:
-              opCancel(timer->op, armedGeneration, aosTimeout);
-              break;
+            break;
           }
+
+          case rteExpireOperation:
+            opCancel(timer->op, armedGeneration, aosTimeout);
+            break;
         }
       } else {
         uint32_t eventMask = 0;
@@ -424,9 +438,13 @@ void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
   timer->root.base = base;
   timer->root.type = ioObjectTimer;
   timer->tag = 0;
+  timer->armedGeneration = 0;
   timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
   timer->op = op;
-  epollControl(localBase->epollFd, EPOLL_CTL_ADD, 0, (int)timer->fd, timer);
+  // Even this disabled registration must carry the udataTimer bit:
+  // EPOLLERR/EPOLLHUP are mask-exempt, and a bare timer pointer would route
+  // them into the fd-object branch through the timer's uninitialized Head
+  epollControl(localBase->epollFd, EPOLL_CTL_ADD, 0, (int)timer->fd, reactorTimerUdata(timer, 0));
   op->timerId = timer;
 }
 
@@ -440,8 +458,12 @@ void epollStartTimer(asyncOpRoot *op)
   its.it_interval.tv_nsec = periodic ? its.it_value.tv_nsec : 0;
 
   aioTimer *timer = (aioTimer*)op->timerId;
-  void *udata = reactorTimerArm(timer, op);
+  // Order contract of the count protocol (reactorTimer.h): settime resets
+  // the fd's expiration counter BEFORE the tag publishes the arming, and the
+  // MOD that re-enables delivery comes last - a delivery that acquired this
+  // arming's tag can then never attribute a previous arming's residue to it
   timerfd_settime((int)timer->fd, 0, &its, 0);
+  void *udata = reactorTimerArmCount(timer, op);
   epollControl(((epollBase*)timer->root.base)->epollFd,
                EPOLL_CTL_MOD,
                EPOLLIN | EPOLLONESHOT,
@@ -458,7 +480,9 @@ void epollStopTimer(asyncOpRoot *op)
   aioTimer *timer = (aioTimer*)op->timerId;
   reactorTimerDisarm(timer);
   timerfd_settime((int)timer->fd, 0, &its, 0);
-  epollControl(((epollBase*)timer->root.base)->epollFd, EPOLL_CTL_MOD, 0, (int)timer->fd, &timer->root);
+  // The disabled registration keeps the udataTimer bit for the same reason
+  // as in epollInitializeTimer (mask-exempt EPOLLERR/EPOLLHUP)
+  epollControl(((epollBase*)timer->root.base)->epollFd, EPOLL_CTL_MOD, 0, (int)timer->fd, reactorTimerUdata(timer, 0));
   while (read((int)timer->fd, &data, sizeof(data)) > 0)
     continue;
 }

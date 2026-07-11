@@ -13,6 +13,11 @@
 
 __tls unsigned currentFinishedSync;
 __tls unsigned messageLoopThreadId;
+// Set only by a successful slot claim in graceThreadEnter: with an elastic
+// thread pool messageLoopThreadId alone does not prove ownership - an id can
+// be adopted while its previous holder is still inside the message loop.
+// Thread-local, so plain loads/stores suffice
+static __tls unsigned graceSlotOwned;
 
 ConcurrentQueue asyncOpLinkListPool;
 
@@ -288,8 +293,12 @@ void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, v
 
 void cancelIo(aioObjectRoot *object)
 {
+  // The dedicated bit makes the sweep positional to THIS call: reapObject
+  // consumes the flag only on a CANCELIO position, so an older plain CANCEL
+  // (grid timeout/opCancel) in the same captured chain cannot spend it before
+  // the operations submitted prior to this call have entered the queues
   if (__uint_atomic_fetch_and_add(&object->CancelIoFlag, 1) == 0)
-    combinerPushCounter(object, COMBINER_TAG_CANCEL);
+    combinerPushCounter(object, COMBINER_TAG_CANCELIO);
 }
 
 void objectDelete(aioObjectRoot *object)
@@ -583,21 +592,25 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
     *needStart |= tag;
 }
 
-// CANCEL reconcile: a cancel source (timeout/opCancel/cancelIo) has already set
-// the terminal status (winner-takes) and asked the combiner to scan. Reap the
-// terminals it left behind, positionally, across the initialization slot and both
-// queues.
-void reapObject(aioObjectRoot *object, uint32_t *needStart)
+// CANCEL/CANCELIO reconcile: a cancel source (timeout/opCancel/cancelIo) has
+// already set the terminal status (winner-takes) and asked the combiner to
+// scan. Reap the terminals it left behind, positionally, across the
+// initialization slot and both queues.
+void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
 {
-  // cancelIo sweep, positional: the CANCEL bit was OR-ed onto the chain entry
-  // that was the head at cancelIo() time, and the backend starts that entry's
-  // operation before calling here - so everything submitted before the cancel
-  // is already in the queues and gets swept, while entries pushed after it sit
-  // above the bit and survive. Cheap relaxed load keeps the hot path free of
-  // RMW; consuming the counter before the sweep (not after) means a cancelIo
-  // racing with the sweep sees 0, increments and pushes a fresh CANCEL pass -
-  // a coalesced request cannot be lost
-  if (__uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
+  // cancelIo sweep, positional: the CANCELIO bit was OR-ed onto the chain
+  // entry that was the head at cancelIo() time, and the backend starts that
+  // entry's operation before calling here - so everything submitted before
+  // the cancel is already in the queues and gets swept, while entries pushed
+  // after it sit above the bit and survive. The sweep is gated on the
+  // CANCELIO position itself: an older plain CANCEL position in the same
+  // captured chain must not consume the flag before the submissions between
+  // the two positions have started. Cheap relaxed load keeps the hot path
+  // free of RMW; consuming the counter before the sweep (not after) means a
+  // cancelIo racing with the sweep sees 0, increments and pushes a fresh
+  // CANCELIO pass - a coalesced request cannot be lost
+  if ((tag & COMBINER_TAG_CANCELIO) &&
+      __uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
       __uint_atomic_exchange(&object->CancelIoFlag, 0) != 0) {
     cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
@@ -888,11 +901,14 @@ void graceReclaim(asyncBase *base)
     if (base->gracePending) {
       if (!gracePendingRipe(base))
         break;
-      // Freeing after a later freeze is still safe: the pending batch was
-      // detached while the authoritative frozen check below read 0, so the
-      // freeze linearized after the detach - an untracked thread's first
-      // kernel wait started after these objects left the backend and its
-      // batches cannot reference them
+      // Authoritative frozen re-check before every free, mirroring the one
+      // after the exchange below: the relaxed gate at the top may run on a
+      // stale 0, and a freeze that became visible while the batch was
+      // parked here means quiescence bookkeeping is no longer trusted -
+      // park the batch forever (the frozen degradation) instead of acting
+      // on counters that may already be forged
+      if (__uint_atomic_load(&base->graceFrozen, amoSeqCst))
+        break;
       aioObjectRoot *ripe = base->gracePending;
       __pointer_atomic_store((void *volatile*)&base->gracePending, 0, amoRelaxed);
       while (ripe) {
@@ -940,6 +956,11 @@ void graceReclaim(asyncBase *base)
 
 void graceThreadEnter(asyncBase *base)
 {
+  // A quit->restart cycle re-enters with the flag still set from the
+  // previous life; every branch below except a successful claim must
+  // leave it clear
+  graceSlotOwned = 0;
+
   // Freezing reclamation is the memory-safe degradation for thread
   // configurations the slots cannot describe: dead objects then stay in
   // the limbo for the rest of the base's life. The store must be seq-cst
@@ -968,6 +989,7 @@ void graceThreadEnter(asyncBase *base)
     __uint_atomic_store(&base->graceFrozen, 1, amoSeqCst);  // see the seq-cst note above
     return;
   }
+  graceSlotOwned = 1;
 
   // High-water mark of claimed slots bounds the reclaim scan, so the slot
   // array can afford a generous limit. The claim above and this bump are
@@ -980,7 +1002,13 @@ void graceThreadEnter(asyncBase *base)
 
 void graceQuiesce(asyncBase *base)
 {
-  if (messageLoopThreadId >= base->graceSlotLimit)
+  // Only the thread that actually claimed the slot may tick it (the claim
+  // implies messageLoopThreadId < graceSlotLimit). A thread whose claim
+  // failed froze reclamation, but the freeze takes a moment to reach a
+  // scanner holding a captured batch - a tick from the loser meanwhile is
+  // indistinguishable from the live owner's quiescence and ripens batches
+  // whose objects the owner may still reference
+  if (!graceSlotOwned)
     return;
 
   // With nothing parked anywhere a tick has no reader, so the whole
@@ -1008,15 +1036,19 @@ void graceThreadExit(asyncBase *base)
 {
   // Stamp the slot out with the free/exited sentinel; the release store
   // publishes all processing of the thread's final kernel batches to the
-  // scanner's acquire load. The caller must not have dropped the loop thread
-  // counter yet: once it does, a future loop thread may adopt this id, and a
-  // stale live stamp would shield its batches from the grace period. The
-  // last thread out drains the limbo: with every slot stamped, a captured
-  // batch is immediately ripe
-  if (messageLoopThreadId < base->graceSlotLimit)
+  // scanner's acquire load. Only the claim's owner stamps: an exiting
+  // thread that failed its claim would mark the live owner exited,
+  // removing its batches from the grace gate entirely. The caller must
+  // not have dropped the loop thread counter yet: once it does, a future
+  // loop thread may adopt this id, and a stale live stamp would shield
+  // its batches from the grace period. The last thread out drains the
+  // limbo: with every slot stamped, a captured batch is immediately ripe
+  if (graceSlotOwned) {
     __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
                            UINTPTR_MAX,
                            amoRelease);
+    graceSlotOwned = 0;
+  }
   graceReclaim(base);
 }
 

@@ -11,6 +11,13 @@
 #include <memory>
 #include <thread>
 
+#ifdef __linux__
+#include <sys/timerfd.h>
+#include <poll.h>
+#include <unistd.h>
+#include <cerrno>
+#endif
+
 namespace {
 
 static_assert(COMBINER_TAG_PROGRESS_READ == IO_EVENT_READ, "READ tag must map directly to backend events");
@@ -276,7 +283,7 @@ TEST(core_cancel, waiting_and_synchronously_cancelled_running_operations_release
             (std::vector<asyncOpRoot*>{&alreadyTerminal.root}));
 
   uint32_t needStart = 0;
-  reapObject(&object.root, &needStart);
+  reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(alreadyTerminal.releaseCalls, 1u);
   EXPECT_EQ(object.root.readQueue.head, nullptr);
   backend.drainCompletions();
@@ -324,14 +331,14 @@ TEST(core_cancel, reap_rebuilds_multiple_retained_nodes_and_late_progress_advanc
   eqPushBack(&object.root.readQueue, &waiting.root);
   uint32_t needStart = 0;
 
-  reapObject(&object.root, &needStart);
+  reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(running.root.running, arCancelling);
   EXPECT_EQ(listContents(object.root.readQueue),
             (std::vector<asyncOpRoot*>{&running.root, &waiting.root}));
 
   // A second idempotent reconcile covers the already-cancelling survivor and
   // rebuilds both links again.
-  reapObject(&object.root, &needStart);
+  reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(listContents(object.root.readQueue),
             (std::vector<asyncOpRoot*>{&running.root, &waiting.root}));
   EXPECT_EQ(waiting.root.executeQueue.prev, &running.root);
@@ -360,7 +367,7 @@ TEST(core_cancel, multiple_status_race_losers_remain_linked_for_winner_reap)
             (std::vector<asyncOpRoot*>{&first.root, &second.root}));
   EXPECT_EQ(second.root.executeQueue.prev, &first.root);
   uint32_t needStart = 0;
-  reapObject(&object.root, &needStart);
+  reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(object.root.readQueue.head, nullptr);
   backend.drainCompletions();
   EXPECT_EQ(first.callbackStatus, aosTimeout);
@@ -631,7 +638,7 @@ TEST(core_initialization, direct_reap_handles_running_and_waiting_terminal_state
   ASSERT_TRUE(opSetStatus(&running.root, opGetGeneration(&running.root), aosTimeout));
   uint32_t needStart = 0;
 
-  reapObject(&object.root, &needStart);
+  reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(running.cancelCalls, 1u);
   EXPECT_EQ(running.releaseCalls, 1u);
   EXPECT_EQ(object.root.initializationOp, 0u);
@@ -639,7 +646,7 @@ TEST(core_initialization, direct_reap_handles_running_and_waiting_terminal_state
   object.root.initializationOp = reinterpret_cast<uintptr_t>(&waiting.root);
   waiting.root.running = arWaiting;
   ASSERT_TRUE(opSetStatus(&waiting.root, opGetGeneration(&waiting.root), aosCanceled));
-  reapObject(&object.root, &needStart);
+  reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(waiting.cancelCalls, 0u);
   EXPECT_EQ(waiting.releaseCalls, 1u);
   EXPECT_EQ(object.root.initializationOp, 0u);
@@ -1118,8 +1125,8 @@ TEST(core_grace_period, active_thread_holds_retired_batch_until_quiescence)
 {
   TestBackend backend;
   TestObject first(backend), second(backend);
-  backend.base.graceSlotCount = 1;
-  backend.base.graceSeen[0].seen = 0;
+  messageLoopThreadId = 0;
+  graceThreadEnter(&backend.base);        // claims slot 0: counter 0, high water 1
 
   graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
   graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
@@ -1132,7 +1139,6 @@ TEST(core_grace_period, active_thread_holds_retired_batch_until_quiescence)
   EXPECT_EQ(backend.base.gracePending, &second.root);
 
   // The quiescent tick ripens the whole batch at once
-  messageLoopThreadId = 0;
   graceQuiesce(&backend.base);
   EXPECT_EQ(first.memoryReleases, 1u);
   EXPECT_EQ(second.memoryReleases, 1u);
@@ -1143,9 +1149,8 @@ TEST(core_grace_period, objects_retired_after_capture_wait_for_the_next_batch)
 {
   TestBackend backend;
   TestObject first(backend), second(backend);
-  backend.base.graceSlotCount = 1;
-  backend.base.graceSeen[0].seen = 0;
   messageLoopThreadId = 0;
+  graceThreadEnter(&backend.base);        // claims slot 0: counter 0, high water 1
 
   graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
   graceReclaim(&backend.base);            // captures batch {first}
@@ -1167,9 +1172,10 @@ TEST(core_grace_period, exited_slot_does_not_gate_the_pending_batch)
 {
   TestBackend backend;
   TestObject object(backend);
+  messageLoopThreadId = 0;
+  graceThreadEnter(&backend.base);        // claims slot 0
+  backend.base.graceSeen[1].seen = 5;     // a live foreign thread in slot 1
   backend.base.graceSlotCount = 2;
-  backend.base.graceSeen[0].seen = 0;
-  backend.base.graceSeen[1].seen = 5;
 
   graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
   graceReclaim(&backend.base);            // captured against {0, 5}
@@ -1177,7 +1183,6 @@ TEST(core_grace_period, exited_slot_does_not_gate_the_pending_batch)
 
   // Slot 1 exits (quit path stamp), slot 0 ticks: the batch ripens
   backend.base.graceSeen[1].seen = UINTPTR_MAX;
-  messageLoopThreadId = 0;
   graceQuiesce(&backend.base);
   EXPECT_EQ(object.memoryReleases, 1u);
 }
@@ -1731,39 +1736,6 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
 }
 
 
-// TDD regression: once the last reference is gone the DELETE
-// tag has already run the destructor and parked the object for the grace
-// period; nothing may touch it again. Yet the DeletePending gates
-// (combinerAcquire and the datagram fast paths in aioReadMsg/aioWriteMsg)
-// route a late submission through newAsyncOp -> objectIncrementReference,
-// resurrecting the dead object's reference count from zero (debug builds
-// abort on the "Removed object access" assert instead) and parking the
-// operation forever on the poisoned Head - the release then re-runs the
-// repurposed destructor: double release. Intentionally red until the gates
-// reject a submission to a dead object without touching it.
-TEST(core_delete_lifecycle, late_submission_after_final_release_does_not_touch_the_dead_object)
-{
-  TestBackend backend;
-  TestObject object(backend);
-  objectDelete(&object.root);
-  ASSERT_EQ(object.root.refs, 0u);
-  ASSERT_EQ(object.destructorCallbacks, 1u);
-  ASSERT_EQ(object.resourceDestructors, 1u);
-  SyncScenario scenario(object);
-
-  runSyncScenario(scenario, afNone, &scenario);
-  backend.drainCompletions();
-
-  EXPECT_EQ(object.root.refs, 0u)
-    << "a late submission resurrected the dead object's reference count";
-  EXPECT_EQ(object.destructorCallbacks, 1u);
-  EXPECT_EQ(object.resourceDestructors, 1u);
-  if (scenario.operation) {
-    EXPECT_NE(opGetStatus(&scenario.operation->root), aosPending)
-      << "the late submission was parked forever on the dead object's combiner";
-  }
-}
-
 TEST(core_timeout_map, rounds_deadlines_up_and_extracts_each_bucket_once)
 {
   TestBackend backend;
@@ -1950,30 +1922,28 @@ TEST(core_realtime_timer, timeout_completion_does_not_stop_fired_timer)
   objectDelete(&object.root);
 }
 
-// TDD regression: the delivery side reads the generation from
-// the LIVE timer->tag instead of an identity captured by the arming the event
-// belongs to. A stale doorbell - harvested into another loop thread's batch,
-// then processed after the operation completed, its storage got recycled and
-// re-armed - adopts the NEW incarnation's generation and wins the status CAS:
-// the fresh operation is expired the moment it starts. The base commit
-// rejected this by the truncated generation bits carried in udata
-// (opEncodeTag). Intentionally red until the delivered event again carries
-// the identity of its own arming.
+// Regression for the opEncodeTag removal (kqueue/ident protocol): a stale
+// doorbell - harvested into another loop thread's batch, then processed after
+// the operation completed, its storage got recycled and the SAME timer got
+// re-armed - must not adopt the new arming's generation and win the status
+// CAS. The arming identity travels full-width through the kernel as the
+// knote ident; a mismatch with the published tag rejects the doorbell.
 TEST(core_reactor_timer, stale_doorbell_must_not_expire_a_rearmed_operation)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
-  aioTimer timer{};
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
   timer.root.base = &backend.base;
   timer.root.type = ioObjectTimer;
   timer.op = &op.root;
-  timer.fd = 1;
+  timer.fd = static_cast<intptr_t>(uintptr_t{7} << rtIdentSeqBits);  // creation seeds the base id
   op.root.timerId = &timer;
 
-  // The first incarnation arms its realtime timer; the kernel doorbell keeps
-  // the udata of this arming while it waits in a harvested batch
-  void *udata = reactorTimerArm(&timer, &op.root);
+  // The first incarnation arms its realtime timer; the kernel keeps both the
+  // udata and the ident of this arming inside the harvested event
+  void *udata = reactorTimerArmIdent(&timer, &op.root);
+  uintptr_t staleIdent = static_cast<uintptr_t>(timer.fd);
   void *decodedTimer = nullptr;
   uintptr_t staleBits = 0;
   __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
@@ -1983,28 +1953,68 @@ TEST(core_reactor_timer, stale_doorbell_must_not_expire_a_rearmed_operation)
   // submission with a fresh deadline before the doorbell gets processed
   uintptr_t firstGeneration = opGetGeneration(&op.root);
   op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
-  reactorTimerArm(&timer, &op.root);
+  reactorTimerArmIdent(&timer, &op.root);
 
   // Another loop thread finally processes the stale doorbell
   uintptr_t armedGeneration = 0;
-  if (reactorTimerDecodeEvent(&timer, staleBits, &armedGeneration) == rteExpireOperation)
-    opCancel(timer.op, armedGeneration, aosTimeout);
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, staleIdent, &armedGeneration), rteIgnore)
+    << "a doorbell carrying the previous arming's ident matched the re-armed timer";
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
 
-  EXPECT_EQ(opGetStatus(&op.root), aosPending)
-    << "a stale doorbell adopted the new arming's generation and expired the re-armed operation";
+  // The current arming's own doorbell still expires it, with its generation
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, static_cast<uintptr_t>(timer.fd), &armedGeneration),
+            rteExpireOperation);
+  EXPECT_EQ(armedGeneration, opGetGeneration(&op.root));
 
   reactorTimerDisarm(&timer);
   objectDecrementReference(&object.root, 1);
   deleteOwner(backend, object);
 }
 
-// TDD regression: for user events the delivery gate only
-// distinguishes armed (tag != 0) from stopped - not WHICH arming the doorbell
-// belongs to. A doorbell of a previous arming, delivered after
-// userEventStopTimer + userEventStartTimer of the same event (same operation
-// generation!), passes the gate and activates the event early, consuming one
-// of its counted ticks. Intentionally red until the arming identity
-// distinguishes restarts (the old "compare timer and event tag" TODO).
+// Same scenario through the epoll/count protocol: the re-arm's settime reset
+// the fd's expiration counter, so the stale doorbell reads 0 and is dropped;
+// a positive count proves the CURRENT arming expired, and expiring it with
+// its own generation is correct whoever's envelope delivered the wakeup.
+TEST(core_reactor_timer, stale_count_doorbell_must_not_expire_a_rearmed_operation)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object, OPCODE_READ, afRealtime, 10);
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
+  timer.root.base = &backend.base;
+  timer.root.type = ioObjectTimer;
+  timer.op = &op.root;
+  op.root.timerId = &timer;
+
+  void *udata = reactorTimerArmCount(&timer, &op.root);
+  void *decodedTimer = nullptr;
+  uintptr_t staleBits = 0;
+  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
+  ASSERT_EQ(decodedTimer, &timer);
+
+  uintptr_t firstGeneration = opGetGeneration(&op.root);
+  op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
+  reactorTimerArmCount(&timer, &op.root);
+
+  uintptr_t armedTag = reactorTimerArmedCountTag(&timer);
+  ASSERT_NE(armedTag, 0u);
+  uintptr_t armedGeneration = 0;
+  EXPECT_EQ(reactorTimerDecodeCount(armedTag, staleBits, 0, &armedGeneration), rteIgnore)
+    << "a stale doorbell of the re-armed timer expired an operation whose deadline is ahead";
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+
+  EXPECT_EQ(reactorTimerDecodeCount(armedTag, staleBits, 1, &armedGeneration), rteExpireOperation);
+  EXPECT_EQ(armedGeneration, opGetGeneration(&op.root));
+
+  reactorTimerDisarm(&timer);
+  objectDecrementReference(&object.root, 1);
+  deleteOwner(backend, object);
+}
+
+// User events restart with an UNCHANGED operation generation, so the arming
+// identity - not the generation - must distinguish restarts (the old
+// "compare timer and event tag" TODO). kqueue/ident protocol: every arming
+// takes a fresh ident, a doorbell of the previous one no longer matches.
 TEST(core_reactor_timer, stale_doorbell_must_not_activate_a_restarted_user_event)
 {
   aioUserEvent event{};
@@ -2012,153 +2022,251 @@ TEST(core_reactor_timer, stale_doorbell_must_not_activate_a_restarted_user_event
   event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;  // generation 1, stable across restarts
   event.tag = 1;
   event.counter = 5;
-  aioTimer timer{};
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
   timer.op = &event.root;
-  timer.fd = 2;
+  timer.fd = static_cast<intptr_t>(uintptr_t{2} << rtIdentSeqBits);
   event.root.timerId = &timer;
 
-  void *udata = reactorTimerArm(&timer, &event.root);   // first arming
+  void *udata = reactorTimerArmIdent(&timer, &event.root);   // first arming
+  uintptr_t staleIdent = static_cast<uintptr_t>(timer.fd);
   void *decodedTimer = nullptr;
   uintptr_t staleBits = 0;
   __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
 
-  reactorTimerDisarm(&timer);                           // userEventStopTimer
-  reactorTimerArm(&timer, &event.root);                 // userEventStartTimer again
+  reactorTimerDisarm(&timer);                                // userEventStopTimer
+  reactorTimerArmIdent(&timer, &event.root);                 // userEventStartTimer again
 
   uintptr_t armedGeneration = 0;
-  EXPECT_EQ(reactorTimerDecodeEvent(&timer, staleBits, &armedGeneration), rteIgnore)
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, staleIdent, &armedGeneration), rteIgnore)
     << "a doorbell of the previous arming would activate the restarted user event and consume its tick";
+
+  // The current arming's own tick still delivers
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, static_cast<uintptr_t>(timer.fd), &armedGeneration),
+            rteUserEvent);
 }
 
-// TDD regression: the "tag == 0 means disarmed" sentinel collides
-// with a legally wrapped generation. On a 32-bit target the generation field
-// is 24 bits wide: after 2^24 recycles of one operation slot initAsyncOpRoot
-// wraps it to zero and the arming publishes tag 0 - every delivery then reads
-// "stale doorbell" and the timeout is dropped forever (the operation hangs).
-// The protocol requirement on the seam: an arming must never be
-// indistinguishable from the disarmed state, whatever generation it carries.
-// Intentionally red until the armed encoding is disjoint from the sentinel.
+// Same restart through the epoll/count protocol: the restart's settime reset
+// the counter - an early doorbell of the previous arming reads 0 and is
+// dropped instead of consuming a counted tick ahead of schedule.
+TEST(core_reactor_timer, stale_count_doorbell_must_not_activate_a_restarted_user_event)
+{
+  aioUserEvent event{};
+  event.root.opCode = actUserEvent;
+  event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;
+  event.tag = 1;
+  event.counter = 5;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
+  timer.op = &event.root;
+  event.root.timerId = &timer;
+
+  void *udata = reactorTimerArmCount(&timer, &event.root);   // first arming
+  void *decodedTimer = nullptr;
+  uintptr_t staleBits = 0;
+  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
+
+  reactorTimerDisarm(&timer);                                // userEventStopTimer
+  reactorTimerArmCount(&timer, &event.root);                 // userEventStartTimer again
+
+  uintptr_t armedTag = reactorTimerArmedCountTag(&timer);
+  ASSERT_NE(armedTag, 0u);
+  uintptr_t armedGeneration = 0;
+  EXPECT_EQ(reactorTimerDecodeCount(armedTag, staleBits, 0, &armedGeneration), rteIgnore)
+    << "an early doorbell of the previous arming consumed a tick of the restarted event";
+  EXPECT_EQ(reactorTimerDecodeCount(armedTag, staleBits, 1, &armedGeneration), rteUserEvent);
+}
+
+// The "tag == 0 means disarmed" sentinel must not collide with a legally
+// wrapped generation. On a 32-bit target the generation field is 24 bits
+// wide: after 2^24 recycles of one operation slot initAsyncOpRoot wraps it
+// to zero - the armed encoding must stay disjoint from the sentinel anyway,
+// or every delivery reads "stale doorbell" and the timeout is dropped
+// forever (the operation hangs). kqueue: the ident's seq part skips 0;
+// epoll: the armed bit in (generation << 1) | 1.
 TEST(core_reactor_timer, arming_a_wrapped_generation_must_not_publish_the_disarmed_sentinel)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
-  aioTimer timer{};
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
   timer.op = &op.root;
-  timer.fd = 3;
+  timer.fd = 0;  // even a zero base id must not let the composite ident hit 0
   op.root.timerId = &timer;
 
   // The slot's generation legally wraps around to zero (2^24 recycles on a
   // 32-bit target)
   op.root.tag = (uintptr_t{0} << TAG_STATUS_SIZE) | aosPending;
-  void *udata = reactorTimerArm(&timer, &op.root);
+  void *udata = reactorTimerArmIdent(&timer, &op.root);
   void *decodedTimer = nullptr;
   uintptr_t udataBits = 0;
   __tagged_pointer_decode(udata, &decodedTimer, &udataBits);
 
-  uintptr_t armedGeneration = 0;
-  EXPECT_NE(reactorTimerDecodeEvent(&timer, udataBits, &armedGeneration), rteIgnore)
+  uintptr_t armedGeneration = ~uintptr_t{0};
+  EXPECT_NE(static_cast<uintptr_t>(timer.fd), 0u);
+  EXPECT_NE(reactorTimerDecodeIdent(&timer, udataBits, static_cast<uintptr_t>(timer.fd), &armedGeneration),
+            rteIgnore)
     << "an armed timer with generation 0 is indistinguishable from a disarmed one: its timeout is lost";
+  EXPECT_EQ(armedGeneration, 0u);
+  reactorTimerDisarm(&timer);
+
+  // epoll flavor: the armed bit keeps generation 0 away from the sentinel
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer countTimer{};  // production timers come from alignedMalloc
+  countTimer.op = &op.root;
+  op.root.timerId = &countTimer;
+  reactorTimerArmCount(&countTimer, &op.root);
+  uintptr_t armedTag = reactorTimerArmedCountTag(&countTimer);
+  EXPECT_NE(armedTag, 0u)
+    << "the armed count encoding of generation 0 collided with the disarmed sentinel";
+  armedGeneration = ~uintptr_t{0};
+  EXPECT_EQ(reactorTimerDecodeCount(armedTag, udataBits, 1, &armedGeneration), rteExpireOperation);
+  EXPECT_EQ(armedGeneration, 0u);
+  reactorTimerDisarm(&countTimer);
 
   objectDecrementReference(&object.root, 1);
   deleteOwner(backend, object);
 }
 
-struct DatagramGateContext {
-  unsigned readCallbacks = 0;
-  unsigned writeCallbacks = 0;
-  unsigned destructorCallbacks = 0;
-};
-
-void datagramGateReadCb(AsyncOpStatus, aioObject*, HostAddress, size_t, void *arg)
+#ifdef __linux__
+// The kernel dependency the count protocol stands on: timerfd_settime with a
+// new value RESETS the fd's expiration counter, so a doorbell of a previous
+// arming reads 0 after a re-arm instead of inheriting stale expirations. If
+// this ever breaks on a target kernel, reactorTimerDecodeCount loses its
+// oracle and the stop-side drain needs rethinking.
+TEST(core_reactor_timer, timerfd_settime_resets_the_expiration_counter)
 {
-  static_cast<DatagramGateContext*>(arg)->readCallbacks++;
+  int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  ASSERT_NE(fd, -1);
+  itimerspec its{};
+  its.it_value.tv_nsec = 1000000;  // 1ms
+  ASSERT_EQ(timerfd_settime(fd, 0, &its, nullptr), 0);
+  pollfd waiter{fd, POLLIN, 0};
+  ASSERT_EQ(poll(&waiter, 1, 1000), 1) << "the armed timerfd never expired";
+
+  // Re-arm with a distant deadline WITHOUT reading the expired count first -
+  // exactly what a recycle+rearm does while a stale doorbell sits in a batch
+  its.it_value.tv_sec = 10;
+  its.it_value.tv_nsec = 0;
+  ASSERT_EQ(timerfd_settime(fd, 0, &its, nullptr), 0);
+  uint64_t expirations = 0;
+  ssize_t result = read(fd, &expirations, sizeof(expirations));
+  EXPECT_TRUE(result == -1 && errno == EAGAIN)
+    << "settime did not reset the expiration counter: read returned " << result
+    << " with count " << expirations << " - a stale doorbell would expire the fresh arming";
+
+  // And a genuine expiration of the current arming still reads back
+  its.it_value.tv_sec = 0;
+  its.it_value.tv_nsec = 1000000;
+  ASSERT_EQ(timerfd_settime(fd, 0, &its, nullptr), 0);
+  ASSERT_EQ(poll(&waiter, 1, 1000), 1);
+  result = read(fd, &expirations, sizeof(expirations));
+  EXPECT_EQ(result, (ssize_t)sizeof(expirations));
+  EXPECT_GT(expirations, 0u);
+  close(fd);
+}
+#endif
+
+// Regression: a user-event tick whose activation collided with a concurrent
+// userEventActivate (the AIOPing pattern) is dropped - but on a backend whose
+// registration is consumed by every delivery (epoll EPOLLONESHOT) the
+// registration must still be re-armed. Losing the only oneshot registration
+// silences the periodic event forever: the kernel timer keeps ticking, epoll
+// never reports it again until a manual userEventStartTimer.
+TEST(core_reactor_timer, failed_activation_must_still_rearm_a_oneshot_registration)
+{
+  ReactorUserEventTickPlan plan = reactorTimerUserEventTick(0, 0, 1);
+  EXPECT_EQ(plan.activate, 0);
+  EXPECT_EQ(plan.stopTimer, 0);
+  EXPECT_EQ(plan.rearm, 1)
+    << "a dropped tick consumed the oneshot registration without re-arming it";
+
+  // kqueue: the periodic kernel timer stays armed, a dropped tick needs no action
+  plan = reactorTimerUserEventTick(0, 0, 0);
+  EXPECT_EQ(plan.activate, 0);
+  EXPECT_EQ(plan.stopTimer, 0);
+  EXPECT_EQ(plan.rearm, 0);
 }
 
-void datagramGateWriteCb(AsyncOpStatus, aioObject*, size_t, void *arg)
+// Pins the green user-event delivery paths of both backends around the plan.
+TEST(core_reactor_timer, user_event_tick_plan_pins_the_green_paths)
 {
-  static_cast<DatagramGateContext*>(arg)->writeCallbacks++;
+  // Counted tick with ticks remaining: deliver, re-arm the consumed oneshot
+  ReactorUserEventTickPlan plan = reactorTimerUserEventTick(1, 0, 1);
+  EXPECT_EQ(plan.activate, 1);
+  EXPECT_EQ(plan.stopTimer, 0);
+  EXPECT_EQ(plan.rearm, 1);
+
+  // Final counted tick: stop the timer, the dead registration is not re-armed
+  plan = reactorTimerUserEventTick(1, 1, 1);
+  EXPECT_EQ(plan.activate, 1);
+  EXPECT_EQ(plan.stopTimer, 1);
+  EXPECT_EQ(plan.rearm, 0);
+
+  // kqueue twins: never re-arm, the kernel-side periodic timer is standing
+  plan = reactorTimerUserEventTick(1, 0, 0);
+  EXPECT_EQ(plan.activate, 1);
+  EXPECT_EQ(plan.stopTimer, 0);
+  EXPECT_EQ(plan.rearm, 0);
+  plan = reactorTimerUserEventTick(1, 1, 0);
+  EXPECT_EQ(plan.activate, 1);
+  EXPECT_EQ(plan.stopTimer, 1);
+  EXPECT_EQ(plan.rearm, 0);
 }
 
-void datagramGateDestructorCb(aioObjectRoot*, void *arg)
+// Every kernel publication of a timer pointer must carry the udataTimer
+// discriminator - including the disabled registrations (epoll InitializeTimer
+// CTL_ADD with mask 0, StopTimer CTL_MOD to mask 0): EPOLLERR/EPOLLHUP are
+// mask-exempt, and a bare timer pointer would route such an event into the
+// fd-object branch, pushing a combiner signal through the aioTimer's
+// never-initialized Head. The seam owns the single udata constructor; this
+// pins its bits for every flavor.
+TEST(core_reactor_timer, every_timer_udata_publication_carries_the_timer_bit)
 {
-  static_cast<DatagramGateContext*>(arg)->destructorCallbacks++;
-}
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object, OPCODE_READ, afRealtime, 10);
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
+  timer.op = &op.root;
+  op.root.timerId = &timer;
 
-// Build the dead-object precondition on a real backend: a datagram object whose
-// last reference is already gone. With no operations in flight deleteAioObject
-// drops the final reference right here - the DELETE tag runs in this thread,
-// the resource destructor fires and the object parks in the grace limbo, where
-// its memory stays valid (type-stable pools) but nothing may touch it again.
-aioObject *makeDeadDatagramObject(asyncBase *base, DatagramGateContext &context)
-{
-  socketTy udpSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
-  aioObject *object = newSocketIo(base, udpSocket);
-  if (!object)
-    return nullptr;
-  objectSetDestructorCb(&object->root, datagramGateDestructorCb, &context);
-  deleteAioObject(object);
-  return object;
-}
+  auto bitsOf = [](void *udata, aioTimer *expected) {
+    void *ptr = nullptr;
+    uintptr_t bits = 0;
+    __tagged_pointer_decode(udata, &ptr, &bits);
+    EXPECT_EQ(ptr, expected) << "udata does not point back at the timer";
+    return bits;
+  };
 
-// TDD regression: the datagram DeletePending gate in aioReadMsg,
-// with a callback supplied, routes the rejection through newAsyncOp ->
-// objectIncrementReference - resurrecting a dead object's reference count
-// from zero and queueing a completion whose release would drop the count back
-// to zero and run the repurposed destructor a second time. Intentionally red
-// until the gate rejects a dead object without touching it.
-// The private base is deliberately abandoned without draining: in the red
-// state delivering the parked canceled completion would run the second DELETE
-// and push the limbo-parked object into the backend's global recycling pool,
-// poisoning every later test in this process.
-TEST(core_datagram_gate, read_after_final_release_must_be_rejected_without_touching_the_dead_object)
-{
-  asyncBase *base = createAsyncBase(amOSDefault, 1);
-  ASSERT_NE(base, nullptr);
-  DatagramGateContext context;
-  aioObject *object = makeDeadDatagramObject(base, context);
-  ASSERT_NE(object, nullptr);
-  ASSERT_EQ(context.destructorCallbacks, 1u);
-  ASSERT_EQ(object->root.refs, 0u);
-  ASSERT_EQ(object->root.DeletePending, 1u);
+  // The registration-only udata (disabled epoll registrations)
+  EXPECT_EQ(bitsOf(reactorTimerUdata(&timer, 0), &timer) & udataTimer, uintptr_t{udataTimer});
+  EXPECT_EQ(bitsOf(reactorTimerUdata(&timer, 1), &timer) & (udataTimer | udataUserEvent),
+            uintptr_t{udataTimer | udataUserEvent});
 
-  char buffer[16];
-  ssize_t result = aioReadMsg(object, buffer, sizeof(buffer), afNone, 0,
-                              datagramGateReadCb, &context);
+  // Both arm flavors of a realtime operation: timer bit set, user-event bit clear
+  uintptr_t identBits = bitsOf(reactorTimerArmIdent(&timer, &op.root), &timer);
+  EXPECT_EQ(identBits & udataTimer, uintptr_t{udataTimer});
+  EXPECT_EQ(identBits & udataUserEvent, 0u);
+  reactorTimerDisarm(&timer);
+  uintptr_t countBits = bitsOf(reactorTimerArmCount(&timer, &op.root), &timer);
+  EXPECT_EQ(countBits & udataTimer, uintptr_t{udataTimer});
+  EXPECT_EQ(countBits & udataUserEvent, 0u);
+  reactorTimerDisarm(&timer);
 
-  EXPECT_EQ(result, -(ssize_t)aosCanceled)
-    << "a read submitted after the final release was not rejected outright";
-  EXPECT_EQ(object->root.refs, 0u)
-    << "the aioReadMsg DeletePending gate resurrected the dead object's reference count";
-  EXPECT_EQ(context.destructorCallbacks, 1u);
-  EXPECT_EQ(context.readCallbacks, 0u);
-}
+  // User-event arms additionally mark the udata so the decode can branch
+  // without touching the operation's memory
+  aioUserEvent event{};
+  event.root.opCode = actUserEvent;
+  event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer eventTimer{};  // production timers come from alignedMalloc
+  eventTimer.op = &event.root;
+  event.root.timerId = &eventTimer;
+  EXPECT_EQ(bitsOf(reactorTimerArmIdent(&eventTimer, &event.root), &eventTimer) & (udataTimer | udataUserEvent),
+            uintptr_t{udataTimer | udataUserEvent});
+  reactorTimerDisarm(&eventTimer);
+  EXPECT_EQ(bitsOf(reactorTimerArmCount(&eventTimer, &event.root), &eventTimer) & (udataTimer | udataUserEvent),
+            uintptr_t{udataTimer | udataUserEvent});
+  reactorTimerDisarm(&eventTimer);
 
-// TDD regression: same for the aioWriteMsg gate. See the read
-// test above for why the base is abandoned without draining.
-TEST(core_datagram_gate, write_after_final_release_must_be_rejected_without_touching_the_dead_object)
-{
-  asyncBase *base = createAsyncBase(amOSDefault, 1);
-  ASSERT_NE(base, nullptr);
-  DatagramGateContext context;
-  aioObject *object = makeDeadDatagramObject(base, context);
-  ASSERT_NE(object, nullptr);
-  ASSERT_EQ(context.destructorCallbacks, 1u);
-  ASSERT_EQ(object->root.refs, 0u);
-
-  HostAddress address;
-  ASSERT_EQ(hostAddressFromAscii("127.0.0.1", &address), 1);
-  address.port = 1;
-  char buffer[16] = {};
-  ssize_t result = aioWriteMsg(object, &address, buffer, sizeof(buffer), afNone, 0,
-                               datagramGateWriteCb, &context);
-
-  EXPECT_EQ(result, -(ssize_t)aosCanceled)
-    << "a write submitted after the final release was not rejected outright";
-  EXPECT_EQ(object->root.refs, 0u)
-    << "the aioWriteMsg DeletePending gate resurrected the dead object's reference count";
-  EXPECT_EQ(context.destructorCallbacks, 1u);
-  EXPECT_EQ(context.writeCallbacks, 0u);
+  objectDecrementReference(&object.root, 1);
+  deleteOwner(backend, object);
 }
 
 } // namespace

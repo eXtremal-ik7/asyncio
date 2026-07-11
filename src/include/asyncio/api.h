@@ -133,12 +133,17 @@ extern __tls unsigned messageLoopThreadId;
 // so a re-pushed signal can neither be lost nor double-counted - the action is
 // derived from object/operation state, not carried in the node. Progress is
 // always emitted; cancel only by the status-race winner (invariant 1).
-#define COMBINER_TAG_SIZE           5
+// CANCELIO is the cancelIo() request: same terminal scan as CANCEL, plus the
+// position defines the CancelIoFlag sweep boundary - a distinct bit, so an
+// older CANCEL position (grid timeout/opCancel) cannot consume the flag early
+// and exempt operations submitted before the cancelIo() call.
+#define COMBINER_TAG_SIZE           6
 #define COMBINER_TAG_PROGRESS_READ  (1u << 0)
 #define COMBINER_TAG_PROGRESS_WRITE (1u << 1)
 #define COMBINER_TAG_ERROR          (1u << 2)
 #define COMBINER_TAG_CANCEL         (1u << 3)
 #define COMBINER_TAG_DELETE         (1u << 4)
+#define COMBINER_TAG_CANCELIO       (1u << 5)
 #define COMBINER_TAG_PROGRESS_MASK  (COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE)
 
 typedef struct AsyncOpTaggedPtr {
@@ -326,7 +331,7 @@ void startOperation(asyncOpRoot *op, uint32_t *needStart);
 // CANCEL reconcile: scan read/write queues and the initialization slot for
 // terminal operations and reap them positionally (an in-flight op whose cancelMethod
 // returns 0 stays on its head until its late completion moves it).
-void reapObject(aioObjectRoot *object, uint32_t *needStart);
+void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart);
 void processInitializationOp(aioObjectRoot *object, uint32_t *needStart);
 void executeOperationList(List *list);
 void cancelOperationList(List *list, AsyncOpStatus status);

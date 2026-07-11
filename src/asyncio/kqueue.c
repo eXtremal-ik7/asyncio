@@ -21,8 +21,13 @@ static ConcurrentQueue objectPool;
 typedef struct kqueueBase {
   asyncBase B;
   int kqueueFd;
-  intptr_t timerIdCounter;
 } kqueueBase;
+
+// Base part of the composite kevent ident (reactorTimer.h). Process-global
+// like the op pools themselves: a pooled op slot - and its timer - can be
+// recycled into any base, so per-base counters could hand two timers equal
+// bases and let their idents collide inside one kqueue
+static volatile intptr_t timerIdCounter;
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op);
@@ -97,7 +102,6 @@ asyncBase *kqueueNewAsyncBase()
       // fprintf(stderr, " * kqueueNewAsyncBase: kqueue_create failed\n");
     }
 
-    base->timerIdCounter = 1;
     kqueueControl(base->kqueueFd, EV_ADD | EV_CLEAR, EVFILT_USER, 1, 0);
   }
 
@@ -153,9 +157,10 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
     processInitializationOp(object, &needStart);
 
-  // CANCEL: a timeout/opCancel/cancelIo set the status and asked for a scan
-  if (sig & COMBINER_TAG_CANCEL)
-    reapObject(object, &needStart);
+  // CANCEL/CANCELIO: a timeout/opCancel/cancelIo set the status and asked for
+  // a scan; the CANCELIO position additionally drives the CancelIoFlag sweep
+  if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
+    reapObject(object, sig, &needStart);
 
   if (ioEvents & IO_EVENT_ERROR) {
     // EV_EOF mapped to TAG_ERROR, cancel all operations with aosDisconnected status
@@ -230,17 +235,21 @@ void kqueueNextFinishedOperation(asyncBase *base)
       } else if (timerId & udataTimer) {
         aioTimer *timer = (aioTimer*)object;
         uintptr_t armedGeneration = 0;
-        switch (reactorTimerDecodeEvent(timer, timerId, &armedGeneration)) {
+        switch (reactorTimerDecodeIdent(timer, timerId, (uintptr_t)events[n].ident, &armedGeneration)) {
           case rteIgnore:
-            // stale doorbell, timer disarmed
+            // stale doorbell: a previous arming's ident, timer disarmed
             break;
 
           case rteUserEvent: {
             aioUserEvent *event = (aioUserEvent*)timer->op;
-            if (eventTryActivate(event)) {
-              if (event->counter > 0 && --event->counter == 0)
-                kqueueStopTimer(&event->root);
-
+            int activated = eventTryActivate(event);
+            int counterExhausted = activated && event->counter > 0 && --event->counter == 0;
+            // Periodic EVFILT_TIMER stays armed in the kernel: no oneshot
+            // registration to re-arm, a dropped tick needs no action
+            ReactorUserEventTickPlan plan = reactorTimerUserEventTick(activated, counterExhausted, 0);
+            if (plan.stopTimer)
+              kqueueStopTimer(&event->root);
+            if (plan.activate) {
               eventDeactivate(event);
               event->root.finishMethod(&event->root);
               eventDecrementReference(event, 1);
@@ -341,12 +350,14 @@ void kqueueDeleteObject(aioObject *object)
 
 void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op)
 {
-  kqueueBase *localBase = (kqueueBase*)base;
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   timer->root.base = base;
   timer->root.type = ioObjectTimer;
   timer->tag = 0;
-  timer->fd = __sync_fetch_and_add(&localBase->timerIdCounter, 1);
+  timer->armedGeneration = 0;
+  // Seed the permanent base into the high half; the low half is the arm
+  // sequence, advanced by reactorTimerArmIdent with each arming
+  timer->fd = (intptr_t)((uintptr_t)__sync_fetch_and_add(&timerIdCounter, 1) << rtIdentSeqBits);
   timer->op = op;
   op->timerId = timer;
 }
@@ -356,7 +367,7 @@ void kqueueStartTimer(asyncOpRoot *op)
   struct kevent event;
   int periodic = op->opCode == actUserEvent;
   aioTimer *timer = (aioTimer*)op->timerId;
-  void *udata = reactorTimerArm(timer, op);
+  void *udata = reactorTimerArmIdent(timer, op);
   EV_SET(&event,
          timer->fd,
          EVFILT_TIMER,

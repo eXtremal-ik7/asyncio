@@ -185,8 +185,8 @@ struct TestBackend : asyncBase {
     }
     if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
       processInitializationOp(object, &needStart);
-    if (signals & COMBINER_TAG_CANCEL)
-      reapObject(object, &needStart);
+    if (signals & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
+      reapObject(object, signals, &needStart);
 
     if (needStart & IO_EVENT_READ)
       executeOperationList(&object->readQueue);
