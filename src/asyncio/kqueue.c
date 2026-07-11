@@ -9,7 +9,6 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -71,13 +70,17 @@ static struct asyncImpl kqueueImpl = {
   kqueueAsyncWriteMsg
 };
 
+// kevent failures are deliberately swallowed. EV_DELETE races the oneshot
+// consume: the knote dies when its event is harvested, and that event can
+// still sit unprocessed in a loop thread's batch while the combiner drops
+// interest, so ENOENT is a normal outcome even single-threaded. EV_ADD fails
+// only on kernel resource exhaustion, which has no recovery path from
+// combiner context - parked operations are then left to their timeouts
 static void kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, int fd, void *ptr)
 {
   struct kevent event;
   EV_SET(&event, fd, filter, flags, 0, 0, ptr);
-  if (kevent(kqueueFd, &event, 1, 0, 0, 0) == -1) {
-    // fprintf(stderr, "kqueue event error, errno: %s\n", strerror(errno));
-  }
+  kevent(kqueueFd, &event, 1, 0, 0, 0);
 }
 
 static int getFd(aioObject *object)
@@ -99,7 +102,10 @@ asyncBase *kqueueNewAsyncBase()
     base->B.methodImpl = kqueueImpl;
     base->kqueueFd = kqueue();
     if (base->kqueueFd == -1) {
-      // fprintf(stderr, " * kqueueNewAsyncBase: kqueue_create failed\n");
+      // Descriptor exhaustion. Without the kqueue fd every kevent call fails
+      // and the message loop would spin hot on EBADF: fail creation instead
+      free(base);
+      return 0;
     }
 
     kqueueControl(base->kqueueFd, EV_ADD | EV_CLEAR, EVFILT_USER, 1, 0);
@@ -375,9 +381,11 @@ void kqueueStartTimer(asyncOpRoot *op)
          NOTE_USECONDS,
          op->timeout,
          udata);
-  if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1) {
-    // fprintf(stderr, "kqueueStartTimer: %s\n", strerror(errno));
-  }
+  // Each arming is a fresh knote, so EV_ADD can fail on kernel resource
+  // exhaustion. The void start path has no failure channel and the arming is
+  // then lost: the operation waits without its timeout backstop, a periodic
+  // user event goes silent
+  kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0);
 }
 
 
@@ -387,9 +395,9 @@ void kqueueStopTimer(asyncOpRoot *op)
   aioTimer *timer = (aioTimer*)op->timerId;
   reactorTimerDisarm(timer);
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
-  if (kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0) == -1) {
-    // fprintf(stderr, "kqueueStopTimer: %s\n", strerror(errno));
-  }
+  // ENOENT is the normal outcome whenever the oneshot already fired and was
+  // harvested (every expiry-driven stop) or the timer was never armed
+  kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0);
 }
 
 // Memory half only: the timer pointer is published to the kernel as udata and

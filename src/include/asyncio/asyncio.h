@@ -25,6 +25,8 @@ void initializeAsyncIo(AsyncInitFlags flags);
 // array - one cache line per thread. Exceeding it is memory-safe but disables
 // reclamation of dead objects for the rest of the base's life, so err on the
 // high side when the count is not exact.
+// Returns 0 when the OS multiplexor cannot be created (descriptor or handle
+// exhaustion) or memory allocation fails.
 asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads);
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket);
 aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice);

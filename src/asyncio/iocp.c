@@ -251,6 +251,12 @@ asyncBase *iocpNewAsyncBase()
 
     base->completionPort =
       CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
+    if (!base->completionPort) {
+      // Without the completion port the message loop cannot run: fail
+      // creation, like the reactor backends do on descriptor exhaustion
+      free(base);
+      return 0;
+    }
     base->ConnectExPtr = 0;
     tmpSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     WSAIoctl(tmpSocket,

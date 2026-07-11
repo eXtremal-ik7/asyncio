@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -82,16 +81,17 @@ static struct asyncImpl epollImpl = {
   epollAsyncWriteMsg
 };
 
+// epoll_ctl failures are deliberately swallowed, mirroring kqueueControl.
+// The Registered flag keeps the ADD/MOD/DEL choice exact, so a failure here
+// means kernel resource exhaustion (ENOMEM, or ENOSPC against
+// max_user_watches) with no recovery path from combiner context - parked
+// operations are then left to their timeouts
 static void epollControl(int epollFd, int action, uint32_t events, int fd, void *ptr)
 {
   struct epoll_event ev;
   ev.events = events;
   ev.data.ptr = ptr;
-  if (epoll_ctl(epollFd,
-                action,
-                fd,
-                &ev) == -1)
-    fprintf(stderr, "epoll_ctl error, errno: %s\n", strerror(errno));
+  epoll_ctl(epollFd, action, fd, &ev);
 }
 
 static int getFd(EPollObject *object)
@@ -123,8 +123,16 @@ asyncBase *epollNewAsyncBase()
     base->eventFd = eventfd(0, EFD_NONBLOCK);
     base->B.methodImpl = epollImpl;
     base->epollFd = epoll_create(MAX_EVENTS);
-    if (base->epollFd == -1) {
-      fprintf(stderr, " * epollNewAsyncBase: epoll_create failed\n");
+    if (base->eventFd == -1 || base->epollFd == -1) {
+      // Descriptor exhaustion. A base without its epoll set or its doorbell
+      // eventfd cannot run a message loop: fail creation instead of returning
+      // an object that spins on EBADF
+      if (base->eventFd != -1)
+        close(base->eventFd);
+      if (base->epollFd != -1)
+        close(base->epollFd);
+      free(base);
+      return 0;
     }
 
     base->eventObject = epollNewAioObject(&base->B, ioObjectDevice, &base->eventFd);

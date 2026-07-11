@@ -206,6 +206,9 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
       break;
   }
 
+  if (!base)
+    return 0;
+
 #ifndef NDEBUG
   base->opsCount = 0;
 #endif
