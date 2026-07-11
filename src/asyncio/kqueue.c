@@ -137,7 +137,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   // cancelled wholesale anyway, and for a stale batch entry landing here
   // within the grace period the descriptor is already closed - the error
   // path ioctl and the rearm kevent would run on a dead or reused fd
-  if (fdObject && object->DeletePending) {
+  if (fdObject && __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
     ioEvents = 0;
     progress = 0;
   }
@@ -177,7 +177,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   if (needStart & IO_EVENT_WRITE)
     executeOperationList(&object->writeQueue);
 
-  if (fdObject && !object->DeletePending) {
+  if (fdObject && !__uint_atomic_load(&object->DeletePending, amoRelaxed)) {
     int fd = getFd(fdObject);
     uint32_t newIoEvents = combinerActiveIoEvents(object);
     unsigned readEventActivated = (oldIoEvents & IO_EVENT_READ) && !(ioEvents & IO_EVENT_READ);

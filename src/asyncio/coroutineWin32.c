@@ -35,7 +35,7 @@ typedef struct coroutineTy {
   void *arg;
   coroutineCbTy *finishCb;
   void *finishArg;
-  int finished;
+  unsigned finished;
   unsigned counter;
 #ifdef BUILD_SANITIZE_ADDRESS
   void *asanFakeStack;
@@ -140,7 +140,10 @@ static NO_SANITIZE_ADDRESS VOID __stdcall fiberEntryPoint(LPVOID lpParameter)
   sanitizerFinishSwitch(coro, coro->asanPrevious);
 #endif
   coro->entryPoint(coro->arg);
-  coro->finished = 1;
+  // A wakeup racing from another loop thread reads the flag before claiming
+  // the counter, so the write must be atomic; release orders the coroutine's
+  // final state before the flag for that reader
+  __uint_atomic_store(&coro->finished, 1, amoRelease);
   __uint_atomic_fetch_and_add(&coro->counter, -1);
   currentCoroutine = coro->prev;
   assert(currentCoroutine && "Try exit from main coroutine");
@@ -160,7 +163,7 @@ coroutineTy *coroutineCurrent()
 
 int coroutineFinished(coroutineTy *coroutine)
 {
-  return coroutine->finished;
+  return (int)__uint_atomic_load(&coroutine->finished, amoAcquire);
 }
 
 coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
@@ -231,9 +234,10 @@ int coroutineCall(coroutineTy *coroutine)
       // when the coroutine returns; re-entering a finished fiber would run
       // off the end of fiberEntryPoint (which terminates the thread). The
       // pending wakeup is consumed by the finished path below
-    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1 && !coroutine->finished);
+    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1 &&
+             !__uint_atomic_load(&coroutine->finished, amoAcquire));
 
-    int finished = coroutine->finished;
+    int finished = (int)__uint_atomic_load(&coroutine->finished, amoAcquire);
     if (finished) {
       coroutineCbTy *finishCb = coroutine->finishCb;
       void *finishArg = coroutine->finishArg;

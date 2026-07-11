@@ -272,6 +272,8 @@ struct aioObjectRoot {
   // still be referenced by kernel event batches already copied into loop
   // thread buffers. Nothing else may touch these fields
   aioObjectRoot *GraceNext;
+  // Retirement sequence token: it publishes no object data, batch completion
+  // is synchronized through release/acquire accesses to graceSeen
   uintptr_t GraceEpoch;
 
   IoObjectTy type;
@@ -281,6 +283,12 @@ struct aioObjectRoot {
 };
 
 struct asyncOpRoot {
+  // Generation (upper bits) + status (lower bits). Operation storage is
+  // type-stable: a stale holder (timeout grid link, realtime timer event) may
+  // legitimately touch the tag of an already recycled operation, so every
+  // access goes through the atomic helpers; the generation part of the status
+  // CAS is what rejects such stale writers. Nothing beyond the tag may be
+  // read until that CAS succeeds
   volatile uintptr_t tag;
   ConcurrentQueue *objectPool;
   aioExecuteProc *executeMethod;

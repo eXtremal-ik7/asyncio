@@ -23,6 +23,15 @@ static inline int __uint_atomic_compare_and_swap(unsigned volatile *ptr, unsigne
 #endif
 }
 
+static inline unsigned __uint_atomic_exchange(unsigned volatile *ptr, unsigned value)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_exchange_n(ptr, value, __ATOMIC_SEQ_CST);
+#else
+  return (unsigned)InterlockedExchange((volatile LONG*)ptr, (LONG)value);
+#endif
+}
+
 static inline uintptr_t __uintptr_atomic_fetch_and_add(uintptr_t volatile *ptr, uintptr_t value)
 {
 #ifndef _MSC_VER // Not Microsoft compiler
@@ -144,6 +153,20 @@ static inline void *__pointer_atomic_load(void *volatile *ptr, AtomicMemoryOrder
   return __atomic_load_n(ptr, order);
 #else
   return order == amoRelaxed ? ReadPointerNoFence(ptr) : ReadPointerAcquire(ptr);
+#endif
+}
+
+static inline void __pointer_atomic_store(void *volatile *ptr, void *value, AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  __atomic_store_n(ptr, value, order);
+#else
+  if (order == amoRelaxed)
+    WritePointerNoFence(ptr, value);
+  else if (order == amoRelease)
+    WritePointerRelease(ptr, value);
+  else
+    InterlockedExchangePointer(ptr, value);
 #endif
 }
 

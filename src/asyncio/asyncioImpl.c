@@ -231,7 +231,11 @@ uint64_t getMonotonicSeconds(void)
 
 void processTimeoutQueue(asyncBase *base, uint64_t currentTime)
 {
-  if (base->lastCheckPoint >= currentTime || !__spinlock_try_acquire(&base->timerMapLock))
+  // The lock-free fast check races with the update below only formally: a
+  // stale (smaller) value just leads to taking the lock and sweeping an
+  // empty range, the checkpoint itself is only advanced under the lock
+  if (__uintptr_atomic_load(&base->lastCheckPoint, amoRelaxed) >= currentTime ||
+      !__spinlock_try_acquire(&base->timerMapLock))
     return;
 
   // check timeout queue
@@ -246,7 +250,7 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTime)
     }
   }
 
-  base->lastCheckPoint = currentTime;
+  __uintptr_atomic_store(&base->lastCheckPoint, (uintptr_t)currentTime, amoRelaxed);
   __spinlock_release(&base->timerMapLock);
 }
 
@@ -286,20 +290,23 @@ void cancelIo(aioObjectRoot *object)
 
 void objectDelete(aioObjectRoot *object)
 {
-  // Before the cancelIo push: the pass it triggers must already see the flag
-  object->DeletePending = 1;
+  // Before the cancelIo push: the pass it triggers must already see the flag.
+  // Release-store: readers use relaxed loads, cross-thread visibility rides on
+  // the seq-cst Head publication of that push; the flag is sticky, so a stale
+  // read only delays the gate by one pass
+  __uint_atomic_store(&object->DeletePending, 1, amoRelease);
   cancelIo(object);
   objectDecrementReference(object, 1);
 }
 
 uintptr_t opGetGeneration(asyncOpRoot *op)
 {
-  return op->tag >> TAG_STATUS_SIZE;
+  return __uintptr_atomic_load(&op->tag, amoRelaxed) >> TAG_STATUS_SIZE;
 }
 
 AsyncOpStatus opGetStatus(asyncOpRoot *op)
 {
-  return op->tag & TAG_STATUS_MASK;
+  return __uintptr_atomic_load(&op->tag, amoRelaxed) & TAG_STATUS_MASK;
 }
 
 int opSetStatus(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status)
@@ -311,12 +318,14 @@ int opSetStatus(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status)
 
 void opForceStatus(asyncOpRoot *op, AsyncOpStatus status)
 {
-  op->tag = (op->tag & TAG_GENERATION_MASK) | (uintptr_t)status;
+  __uintptr_atomic_store(&op->tag,
+                         (__uintptr_atomic_load(&op->tag, amoRelaxed) & TAG_GENERATION_MASK) | (uintptr_t)status,
+                         amoRelaxed);
 }
 
 uintptr_t opEncodeTag(asyncOpRoot *op, uintptr_t tag)
 {
-  return ((op->tag >> TAG_STATUS_SIZE) & ~((uintptr_t)TAGGED_POINTER_DATA_MASK)) | (tag & (uintptr_t)TAGGED_POINTER_DATA_MASK);
+  return ((__uintptr_atomic_load(&op->tag, amoRelaxed) >> TAG_STATUS_SIZE) & ~((uintptr_t)TAGGED_POINTER_DATA_MASK)) | (tag & (uintptr_t)TAGGED_POINTER_DATA_MASK);
 }
 
 int asyncOpAlloc(asyncBase *base,
@@ -363,7 +372,9 @@ void initAsyncOpRoot(asyncOpRoot *op,
                      int opCode,
                      uint64_t timeout)
 {
-  op->tag = ((opGetGeneration(op)+1) << TAG_STATUS_SIZE) | aosPending;
+  // Atomic store: a stale timeout-grid link may concurrently CAS the tag of
+  // this recycled storage; bumping the generation is what invalidates it
+  __uintptr_atomic_store(&op->tag, ((opGetGeneration(op)+1) << TAG_STATUS_SIZE) | aosPending, amoRelaxed);
   op->executeMethod = startMethod;
   op->cancelMethod = cancelMethod;
   // TODO: better type control
@@ -795,15 +806,22 @@ void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *me
   // harvested batches
   object->destructor = memoryRelease;
   __spinlock_acquire(&base->graceLimboLock);
-  object->GraceEpoch = ++base->graceEpoch;
+  // The write is serialized by the lock, but loop threads read the epoch
+  // concurrently; the full-barrier RMW also keeps the epoch advance ordered
+  // after the object's logical detachment from the backend
+  object->GraceEpoch = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 1) + 1;
+  // The list head is also read lock-free by the fast checks in graceReclaim
+  // and graceQuiesce, so its writes must be atomic; relaxed is enough, the
+  // readers only test it against NULL before taking this very lock
   object->GraceNext = base->graceLimbo;
-  base->graceLimbo = object;
+  __pointer_atomic_store((void *volatile*)&base->graceLimbo, object, amoRelaxed);
   __spinlock_release(&base->graceLimboLock);
 }
 
 void graceReclaim(asyncBase *base)
 {
-  if (!base->graceLimbo || base->graceFrozen)
+  if (!__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed) ||
+      __uint_atomic_load(&base->graceFrozen, amoRelaxed))
     return;
 
   // The scan runs under the limbo lock: a thread claims its slot before its
@@ -825,11 +843,17 @@ void graceReclaim(asyncBase *base)
   // Epochs decrease along the list: everything past the first ripe object
   // is ripe as well. Release outside the lock - pool pushes and frees do
   // not need it, and a concurrent retire must not wait on them
-  aioObjectRoot **cursor = &base->graceLimbo;
-  while (*cursor && (*cursor)->GraceEpoch > minSeen)
-    cursor = &(*cursor)->GraceNext;
-  ripe = *cursor;
-  *cursor = 0;
+  aioObjectRoot *prev = 0;
+  aioObjectRoot *cur = base->graceLimbo;
+  while (cur && cur->GraceEpoch > minSeen) {
+    prev = cur;
+    cur = cur->GraceNext;
+  }
+  ripe = cur;
+  if (prev)
+    prev->GraceNext = 0;
+  else
+    __pointer_atomic_store((void *volatile*)&base->graceLimbo, 0, amoRelaxed);
   __spinlock_release(&base->graceLimboLock);
 
   while (ripe) {
@@ -845,7 +869,7 @@ void graceThreadEnter(asyncBase *base)
   // configurations the slots cannot describe: dead objects then stay in
   // the limbo for the rest of the base's life
   if (messageLoopThreadId >= GRACE_LOOP_THREAD_LIMIT) {
-    base->graceFrozen = 1;
+    __uint_atomic_store(&base->graceFrozen, 1, amoRelaxed);
     return;
   }
 
@@ -862,7 +886,7 @@ void graceThreadEnter(asyncBase *base)
   // goes undetected
   uintptr_t epoch = __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0);
   if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen, UINTPTR_MAX, epoch)) {
-    base->graceFrozen = 1;
+    __uint_atomic_store(&base->graceFrozen, 1, amoRelaxed);
     return;
   }
 
@@ -880,20 +904,25 @@ void graceQuiesce(asyncBase *base)
   if (messageLoopThreadId >= GRACE_LOOP_THREAD_LIMIT)
     return;
 
-  // The stamp may not become visible before the batch dispatched above it:
-  // the atomic read-modify-write of the epoch is a full barrier in both
-  // implementations, and it cannot drift backwards either
+  // Publishing the stamp with release orders all processing of the preceding
+  // kernel batch before the reclaimer's acquire load. graceEpoch is only a
+  // sequence token: a relaxed load is sufficient, and a stale value merely
+  // delays reclamation
   __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
-                         __uintptr_atomic_fetch_and_add(&base->graceEpoch, 0),
+                         __uintptr_atomic_load(&base->graceEpoch, amoRelaxed),
                          amoRelease);
-  if (base->graceLimbo)
+  if (__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed))
     graceReclaim(base);
 }
 
 static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 {
-  if (object->CancelIoFlag) {
-    object->CancelIoFlag = 0;
+  // Cheap relaxed load keeps the hot path free of RMW; the exchange runs only
+  // when a cancel is actually pending. Consuming the counter before the sweep
+  // (not after) means a cancelIo racing with the sweep sees 0, increments and
+  // pushes a fresh CANCEL pass - a coalesced request cannot be lost
+  if (__uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
+      __uint_atomic_exchange(&object->CancelIoFlag, 0) != 0) {
     cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
@@ -934,7 +963,7 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       // action of the captured chains, so a submission that slipped past the
       // CancelIoFlag pass cannot survive the delete and pin the object
       // (sticky flag; the sweep is idempotent, re-runs only cost a re-check)
-      if (object->DeletePending) {
+      if (__uint_atomic_load(&object->DeletePending, amoRelaxed)) {
         cancelInitializationOp(object, aosCanceled);
         cancelOperationList(&object->readQueue, aosCanceled);
         cancelOperationList(&object->writeQueue, aosCanceled);

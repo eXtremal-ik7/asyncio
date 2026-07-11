@@ -76,7 +76,11 @@ struct asyncBase {
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
   struct pageMap timerMap;
-  uint64_t lastCheckPoint;
+  // Monotonic seconds of the last timeout-grid sweep. uintptr_t so the
+  // lock-free fast check in processTimeoutQueue can use the plain atomic
+  // helpers on 32-bit targets too (2^32 seconds of uptime is out of scope);
+  // updates happen under timerMapLock
+  uintptr_t lastCheckPoint;
   volatile unsigned messageLoopThreadCounter;
   volatile unsigned timerMapLock;
 

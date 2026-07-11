@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "asyncio/coroutine.h"
 #include "asyncioconfig.h"
+#include "atomic.h"
 
 #ifdef BUILD_SANITIZE_ADDRESS
 #include <sanitizer/asan_interface.h>
@@ -70,7 +71,7 @@ typedef struct coroutineTy {
   void *arg;
   coroutineCbTy *finishCb;
   void *finishArg;
-  int finished;
+  unsigned finished;
   int counter;
 #ifdef BUILD_SANITIZE_ADDRESS
   void *asanFakeStack;
@@ -190,7 +191,10 @@ static void fiberEntryPoint(coroutineTy *coroutine)
   sanitizerFinishSwitch(coroutine, coroutine->asanPrevious);
 #endif
   coroutine->entryPoint(coroutine->arg);
-  coroutine->finished = 1;
+  // A wakeup racing from another loop thread reads the flag before claiming
+  // the counter, so the write must be atomic; release orders the coroutine's
+  // final state before the flag for that reader
+  __uint_atomic_store(&coroutine->finished, 1, amoRelease);
   __sync_fetch_and_add(&coroutine->counter, -1);
   currentCoroutine = currentCoroutine->prev;
   assert(currentCoroutine && "Try exit from main coroutine");
@@ -260,7 +264,7 @@ coroutineTy *coroutineCurrent()
 
 int coroutineFinished(coroutineTy *coroutine)
 {
-  return coroutine->finished;
+  return (int)__uint_atomic_load(&coroutine->finished, amoAcquire);
 }
 
 /// coroutineNew - create coroutine
@@ -335,9 +339,10 @@ int coroutineCall(coroutineTy *coroutine)
       // off the end of fiberEntryPoint. The pending wakeup is consumed by the
       // finished path below (free + finishCb), same as a call on a finished
       // coroutine is a no-op
-    } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1 && !coroutine->finished);
+    } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1 &&
+             !__uint_atomic_load(&coroutine->finished, amoAcquire));
 
-    int finished = coroutine->finished;
+    int finished = (int)__uint_atomic_load(&coroutine->finished, amoAcquire);
     if (finished) {
       coroutineCbTy *finishCb = coroutine->finishCb;
       void *finishArg = coroutine->finishArg;
