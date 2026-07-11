@@ -90,10 +90,12 @@ struct TestBackend : asyncBase {
   unsigned stopTimerCalls = 0;
   unsigned initializeTimerCalls = 0;
   unsigned deleteTimerCalls = 0;
+  unsigned wakeupCalls = 0;
   uintptr_t nextTimerTag = 1;
-  // Backs base.graceSeen/gracePendingSeen: production bases get the arrays
-  // from createAsyncBase
+  // Backs base.graceSeen/gracePendingSeen/timerSleep: production bases get
+  // the arrays from createAsyncBase
   alignas(CACHE_LINE_SIZE) std::array<GraceSlot, 8> graceSlots{};
+  alignas(CACHE_LINE_SIZE) std::array<TimerSleepSlot, 8> sleepSlots{};
   std::array<uintptr_t, 8> gracePendingSlotsSeen{};
 
   TestBackend() : asyncBase{}, base(*this)
@@ -107,11 +109,15 @@ struct TestBackend : asyncBase {
     base.methodImpl.startTimer = startTimer;
     base.methodImpl.stopTimer = stopTimer;
     base.methodImpl.deleteTimer = deleteTimer;
+    base.methodImpl.wakeupLoop = wakeupLoop;
     base.graceSeen = graceSlots.data();
     base.gracePendingSeen = gracePendingSlotsSeen.data();
     base.graceSlotLimit = static_cast<unsigned>(graceSlots.size());
+    base.timerSleep = sleepSlots.data();
     for (GraceSlot &slot : graceSlots)
       slot.seen = UINTPTR_MAX;
+    for (TimerSleepSlot &slot : sleepSlots)
+      slot.wakeTick = UINTPTR_MAX;
     currentFinishedSync = 0;
     messageLoopThreadId = 0;
   }
@@ -182,19 +188,33 @@ struct TestBackend : asyncBase {
     op->timerId = reinterpret_cast<void*>(backend.nextTimerTag++);
   }
 
+  // User events never initialize root.object, production backends route
+  // their timer calls through event->base - the stubs must mirror that or any
+  // deleteUserEvent/userEventStartTimer on a TestBackend event dereferences
+  // garbage
+  static asyncBase *timerBase(asyncOpRoot *op)
+  {
+    return op->opCode == actUserEvent ? reinterpret_cast<aioUserEvent*>(op)->base : op->object->base;
+  }
+
   static void startTimer(asyncOpRoot *op)
   {
-    from(op->object->base).startTimerCalls++;
+    from(timerBase(op)).startTimerCalls++;
   }
 
   static void stopTimer(asyncOpRoot *op)
   {
-    from(op->object->base).stopTimerCalls++;
+    from(timerBase(op)).stopTimerCalls++;
   }
 
   static void deleteTimer(asyncOpRoot *op)
   {
-    from(op->object->base).deleteTimerCalls++;
+    from(timerBase(op)).deleteTimerCalls++;
+  }
+
+  static void wakeupLoop(asyncBase *base)
+  {
+    from(base).wakeupCalls++;
   }
 };
 
@@ -281,4 +301,16 @@ inline std::vector<asyncOpRoot*> listContents(const List &list)
   for (asyncOpRoot *op = list.head; op; op = op->executeQueue.next)
     result.push_back(op);
   return result;
+}
+
+inline void cancelAndDrain(TestBackend &backend, TestObject &object)
+{
+  cancelIo(&object.root);
+  backend.drainCompletions();
+}
+
+inline void deleteOwner(TestBackend &backend, TestObject &object)
+{
+  objectDelete(&object.root);
+  backend.drainCompletions();
 }

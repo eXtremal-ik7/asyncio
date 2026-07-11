@@ -31,6 +31,7 @@ static volatile intptr_t timerIdCounter;
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op);
 void kqueuePostEmptyOperation(asyncBase *base);
+void kqueueWakeupLoop(asyncBase *base);
 void kqueueNextFinishedOperation(asyncBase *base);
 aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data);
 asyncOpRoot *kqueueNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool);
@@ -67,7 +68,8 @@ static struct asyncImpl kqueueImpl = {
   kqueueAsyncRead,
   kqueueAsyncWrite,
   kqueueAsyncReadMsg,
-  kqueueAsyncWriteMsg
+  kqueueAsyncWriteMsg,
+  kqueueWakeupLoop
 };
 
 // kevent failures are deliberately swallowed. EV_DELETE races the oneshot
@@ -126,6 +128,16 @@ void kqueueEnqueue(asyncBase *base, asyncOpRoot *op)
 void kqueuePostEmptyOperation(asyncBase *base)
 {
   kqueueEnqueue(base, 0);
+}
+
+void kqueueWakeupLoop(asyncBase *base)
+{
+  // Pure kick: trigger the user event without a queue node (an empty node is
+  // the quit marker). One sleeper wakes; the loop's udata==0 branch is a
+  // no-op and EV_CLEAR resets the event on delivery
+  struct kevent ev;
+  EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, 0);
+  kevent(((kqueueBase*)base)->kqueueFd, &ev, 1, 0, 0, 0);
 }
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
@@ -220,16 +232,18 @@ void kqueueNextFinishedOperation(asyncBase *base)
         return;
       }
 
+      uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, 1000);
       struct timespec timeout;
-      timeout.tv_sec = 1;
-      timeout.tv_nsec = 0;
+      timeout.tv_sec = sleepMs / 1000;
+      timeout.tv_nsec = (long)(sleepMs % 1000) * 1000000;
       graceQuiesce(base);
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, &timeout);
+      timerLoopCancelSleep(base, messageLoopThreadId);
 
-      uint64_t currentTime = getMonotonicTicks();
-      unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
-      if (currentTime % loopThreadCount == messageLoopThreadId)
-        processTimeoutQueue(base, currentTime);
+      // Unconditional sweep (the modulo election is gone): an idle pass costs
+      // one relaxed load, and the wakeup handshake relies on whichever thread
+      // the kick lands on doing the sweep itself
+      processTimeoutQueue(base, getMonotonicTicks());
     } while (nfds <= 0 && errno == EINTR);
 
     for (n = 0; n < nfds; n++) {

@@ -18,6 +18,8 @@ set(
   uriparsetest.cpp
   httpparsetest.cpp
   coretest.cpp
+  timertest.cpp
+  eventtest.cpp
   clocksteptest.cpp
 )
 

@@ -229,6 +229,57 @@ TEST(socket, io_accept_timeout_returns_status_separately)
   deleteAioObject(ctx.listener);
 }
 
+// Sleep-handshake regression: a grid timeout armed from an application
+// thread while the only loop thread is deep in its long idle wait must be
+// delivered within about a grid step - the producer observes the published
+// sleep horizon and kicks the sleeper. Without the kick the delivery would
+// wait out the rest of the idle sleep (~450 ms on epoll/iocp, ~950 ms on
+// kqueue with the 50 ms head start below), which the duration bound catches.
+struct SleepingArmContext {
+  asyncBase *base;
+  std::chrono::steady_clock::time_point armed;
+  AsyncOpStatus status;
+  long deliveryMs;
+  SleepingArmContext(asyncBase *baseArg) : base(baseArg), status(aosUnknown), deliveryMs(-1) {}
+};
+
+static void sleepingArmReadCb(AsyncOpStatus status, aioObject*, HostAddress, size_t, void *arg)
+{
+  SleepingArmContext *ctx = static_cast<SleepingArmContext*>(arg);
+  ctx->status = status;
+  ctx->deliveryMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - ctx->armed).count());
+  postQuitOperation(ctx->base);
+}
+
+TEST(socket, timeout_armed_against_sleeping_loop_is_delivered_within_grid_step)
+{
+  SleepingArmContext ctx(gBase);
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy udpSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  ASSERT_NE(udpSocket, INVALID_SOCKET);
+  ASSERT_EQ(socketBind(udpSocket, &address), 0);
+  aioObject *object = newSocketIo(gBase, udpSocket);
+
+  std::thread loop([] { asyncLoop(gBase); });
+  // Let the loop thread settle into its idle wait with an empty wheel
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  uint8_t buffer[16];
+  ctx.armed = std::chrono::steady_clock::now();
+  aioReadMsg(object, buffer, sizeof(buffer), afNone, 125000, sleepingArmReadCb, &ctx);
+  loop.join();
+
+  EXPECT_EQ(ctx.status, aosTimeout);
+  EXPECT_GE(ctx.deliveryMs, 0);
+  EXPECT_LT(ctx.deliveryMs, 400)
+    << "the sleeping loop was not kicked and the timeout waited out the idle sleep";
+  deleteAioObject(object);
+}
+
 #ifdef OS_COMMONUNIX
 // Regression test: aioWrite() to a connection dropped by the peer must
 // report an error through the operation status, never kill the process with

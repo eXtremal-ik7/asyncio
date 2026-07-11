@@ -47,6 +47,15 @@ typedef struct GraceSlot {
   uint8_t pad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
 } GraceSlot;
 
+// Published sleep horizon of one loop thread: the absolute grid tick it will
+// wake at on its own, UINTPTR_MAX while awake. A producer arming a deadline
+// no sleeper would meet in time kicks one loop through the backend wakeup.
+// Padded like GraceSlot: the slot is rewritten around every wait syscall
+typedef struct TimerSleepSlot {
+  volatile uintptr_t wakeTick;
+  uint8_t pad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
+} TimerSleepSlot;
+
 typedef enum IoActionTy {
   actAccept = OPCODE_READ,
   actRead,
@@ -63,6 +72,7 @@ typedef enum IoActionTy {
 typedef void combinerTaskHandlerTy(aioObjectRoot*, asyncOpRoot*, uint32_t);
 typedef void enqueueOperationTy(asyncBase*, asyncOpRoot*);
 typedef void postEmptyOperationTy(asyncBase*);
+typedef void loopWakeupTy(asyncBase*);
 typedef void nextFinishedOperationTy(asyncBase*);
 typedef aioObject *newAioObjectTy(asyncBase*, IoObjectTy, void*);
 typedef void deleteObjectTy(aioObject*);
@@ -91,6 +101,10 @@ struct asyncImpl {
   aioExecuteProc *write;
   aioExecuteProc *readMsg;
   aioExecuteProc *writeMsg;
+  // Pure kick of one sleeping loop thread (no queue traffic, unlike
+  // postEmptyOperation whose empty node is the quit marker): eventfd write /
+  // EVFILT_USER trigger / posted completion with a byte count
+  loopWakeupTy *wakeupLoop;
 };
 
 struct asyncBase {
@@ -110,6 +124,17 @@ struct asyncBase {
   uint8_t timerCloseCursorPadBefore[CACHE_LINE_SIZE - sizeof(uintptr_t)];
   uintptr_t timerCloseCursor;
   uint8_t timerCloseCursorPadAfter[CACHE_LINE_SIZE - sizeof(uintptr_t)];
+  // Number of links parked in the wheel (transitional, until the occupancy
+  // bitmap): non-zero caps every loop sleep at one tick, so a parked deadline
+  // is never behind a wait longer than the grid step. Lazy cancellation keeps
+  // it non-zero until stale links expire - the price of the transitional
+  // scheme. The RMW on it is also the full barrier of the sleep handshake
+  // (see timerLoopPrepareSleep); own cache line, it is hit by every arm
+  uintptr_t timerOutstanding;
+  uint8_t timerOutstandingPad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
+  // One published sleep horizon per loop thread, graceSlotLimit entries;
+  // allocated with the base (freed at 0.6 teardown, like graceSeen)
+  TimerSleepSlot *timerSleep;
   volatile unsigned messageLoopThreadCounter;
 
   // Grace-period reclamation for dead aio objects. epoll_wait/kevent batches
@@ -314,6 +339,18 @@ void timerWheelSweepTick(asyncBase *base, uint64_t tick);
 
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
 void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
+
+// Sleep handshake of the message loops with the timeout grid. Before
+// blocking, a loop publishes the tick it will wake at on its own and gets its
+// wait bounded to one grid tick while any timer is parked in the wheel; the
+// publication and the outstanding-counter re-read are ordered by one seq-cst
+// RMW, pairing with the increment in addToTimeoutQueue - either the loop sees
+// the fresh link and shortens the sleep, or the producer sees the published
+// horizon and wakes the loop through methodImpl.wakeupLoop. After the wait
+// returns, the slot is parked at UINTPTR_MAX (awake threads sweep on their
+// own and must not attract kicks). Returns the wait bound in milliseconds.
+uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint32_t fallbackMs);
+void timerLoopCancelSleep(asyncBase *base, unsigned threadId);
 
 // Monotonic (wall-clock-independent) 125 ms ticks for the timeout grid; see
 // the definition in asyncioImpl.c for why the grid must not use time(0).

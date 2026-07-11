@@ -45,6 +45,7 @@ typedef struct aioTimer {
 void combinerTaskHandler(aioObjectRoot* object, asyncOpRoot* op, uint32_t sig);
 void iocpEnqueue(asyncBase *base, asyncOpRoot *op);
 void postEmptyOperation(asyncBase *base);
+void iocpWakeupLoop(asyncBase *base);
 void iocpNextFinishedOperation(asyncBase *base);
 aioObject *iocpNewAioObject(asyncBase *base, IoObjectTy type, void *data);
 asyncOpRoot *iocpNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool);
@@ -81,7 +82,8 @@ static struct asyncImpl iocpImpl = {
   iocpAsyncRead,
   iocpAsyncWrite,
   iocpAsyncReadMsg,
-  iocpAsyncWriteMsg
+  iocpAsyncWriteMsg,
+  iocpWakeupLoop
 };
 
 static aioObject *getObject(iocpOp *op)
@@ -241,6 +243,14 @@ void postEmptyOperation(asyncBase *base)
 }
 
 
+void iocpWakeupLoop(asyncBase *base)
+{
+  // Pure kick of one sleeper: key 0 + overlapped 0 is the quit marker, the
+  // byte count 1 tells the loop's marker branch apart from it
+  PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 1, 0, 0);
+}
+
+
 asyncBase *iocpNewAsyncBase()
 {
   iocpBase *base = malloc(sizeof(iocpBase));
@@ -287,12 +297,14 @@ void iocpNextFinishedOperation(asyncBase *base)
   while (1) {
     ULONG N, i;
 
-    BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N, 500, FALSE);
+    BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N,
+                                              timerLoopPrepareSleep(base, messageLoopThreadId, 500), FALSE);
+    timerLoopCancelSleep(base, messageLoopThreadId);
 
-    uint64_t currentTime = getMonotonicTicks();
-    unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
-    if (currentTime % loopThreadCount == messageLoopThreadId)
-      processTimeoutQueue(base, currentTime);
+    // Unconditional sweep (the modulo election is gone): an idle pass costs
+    // one relaxed load, and the wakeup handshake relies on whichever thread
+    // the kick lands on doing the sweep itself
+    processTimeoutQueue(base, getMonotonicTicks());
 
     // ignore false status
     if (status == FALSE)
@@ -380,6 +392,9 @@ void iocpNextFinishedOperation(asyncBase *base)
 
         opSetStatus(&op->info.root, opGetGeneration(&op->info.root), result);
         combinerPushProgress(&op->info.root);
+      } else if (entry->dwNumberOfBytesTransferred) {
+        // Wakeup kick from a timer producer: the wait already returned and
+        // the sweep at the loop top delivers, nothing to do with the entry
       } else {
         unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, -1) - 1;
         if (threadsRunning)

@@ -78,6 +78,7 @@ void timerWheelInit(asyncBase *base, uint64_t currentTick)
     }
   }
   base->timerCloseCursor = (uintptr_t)currentTick;
+  base->timerOutstanding = 0;
 }
 
 void timerWheelTeardown(asyncBase *base)
@@ -97,6 +98,7 @@ void timerWheelTeardown(asyncBase *base)
       }
     }
   }
+  base->timerOutstanding = 0;
 }
 
 int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
@@ -175,10 +177,18 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   timerLink->op = op;
   timerLink->generation = opGetGeneration(op);
   timerLink->deadlineTick = timerDeadlineTick(op->endTime);
+  // The deadline is read back after the publication for the wakeup check, and
+  // a published link belongs to the wheel - keep a local copy
+  uint64_t deadline = timerLink->deadlineTick;
   // timerId strictly before publication: the moment the link is in the slot a
   // concurrent sweep may deliver the timeout and recycle the operation, and a
   // late store would corrupt the next incarnation's field
   op->timerId = timerLink;
+  // Counted strictly before publication, and the increment is a seq-cst RMW:
+  // the sleep handshake leans on it (a loop publishing its horizon re-reads
+  // the counter after its own RMW - one of the two sides is guaranteed to see
+  // the other, so a link is never parked against only long sleepers)
+  __uintptr_atomic_fetch_and_add(&base->timerOutstanding, 1);
   if (!timerWheelInsert(base, timerLink, __uintptr_atomic_load(&base->timerCloseCursor, amoRelaxed))) {
     // Expired: the deadline's window is already swept. The link never became
     // visible, so it is still producer-owned; recycle it and deliver the
@@ -188,7 +198,25 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
     uintptr_t generation = timerLink->generation;
     op->timerId = 0;
     objectPoolPut(&asyncOpLinkListPool, timerLink, sizeof(asyncOpListLink));
+    __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     opCancel(op, generation, aosTimeout);
+    return;
+  }
+
+  // Wake one loop if no published sleeper would meet the deadline in time: a
+  // sleeper waking at wakeTick sweeps every tick below it, so a lag of one
+  // tick is covered by the sleeper itself and anything longer needs the kick.
+  // Awake threads park their slots at UINTPTR_MAX and never attract kicks -
+  // they re-read the counter before their next sleep. The slot loads are
+  // ordered after the counter RMW above
+  if (base->timerSleep) {
+    for (unsigned i = 0; i < base->graceSlotLimit; i++) {
+      uintptr_t wakeTick = __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoAcquire);
+      if (wakeTick != UINTPTR_MAX && wakeTick > (uintptr_t)(deadline + 1)) {
+        base->methodImpl.wakeupLoop(base);
+        break;
+      }
+    }
   }
 }
 
@@ -229,17 +257,21 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
       // The operation completed and moved on long ago; lazy cancellation ends
       // here without touching anything beyond the atomic tag
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
+      __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     } else if (link->deadlineTick <= windowStart) {
       opCancel(link->op, link->generation, aosTimeout);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
+      __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     } else if (!timerWheelInsert(base, link, windowStart)) {
       // Cascade: the deadline is inside a narrower window; re-route from the
       // tick being processed (the target level only shrinks for an in-window
       // deadline). A refused publication means the lower window is already
       // terminal - a stalled owner resuming an old chain - so the timeout is
-      // due right now
+      // due right now. A re-published link stays counted; only a recycled one
+      // leaves the outstanding counter
       opCancel(link->op, link->generation, aosTimeout);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
+      __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     }
     link = next;
   }
@@ -284,4 +316,37 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
   uint64_t tick;
   while ((tick = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire)) < currentTick)
     timerWheelSweepTick(base, tick);
+}
+
+uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint32_t fallbackMs)
+{
+  const uint32_t tickMs = TIMER_TICK_MICROSECONDS / 1000;
+  TimerSleepSlot *slot =
+    base->timerSleep && threadId < base->graceSlotLimit ? &base->timerSleep[threadId] : 0;
+  uint32_t sleepMs = fallbackMs;
+  if (slot)
+    __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)(getMonotonicTicks() + fallbackMs / tickMs), amoRelease);
+
+  // The seq-cst RMW is both the store/load barrier of the handshake and the
+  // counter re-read: the producer increments the counter (RMW on the same
+  // address) before reading the horizon slots, so either this read observes
+  // its link and the sleep shrinks to one tick, or the producer observes the
+  // horizon published above and kicks. Without the RMW pairing both sides
+  // could read stale values and park a deadline behind a full fallback sleep
+  if (__uintptr_atomic_fetch_and_add(&base->timerOutstanding, 0) != 0) {
+    sleepMs = tickMs < fallbackMs ? tickMs : fallbackMs;
+    if (slot)
+      __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)(getMonotonicTicks() + 1), amoRelease);
+  }
+
+  return sleepMs;
+}
+
+void timerLoopCancelSleep(asyncBase *base, unsigned threadId)
+{
+  // Awake: the thread sweeps on its own before its next sleep, kicking it
+  // would be a wasted syscall. A producer racing this store at worst reads
+  // the stale horizon and issues one spurious wakeup
+  if (base->timerSleep && threadId < base->graceSlotLimit)
+    __uintptr_atomic_store(&base->timerSleep[threadId].wakeTick, UINTPTR_MAX, amoRelaxed);
 }

@@ -228,8 +228,11 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   base->gracePendingSlots = 0;
   base->gracePendingSeen = (uintptr_t*)malloc(sizeof(uintptr_t) * base->graceSlotLimit);
   base->graceSeen = (GraceSlot*)alignedMalloc(sizeof(GraceSlot) * base->graceSlotLimit, CACHE_LINE_SIZE);
-  for (unsigned i = 0; i < base->graceSlotLimit; i++)
+  base->timerSleep = (TimerSleepSlot*)alignedMalloc(sizeof(TimerSleepSlot) * base->graceSlotLimit, CACHE_LINE_SIZE);
+  for (unsigned i = 0; i < base->graceSlotLimit; i++) {
     base->graceSeen[i].seen = UINTPTR_MAX;   // empty slots never gate the limbo
+    base->timerSleep[i].wakeTick = UINTPTR_MAX;  // nobody sleeps yet, kicks not needed
+  }
   return base;
 }
 

@@ -42,6 +42,7 @@ __NO_PADDING_END
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void epollEnqueue(asyncBase *base, asyncOpRoot *op);
 void epollPostEmptyOperation(asyncBase *base);
+void epollWakeupLoop(asyncBase *base);
 void epollNextFinishedOperation(asyncBase *base);
 aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data);
 asyncOpRoot *epollNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool);
@@ -78,7 +79,8 @@ static struct asyncImpl epollImpl = {
   epollAsyncRead,
   epollAsyncWrite,
   epollAsyncReadMsg,
-  epollAsyncWriteMsg
+  epollAsyncWriteMsg,
+  epollWakeupLoop
 };
 
 // epoll_ctl failures are deliberately swallowed, mirroring kqueueControl.
@@ -156,6 +158,14 @@ void epollEnqueue(asyncBase *base, asyncOpRoot *op)
 void epollPostEmptyOperation(asyncBase *base)
 {
   epollEnqueue(base, 0);
+}
+
+void epollWakeupLoop(asyncBase *base)
+{
+  // Pure kick: no queue node (an empty node is the quit marker). The eventfd
+  // is EPOLLIN|EPOLLONESHOT-registered, one sleeper wakes, reads it out and
+  // re-arms; with nobody sleeping the next epoll_wait returns once immediately
+  eventfd_write(((epollBase*)base)->eventFd, 1);
 }
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
@@ -265,11 +275,13 @@ void epollNextFinishedOperation(asyncBase *base)
       }
 
       graceQuiesce(base);
-      nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, 500);
-      uint64_t currentTime = getMonotonicTicks();
-      unsigned loopThreadCount = __uint_atomic_load(&base->messageLoopThreadCounter, amoRelaxed);
-      if (currentTime % loopThreadCount == messageLoopThreadId)
-        processTimeoutQueue(base, currentTime);
+      nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS,
+                        (int)timerLoopPrepareSleep(base, messageLoopThreadId, 500));
+      timerLoopCancelSleep(base, messageLoopThreadId);
+      // Unconditional sweep (the modulo election is gone): an idle pass costs
+      // one relaxed load, and the wakeup handshake relies on whichever thread
+      // the kick lands on doing the sweep itself
+      processTimeoutQueue(base, getMonotonicTicks());
     } while (nfds <= 0 && errno == EINTR);
 
     for (n = 0; n < nfds; n++) {
