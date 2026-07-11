@@ -37,13 +37,14 @@ typedef struct timerWheel {
   uint128Pair slots[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS];
 } timerWheel;
 
+#define CACHE_LINE_SIZE 64
+
 // One quiescence stamp per loop thread, padded to a cache line so the
 // per-iteration stamps of neighbour threads do not false-share; the padding
 // is byte-sized so 32-bit targets get the full line too
-#define GRACE_SLOT_ALIGNMENT 64
 typedef struct GraceSlot {
   volatile uintptr_t seen;
-  uint8_t pad[GRACE_SLOT_ALIGNMENT - sizeof(uintptr_t)];
+  uint8_t pad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
 } GraceSlot;
 
 typedef enum IoActionTy {
@@ -97,13 +98,19 @@ struct asyncBase {
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
   struct timerWheel timerWheel;
-  // First monotonic tick whose sweep is not confirmed yet. uintptr_t matches
-  // the plain atomic helpers; the wheel already requires a 64-bit target
-  // (atomic128.h), so the full 64-bit tick range is available and wrap is out
-  // of scope. Updates happen under timerMapLock
-  uintptr_t lastCheckPoint;
+  // First monotonic tick whose sweep is not confirmed yet. Moves only by the
+  // exact tick->tick+1 CAS in timerWheelSweepTick, performed by whichever
+  // thread sweeps the tick first (helping), so it is monotonic without any
+  // lock. uintptr_t matches the plain atomic helpers; the wheel already
+  // requires a 64-bit target (atomic128.h), so the full 64-bit tick range is
+  // available and wrap is out of scope. The byte pads give the cursor a cache
+  // line of its own whatever the base allocation's alignment: the confirm CAS
+  // must not ping-pong the lines holding the wheel's last slots or the
+  // per-iteration loads of messageLoopThreadCounter
+  uint8_t timerCloseCursorPadBefore[CACHE_LINE_SIZE - sizeof(uintptr_t)];
+  uintptr_t timerCloseCursor;
+  uint8_t timerCloseCursorPadAfter[CACHE_LINE_SIZE - sizeof(uintptr_t)];
   volatile unsigned messageLoopThreadCounter;
-  volatile unsigned timerMapLock;
 
   // Grace-period reclamation for dead aio objects. epoll_wait/kevent batches
   // hold raw object pointers that cannot be recalled, so releasing the memory
@@ -285,10 +292,25 @@ struct aioUserEvent {
 void timerWheelInit(asyncBase *base, uint64_t currentTick);
 void timerWheelTeardown(asyncBase *base);
 
-// Publish a link into the wheel; the routing cursor is only a placement hint
-// (a stale cursor routes the link to a slot whose visit re-cascades it), the
-// publication itself is validated by the slot pair CAS.
-void timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor);
+// Publish a link into the exact slot incarnation covering its deadline; the
+// pair CAS validates head and baseTick together. cursor is a routing hint and
+// must not be ahead of the confirmed sweep (stale is fine - it only costs
+// descend iterations). Returns non-zero when published (the link then belongs
+// to the wheel and may be delivered/recycled immediately); zero when the
+// deadline's window is already swept - the link stays with the caller, which
+// must expire the operation instead of parking the link a rotation late.
+int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor);
+
+// Lock-free sweep protocol, safe to run from any number of threads. Detach
+// atomically takes the whole chain of the window starting at windowStart and
+// reopens the slot for the next rotation (0 = already visited or empty); the
+// winner delivers/drops/re-cascades its private chain with
+// timerWheelProcessDetached. timerWheelSweepTick composes the level visits of
+// one tick in the required order and confirms the cursor with the exact
+// tick->tick+1 CAS - any thread sweeping the same tick helps a stalled one.
+asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t windowStart);
+void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t windowStart);
+void timerWheelSweepTick(asyncBase *base, uint64_t tick);
 
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
 void processTimeoutQueue(asyncBase *base, uint64_t currentTick);

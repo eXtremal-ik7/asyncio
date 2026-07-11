@@ -531,9 +531,10 @@ void aio_pull_accept_coro(void *arg)
 {
   zmtpSocket *socket = nullptr;
   auto ctx = static_cast<zmtpContext*>(arg);
-  socketTy fd = ioAccept(ctx->listener, 1000000);
-  EXPECT_GT(fd, 0);
-  if (fd > 0) {
+  socketTy fd;
+  int status = ioAccept(ctx->listener, &fd, nullptr, 1000000);
+  EXPECT_EQ(status, 0);
+  if (status == 0) {
     socket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, fd), zmtpSocketPULL);
     int acceptResult = ioZmtpAccept(socket, afNone, 3000000);
     EXPECT_EQ(acceptResult, 0);
@@ -965,9 +966,10 @@ void aio_rep_accept_coro(void *arg)
 {
   auto ctx = static_cast<zmtpContext*>(arg);
   zmtpSocket *socket = nullptr;
-  socketTy fd = ioAccept(ctx->listener, 1000000);
-  EXPECT_GT(fd, 0);
-  if (fd > 0) {
+  socketTy fd;
+  int status = ioAccept(ctx->listener, &fd, nullptr, 1000000);
+  EXPECT_EQ(status, 0);
+  if (status == 0) {
     socket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, fd), zmtpSocketREP);
     int acceptResult = ioZmtpAccept(socket, afNone, 3000000);
     EXPECT_EQ(acceptResult, 0);
@@ -1289,8 +1291,8 @@ TEST(zmtp, double_connect_rejected)
   address.family = AF_INET;
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioZmtpConnect(client, &address, afNone, 300000, zmtp_double_connect_firstcb, &ctx);
-  aioZmtpConnect(client, &address, afNone, 300000, zmtp_double_connect_secondcb, &ctx);
+  aioZmtpConnect(client, &address, afNone, 150000, zmtp_double_connect_firstcb, &ctx);
+  aioZmtpConnect(client, &address, afNone, 150000, zmtp_double_connect_secondcb, &ctx);
 
   asyncLoop(gBase);
   zmtpSocketDelete(client);

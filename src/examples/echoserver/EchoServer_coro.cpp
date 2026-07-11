@@ -43,16 +43,17 @@ void listenerProc(void *arg)
 {
   listenerContext *ctx = (listenerContext*)arg;
   while (true) {
-    socketTy acceptSocket = ioAccept(ctx->socket, 0);
-    if (acceptSocket > 0) {
+    socketTy acceptSocket;
+    int status = ioAccept(ctx->socket, &acceptSocket, nullptr, 0);
+    if (status == 0) {
       fprintf(stderr, "new connection accepted\n");
       readerContext *reader = new readerContext;
       reader->base = ctx->base;
       reader->socket = newSocketIo(ctx->base, acceptSocket);      
       coroutineTy *echoProc = coroutineNew(readerProc, reader, 0x10000);
-      coroutineCall(echoProc);      
+      coroutineCall(echoProc);
     } else {
-      fprintf(stderr, "accept error %i\n", -static_cast<int>(acceptSocket));
+      fprintf(stderr, "accept error %i\n", -status);
     }
   }
 }

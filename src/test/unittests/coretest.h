@@ -93,7 +93,7 @@ struct TestBackend : asyncBase {
   uintptr_t nextTimerTag = 1;
   // Backs base.graceSeen/gracePendingSeen: production bases get the arrays
   // from createAsyncBase
-  alignas(GRACE_SLOT_ALIGNMENT) std::array<GraceSlot, 8> graceSlots{};
+  alignas(CACHE_LINE_SIZE) std::array<GraceSlot, 8> graceSlots{};
   std::array<uintptr_t, 8> gracePendingSlotsSeen{};
 
   TestBackend() : asyncBase{}, base(*this)

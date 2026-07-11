@@ -180,6 +180,55 @@ TEST(socket, test_tcp_rw_ipv6)
   ASSERT_TRUE(context.success);
 }
 
+struct IoAcceptTimeoutContext {
+  asyncBase *base;
+  aioObject *listener;
+  int status;
+  socketTy acceptedSocket;
+  HostAddress remoteAddress;
+
+  explicit IoAcceptTimeoutContext(asyncBase *baseArg)
+    : base(baseArg), listener(nullptr), status(1), acceptedSocket(0)
+  {
+    memset(&remoteAddress, 0xff, sizeof(remoteAddress));
+  }
+};
+
+static void ioAcceptTimeoutProc(void *arg)
+{
+  IoAcceptTimeoutContext *ctx = static_cast<IoAcceptTimeoutContext*>(arg);
+  ctx->status = ioAccept(ctx->listener,
+                         &ctx->acceptedSocket,
+                         &ctx->remoteAddress,
+                         10000);
+  postQuitOperation(ctx->base);
+}
+
+TEST(socket, io_accept_timeout_returns_status_separately)
+{
+  IoAcceptTimeoutContext ctx(gBase);
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy listenerSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_NE(listenerSocket, INVALID_SOCKET);
+  ASSERT_EQ(socketBind(listenerSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenerSocket), 0);
+  ctx.listener = newSocketIo(gBase, listenerSocket);
+  ASSERT_NE(ctx.listener, nullptr);
+
+  coroutineTy *coroutine = coroutineNew(ioAcceptTimeoutProc, &ctx, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  ASSERT_EQ(coroutineCall(coroutine), 0);
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.status, -aosTimeout);
+  EXPECT_EQ(ctx.acceptedSocket, INVALID_SOCKET);
+  EXPECT_EQ(ctx.remoteAddress.family, AF_UNSPEC);
+  deleteAioObject(ctx.listener);
+}
+
 #ifdef OS_COMMONUNIX
 // Regression test: aioWrite() to a connection dropped by the peer must
 // report an error through the operation status, never kill the process with
@@ -298,7 +347,7 @@ TEST(socket, test_tcp_read_pipelined_with_connect)
 
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioConnect(client, &address, 300000, tcpPipelineConnectCb, &ctx);
+  aioConnect(client, &address, 150000, tcpPipelineConnectCb, &ctx);
   aioRead(client, ctx.buffer, sizeof(ctx.buffer), afNone, 2000000, tcpPipelineReadCb, &ctx);
 
   asyncLoop(gBase);
@@ -360,8 +409,8 @@ TEST(socket, double_connect_rejected)
 
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioConnect(client, &address, 300000, doubleConnectFirstCb, &ctx);
-  aioConnect(client, &address, 300000, doubleConnectSecondCb, &ctx);
+  aioConnect(client, &address, 150000, doubleConnectFirstCb, &ctx);
+  aioConnect(client, &address, 150000, doubleConnectSecondCb, &ctx);
 
   asyncLoop(gBase);
   deleteAioObject(client);

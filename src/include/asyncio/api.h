@@ -177,6 +177,11 @@ typedef struct AsyncOpTaggedPtr {
 
 uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count);
 uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count);
+// Internal user-event lifetime protocol. A successful eventTryActivate owns
+// one delivery reference; the delivery path must call eventDeactivate before
+// invoking the callback and eventDecrementReference(event, 1) afterwards.
+// Activation fails once deletion has begun and, for a non-semaphore event,
+// while another delivery is pending.
 uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t tag);
 uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t tag);
 int eventTryActivate(aioUserEvent *event);
@@ -314,6 +319,9 @@ struct asyncOpRoot {
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor);
 void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg);
+// Construction-time configuration: set before publishing or deleting event.
+// Called exactly once by the thread releasing the final reference, after the
+// sole deleteUserEvent call and all accepted deliveries have finished.
 void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, void *arg);
 
 void cancelIo(aioObjectRoot *object);

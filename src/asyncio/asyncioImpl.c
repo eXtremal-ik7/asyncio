@@ -411,6 +411,14 @@ void startOperation(asyncOpRoot *op, uint32_t *needStart)
       return;
     }
     opArmTimer(op);
+    if (opGetStatus(op) != aosPending) {
+      // The arm itself expired the operation (its deadline window was already
+      // swept): the timeout won before the I/O started, so never issue the
+      // connect/handshake. Releasing here mirrors the pre-start branch above -
+      // the cancel signal's sweep will find the slot already empty
+      initializationRelease(op, opGetStatus(op), needStart);
+      return;
+    }
     initializationTryComplete(op, op->executeMethod(op), needStart);
     return;
   }

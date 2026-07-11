@@ -326,7 +326,7 @@ TEST(ssl, write_before_handshake)
   ctx.client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
-  aioSslConnect(ctx.client, &address, nullptr, 300000, sslWriteBeforeHandshakeConnectCb, &ctx);
+  aioSslConnect(ctx.client, &address, nullptr, 150000, sslWriteBeforeHandshakeConnectCb, &ctx);
   // queued right behind the connect, as an application pipelining its first
   // request would do; the write timeout only bounds the test if a fix leaves
   // the operation waiting for a handshake that can no longer complete
@@ -438,8 +438,8 @@ TEST(ssl, double_connect_rejected)
 
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioSslConnect(client, &address, nullptr, 300000, sslDoubleConnectFirstCb, &ctx);
-  aioSslConnect(client, &address, nullptr, 300000, sslDoubleConnectSecondCb, &ctx);
+  aioSslConnect(client, &address, nullptr, 150000, sslDoubleConnectFirstCb, &ctx);
+  aioSslConnect(client, &address, nullptr, 150000, sslDoubleConnectSecondCb, &ctx);
 
   asyncLoop(gBase);
   sslSocketDelete(client);

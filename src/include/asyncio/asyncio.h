@@ -35,10 +35,30 @@ asyncBase *aioGetBase(aioObject *object);
 
 void setSocketBuffer(aioObject *socket, size_t bufferSize);
 
+// A non-NULL user-event callback runs asynchronously on an asyncLoop(base)
+// thread. With isSemaphore == 0, activations coalesce while one delivery is
+// pending; with isSemaphore != 0, every userEventActivate call produces a
+// delivery. The pending gate is released before the callback, so callbacks of
+// the same event may overlap when several threads run asyncLoop(base).
 aioUserEvent *newUserEvent(asyncBase* base, int isSemaphore, aioEventCb callback, void* arg);
+
+// Starts a periodic timer and atomically replaces the previous timer schedule.
+// usTimeout > 0 is the period; counter > 0 limits the number of delivered timer
+// activations, while counter <= 0 repeats until stopped. A delivery already
+// accepted from the previous schedule is not retracted.
 void userEventStartTimer(aioUserEvent *event, uint64_t usTimeout, int counter);
+
+// Stops the current timer schedule. It does not cancel manual or already
+// accepted activations. Concurrent start/stop calls take effect in their
+// linearized order, so the last one wins.
 void userEventStopTimer(aioUserEvent *event);
+
+// Thread-safe cross-thread activation; see newUserEvent for coalescing rules.
 void userEventActivate(aioUserEvent *event);
+
+// May be called exactly once, from any thread (including the event callback).
+// It stops the timer and releases the event after accepted deliveries finish;
+// no new call using event may start after deletion.
 void deleteUserEvent(aioUserEvent *event);
 
 asyncOpRoot *implRead(aioObject *object,
@@ -107,11 +127,19 @@ ssize_t aioWriteMsg(aioObject *object,
 
 
 int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout);
-socketTy ioAccept(aioObject *object, uint64_t usTimeout);
+// Returns 0 on success or -AsyncOpStatus on failure. acceptedSocket must not
+// be NULL and is set to INVALID_SOCKET on failure; remoteAddress may be NULL.
+int ioAccept(aioObject *object,
+             socketTy *acceptedSocket,
+             HostAddress *remoteAddress,
+             uint64_t usTimeout);
 ssize_t ioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
+// Coroutine-only helpers for a dedicated event created with callback == NULL.
+// Only one coroutine may wait on the event at a time; activation may still
+// come from any thread. A pending activation is consumed without suspending.
 void ioSleep(aioUserEvent *event, uint64_t usTimeout);
 void ioWaitUserEvent(aioUserEvent *event);
 

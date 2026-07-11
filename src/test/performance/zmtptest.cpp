@@ -497,9 +497,11 @@ void receiverCoroutineProc(void *arg)
 {
   auto ctx = static_cast<ReceiverContext*>(arg);
   socketTy socketId;
-  if ( (socketId = ioAccept(ctx->listener, 3000000)) < 0) {
-    fprintf(stderr, "receiverCoroutine: accept failed code %i\n", -static_cast<int>(socketId));
+  int status = ioAccept(ctx->listener, &socketId, nullptr, 3000000);
+  if (status < 0) {
+    fprintf(stderr, "receiverCoroutine: accept failed code %i\n", -status);
     postQuitOperation(ctx->base);
+    return;
   }
 
   zmtpSocket *socket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, socketId), zmtpSocketPULL);

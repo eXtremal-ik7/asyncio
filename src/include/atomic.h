@@ -188,31 +188,5 @@ static inline void *__pointer_atomic_exchange(void *volatile *pointer, void *v1)
 #endif
 }
 
-static inline void __spinlock_acquire(unsigned *lock)
-{
-  for (;;) {
-    int i;
-    for (i = 0; i < 7777; i++) {
-      if (__uint_atomic_compare_and_swap(lock, 0, 1))
-        return;
-    }
-#ifdef OS_WINDOWS
-    SwitchToThread();
-#else
-    sched_yield();
-#endif
-  }
-}
-
-static inline int __spinlock_try_acquire(volatile unsigned *lock)
-{
-  return __uint_atomic_compare_and_swap(lock, 0, 1) ? 1 : 0;
-}
-
-static inline void __spinlock_release(volatile unsigned *lock)
-{
-  __uint_atomic_store(lock, 0, amoRelease);
-}
-
 __NO_UNUSED_FUNCTION_END
 #endif //__ATOMIC_H_

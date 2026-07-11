@@ -108,6 +108,10 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
   op->state = 0;
   op->transactionSize = context->TransactionSize;
   op->bytesTransferred = 0;
+  if (opCode == actAccept) {
+    op->acceptSocket = INVALID_SOCKET;
+    memset(&op->host, 0, sizeof(op->host));
+  }
   if (context->TransactionSize && (opCode & OPCODE_WRITE) && !(flags & afNoCopy)) {
     if (op->internalBuffer == 0) {
       op->internalBuffer = malloc(context->TransactionSize);
@@ -223,7 +227,7 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   base->gracePending = 0;
   base->gracePendingSlots = 0;
   base->gracePendingSeen = (uintptr_t*)malloc(sizeof(uintptr_t) * base->graceSlotLimit);
-  base->graceSeen = (GraceSlot*)alignedMalloc(sizeof(GraceSlot) * base->graceSlotLimit, GRACE_SLOT_ALIGNMENT);
+  base->graceSeen = (GraceSlot*)alignedMalloc(sizeof(GraceSlot) * base->graceSlotLimit, CACHE_LINE_SIZE);
   for (unsigned i = 0; i < base->graceSlotLimit; i++)
     base->graceSeen[i].seen = UINTPTR_MAX;   // empty slots never gate the limbo
   return base;
@@ -700,8 +704,15 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
 }
 
 
-socketTy ioAccept(aioObject *object, uint64_t usTimeout)
+int ioAccept(aioObject *object,
+             socketTy *acceptedSocket,
+             HostAddress *remoteAddress,
+             uint64_t usTimeout)
 {
+  *acceptedSocket = INVALID_SOCKET;
+  if (remoteAddress)
+    memset(remoteAddress, 0, sizeof(*remoteAddress));
+
 #ifdef OS_WINDOWS
   AsyncFlags flags = afNone;
 #else
@@ -714,9 +725,13 @@ socketTy ioAccept(aioObject *object, uint64_t usTimeout)
 
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
-  socketTy acceptSocket = op->acceptSocket;
+  if (status == aosSuccess) {
+    *acceptedSocket = op->acceptSocket;
+    if (remoteAddress)
+      *remoteAddress = op->host;
+  }
   releaseAsyncOp(&op->root);
-  return status == aosSuccess ? acceptSocket : -(int)status;
+  return status == aosSuccess ? 0 : -(int)status;
 }
 
 

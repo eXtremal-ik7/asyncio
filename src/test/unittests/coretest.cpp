@@ -1803,7 +1803,7 @@ TEST(core_timeout_grid, rounds_deadlines_up_and_delivers_each_window_once)
 TEST(core_timeout_grid, expiration_cancels_and_releases_waiting_operation)
 {
   TestBackend backend;
-  backend.base.lastCheckPoint = 100;
+  backend.base.timerCloseCursor = 100;
   TestObject object(backend);
   TestOp op(object);
   op.root.endTime = 100 * TIMER_TICK_MICROSECONDS;
@@ -1812,7 +1812,7 @@ TEST(core_timeout_grid, expiration_cancels_and_releases_waiting_operation)
 
   processTimeoutQueue(&backend.base, 101);
 
-  EXPECT_EQ(backend.base.lastCheckPoint, 101u);
+  EXPECT_EQ(backend.base.timerCloseCursor, 101u);
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
   EXPECT_EQ(op.releaseCalls, 1u);
   EXPECT_EQ(object.root.readQueue.head, nullptr);
@@ -1821,24 +1821,22 @@ TEST(core_timeout_grid, expiration_cancels_and_releases_waiting_operation)
   objectDelete(&object.root);
 }
 
-// TDD regression for the legal producer/sweeper ordering the wheel does not
-// reject yet: the sweep reopens window 100 and publishes checkpoint 101, then
-// the producer resumes and publishes a deadline-100 link into the reopened
-// slot (next rotation). A correct terminal-window protocol must refuse the
-// publication and expire the operation immediately instead of delivering it
-// one rotation late. Both expectations below stay red until the producer
-// validates the observed baseTick (the published/expired protocol stage).
+// Terminal-window regression: the sweep reopens window 100 and publishes
+// checkpoint 101, then the producer resumes and arms a deadline-100 timer.
+// The publication must be refused (the producer observes the swept window)
+// and the operation expired immediately instead of being delivered one
+// rotation late.
 TEST(core_timeout_grid, late_arm_after_swept_checkpoint_expires_instead_of_being_stranded)
 {
   TestBackend backend;
-  backend.base.lastCheckPoint = 100;
+  backend.base.timerCloseCursor = 100;
   TestObject object(backend);
   TestOp op(object);
   op.root.endTime = 100 * TIMER_TICK_MICROSECONDS;
   eqPushBack(&object.root.readQueue, &op.root);
 
   processTimeoutQueue(&backend.base, 101);
-  ASSERT_EQ(backend.base.lastCheckPoint, 101u);
+  ASSERT_EQ(backend.base.timerCloseCursor, 101u);
   addToTimeoutQueue(&backend.base, &op.root);
 
   AsyncOpStatus statusAfterArm = opGetStatus(&op.root);
@@ -1861,25 +1859,24 @@ TEST(core_timeout_grid, late_arm_after_swept_checkpoint_expires_instead_of_being
   objectDelete(&object.root);
 }
 
-TEST(core_timeout_grid, current_or_locked_checkpoint_is_a_noop)
+TEST(core_timeout_grid, current_or_stale_clock_reading_is_a_noop)
 {
   TestBackend backend;
-  backend.base.lastCheckPoint = 10;
+  backend.base.timerCloseCursor = 10;
 
   processTimeoutQueue(&backend.base, 10);
-  EXPECT_EQ(backend.base.lastCheckPoint, 10u);
+  EXPECT_EQ(backend.base.timerCloseCursor, 10u);
 
-  backend.base.timerMapLock = 1;
-  processTimeoutQueue(&backend.base, 12);
-  EXPECT_EQ(backend.base.lastCheckPoint, 10u);
-  EXPECT_EQ(backend.base.timerMapLock, 1u);
-  backend.base.timerMapLock = 0;
+  // A caller whose clock reading is behind the confirmed cursor (it raced a
+  // faster sweeper) must not sweep anything or move the cursor backwards
+  processTimeoutQueue(&backend.base, 8);
+  EXPECT_EQ(backend.base.timerCloseCursor, 10u);
 }
 
 TEST(core_timeout_grid, stale_generation_link_does_not_cancel_reused_operation)
 {
   TestBackend backend;
-  backend.base.lastCheckPoint = 7;
+  backend.base.timerCloseCursor = 7;
   TestObject object(backend);
   TestOp op(object);
   uintptr_t staleGeneration = opGetGeneration(&op.root);
@@ -1918,6 +1915,361 @@ TEST(core_timeout_grid, ordinary_operation_arms_monotonic_grid_timer)
   backend.drainCompletions();
   // The armed link stays parked in the wheel with a now-stale generation; the
   // TestBackend teardown recycles it without touching this stack operation
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, detach_reopens_and_is_idempotent_per_incarnation)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  op.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  auto *link = static_cast<asyncOpListLink*>(op.root.timerId);
+  ASSERT_NE(link, nullptr);
+  ASSERT_EQ(link->deadlineTick, 5u);
+
+  // The winner takes the chain, and the same CAS reopens the slot for the
+  // next rotation
+  asyncOpListLink *chain = timerWheelDetach(&backend.base, 0, 5);
+  ASSERT_EQ(chain, link);
+  uint128Pair slotPair = peekWheelSlot(backend, 0, 5);
+  EXPECT_EQ(slotPair.low, 0u);
+  EXPECT_EQ(slotPair.high, 5u + TIMER_WHEEL_SLOTS);
+
+  // Any other visitor of the same window observes the advanced baseTick:
+  // no chain, no second reopen
+  EXPECT_EQ(timerWheelDetach(&backend.base, 0, 5), nullptr);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 5).high, 5u + TIMER_WHEEL_SLOTS);
+
+  // Publication into the drained window is refused: its deadlines are
+  // terminal, and the wheel must not accept a link that could only fire a
+  // rotation late
+  link->next = nullptr;
+  EXPECT_EQ(timerWheelInsert(&backend.base, link, 5), 0);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 5).low, 0u);
+
+  // The refused link stays with its owner and is processed exactly as during
+  // a sweep: the timeout is delivered and the link recycled
+  timerWheelProcessDetached(&backend.base, chain, 5);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, arm_behind_multiple_rotations_expires_without_publication)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  // The producer was preempted between reading the cursor and publishing for
+  // two whole rotations of the deadline's slot: the slot alone proves the
+  // window is long gone, whatever the stale cursor hint says
+  EXPECT_EQ(timerWheelDetach(&backend.base, 0, 5), nullptr);
+  EXPECT_EQ(timerWheelDetach(&backend.base, 0, 5 + TIMER_WHEEL_SLOTS), nullptr);
+  op.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
+  eqPushBack(&object.root.readQueue, &op.root);
+
+  addToTimeoutQueue(&backend.base, &op.root);
+
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+  EXPECT_EQ(op.root.timerId, nullptr);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 5).low, 0u);
+  backend.drainCompletions();
+  EXPECT_EQ(op.callbackStatus, aosTimeout);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, publication_descends_into_open_lower_window_of_drained_upper)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  // The sweep legally passed the level-1 boundary: the [1024, 2048) window is
+  // drained, but tick 1030 inside it is still ahead of the cursor
+  processTimeoutQueue(&backend.base, 1025);
+  ASSERT_EQ(backend.base.timerCloseCursor, 1025u);
+
+  // A producer with a stale cursor hint routes to the drained level-1 window
+  // first; the publication must descend into the still-open level-0 slot -
+  // not be refused and not park a rotation late in level 1
+  auto *link = static_cast<asyncOpListLink*>(malloc(sizeof(asyncOpListLink)));
+  link->op = &op.root;
+  link->generation = opGetGeneration(&op.root);
+  link->next = nullptr;
+  link->deadlineTick = 1030;
+  ASSERT_EQ(timerWheelInsert(&backend.base, link, 0), 1);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).low,
+            reinterpret_cast<uint64_t>(link));
+  EXPECT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
+
+  // Delivered by the normal sweep in its exact tick
+  processTimeoutQueue(&backend.base, 1030);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+  processTimeoutQueue(&backend.base, 1031);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, expired_arm_never_starts_initialization_io)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object, OPCODE_WRITE, afNone, 1);
+  op.setResults({aosPending});
+  // A connect whose timeout elapsed before the submission reached the
+  // combiner: the deadline computed from the monotonic clock lies behind the
+  // confirmed sweep position
+  backend.base.timerCloseCursor = static_cast<uintptr_t>(getMonotonicTicks() + 1024);
+  ASSERT_TRUE(__uintptr_atomic_compare_and_swap(&object.root.initializationOp, 0,
+                                                reinterpret_cast<uintptr_t>(&op.root)));
+
+  combinerPushOperation(&op.root);
+
+  EXPECT_EQ(op.executeCalls, 0u)
+    << "initialization I/O was issued after its timeout had already won";
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+  EXPECT_EQ(__uintptr_atomic_load(&object.root.initializationOp, amoRelaxed), 0u);
+  backend.drainCompletions();
+  EXPECT_EQ(op.callbackStatus, aosTimeout);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, helper_confirms_cursor_and_stalled_owner_keeps_its_chain)
+{
+  TestBackend backend;
+  backend.base.timerCloseCursor = 100;
+  TestObject object(backend);
+  TestOp stalledOp(object), liveOp(object);
+  stalledOp.root.endTime = 100 * TIMER_TICK_MICROSECONDS;
+  liveOp.root.endTime = 101 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &stalledOp.root);
+  addToTimeoutQueue(&backend.base, &liveOp.root);
+
+  // Sweeper A wins the tick-100 visit and stalls before both the confirm CAS
+  // and the processing of its detached chain
+  asyncOpListLink *ownedChain = timerWheelDetach(&backend.base, 0, 100);
+  ASSERT_EQ(ownedChain, static_cast<asyncOpListLink*>(stalledOp.root.timerId));
+  ASSERT_EQ(backend.base.timerCloseCursor, 100u);
+
+  // Sweeper B's tick-100 visits are idempotent no-ops, yet B confirms the
+  // cursor on A's behalf and the ticks behind the stalled one stay alive
+  processTimeoutQueue(&backend.base, 102);
+  EXPECT_EQ(backend.base.timerCloseCursor, 102u);
+  EXPECT_EQ(opGetStatus(&liveOp.root), aosTimeout);
+  // Helping never delivers or steals the private chain
+  EXPECT_EQ(opGetStatus(&stalledOp.root), aosPending);
+  EXPECT_EQ(ownedChain->next, nullptr);
+
+  // A resumes: its chain is processed as if the stall never happened
+  timerWheelProcessDetached(&backend.base, ownedChain, 100);
+  EXPECT_EQ(opGetStatus(&stalledOp.root), aosTimeout);
+
+  objectDecrementReference(&object.root, 2);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, resurfaced_sweeper_with_stale_tick_cannot_rewind_cursor)
+{
+  TestBackend backend;
+  backend.base.timerCloseCursor = 100;
+
+  processTimeoutQueue(&backend.base, 110);
+  ASSERT_EQ(backend.base.timerCloseCursor, 110u);
+
+  // A sweeper that stalled before its confirm CAS resurfaces long after its
+  // tick was confirmed by helpers: the visits are idempotent no-ops and the
+  // tick-exact confirm CAS misses, a plain checkpoint store would rewind here
+  timerWheelSweepTick(&backend.base, 100);
+  EXPECT_EQ(backend.base.timerCloseCursor, 110u);
+
+  processTimeoutQueue(&backend.base, 105);
+  EXPECT_EQ(backend.base.timerCloseCursor, 110u);
+}
+
+TEST(core_timer_wheel, boundary_deadline_migrates_and_fires_in_its_exact_tick)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp boundary(object), inWindow(object);
+  // Against cursor 0 both deadlines differ in the bits 10..19 group, so both
+  // are routed to level 1 (the [1024, 2048) window slot)
+  boundary.root.endTime = 1024 * TIMER_TICK_MICROSECONDS;
+  inWindow.root.endTime = 1025 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &boundary.root);
+  addToTimeoutQueue(&backend.base, &inWindow.root);
+  ASSERT_EQ(peekWheelSlot(backend, 0, 0).low, 0u);
+  ASSERT_EQ(peekWheelSlot(backend, 0, 1).low, 0u);
+  ASSERT_NE(peekWheelSlot(backend, 1, 1).low, 0u);
+
+  // The whole level-0 rotation before the boundary delivers nothing
+  processTimeoutQueue(&backend.base, 1024);
+  EXPECT_EQ(opGetStatus(&boundary.root), aosPending);
+  EXPECT_EQ(opGetStatus(&inWindow.root), aosPending);
+
+  // Tick 1024 visits level 1 before level 0: the boundary deadline expires in
+  // this very tick (not one rotation later), the in-window one migrates down
+  // into its level-0 slot
+  processTimeoutQueue(&backend.base, 1025);
+  EXPECT_EQ(opGetStatus(&boundary.root), aosTimeout);
+  EXPECT_EQ(opGetStatus(&inWindow.root), aosPending);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1).low,
+            reinterpret_cast<uint64_t>(inWindow.root.timerId));
+
+  processTimeoutQueue(&backend.base, 1026);
+  EXPECT_EQ(opGetStatus(&inWindow.root), aosTimeout);
+
+  objectDecrementReference(&object.root, 2);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, cascade_chain_migrates_l2_to_l1_to_l0_and_fires_in_its_exact_tick)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp boundary(object), chained(object);
+  // Both deadlines differ from cursor 0 in the bits 20..29 group: level-2
+  // routing. The boundary one sits exactly on the window start; the chained
+  // one needs the full migration ladder level 2 -> level 1 -> level 0
+  const uint64_t l2Window = uint64_t{1} << (2 * TIMER_WHEEL_LEVEL_BITS);
+  const uint64_t chainedDeadline = l2Window + TIMER_WHEEL_SLOTS + 1;
+  boundary.root.endTime = l2Window * TIMER_TICK_MICROSECONDS;
+  chained.root.endTime = chainedDeadline * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &boundary.root);
+  addToTimeoutQueue(&backend.base, &chained.root);
+  ASSERT_EQ(peekWheelSlot(backend, 2, 1).low,
+            reinterpret_cast<uint64_t>(chained.root.timerId));
+  ASSERT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
+
+  // Catching up a whole level-1 rotation in one call (a base resuming from
+  // suspend) delivers nothing ahead of time
+  processTimeoutQueue(&backend.base, l2Window);
+  EXPECT_EQ(opGetStatus(&boundary.root), aosPending);
+  EXPECT_EQ(opGetStatus(&chained.root), aosPending);
+
+  // Tick 2^20 visits level 2: the boundary deadline expires in this very tick
+  // (not one rotation later), the chained one migrates into the level-1
+  // window reopened by the sweep in exact lockstep
+  processTimeoutQueue(&backend.base, l2Window + 1);
+  EXPECT_EQ(opGetStatus(&boundary.root), aosTimeout);
+  EXPECT_EQ(opGetStatus(&chained.root), aosPending);
+  EXPECT_EQ(peekWheelSlot(backend, 2, 1).low, 0u);
+  ASSERT_EQ(peekWheelSlot(backend, 1, 1).low,
+            reinterpret_cast<uint64_t>(chained.root.timerId));
+  EXPECT_EQ(peekWheelSlot(backend, 1, 1).high, l2Window + TIMER_WHEEL_SLOTS);
+
+  // The level-1 boundary tick migrates it again, into the level-0 slot whose
+  // current incarnation covers exactly the deadline tick
+  processTimeoutQueue(&backend.base, chainedDeadline);
+  EXPECT_EQ(opGetStatus(&chained.root), aosPending);
+  EXPECT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
+  ASSERT_EQ(peekWheelSlot(backend, 0, 1).low,
+            reinterpret_cast<uint64_t>(chained.root.timerId));
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1).high, chainedDeadline);
+
+  // The last hop is the delivery itself, in the exact deadline tick
+  processTimeoutQueue(&backend.base, chainedDeadline + 1);
+  EXPECT_EQ(opGetStatus(&chained.root), aosTimeout);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1).low, 0u);
+
+  objectDecrementReference(&object.root, 2);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, boundary_deadline_at_top_level_window_start_fires_at_its_visit)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  // Differs from cursor 0 in the bits 30..39 group: top-level routing, into
+  // the [2^30, 2^31) window whose slot still holds its initial incarnation
+  const uint64_t l3Window = uint64_t{1} << (3 * TIMER_WHEEL_LEVEL_BITS);
+  op.root.endTime = l3Window * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_EQ(peekWheelSlot(backend, 3, 1).low,
+            reinterpret_cast<uint64_t>(op.root.timerId));
+
+  // Sweeping 2^30 ticks one by one is out of unit-test reach; the visit units
+  // run directly at the exact window-start tick, as the contiguous sweep
+  // would. The window-start deadline is due at this very visit and must be
+  // delivered here, not re-parked for another rotation
+  timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 3, l3Window), l3Window);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+  EXPECT_EQ(peekWheelSlot(backend, 3, 1).low, 0u);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, beyond_range_deadline_clamps_and_reclamps_keeping_its_exact_tick)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  // The deadline differs from cursor 0 above the wheel's addressable bits: no
+  // slot covers it yet, the arm clamps into the farthest top-level slot
+  const uint64_t wheelRange = uint64_t{1} << (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS);
+  const uint64_t topWidth = uint64_t{1} << (3 * TIMER_WHEEL_LEVEL_BITS);
+  op.root.endTime = (wheelRange + 5) * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  auto *link = static_cast<asyncOpListLink*>(op.root.timerId);
+  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low,
+            reinterpret_cast<uint64_t>(link));
+
+  // The far slot's visit re-cascades; from this window's position the
+  // deadline is still beyond range, so it clamps again - parked with its
+  // exact deadline tick intact, neither delivered early nor dropped
+  const uint64_t farWindow = (TIMER_WHEEL_SLOTS - 1) * topWidth;
+  timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 3, farWindow), farWindow);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+  EXPECT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low, 0u);
+  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low,
+            reinterpret_cast<uint64_t>(link));
+  EXPECT_EQ(link->deadlineTick, wheelRange + 5);
+
+  // Still pending and parked: the wheel teardown recycles the link without
+  // delivering it
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(core_timer_wheel, stalled_cascade_into_swept_window_delivers_exactly_once)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  // Level-1 routing against cursor 0: window [1024, 2048), deadline inside it
+  op.root.endTime = 1030 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  auto *link = static_cast<asyncOpListLink*>(op.root.timerId);
+  ASSERT_EQ(peekWheelSlot(backend, 1, 1).low, reinterpret_cast<uint64_t>(link));
+
+  processTimeoutQueue(&backend.base, 1024);
+
+  // The owner wins the level-1 boundary visit and stalls before processing
+  // its chain; helpers sweep past the deadline meanwhile, so the level-0 slot
+  // the cascade is aiming at is already reopened for its next rotation
+  asyncOpListLink *ownedChain = timerWheelDetach(&backend.base, 1, 1024);
+  ASSERT_EQ(ownedChain, link);
+  processTimeoutQueue(&backend.base, 1031);
+  ASSERT_EQ(backend.base.timerCloseCursor, 1031u);
+  ASSERT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).high,
+            1030u + TIMER_WHEEL_SLOTS);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+
+  // The resumed cascade observes the terminal window and must deliver right
+  // now (late, never early - the deadline tick is already swept), not park
+  // the link into the reopened incarnation to fire a rotation later
+  timerWheelProcessDetached(&backend.base, ownedChain, 1024);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).low, 0u);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).high,
+            1030u + TIMER_WHEEL_SLOTS);
+
+  objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
 }
 
