@@ -39,26 +39,41 @@ void setSocketBuffer(aioObject *socket, size_t bufferSize);
 // thread. With isSemaphore == 0, activations coalesce while one delivery is
 // pending; with isSemaphore != 0, every userEventActivate call produces a
 // delivery. The pending gate is released before the callback, so callbacks of
-// the same event may overlap when several threads run asyncLoop(base).
+// the same event may overlap when several threads run asyncLoop(base). The
+// caller receives one initial strong reference. Before publishing event to an
+// independently using thread, retain it with eventIncrementReference(event, 1);
+// that thread releases its reference with eventDecrementReference(event, 1).
+// All strong references are equivalent for lifetime. Exactly one holder closes
+// the event with deleteUserEvent instead of ordinary release; ordinary release
+// changes lifetime only. Retain is valid only while the caller already owns a
+// strong reference.
 aioUserEvent *newUserEvent(asyncBase* base, int isSemaphore, aioEventCb callback, void* arg);
 
-// Starts a periodic timer and atomically replaces the previous timer schedule.
-// usTimeout > 0 is the period; counter > 0 limits the number of delivered timer
-// activations, while counter <= 0 repeats until stopped. A delivery already
-// accepted from the previous schedule is not retracted.
+// Starts a periodic timer and replaces the previous timer schedule. usTimeout
+// > 0 is the period; counter > 0 limits the number of delivered timer
+// activations, while counter <= 0 repeats until stopped. Calls to Start/Stop
+// for the same event must be externally serialized; overlapping timer-control
+// calls are a caller error. Every caller must own a strong reference. Timer
+// control may race with activation and deletion; once deletion wins, Start is
+// a safe no-op and cannot revive the event.
 void userEventStartTimer(aioUserEvent *event, uint64_t usTimeout, int counter);
 
 // Stops the current timer schedule. It does not cancel manual or already
-// accepted activations. Concurrent start/stop calls take effect in their
-// linearized order, so the last one wins.
+// accepted activations. Subject to the external-serialization rule above,
+// Stop is idempotent.
 void userEventStopTimer(aioUserEvent *event);
 
 // Thread-safe cross-thread activation; see newUserEvent for coalescing rules.
 void userEventActivate(aioUserEvent *event);
 
-// May be called exactly once, from any thread (including the event callback).
-// It stops the timer and releases the event after accepted deliveries finish;
-// no new call using event may start after deletion.
+// May be called exactly once, from any thread (including the event callback),
+// and may overlap one already-running timer-control call. It is close +
+// release: it publishes the terminal state, stops the timer and consumes one
+// strong reference. This exactly-once close is what distinguishes it from
+// eventDecrementReference; no separate kind of reference is stored. Other
+// strong references keep storage alive, while their operations observe the
+// terminal state and become no-ops. Final destruction follows their release
+// plus accepted deliveries/control.
 void deleteUserEvent(aioUserEvent *event);
 
 asyncOpRoot *implRead(aioObject *object,

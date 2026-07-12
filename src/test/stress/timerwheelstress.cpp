@@ -21,6 +21,11 @@
 // insertion - the producer observes a foreign baseTick and reports expired -
 // so nothing is accepted and nothing is parked in the reopened incarnations.
 //
+// Phases A and B also verify the occupancy-bitmap invariant at their
+// quiescence points and after the teardown: a slot holding a chain must have
+// its bit set (a bitless chain would let a sleeping loop oversleep the
+// deadline; extra bits over empty slots are legal spurious wakeups).
+//
 // Usage: timerwheelstress [threads] [rounds] [itemsPerThread]
 
 #include "asyncioImpl.h"
@@ -87,6 +92,36 @@ uint64_t parseArgument(const char *value, const char *name)
     exit(2);
   }
   return parsed;
+}
+
+// Occupancy invariant, checked at quiescence points (no visit or publication
+// in flight): a slot holding a chain must have its bit set - a bitless chain
+// is a lost wakeup, a sleeping loop would oversleep its deadlines. Spurious
+// set bits over empty slots are legal (they only cost a wakeup) and are not
+// counted.
+uint64_t occupancyViolations(asyncBase *base)
+{
+  uint64_t violations = 0;
+  for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; ++level) {
+    for (unsigned index = 0; index < TIMER_WHEEL_SLOTS; ++index) {
+      uint128Pair pair = __uint128_atomic_load(&base->timerWheel.slots[level][index]);
+      if (pair.low &&
+          !(base->timerWheel.occupancy[level][index >> 6] & (static_cast<uintptr_t>(1) << (index & 63))))
+        ++violations;
+    }
+  }
+  return violations;
+}
+
+// The teardown contract: no bits survive it
+uint64_t occupancyResidue(asyncBase *base)
+{
+  uint64_t residue = 0;
+  for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; ++level) {
+    for (unsigned word = 0; word < TIMER_WHEEL_SLOTS / 64; ++word)
+      residue += base->timerWheel.occupancy[level][word] != 0;
+  }
+  return residue;
 }
 
 } // namespace
@@ -174,6 +209,8 @@ int main(int argc, char **argv)
         }
 
         barrier.wait();
+        // Main checks the occupancy invariant over the fully published wheel
+        barrier.wait();
 
         // Race the visits, starting at staggered offsets so the interleaving
         // is not lockstep. The winner owns the whole chain and claims each
@@ -205,8 +242,11 @@ int main(int argc, char **argv)
 
   uint64_t lostLinks = 0;
   uint64_t doubleDetaches = 0;
+  uint64_t bitlessChains = 0;
   for (uint64_t round = 0; round < rounds; ++round) {
     barrier.wait();
+    barrier.wait();
+    bitlessChains += occupancyViolations(ownershipBase.get());
     barrier.wait();
     barrier.wait();
 
@@ -229,12 +269,13 @@ int main(int argc, char **argv)
   // Every window was detached, so the wheel holds no stress-owned memory and
   // the teardown must not leak it into the global link pool
   timerWheelTeardown(ownershipBase.get());
+  bitlessChains += occupancyResidue(ownershipBase.get());
 
   printf("phase A (ownership): %" PRIu64 " link(s), lost/multiply-claimed: %" PRIu64
-         ", non-single detaches: %" PRIu64 ", corrupt: %" PRIu64 "\n",
-         rounds * slotCount, lostLinks, doubleDetaches, corrupt.load());
-  if (lostLinks || doubleDetaches || corrupt.load()) {
-    fprintf(stderr, "FAILED: a window chain was lost, stolen or claimed twice\n");
+         ", non-single detaches: %" PRIu64 ", bitless chains: %" PRIu64 ", corrupt: %" PRIu64 "\n",
+         rounds * slotCount, lostLinks, doubleDetaches, bitlessChains, corrupt.load());
+  if (lostLinks || doubleDetaches || bitlessChains || corrupt.load()) {
+    fprintf(stderr, "FAILED: a window chain was lost, stolen, claimed twice or left bitless\n");
     return 1;
   }
 
@@ -269,6 +310,8 @@ int main(int argc, char **argv)
         for (uint64_t item = 0; item < itemsPerThread; ++item)
           myOps[static_cast<size_t>(item)].tag += static_cast<uintptr_t>(1) << TAG_STATUS_SIZE;
 
+        barrier.wait();
+        // Main checks the occupancy invariant over the armed wheel
         barrier.wait();
 
         // Race the sweep with no lock and no election. The simulated stall
@@ -309,8 +352,11 @@ int main(int argc, char **argv)
   }
 
   uint64_t tagViolations = 0;
+  uint64_t bitlessArmed = 0;
   for (uint64_t round = 0; round < rounds; ++round) {
     barrier.wait();
+    barrier.wait();
+    bitlessArmed += occupancyViolations(sweepBase.get());
     barrier.wait();
     barrier.wait();
 
@@ -332,11 +378,12 @@ int main(int argc, char **argv)
   // Stale links whose windows lie beyond the last block are still parked in
   // the wheel; the official teardown recycles them into the pool
   timerWheelTeardown(sweepBase.get());
+  bitlessArmed += occupancyResidue(sweepBase.get());
 
   printf("phase B (cursor): %" PRIu64 " tick(s), cursor violations: %" PRIu64
-         ", touched operations: %" PRIu64 ", corrupt: %" PRIu64 "\n",
-         rounds * blockTicks, cursorViolations.load(), tagViolations, corrupt.load());
-  if (cursorViolations.load() || tagViolations || corrupt.load()) {
+         ", touched operations: %" PRIu64 ", bitless chains: %" PRIu64 ", corrupt: %" PRIu64 "\n",
+         rounds * blockTicks, cursorViolations.load(), tagViolations, bitlessArmed, corrupt.load());
+  if (cursorViolations.load() || tagViolations || bitlessArmed || corrupt.load()) {
     fprintf(stderr, "FAILED: the sweep protocol broke without the lock\n");
     return 1;
   }

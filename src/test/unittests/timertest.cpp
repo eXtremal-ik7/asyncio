@@ -40,6 +40,11 @@ inline asyncOpListLink *drainWheelSlot(TestBackend &backend, unsigned level, uns
   return reinterpret_cast<asyncOpListLink*>(static_cast<uintptr_t>(observed.low));
 }
 
+inline bool wheelSlotOccupied(TestBackend &backend, unsigned level, unsigned index)
+{
+  return (backend.base.timerWheel.occupancy[level][index >> 6] >> (index & 63)) & 1;
+}
+
 TEST(timer_grid, rounds_deadlines_up_and_delivers_each_window_once)
 {
   TestBackend backend;
@@ -558,33 +563,67 @@ TEST(timer_wheel, stalled_cascade_into_swept_window_delivers_exactly_once)
   objectDelete(&object.root);
 }
 
-TEST(timer_wakeup, outstanding_counter_follows_link_lifecycle)
+// The visitor pre-clears the occupancy bit before its drain CAS, so losing
+// the drain race can leave the clear ordered after a fresh publication into
+// the reopened incarnation. The idempotent exit must repair that: a live
+// chain observed behind an advanced baseTick gets its bit re-set before the
+// visitor backs off empty-handed.
+TEST(timer_wheel, stale_detach_restores_live_occupancy_bit)
+{
+  TestBackend backend;
+  timerWheelInit(&backend.base, 2048);
+  TestObject object(backend);
+  TestOp op(object);
+
+  // Park a link in level-0 slot 5 (tick 2053 of the current rotation)
+  op.root.endTime = 2053 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_TRUE(wheelSlotOccupied(backend, 0, 5));
+
+  // Simulate the lost race: the stale visitor's pre-clear landing after the
+  // fresh publication
+  __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][0], ~(static_cast<uintptr_t>(1) << 5));
+
+  // The stale visitor re-reads the pair, sees the advanced incarnation with
+  // a live chain and restores the bit while claiming nothing
+  EXPECT_EQ(timerWheelDetach(&backend.base, 0, 2053 - TIMER_WHEEL_SLOTS), nullptr);
+  EXPECT_TRUE(wheelSlotOccupied(backend, 0, 5));
+  EXPECT_NE(peekWheelSlot(backend, 0, 5).low, 0u);
+
+  processTimeoutQueue(&backend.base, 2054);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wakeup, occupancy_bit_follows_link_lifecycle)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp delivered(object), stale(object), late(object);
-  ASSERT_EQ(backend.base.timerOutstanding, 0u);
+  TestOp delivered(object), stacked(object), late(object);
+  ASSERT_FALSE(wheelSlotOccupied(backend, 0, 5));
 
+  // Activating an empty slot sets its bit; stacking onto a live chain rides
+  // on the bit already set (the same slot means the same wake tick)
   delivered.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &delivered.root);
-  EXPECT_EQ(backend.base.timerOutstanding, 1u);
+  EXPECT_TRUE(wheelSlotOccupied(backend, 0, 5));
+  stacked.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &stacked.root);
+  EXPECT_TRUE(wheelSlotOccupied(backend, 0, 5));
 
-  stale.root.endTime = 6 * TIMER_TICK_MICROSECONDS;
-  addToTimeoutQueue(&backend.base, &stale.root);
-  EXPECT_EQ(backend.base.timerOutstanding, 2u);
-  // The operation completes and moves on before its deadline: the parked
-  // link goes stale and must still leave the counter when the sweep drops it
-  stale.root.tag += static_cast<uintptr_t>(1) << TAG_STATUS_SIZE;
-
-  processTimeoutQueue(&backend.base, 7);
-  EXPECT_EQ(backend.base.timerOutstanding, 0u);
+  // The visit clears the bit before draining the chain
+  processTimeoutQueue(&backend.base, 6);
   EXPECT_EQ(opGetStatus(&delivered.root), aosTimeout);
+  EXPECT_EQ(opGetStatus(&stacked.root), aosTimeout);
+  EXPECT_FALSE(wheelSlotOccupied(backend, 0, 5));
 
-  // A refused late arm is counted and uncounted symmetrically: the link never
-  // became visible and the timeout is delivered by the arm itself
+  // A refused late arm never becomes visible: no bit and no kick, the
+  // timeout is delivered by the arm itself
   late.root.endTime = 3 * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &late.root);
-  EXPECT_EQ(backend.base.timerOutstanding, 0u);
+  EXPECT_FALSE(wheelSlotOccupied(backend, 0, 3));
   EXPECT_EQ(opGetStatus(&late.root), aosTimeout);
   EXPECT_EQ(backend.wakeupCalls, 0u);
 
@@ -592,17 +631,20 @@ TEST(timer_wakeup, outstanding_counter_follows_link_lifecycle)
   objectDelete(&object.root);
 }
 
-TEST(timer_wakeup, teardown_resets_outstanding_counter)
+TEST(timer_wakeup, teardown_clears_occupancy)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object);
   op.root.endTime = 5000 * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &op.root);
-  ASSERT_EQ(backend.base.timerOutstanding, 1u);
+  ASSERT_TRUE(wheelSlotOccupied(backend, 1, 5000 >> TIMER_WHEEL_LEVEL_BITS));
 
   timerWheelTeardown(&backend.base);
-  EXPECT_EQ(backend.base.timerOutstanding, 0u);
+  for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; level++) {
+    for (unsigned word = 0; word < TIMER_WHEEL_SLOTS / 64; word++)
+      EXPECT_EQ(backend.base.timerWheel.occupancy[level][word], 0u);
+  }
 
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
@@ -628,8 +670,8 @@ TEST(timer_wakeup, producer_kicks_only_sleepers_that_would_miss_the_deadline)
   addToTimeoutQueue(&backend.base, &second.root);
   EXPECT_EQ(backend.wakeupCalls, 1u);
 
-  // Awake threads park their slots and never attract kicks: they re-read the
-  // outstanding counter before their next sleep
+  // Awake threads park their slots and never attract kicks: they re-scan the
+  // occupancy bitmap before their next sleep
   backend.sleepSlots[2].wakeTick = UINTPTR_MAX;
   third.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &third.root);
@@ -639,35 +681,83 @@ TEST(timer_wakeup, producer_kicks_only_sleepers_that_would_miss_the_deadline)
   objectDelete(&object.root);
 }
 
-TEST(timer_wakeup, prepare_sleep_caps_wait_and_publishes_horizon)
+TEST(timer_wakeup, prepare_sleep_is_tickless_and_wakes_right_after_nearest_deadline)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp op(object);
+  TestOp nearOp(object), farOp(object);
 
   // Empty wheel: the full fallback wait, the horizon spans all of it
-  uint64_t before = getMonotonicTicks();
-  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 1000), 1000u);
-  uintptr_t horizon = backend.sleepSlots[0].wakeTick;
-  EXPECT_GE(horizon, static_cast<uintptr_t>(before + 8));
-  EXPECT_LE(horizon, static_cast<uintptr_t>(getMonotonicTicks() + 8));
-
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 1000u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 8u);
   timerLoopCancelSleep(&backend.base, 0);
   EXPECT_EQ(backend.sleepSlots[0].wakeTick, UINTPTR_MAX);
 
-  // A parked timer caps the wait at one grid tick and shortens the horizon
-  op.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
-  addToTimeoutQueue(&backend.base, &op.root);
-  before = getMonotonicTicks();
-  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 1000), 125u);
-  horizon = backend.sleepSlots[0].wakeTick;
-  EXPECT_GE(horizon, static_cast<uintptr_t>(before + 1));
-  EXPECT_LE(horizon, static_cast<uintptr_t>(getMonotonicTicks() + 1));
+  // A deadline beyond the window keeps the fallback: a parked long timer no
+  // longer forces tick-rate polling (the point of the occupancy bitmap)
+  farOp.root.endTime = 5000 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &farOp.root);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 1000u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 8u);
   timerLoopCancelSleep(&backend.base, 0);
 
-  // A thread beyond the slot array still gets the capped wait, it just
-  // cannot publish a horizon (delivery is carried by the slotted threads)
-  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 100, 1000), 125u);
+  // A deadline inside the window shrinks the wait to its exact wake tick
+  // (deadline + 1: the sweep of a tick runs on the first call past it)
+  nearOp.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &nearOp.root);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 750u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 6u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // A wake tick not ahead of the clock is due backlog: no sleep at all
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 6, 1000), 0u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // Delivery clears the slot and the sleep returns to the fallback
+  processTimeoutQueue(&backend.base, 6);
+  EXPECT_EQ(opGetStatus(&nearOp.root), aosTimeout);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 6, 1000), 1000u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 14u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // A thread beyond the horizon array has no channel for the kick: its wait
+  // is capped at one grid tick instead (out-of-contract degradation)
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 100, 6, 1000), 125u);
+
+  objectDecrementReference(&object.root, 2);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wakeup, prepare_sleep_wakes_at_cascade_boundary_of_occupied_upper_slot)
+{
+  TestBackend backend;
+  timerWheelInit(&backend.base, 1022);
+  TestObject object(backend);
+  TestOp op(object);
+
+  // Deadline 1029 lives in level-1 slot 1 until the tick-1024 visit
+  // re-cascades it: a sleeper spanning that boundary must wake right after
+  // the boundary tick or the cascade (and the deadline) oversleeps
+  op.root.endTime = 1029 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_TRUE(wheelSlotOccupied(backend, 1, 1));
+
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 1022, 1000), 375u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 1025u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // Past the boundary the link sits re-cascaded in its exact level-0 slot
+  // and the next sleep runs up to the deadline itself
+  processTimeoutQueue(&backend.base, 1025);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+  EXPECT_FALSE(wheelSlotOccupied(backend, 1, 1));
+  ASSERT_TRUE(wheelSlotOccupied(backend, 0, 1029 % TIMER_WHEEL_SLOTS));
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 1025, 1000), 625u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 1030u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  processTimeoutQueue(&backend.base, 1030);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
 
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);

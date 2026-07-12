@@ -276,7 +276,7 @@ void epollNextFinishedOperation(asyncBase *base)
 
       graceQuiesce(base);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS,
-                        (int)timerLoopPrepareSleep(base, messageLoopThreadId, 500));
+                        (int)timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500));
       timerLoopCancelSleep(base, messageLoopThreadId);
       // Unconditional sweep (the modulo election is gone): an idle pass costs
       // one relaxed load, and the wakeup handshake relies on whichever thread

@@ -35,6 +35,19 @@ extern "C" {
 // beyond level 3 clamp into its farthest slot and re-cascade on visit.
 typedef struct timerWheel {
   uint128Pair slots[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS];
+  // Occupancy bitmap, one bit per slot (64-bit words - the wheel already
+  // requires a 64-bit target). The loops derive their sleep horizon from it
+  // instead of polling at the grid tick while links are parked. Protocol:
+  // a producer sets the bit with a seq-cst RMW after publishing into a slot
+  // it observed empty (activation pays the extra RMW, not every link); a
+  // visitor clears the bit right before its drain CAS, so a publication into
+  // the reopened incarnation is ordered after the clear and its set wins, and
+  // an idempotent visitor that lost the drain race re-sets the bit when it
+  // still observes a chain. Invariant: a slot holding a chain has its bit set
+  // (or the publisher is still between the publish and the set, which the
+  // wakeup kick in addToTimeoutQueue covers); a set bit over an empty slot is
+  // legal and only costs a spurious wakeup - the next visit clears it.
+  uintptr_t occupancy[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS / 64];
 } timerWheel;
 
 #define CACHE_LINE_SIZE 64
@@ -124,14 +137,6 @@ struct asyncBase {
   uint8_t timerCloseCursorPadBefore[CACHE_LINE_SIZE - sizeof(uintptr_t)];
   uintptr_t timerCloseCursor;
   uint8_t timerCloseCursorPadAfter[CACHE_LINE_SIZE - sizeof(uintptr_t)];
-  // Number of links parked in the wheel (transitional, until the occupancy
-  // bitmap): non-zero caps every loop sleep at one tick, so a parked deadline
-  // is never behind a wait longer than the grid step. Lazy cancellation keeps
-  // it non-zero until stale links expire - the price of the transitional
-  // scheme. The RMW on it is also the full barrier of the sleep handshake
-  // (see timerLoopPrepareSleep); own cache line, it is hit by every arm
-  uintptr_t timerOutstanding;
-  uint8_t timerOutstandingPad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
   // One published sleep horizon per loop thread, graceSlotLimit entries;
   // allocated with the base (freed at 0.6 teardown, like graceSeen)
   TimerSleepSlot *timerSleep;
@@ -341,15 +346,20 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
 void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
 
 // Sleep handshake of the message loops with the timeout grid. Before
-// blocking, a loop publishes the tick it will wake at on its own and gets its
-// wait bounded to one grid tick while any timer is parked in the wheel; the
-// publication and the outstanding-counter re-read are ordered by one seq-cst
-// RMW, pairing with the increment in addToTimeoutQueue - either the loop sees
-// the fresh link and shortens the sleep, or the producer sees the published
-// horizon and wakes the loop through methodImpl.wakeupLoop. After the wait
-// returns, the slot is parked at UINTPTR_MAX (awake threads sweep on their
-// own and must not attract kicks). Returns the wait bound in milliseconds.
-uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint32_t fallbackMs);
+// blocking, a loop publishes the fallback horizon (currentTick + the fallback
+// in ticks), then derives the real wake tick from the occupancy bitmap: the
+// nearest occupied level-0 slot ahead of the sweep and the next visit
+// boundary of an occupied upper-level slot (a cascade must not oversleep its
+// boundary). Every bitmap word the decision rests on is read with a seq-cst
+// RMW, pairing with the producer's set of the same word - either the scan
+// sees the fresh bit and the sleep shrinks to the exact wake tick, or the
+// producer sees the published horizon and wakes one loop through
+// methodImpl.wakeupLoop. An empty window keeps the full fallback: an idle
+// base wakes at the backend period, never at the grid tick (tickless).
+// After the wait returns, the slot is parked at UINTPTR_MAX (awake threads
+// sweep on their own and must not attract kicks). Returns the wait bound in
+// milliseconds; currentTick is the caller's getMonotonicTicks() reading.
+uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t currentTick, uint32_t fallbackMs);
 void timerLoopCancelSleep(asyncBase *base, unsigned threadId);
 
 // Monotonic (wall-clock-independent) 125 ms ticks for the timeout grid; see

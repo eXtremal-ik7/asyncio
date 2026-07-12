@@ -298,7 +298,7 @@ void iocpNextFinishedOperation(asyncBase *base)
     ULONG N, i;
 
     BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N,
-                                              timerLoopPrepareSleep(base, messageLoopThreadId, 500), FALSE);
+                                              timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500), FALSE);
     timerLoopCancelSleep(base, messageLoopThreadId);
 
     // Unconditional sweep (the modulo election is gone): an idle pass costs

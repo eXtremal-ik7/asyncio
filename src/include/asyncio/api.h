@@ -177,11 +177,15 @@ typedef struct AsyncOpTaggedPtr {
 
 uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count);
 uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count);
-// Internal user-event lifetime protocol. A successful eventTryActivate owns
-// one delivery reference; the delivery path must call eventDeactivate before
-// invoking the callback and eventDecrementReference(event, 1) afterwards.
-// Activation fails once deletion has begun and, for a non-semaphore event,
-// while another delivery is pending.
+// Strong ownership for user events. External callers pass an ordinary positive
+// reference count (no TAG_EVENT_* bits), may retain only while already owning a
+// reference, and must release exactly what they own. All external references
+// are equivalent for lifetime. Exactly one holder calls deleteUserEvent instead
+// of ordinary release; that call alone publishes DELETING and consumes one
+// reference. A holder may copy an already-owned reference after delete, but
+// this only extends storage lifetime and cannot reopen the event. A successful
+// eventTryActivate owns a separate internal delivery reference; delivery clears
+// the non-semaphore gate before callback and releases that reference afterwards.
 uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t tag);
 uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t tag);
 int eventTryActivate(aioUserEvent *event);
@@ -321,7 +325,9 @@ void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aio
 void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg);
 // Construction-time configuration: set before publishing or deleting event.
 // Called exactly once by the thread releasing the final reference, after the
-// sole deleteUserEvent call and all accepted deliveries have finished.
+// sole deleteUserEvent call, all external strong references, accepted
+// deliveries and any timer-control transition already in flight at deletion
+// have finished.
 void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, void *arg);
 
 void cancelIo(aioObjectRoot *object);

@@ -232,7 +232,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
         return;
       }
 
-      uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, 1000);
+      uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 1000);
       struct timespec timeout;
       timeout.tv_sec = sleepMs / 1000;
       timeout.tv_nsec = (long)(sleepMs % 1000) * 1000000;

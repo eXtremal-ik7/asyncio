@@ -33,6 +33,32 @@ static inline unsigned highestBitIndex64(uint64_t value)
 #endif
 }
 
+static inline unsigned lowestBitIndex64(uint64_t value)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+  unsigned long index;
+  _BitScanForward64(&index, value);
+  return (unsigned)index;
+#else
+  return (unsigned)__builtin_ctzll(value);
+#endif
+}
+
+// Occupancy bit maintenance (see the protocol comment at struct timerWheel).
+// Both sides are seq-cst RMWs: the set pairs with the RMW reads of the sleep
+// horizon scan, the clear is ordered before the visitor's drain CAS
+static inline void timerWheelMarkOccupied(asyncBase *base, unsigned level, unsigned index)
+{
+  __uintptr_atomic_fetch_or(&base->timerWheel.occupancy[level][index >> 6],
+                            (uintptr_t)1 << (index & 63));
+}
+
+static inline void timerWheelClearOccupied(asyncBase *base, unsigned level, unsigned index)
+{
+  __uintptr_atomic_fetch_and(&base->timerWheel.occupancy[level][index >> 6],
+                             ~((uintptr_t)1 << (index & 63)));
+}
+
 // Window width of a level, in ticks
 static inline uint64_t timerWheelWidth(unsigned level)
 {
@@ -76,9 +102,10 @@ void timerWheelInit(asyncBase *base, uint64_t currentTick)
       base->timerWheel.slots[level][i].low = 0;
       base->timerWheel.slots[level][i].high = windowStart;
     }
+    for (unsigned i = 0; i < TIMER_WHEEL_SLOTS / 64; i++)
+      base->timerWheel.occupancy[level][i] = 0;
   }
   base->timerCloseCursor = (uintptr_t)currentTick;
-  base->timerOutstanding = 0;
 }
 
 void timerWheelTeardown(asyncBase *base)
@@ -97,8 +124,9 @@ void timerWheelTeardown(asyncBase *base)
         link = next;
       }
     }
+    for (unsigned i = 0; i < TIMER_WHEEL_SLOTS / 64; i++)
+      base->timerWheel.occupancy[level][i] = 0;
   }
-  base->timerOutstanding = 0;
 }
 
 int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
@@ -131,8 +159,11 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
         uint128Pair desired;
         desired.low = (uint64_t)(uintptr_t)link;
         desired.high = observed.high;
-        if (__uint128_atomic_compare_and_swap(slot, &observed, desired))
+        if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
+          if (!observed.low)
+            timerWheelMarkOccupied(base, level, index);
           return 1;
+        }
       }
     }
 
@@ -152,8 +183,15 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
       uint128Pair desired;
       desired.low = (uint64_t)(uintptr_t)link;
       desired.high = expectedBase;
-      if (__uint128_atomic_compare_and_swap(slot, &observed, desired))
+      if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
+        // Activation (empty -> non-empty) sets the occupancy bit; links
+        // stacked onto a live chain ride on the bit already set. The set runs
+        // after the publication: the window where the chain exists bitless is
+        // closed by the wakeup check that follows every arm
+        if (!observed.low)
+          timerWheelMarkOccupied(base, level, index);
         return 1;
+      }
     }
 
     // The window's incarnation is gone - its visit already ran (baseTick
@@ -184,11 +222,6 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   // concurrent sweep may deliver the timeout and recycle the operation, and a
   // late store would corrupt the next incarnation's field
   op->timerId = timerLink;
-  // Counted strictly before publication, and the increment is a seq-cst RMW:
-  // the sleep handshake leans on it (a loop publishing its horizon re-reads
-  // the counter after its own RMW - one of the two sides is guaranteed to see
-  // the other, so a link is never parked against only long sleepers)
-  __uintptr_atomic_fetch_and_add(&base->timerOutstanding, 1);
   if (!timerWheelInsert(base, timerLink, __uintptr_atomic_load(&base->timerCloseCursor, amoRelaxed))) {
     // Expired: the deadline's window is already swept. The link never became
     // visible, so it is still producer-owned; recycle it and deliver the
@@ -198,7 +231,6 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
     uintptr_t generation = timerLink->generation;
     op->timerId = 0;
     objectPoolPut(&asyncOpLinkListPool, timerLink, sizeof(asyncOpListLink));
-    __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     opCancel(op, generation, aosTimeout);
     return;
   }
@@ -207,8 +239,10 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   // sleeper waking at wakeTick sweeps every tick below it, so a lag of one
   // tick is covered by the sleeper itself and anything longer needs the kick.
   // Awake threads park their slots at UINTPTR_MAX and never attract kicks -
-  // they re-read the counter before their next sleep. The slot loads are
-  // ordered after the counter RMW above
+  // they re-scan the occupancy bitmap before their next sleep. The horizon
+  // loads are ordered after the occupancy RMW inside the insert (or after the
+  // first publisher's RMW when this arm stacked onto a live chain, whose bit
+  // then already covers this deadline: same slot means same wake tick)
   if (base->timerSleep) {
     for (unsigned i = 0; i < base->graceSlotLimit; i++) {
       uintptr_t wakeTick = __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoAcquire);
@@ -232,17 +266,29 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
   volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
 
   uint128Pair observed = __uint128_atomic_load(slot);
-  uint128Pair desired;
-  do {
-    // Already reopened past this window (a concurrent visit or an overlapping
-    // catch-up): the links for it were taken by that visit, nothing to do here
-    if (observed.high > windowStart)
+  for (;;) {
+    if (observed.high > windowStart) {
+      // Already reopened past this window (a concurrent visit or an
+      // overlapping catch-up): the links for it were taken by that visit,
+      // nothing to do here. A pre-clear issued below on an earlier attempt
+      // may have landed after a fresh publication into the reopened
+      // incarnation - a live chain must never sit bitless, so re-set the bit
+      // when a chain is observed (over-setting is a spurious wakeup at worst)
+      if (observed.low)
+        timerWheelMarkOccupied(base, level, index);
       return 0;
+    }
+    // Clear the occupancy bit strictly before the drain CAS: a publication
+    // into the reopened incarnation is ordered after that CAS, so its set
+    // cannot be erased by this clear; a bit re-set by a producer pushing into
+    // the closing window survives past the drain as a spurious one
+    timerWheelClearOccupied(base, level, index);
+    uint128Pair desired;
     desired.low = 0;
     desired.high = windowStart + timerWheelPeriod(level);
-  } while (!__uint128_atomic_compare_and_swap(slot, &observed, desired));
-
-  return (asyncOpListLink*)(uintptr_t)observed.low;
+    if (__uint128_atomic_compare_and_swap(slot, &observed, desired))
+      return (asyncOpListLink*)(uintptr_t)observed.low;
+  }
 }
 
 // Deliver, drop or re-cascade a detached chain. The chain is private to the
@@ -257,21 +303,17 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
       // The operation completed and moved on long ago; lazy cancellation ends
       // here without touching anything beyond the atomic tag
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
-      __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     } else if (link->deadlineTick <= windowStart) {
       opCancel(link->op, link->generation, aosTimeout);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
-      __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     } else if (!timerWheelInsert(base, link, windowStart)) {
       // Cascade: the deadline is inside a narrower window; re-route from the
       // tick being processed (the target level only shrinks for an in-window
       // deadline). A refused publication means the lower window is already
       // terminal - a stalled owner resuming an old chain - so the timeout is
-      // due right now. A re-published link stays counted; only a recycled one
-      // leaves the outstanding counter
+      // due right now
       opCancel(link->op, link->generation, aosTimeout);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
-      __uintptr_atomic_fetch_and_add(&base->timerOutstanding, (uintptr_t)0 - 1);
     }
     link = next;
   }
@@ -318,28 +360,99 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
     timerWheelSweepTick(base, tick);
 }
 
-uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint32_t fallbackMs)
+// Earliest tick a sleeping loop must wake at to serve the parked timers, or
+// `horizon` when nothing inside the window needs it. A level-0 bit at tick t
+// asks for a wake at t+1 (the sweep of t runs on the first call with now > t);
+// an occupied upper-level slot asks for its next visit boundary + 1, so a
+// cascade is never overslept - the deadlines inside the window are re-routed
+// by that visit and picked up by the following horizon scans. Every word the
+// "nothing earlier" conclusion rests on is read with a seq-cst RMW: it pairs
+// with the producer's set of the same word (both are RMWs on one address, so
+// they are totally ordered) - either this scan observes the fresh bit, or the
+// producer's set follows the scan's RMW and its horizon read then observes
+// the wakeTick published before the scan, triggering the kick. Words beyond
+// `horizon` may be skipped safely: their deadlines wake later than the
+// fallback does, and the loop re-scans after every wait
+static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from, uint64_t horizon)
+{
+  uint64_t best = horizon;
+
+  // Level 0: the slots of ticks [from, horizon-1], in wrap-around order
+  uint64_t span = horizon - from;
+  if (span > TIMER_WHEEL_SLOTS)
+    span = TIMER_WHEEL_SLOTS;
+  uint64_t chunkTick = from;
+  unsigned slotIndex = (unsigned)(from & (TIMER_WHEEL_SLOTS - 1));
+  while (span) {
+    unsigned bitPosition = slotIndex & 63;
+    uint64_t take = 64 - bitPosition;
+    if (take > span)
+      take = span;
+    uintptr_t bits =
+      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[0][slotIndex >> 6], 0);
+    uintptr_t mask = take == 64 ? ~(uintptr_t)0 : ((((uintptr_t)1 << take) - 1) << bitPosition);
+    uintptr_t hit = bits & mask;
+    if (hit) {
+      best = chunkTick + (lowestBitIndex64(hit) - bitPosition) + 1;
+      break;
+    }
+    chunkTick += take;
+    span -= take;
+    slotIndex = (slotIndex + (unsigned)take) & (TIMER_WHEEL_SLOTS - 1);
+  }
+
+  // Upper levels: at most one visit boundary of each level fits into the
+  // window (their widths start at a full level-0 rotation), a single bit test
+  // per level decides whether the boundary needs the wake
+  for (unsigned level = 1; level < TIMER_WHEEL_LEVELS; level++) {
+    uint64_t width = timerWheelWidth(level);
+    uint64_t boundary = (from + width - 1) & ~(width - 1);
+    if (boundary + 1 >= best)
+      continue;
+    unsigned index = (unsigned)(boundary >> (TIMER_WHEEL_LEVEL_BITS * level)) & (TIMER_WHEEL_SLOTS - 1);
+    uintptr_t bits =
+      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[level][index >> 6], 0);
+    if (bits & ((uintptr_t)1 << (index & 63)))
+      best = boundary + 1;
+  }
+
+  return best;
+}
+
+uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t currentTick, uint32_t fallbackMs)
 {
   const uint32_t tickMs = TIMER_TICK_MICROSECONDS / 1000;
   TimerSleepSlot *slot =
     base->timerSleep && threadId < base->graceSlotLimit ? &base->timerSleep[threadId] : 0;
-  uint32_t sleepMs = fallbackMs;
-  if (slot)
-    __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)(getMonotonicTicks() + fallbackMs / tickMs), amoRelease);
+  // A thread beyond the horizon array has no channel for the wakeup kick:
+  // cap its wait at one grid tick so a deadline it cannot be told about is
+  // late by at most the tick (an out-of-contract configuration; delivery is
+  // otherwise carried by the slotted threads)
+  if (!slot)
+    return tickMs < fallbackMs ? tickMs : fallbackMs;
 
-  // The seq-cst RMW is both the store/load barrier of the handshake and the
-  // counter re-read: the producer increments the counter (RMW on the same
-  // address) before reading the horizon slots, so either this read observes
-  // its link and the sleep shrinks to one tick, or the producer observes the
-  // horizon published above and kicks. Without the RMW pairing both sides
-  // could read stale values and park a deadline behind a full fallback sleep
-  if (__uintptr_atomic_fetch_and_add(&base->timerOutstanding, 0) != 0) {
-    sleepMs = tickMs < fallbackMs ? tickMs : fallbackMs;
-    if (slot)
-      __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)(getMonotonicTicks() + 1), amoRelease);
-  }
+  uint64_t capTicks = fallbackMs / tickMs;
+  if (capTicks == 0)
+    capTicks = 1;
+  uint64_t horizon = currentTick + capTicks;
+  // The fallback horizon goes out first: the scan below must run with a
+  // published wakeTick, or a producer racing it would see an awake thread and
+  // skip the kick while the scan misses its fresh bit. Shrinking afterwards
+  // is one-directional - a producer reading the stale larger value kicks
+  // spuriously at worst
+  __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)horizon, amoRelease);
 
-  return sleepMs;
+  // Scan from the confirmed sweep position when it lags the clock (a
+  // concurrent sweeper mid-tick): due backlog then wakes immediately instead
+  // of hiding behind a full window
+  uint64_t cursor = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire);
+  uint64_t from = cursor < currentTick ? cursor : currentTick;
+  uint64_t wake = timerWheelNearestWake(base, from, horizon);
+  if (wake >= horizon)
+    return fallbackMs;
+
+  __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)wake, amoRelease);
+  return wake > currentTick ? (uint32_t)((wake - currentTick) * tickMs) : 0;
 }
 
 void timerLoopCancelSleep(asyncBase *base, unsigned threadId)
