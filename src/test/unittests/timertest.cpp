@@ -315,7 +315,8 @@ TEST(timer_wheel, expired_arm_never_starts_initialization_io)
   // confirmed sweep position
   backend.base.timerCloseCursor = static_cast<uintptr_t>(getMonotonicTicks() + 1024);
   ASSERT_TRUE(__uintptr_atomic_compare_and_swap(&object.root.initializationOp, 0,
-                                                reinterpret_cast<uintptr_t>(&op.root)));
+                                                reinterpret_cast<uintptr_t>(&op.root),
+                                                amoSeqCst));
 
   combinerPushOperation(&op.root);
 
@@ -582,7 +583,9 @@ TEST(timer_wheel, stale_detach_restores_live_occupancy_bit)
 
   // Simulate the lost race: the stale visitor's pre-clear landing after the
   // fresh publication
-  __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][0], ~(static_cast<uintptr_t>(1) << 5));
+  __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][0],
+                             ~(static_cast<uintptr_t>(1) << 5),
+                             amoSeqCst);
 
   // The stale visitor re-reads the pair, sees the advanced incarnation with
   // a live chain and restores the bit while claiming nothing
@@ -896,7 +899,6 @@ TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
   event.root.opCode = actUserEvent;
   event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;  // generation 1, stable across restarts
   event.tag = 1;
-  event.counter = 5;
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
   timer.op = &event.root;
   timer.fd = static_cast<intptr_t>(uintptr_t{2} << rtIdentSeqBits);
@@ -929,7 +931,6 @@ TEST(timer_reactor, stale_count_doorbell_must_not_activate_a_restarted_user_even
   event.root.opCode = actUserEvent;
   event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;
   event.tag = 1;
-  event.counter = 5;
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
   timer.op = &event.root;
   event.root.timerId = &timer;

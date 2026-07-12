@@ -88,10 +88,14 @@ struct TestBackend : asyncBase {
   std::vector<uint32_t> handledSignals;
   unsigned startTimerCalls = 0;
   unsigned stopTimerCalls = 0;
+  unsigned rearmTimerCalls = 0;
   unsigned initializeTimerCalls = 0;
   unsigned deleteTimerCalls = 0;
   unsigned wakeupCalls = 0;
   uintptr_t nextTimerTag = 1;
+  uintptr_t lastEventTimerGeneration = 0;
+  uint64_t lastEventTimerPeriod = 0;
+  std::function<int(aioUserEvent*, EventTimerUpdate, uintptr_t, uint64_t)> eventTimerHook;
   // Backs base.graceSeen/gracePendingSeen/timerSleep: production bases get
   // the arrays from createAsyncBase
   alignas(CACHE_LINE_SIZE) std::array<GraceSlot, 8> graceSlots{};
@@ -109,7 +113,10 @@ struct TestBackend : asyncBase {
     base.methodImpl.startTimer = startTimer;
     base.methodImpl.stopTimer = stopTimer;
     base.methodImpl.deleteTimer = deleteTimer;
+    base.methodImpl.activate = activateEvent;
     base.methodImpl.wakeupLoop = wakeupLoop;
+    base.methodImpl.updateEventTimer = updateEventTimer;
+    base.methodImpl.releaseUserEvent = releaseUserEvent;
     base.graceSeen = graceSlots.data();
     base.gracePendingSeen = gracePendingSlotsSeen.data();
     base.graceSlotLimit = static_cast<unsigned>(graceSlots.size());
@@ -128,6 +135,7 @@ struct TestBackend : asyncBase {
       ADD_FAILURE() << completions.size() << " completion(s) were not drained by the test";
     destroyConcurrentQueue(&operationPool);
     destroyConcurrentQueue(&base.globalQueue);
+    destroyConcurrentQueue(&base.eventPool);
     timerWheelTeardown(&base);
   }
 
@@ -136,6 +144,18 @@ struct TestBackend : asyncBase {
     size_t index = 0;
     while (index < completions.size()) {
       asyncOpRoot *op = completions[index++];
+      if (eventTimerIsControlNode(op)) {
+        eventTimerProcess(eventTimerControlEvent(op));
+        continue;
+      }
+      if (op->opCode == actUserEvent) {
+        aioUserEvent *event = reinterpret_cast<aioUserEvent*>(op);
+        currentFinishedSync = 0;
+        eventReferenceDeactivate(event);
+        op->finishMethod(op);
+        eventDecrementReference(event, 1);
+        continue;
+      }
       if (op->callback)
         op->finishMethod(op);
       releaseAsyncOp(op);
@@ -210,6 +230,37 @@ struct TestBackend : asyncBase {
   static void deleteTimer(asyncOpRoot *op)
   {
     from(timerBase(op)).deleteTimerCalls++;
+  }
+
+  static int activateEvent(aioUserEvent *event)
+  {
+    enqueue(event->base, &event->root);
+    return 1;
+  }
+
+  static int updateEventTimer(aioUserEvent *event,
+                              EventTimerUpdate update,
+                              uintptr_t generation,
+                              uint64_t period)
+  {
+    TestBackend &backend = from(event->base);
+    backend.lastEventTimerGeneration = generation;
+    backend.lastEventTimerPeriod = period;
+    if (update == etuStart)
+      backend.startTimerCalls++;
+    else if (update == etuStop)
+      backend.stopTimerCalls++;
+    else if (update == etuRearm)
+      backend.rearmTimerCalls++;
+    if (backend.eventTimerHook)
+      return backend.eventTimerHook(event, update, generation, period);
+    return 1;
+  }
+
+  static void releaseUserEvent(aioUserEvent *event)
+  {
+    event->root.timerId = nullptr;
+    concurrentQueuePush(event->root.objectPool, event);
   }
 
   static void wakeupLoop(asyncBase *base)

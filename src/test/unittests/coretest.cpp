@@ -1442,7 +1442,10 @@ TEST(core_sync_path, speculative_allocation_is_released_after_combiner_handoff)
   });
   while (phase.load(std::memory_order_acquire) != 1)
     std::this_thread::yield();
-  bool handedOff = __uintptr_atomic_compare_and_swap(&object.root.Head.data, busy.data, 0);
+  bool handedOff = __uintptr_atomic_compare_and_swap(&object.root.Head.data,
+                                                      busy.data,
+                                                      0,
+                                                      amoSeqCst);
   phase.store(2, std::memory_order_release);
   submitter.join();
 

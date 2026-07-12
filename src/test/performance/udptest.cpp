@@ -267,6 +267,9 @@ static void receiverAccountPacket(ReceiverCtx *ctx)
   if (!ctx->started) {
     ctx->started = true;
     ctx->beginPt = getTimeMark();
+    // Keep the interval valid even when a deliberately short diagnostic run
+    // receives fewer packets than one publication group.
+    ctx->endPt = ctx->beginPt;
   }
   ctx->packetsNum++;
   if (ctx->packetsNum % ctx->config->groupSize == 0) {
@@ -458,6 +461,14 @@ void test_aio(unsigned senderThreads, unsigned receiverThreads, uint16_t port, A
             port, senderThreads, receiverThreads,
             aioSenderName[senderTy], aioReceiverName[receiverTy]);
   Context config(port);
+  // Normal benchmarks sample time once per large group to keep clock reads
+  // out of the packet hot path. A small command-line smoke run may distribute
+  // fewer than one group to each receiver; sample every packet in that case
+  // so progress and elapsed time remain meaningful instead of leaving endPt
+  // before the first-packet beginPt.
+  uint64_t expectedPackets = config.totalPacketNum * senderThreads;
+  if (expectedPackets / receiverThreads < config.groupSize)
+    config.groupSize = 1;
   std::unique_ptr<SenderCtx[]> allSenders(new SenderCtx[senderThreads]());
   std::unique_ptr<ReceiverCtx[]> allReceivers(new ReceiverCtx[receiverThreads]);
   ReceiverControl receiverControl;

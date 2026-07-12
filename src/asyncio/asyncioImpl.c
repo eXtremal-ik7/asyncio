@@ -92,58 +92,71 @@ void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData)
 
 uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count)
 {
-  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs, count);
+  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs, count, amoSeqCst);
   assert(result != 0 && "Removed object access detected");
   return result;
 }
 
 uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count)
 {
-  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs, (uintptr_t)0-count);
+  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs,
+                                                     (uintptr_t)0-count,
+                                                     amoSeqCst);
   assert((intptr_t)result > 0 && "Double object release detected");
   if (result == count)
     combinerPushCounter(object, COMBINER_TAG_DELETE);
   return result;
 }
 
-uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t tag)
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline, cold))
+#endif
+static uintptr_t eventFinalizeReference(aioUserEvent *event, uintptr_t oldTag)
 {
-  return __uintptr_atomic_fetch_and_add(&event->tag, tag);
-}
+  if (event->destructorCb)
+    event->destructorCb(event, event->destructorCbArg);
 
-uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t tag)
-{
-  uintptr_t result = __uintptr_atomic_fetch_and_add(&event->tag, (uintptr_t)0 - tag) & TAG_EVENT_MASK;
-  if (result == (tag & TAG_EVENT_MASK)) {
-    if (event->destructorCb)
-      event->destructorCb(event, event->destructorCbArg);
-
+  if (event->base && event->base->methodImpl.releaseUserEvent)
+    event->base->methodImpl.releaseUserEvent(event);
+  else
     concurrentQueuePush(event->root.objectPool, event);
-  }
 
-  return result;
+  return oldTag;
 }
 
-int eventTryActivate(aioUserEvent *event)
+uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t count)
 {
-  if (!event->isSemaphore) {
-    uintptr_t result = __uintptr_atomic_fetch_and_add(&event->tag, TAG_EVENT_OP + 1);
-    if ((result & TAG_EVENT_OP_MASK) == 0) {
-      return 1;
-    } else {
-      __uintptr_atomic_fetch_and_add(&event->tag, STATIC_CAST(uintptr_t, 0)-(TAG_EVENT_OP + 1));
-      return 0;
-    }
-  } else {
-    __uintptr_atomic_fetch_and_add(&event->tag, 1);
-    return 1;
-  }
+  assert(count > 0 && count <= TAG_EVENT_REF_MASK && "Invalid event retain count");
+  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag, count, amoRelaxed);
+#ifndef NDEBUG
+  uintptr_t refs = old & TAG_EVENT_REF_MASK;
+  assert(refs != 0 && "Removed event access detected");
+  assert(refs <= TAG_EVENT_REF_MASK - count && "Event reference overflow");
+#endif
+  return old;
 }
 
-void eventDeactivate(aioUserEvent *event)
+uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t count)
 {
-  if (!event->isSemaphore)
-    __uintptr_atomic_fetch_and_add(&event->tag, (uintptr_t)0-TAG_EVENT_OP);
+  assert(count > 0 && count <= TAG_EVENT_REF_MASK && "Invalid event release count");
+  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag,
+                                                  (uintptr_t)0 - count,
+                                                  amoRelease);
+#ifndef NDEBUG
+  uintptr_t refs = old & TAG_EVENT_REF_MASK;
+  assert(refs >= count && "Double event release detected");
+  assert((refs != count || (old & TAG_EVENT_DELETE)) &&
+         "Final event reference released without deleteUserEvent");
+#endif
+  // Before delete every valid release is necessarily non-final. The common
+  // producer/delivery path is one release RMW plus one sticky-bit test.
+  if ((old & TAG_EVENT_DELETE) && (old & TAG_EVENT_REF_MASK) == count) {
+    __atomic_thread_fence_order(amoAcquire);
+    return eventFinalizeReference(event, old);
+  }
+  return old;
 }
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor)
@@ -184,7 +197,7 @@ void cancelIo(aioObjectRoot *object)
   // consumes the flag only on a CANCELIO position, so an older plain CANCEL
   // (grid timeout/opCancel) in the same captured chain cannot spend it before
   // the operations submitted prior to this call have entered the queues
-  if (__uint_atomic_fetch_and_add(&object->CancelIoFlag, 1) == 0)
+  if (__uint_atomic_fetch_and_add(&object->CancelIoFlag, 1, amoSeqCst) == 0)
     combinerPushCounter(object, COMBINER_TAG_CANCELIO);
 }
 
@@ -213,7 +226,8 @@ int opSetStatus(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status)
 {
   return __uintptr_atomic_compare_and_swap(&op->tag,
                                           (generation<<TAG_STATUS_SIZE) | aosPending,
-                                          (generation<<TAG_STATUS_SIZE) | (uintptr_t)status);
+                                          (generation<<TAG_STATUS_SIZE) | (uintptr_t)status,
+                                          amoSeqCst);
 }
 
 void opForceStatus(asyncOpRoot *op, AsyncOpStatus status)
@@ -506,7 +520,7 @@ void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
   // CANCELIO pass - a coalesced request cannot be lost
   if ((tag & COMBINER_TAG_CANCELIO) &&
       __uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
-      __uint_atomic_exchange(&object->CancelIoFlag, 0) != 0) {
+      __uint_atomic_exchange(&object->CancelIoFlag, 0, amoSeqCst) != 0) {
     cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
@@ -678,11 +692,19 @@ int executeGlobalQueue(asyncBase *base)
     if (!op)
       return 0;
 
+    if (eventTimerIsControlNode(op)) {
+      currentFinishedSync = 0;
+      eventTimerProcess(eventTimerControlEvent(op));
+      continue;
+    }
+
     switch (op->opCode) {
       case actUserEvent : {
         aioUserEvent *event = (aioUserEvent*)op;
-        eventDeactivate(event);
+        currentFinishedSync = 0;
+        eventReferenceDeactivate(event);
         op->finishMethod(op);
+        eventDecrementReference(event, 1);
         break;
       }
 
@@ -745,7 +767,10 @@ void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *me
   do {
     head = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed);
     object->GraceNext = head;
-  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo, head, object));
+  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo,
+                                               head,
+                                               object,
+                                               amoSeqCst));
 }
 
 // Cold path: return a detached chain to the limbo stack (frozen discovered
@@ -759,7 +784,10 @@ static void gracePushList(asyncBase *base, aioObjectRoot *first)
   do {
     head = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed);
     last->GraceNext = head;
-  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo, head, first));
+  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo,
+                                               head,
+                                               first,
+                                               amoSeqCst));
 }
 
 // The pending batch is ripe when every slot active at its capture has either
@@ -789,7 +817,7 @@ void graceReclaim(asyncBase *base)
   // Non-blocking single-scanner gate: the loser leaves instead of waiting, a
   // preempted owner only delays memory, never producers. One scanner at a
   // time keeps the pending batch single-owned, so its fields need no locks
-  if (!__uint_atomic_compare_and_swap(&base->graceScanning, 0, 1))
+  if (!__uint_atomic_compare_and_swap(&base->graceScanning, 0, 1, amoSeqCst))
     return;
 
   for (;;) {
@@ -816,7 +844,9 @@ void graceReclaim(asyncBase *base)
     // The full-barrier exchange takes the whole visible stack and pairs with
     // the producers' release CAS: destructor and GraceNext of every node are
     // visible past this point
-    aioObjectRoot *batch = (aioObjectRoot*)__pointer_atomic_exchange((void *volatile*)&base->graceLimbo, 0);
+    aioObjectRoot *batch = (aioObjectRoot*)__pointer_atomic_exchange((void *volatile*)&base->graceLimbo,
+                                                                     0,
+                                                                     amoSeqCst);
     if (!batch)
       break;
 
@@ -880,7 +910,10 @@ void graceThreadEnter(asyncBase *base)
   // undetected. The full-barrier CAS also orders the claim before the
   // thread's first kernel wait - the batch capture in graceReclaim relies
   // on that to never miss a thread whose buffers could hold its objects
-  if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen, UINTPTR_MAX, 0)) {
+  if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen,
+                                         UINTPTR_MAX,
+                                         0,
+                                         amoSeqCst)) {
     __uint_atomic_store(&base->graceFrozen, 1, amoSeqCst);  // see the seq-cst note above
     return;
   }
@@ -891,7 +924,11 @@ void graceThreadEnter(asyncBase *base)
   // both ordered before the thread's first kernel wait
   unsigned needed = messageLoopThreadId + 1;
   unsigned current = __uint_atomic_load(&base->graceSlotCount, amoRelaxed);
-  while (current < needed && !__uint_atomic_compare_and_swap(&base->graceSlotCount, current, needed))
+  while (current < needed &&
+         !__uint_atomic_compare_and_swap(&base->graceSlotCount,
+                                         current,
+                                         needed,
+                                         amoSeqCst))
     current = __uint_atomic_load(&base->graceSlotCount, amoRelaxed);
 }
 
@@ -993,11 +1030,17 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
         cancelOperationList(&object->readQueue, aosCanceled);
         cancelOperationList(&object->writeQueue, aosCanceled);
       }
-      if (__uintptr_atomic_compare_and_swap(&object->Head.data, stackTop.data, 0))
+      if (__uintptr_atomic_compare_and_swap(&object->Head.data,
+                                            stackTop.data,
+                                            0,
+                                            amoSeqCst))
         return;
     }
 
-    while (!__uintptr_atomic_compare_and_swap(&object->Head.data, currentHead.data, stackTop.data))
+    while (!__uintptr_atomic_compare_and_swap(&object->Head.data,
+                                              currentHead.data,
+                                              stackTop.data,
+                                              amoSeqCst))
       currentHead.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
 
     // The captured chain is linked newest to oldest (each push points to the

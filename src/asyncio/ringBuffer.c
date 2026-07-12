@@ -16,7 +16,10 @@ static void partitionInit(ConcurrentQueuePartition *buffer, size_t size)
     ConcurrentQueueElement *queue = (ConcurrentQueueElement*)malloc(size*sizeof(ConcurrentQueueElement));
     for (size_t i = 0; i < size; i++)
       queue[i].sequence = i;
-    if (!__pointer_atomic_compare_and_swap((void *volatile*)&buffer->queue, 0, queue))
+    if (!__pointer_atomic_compare_and_swap((void *volatile*)&buffer->queue,
+                                           0,
+                                           queue,
+                                           amoSeqCst))
       free(queue);
   }
 }
@@ -32,7 +35,7 @@ static int partitionPush(ConcurrentQueuePartition *buffer, void *data, size_t ma
     size_t seq = __uintptr_atomic_load(&element->sequence, amoAcquire);
     intptr_t diff = (intptr_t)seq - (intptr_t)pos;
     if (diff == 0) {
-      if (__uintptr_atomic_compare_and_swap(&buffer->enqueuePos, pos, pos+1))
+      if (__uintptr_atomic_compare_and_swap(&buffer->enqueuePos, pos, pos+1, amoSeqCst))
         break;
     } else if (diff < 0) {
       // Queue is full
@@ -62,7 +65,7 @@ static int partitionPop(ConcurrentQueuePartition *buffer, void **data, size_t ma
     size_t seq = __uintptr_atomic_load(&element->sequence, amoAcquire);
     intptr_t diff = (intptr_t)seq - (intptr_t)(pos+1);
     if (diff == 0) {
-      if (__uintptr_atomic_compare_and_swap(&buffer->dequeuePos, pos, pos+1))
+      if (__uintptr_atomic_compare_and_swap(&buffer->dequeuePos, pos, pos+1, amoSeqCst))
         break;
     } else if (diff < 0) {
       // Queue is empty
@@ -90,7 +93,10 @@ void concurrentQueuePush(ConcurrentQueue *queue, void *data)
     if (partitionPush(partition, data, mask))
       return;
 
-    __uint_atomic_compare_and_swap(&queue->WritePartition, currentWritePartition, currentWritePartition+1);
+    __uint_atomic_compare_and_swap(&queue->WritePartition,
+                                   currentWritePartition,
+                                   currentWritePartition+1,
+                                   amoSeqCst);
   }
 }
 
@@ -108,6 +114,9 @@ int concurrentQueuePop(ConcurrentQueue *queue, void **data)
     if (currentReadPartition == __uint_atomic_load(&queue->WritePartition, amoRelaxed))
       return 0;
 
-    __uint_atomic_compare_and_swap(&queue->ReadPartition, currentReadPartition, currentReadPartition+1);
+    __uint_atomic_compare_and_swap(&queue->ReadPartition,
+                                   currentReadPartition,
+                                   currentReadPartition+1,
+                                   amoSeqCst);
   }
 }

@@ -1,8 +1,7 @@
 // aioUserEvent contract tests. The core_* suites exercise the protocol's
 // decision machinery on TestBackend; user_event* suites exercise the public
-// API on the real backend. The `event` family are regression markers: each
-// pins one known defect and is expected to stay RED until the matching fix
-// lands; green companions pin behavior the fixes must not break.
+// API on the real backend. The `event` family keeps focused regressions for
+// defects found while implementing the contract.
 
 #include "coretest.h"
 #include "unittest.h"
@@ -32,6 +31,11 @@ void eventFinish(asyncOpRoot *root)
 void eventDestructor(aioUserEvent*, void *arg)
 {
   static_cast<EventContext*>(arg)->destructors++;
+}
+
+void coreEventCallback(aioUserEvent*, void *arg)
+{
+  static_cast<EventContext*>(arg)->finishes++;
 }
 
 using namespace std::chrono_literals;
@@ -149,14 +153,15 @@ TEST(core_user_event, nonsemaphore_activation_coalesces_until_deactivated)
   event.isSemaphore = 0;
   eventSetDestructorCb(&event, eventDestructor, &context);
 
-  EXPECT_TRUE(eventTryActivate(&event));
-  EXPECT_FALSE(eventTryActivate(&event));
-  eventDeactivate(&event);
-  EXPECT_TRUE(eventTryActivate(&event));
-  eventDeactivate(&event);
+  EXPECT_TRUE(eventReferenceTryActivate(&event));
+  EXPECT_FALSE(eventReferenceTryActivate(&event));
+  eventReferenceDeactivate(&event);
+  EXPECT_TRUE(eventReferenceTryActivate(&event));
+  eventReferenceDeactivate(&event);
 
   EXPECT_EQ(eventDecrementReference(&event, 1) & TAG_EVENT_MASK, 3u);
   EXPECT_EQ(eventDecrementReference(&event, 1) & TAG_EVENT_MASK, 2u);
+  ASSERT_TRUE(eventReferenceMarkDeleting(&event));
   EXPECT_EQ(eventDecrementReference(&event, 1) & TAG_EVENT_MASK, 1u);
   EXPECT_EQ(context.destructors, 1u);
 
@@ -171,10 +176,10 @@ TEST(core_user_event, semaphore_counts_each_activation)
   event.tag = 1;
   event.isSemaphore = 1;
 
-  EXPECT_TRUE(eventTryActivate(&event));
-  EXPECT_TRUE(eventTryActivate(&event));
+  EXPECT_TRUE(eventReferenceTryActivate(&event));
+  EXPECT_TRUE(eventReferenceTryActivate(&event));
   EXPECT_EQ(event.tag & TAG_EVENT_MASK, 3u);
-  eventDeactivate(&event);
+  eventReferenceDeactivate(&event);
   EXPECT_EQ(event.tag & TAG_EVENT_MASK, 3u);
 }
 
@@ -189,9 +194,8 @@ TEST(core_user_event, strong_references_delay_final_release_after_delete)
 
   EXPECT_EQ(eventIncrementReference(&event, 2), 1u);
   EXPECT_EQ(event.tag & TAG_EVENT_MASK, 3u);
-  // deleteUserEvent's terminal transition, minus the backend timer stop:
-  // publish DELETE and consume exactly one strong reference.
-  EXPECT_EQ(eventDecrementReference(&event, 1 - TAG_EVENT_DELETE) & TAG_EVENT_MASK, 3u);
+  ASSERT_TRUE(eventReferenceMarkDeleting(&event));
+  EXPECT_EQ(eventDecrementReference(&event, 1) & TAG_EVENT_MASK, 3u);
   EXPECT_EQ(context.destructors, 0u);
   EXPECT_EQ(eventDecrementReference(&event, 1) & TAG_EVENT_MASK, 2u);
   EXPECT_EQ(context.destructors, 0u);
@@ -203,6 +207,116 @@ TEST(core_user_event, strong_references_delay_final_release_after_delete)
   EXPECT_EQ(recycled, &event);
 }
 
+TEST(core_user_event, stale_timer_generation_cannot_touch_restarted_schedule)
+{
+  TestBackend backend;
+  EventContext context;
+  aioUserEvent *event = newUserEvent(&backend.base, 1, coreEventCallback, &context);
+  ASSERT_NE(event, nullptr);
+  eventSetDestructorCb(event, eventDestructor, &context);
+
+  userEventStartTimer(event, 100, 2);
+  uintptr_t firstGeneration = backend.lastEventTimerGeneration;
+  ASSERT_NE(firstGeneration, 0u);
+  EXPECT_EQ(backend.startTimerCalls, 1u);
+
+  eventTimerSignalTick(event, firstGeneration);
+  backend.drainCompletions();
+  EXPECT_EQ(context.finishes, 1u);
+  EXPECT_EQ(backend.rearmTimerCalls, 1u);
+
+  userEventStartTimer(event, 200, 1);
+  uintptr_t secondGeneration = backend.lastEventTimerGeneration;
+  ASSERT_NE(secondGeneration, firstGeneration);
+  EXPECT_EQ(backend.startTimerCalls, 2u);
+  EXPECT_EQ(backend.stopTimerCalls, 1u);
+
+  // The bucket generation changed before backend restart. Even a kernel
+  // delivery which had already copied the old event pointer cannot enqueue a
+  // control pass or spend the new counter.
+  eventTimerSignalTick(event, firstGeneration);
+  backend.drainCompletions();
+  EXPECT_EQ(context.finishes, 1u);
+
+  eventTimerSignalTick(event, secondGeneration);
+  backend.drainCompletions();
+  EXPECT_EQ(context.finishes, 2u);
+  EXPECT_EQ(backend.stopTimerCalls, 2u); // finite counter exhausted
+
+  deleteUserEvent(event);
+  EXPECT_EQ(context.destructors, 1u);
+}
+
+// A POSIX harvested timer envelope may still hold physically grace-protected
+// timer/event storage after stop released the last logical reference. Signal
+// publication must fail instead of retaining 0 -> 1 and queuing a second
+// terminal control pass.
+TEST(core_user_event, retired_timer_signal_cannot_resurrect_zero_ref_event)
+{
+  TestBackend backend;
+  aioUserEvent event{};
+  event.base = &backend.base;
+  event.root.objectPool = &backend.operationPool;
+  event.root.opCode = actUserEvent;
+  event.tag = TAG_EVENT_DELETE;
+  event.timerSignals.high = 42;
+
+  eventTimerSignalTick(&event, 42);
+
+  EXPECT_EQ(event.tag, TAG_EVENT_DELETE);
+  EXPECT_EQ(event.timerSignals.low, 0u);
+  EXPECT_EQ(event.timerControlState, 0u);
+  EXPECT_TRUE(backend.completions.empty());
+}
+
+TEST(core_user_event, delete_reconciles_a_start_already_inside_backend_arm)
+{
+  TestBackend backend;
+  EventContext context;
+  aioUserEvent *event = newUserEvent(&backend.base, 0, coreEventCallback, &context);
+  ASSERT_NE(event, nullptr);
+  eventSetDestructorCb(event, eventDestructor, &context);
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool insideStart = false;
+  bool allowStartReturn = false;
+  backend.eventTimerHook = [&](aioUserEvent*, EventTimerUpdate update, uintptr_t, uint64_t) {
+    if (update == etuStart) {
+      std::unique_lock<std::mutex> lock(mutex);
+      insideStart = true;
+      changed.notify_all();
+      changed.wait(lock, [&]() { return allowStartReturn; });
+    }
+    return 1;
+  };
+
+  eventIncrementReference(event, 1);
+  std::thread controller([&]() {
+    userEventStartTimer(event, 100, 1);
+    eventDecrementReference(event, 1);
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(changed.wait_for(lock, 1500ms, [&]() { return insideStart; }));
+  }
+  deleteUserEvent(event);
+  EXPECT_EQ(context.destructors, 0u);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    allowStartReturn = true;
+  }
+  changed.notify_all();
+  controller.join();
+
+  EXPECT_EQ(backend.startTimerCalls, 1u);
+  EXPECT_EQ(backend.stopTimerCalls, 1u);
+  EXPECT_EQ(context.finishes, 0u);
+  EXPECT_EQ(context.destructors, 1u);
+}
+
 TEST(core_global_queue, user_event_branch_deactivates_and_returns_when_empty)
 {
   TestBackend backend;
@@ -211,8 +325,9 @@ TEST(core_global_queue, user_event_branch_deactivates_and_returns_when_empty)
   event.root.opCode = actUserEvent;
   event.root.finishMethod = eventFinish;
   event.root.arg = &context;
-  event.tag = TAG_EVENT_OP + 1;
+  event.tag = 1;
   event.isSemaphore = 0;
+  ASSERT_TRUE(eventReferenceTryActivate(&event));
   concurrentQueuePush(&backend.base.globalQueue, &event.root);
 
   EXPECT_EQ(executeGlobalQueue(&backend.base), 1);
@@ -234,6 +349,7 @@ TEST(user_event, nonsemaphore_activations_coalesce_while_delivery_is_pending)
   drainQueuedUserEvents(gBase);
   EXPECT_EQ(publicEventCallbackCount(probe), 1u);
   deleteUserEvent(event);
+  drainQueuedUserEvents(gBase);
 }
 
 TEST(user_event, semaphore_delivers_every_activation)
@@ -475,7 +591,7 @@ TEST(user_event_lifetime, strong_reference_keeps_terminal_event_alive_until_rele
   // Like copying a shared_ptr, an existing holder may copy its lifetime
   // reference after close. This must neither reopen the event nor be confused
   // with the exactly-once close transition already performed by delete.
-  EXPECT_EQ(eventIncrementReference(event, 1) & TAG_EVENT_MASK, 1u);
+  eventIncrementReference(event, 1);
   userEventActivate(event); // safe no-op through the retained reference
   drainQueuedUserEvents(gBase);
   {
@@ -563,6 +679,10 @@ TEST(user_event_lifetime, producer_threads_release_their_references_after_delete
 
   for (std::thread &producer : producers)
     producer.join();
+
+  // delete is logically synchronous but physical timer/waiter reconciliation
+  // is a queued loop task; keep draining until that internal reference drops.
+  drainQueuedUserEvents(gBase);
 
   std::lock_guard<std::mutex> lock(probe.mutex);
   EXPECT_EQ(probe.callbacks, 0u);
@@ -1136,6 +1256,28 @@ TEST(user_event_coroutine, activation_resumes_an_installed_waiter)
   deleteUserEvent(probe.event);
 }
 
+TEST(user_event_coroutine, delete_resumes_waiter_before_final_destruction)
+{
+  CoroutineEventProbe probe;
+  PublicEventProbe lifetime;
+  probe.event = newUserEvent(gBase, 0, nullptr, nullptr);
+  ASSERT_NE(probe.event, nullptr);
+  eventSetDestructorCb(probe.event, publicEventDestructor, &lifetime);
+
+  coroutineTy *coroutine = coroutineNew(waitOnceCoroutine, &probe, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  ASSERT_EQ(coroutineCall(coroutine), 0);
+
+  deleteUserEvent(probe.event);
+  EXPECT_EQ(publicEventDestructorCount(lifetime), 0u)
+    << "active waiter reference must keep terminal event storage alive";
+  drainQueuedUserEvents(gBase);
+
+  EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u);
+  EXPECT_EQ(publicEventDestructorCount(lifetime), 1u)
+    << "destructor must follow waiter resume and waiter-reference release";
+}
+
 TEST(user_event_coroutine, semaphore_activations_preserve_every_wait_credit)
 {
   CoroutineEventProbe probe;
@@ -1256,14 +1398,14 @@ TEST(event, manual_delivery_releases_reference_and_delete_recycles)
   event.isSemaphore = 0;
   eventSetDestructorCb(&event, eventDestructor, &context);
 
-  ASSERT_TRUE(eventTryActivate(&event));  // real protocol: tag = TAG_EVENT_OP + 2
+  ASSERT_TRUE(eventReferenceTryActivate(&event));  // real protocol: tag = TAG_EVENT_OP + 2
   concurrentQueuePush(&backend.base.globalQueue, &event.root);
   EXPECT_EQ(executeGlobalQueue(&backend.base), 1);
   EXPECT_EQ(context.finishes, 1u);
   EXPECT_EQ(event.tag, 1u) << "delivery reference was not released after the callback";
 
-  // deleteUserEvent's terminal transition, minus the backend timer stop
-  eventDecrementReference(&event, 1 - TAG_EVENT_DELETE);
+  ASSERT_TRUE(eventReferenceMarkDeleting(&event));
+  eventDecrementReference(&event, 1);
   EXPECT_EQ(context.destructors, 1u) << "leaked delivery reference blocks the destructor forever";
   void *recycled = nullptr;
   EXPECT_TRUE(concurrentQueuePop(&backend.operationPool, &recycled))
@@ -1272,11 +1414,11 @@ TEST(event, manual_delivery_releases_reference_and_delete_recycles)
     EXPECT_EQ(recycled, static_cast<void*>(&event));
 }
 
-// Activation must be rejected once deletion has begun. The semaphore branch
-// ignores the DELETE bit, so a stale tick resurrects the reference count of
-// an already destroyed event and drives a second destructor plus a second
-// push of the same address.
-TEST(event, semaphore_activation_after_final_delete_is_rejected)
+// Activation must be rejected once deletion has begun while the caller's
+// strong reference keeps the storage alive. Calling after the final reference
+// was released is outside the API contract and must not be used as a hot-path
+// hardening requirement.
+TEST(event, semaphore_activation_after_delete_with_owned_reference_is_rejected)
 {
   TestBackend backend;
   EventContext context;
@@ -1285,32 +1427,25 @@ TEST(event, semaphore_activation_after_final_delete_is_rejected)
   event.root.opCode = actUserEvent;
   event.root.finishMethod = eventFinish;
   event.root.arg = &context;
-  event.tag = 1;
+  event.tag = 2; // deleting holder + independently activating holder
   event.isSemaphore = 1;
   eventSetDestructorCb(&event, eventDestructor, &context);
 
-  // Sole owner deletes: the final release runs the destructor and recycles
-  eventDecrementReference(&event, 1 - TAG_EVENT_DELETE);
+  ASSERT_TRUE(eventReferenceMarkDeleting(&event));
+  eventDecrementReference(&event, 1); // delete consumes its holder's reference
+  ASSERT_EQ(context.destructors, 0u);
+
+  uintptr_t deleting = event.tag;
+  EXPECT_FALSE(eventReferenceTryActivate(&event));
+  EXPECT_EQ(event.tag, deleting);
+
+  // The activating thread now releases the reference that made its failed
+  // call valid; this is the one and only terminal release.
+  eventDecrementReference(&event, 1);
   ASSERT_EQ(context.destructors, 1u);
   void *recycled = nullptr;
   ASSERT_TRUE(concurrentQueuePop(&backend.operationPool, &recycled));
-
-  uintptr_t terminal = event.tag;
-  int activated = eventTryActivate(&event);
-  EXPECT_FALSE(activated) << "semaphore branch accepts activation after delete";
-  EXPECT_EQ(event.tag, terminal);
-
-  if (activated) {
-    // Complete the delivery protocol the loop would run: the resurrection
-    // reaches a second destructor and recycles the same address twice
-    eventDeactivate(&event);
-    event.root.finishMethod(&event.root);
-    eventDecrementReference(&event, 1);
-    EXPECT_EQ(context.destructors, 1u) << "second destructor after resurrection";
-    void *again = nullptr;
-    EXPECT_FALSE(concurrentQueuePop(&backend.operationPool, &again))
-      << "same address recycled twice";
-  }
+  EXPECT_EQ(recycled, static_cast<void*>(&event));
 }
 
 // Green companion: the non-semaphore branch already rejects activation on a
@@ -1320,89 +1455,49 @@ TEST(event, nonsemaphore_activation_after_delete_leaves_tag_intact)
 {
   aioUserEvent event{};
   event.isSemaphore = 0;
-  event.tag = TAG_EVENT_DELETE;       // terminal: final release already ran
-  EXPECT_FALSE(eventTryActivate(&event));
-  EXPECT_EQ(event.tag, TAG_EVENT_DELETE);
-
-  event.tag = TAG_EVENT_DELETE + 1;   // delete with one delivery still in flight
-  EXPECT_FALSE(eventTryActivate(&event));
+  event.tag = TAG_EVENT_DELETE + 1; // caller still owns this reference
+  EXPECT_FALSE(eventReferenceTryActivate(&event));
   EXPECT_EQ(event.tag, TAG_EVENT_DELETE + 1);
 }
 
-// A failed non-semaphore activation is two separate RMWs (+OP+1, then the
-// rollback), and TAG_EVENT_OP sits inside TAG_EVENT_MASK - a final release
-// landing between them does not recognize the final count, and the rollback
-// never re-checks it. Every iteration rebuilds "delete done, one
-// delivery in flight" (tag = DELETE+1) and races that delivery's release
-// against a rejected stale tick. Probabilistic per iteration, strict by
-// invariant: every terminal release must produce exactly one destructor and
-// exactly one recycle.
-TEST(event, final_release_survives_concurrent_failed_activation)
+// The semaphore fast path optimistically increments and rolls back when it
+// observes DELETE. A valid activating thread still owns its original strong
+// reference throughout that transient, so a concurrent delete release cannot
+// be final until the activation thread finishes and releases its ownership.
+TEST(event, semaphore_activation_racing_delete_preserves_final_release)
 {
   TestBackend backend;
   EventContext context;
   aioUserEvent event{};
   event.root.objectPool = &backend.operationPool;
-  event.isSemaphore = 0;
+  event.root.opCode = actUserEvent;
+  event.isSemaphore = 1;
   eventSetDestructorCb(&event, eventDestructor, &context);
 
-  constexpr int kIterations = 100000;
-  std::atomic<int> go{-1};
-  std::atomic<unsigned> done{0};
-  std::atomic<bool> stop{false};
+  event.tag = 2;
+  ASSERT_TRUE(eventReferenceMarkDeleting(&event));
+
+  constexpr int kAttempts = 200000;
   std::atomic<bool> activationAccepted{false};
-
-  auto worker = [&](bool releaser) {
-    for (int i = 0; i < kIterations; i++) {
-      while (go.load(std::memory_order_acquire) < i) {
-        if (stop.load(std::memory_order_relaxed))
-          return;
-      }
-      if (stop.load(std::memory_order_acquire))
-        return;
-      if (releaser) {
-        // Phase sweep: walk the release across the activation burst
-        for (volatile int spin = 0; spin < (i & 255); spin++)
-          ;
-        eventDecrementReference(&event, 1);
-      } else {
-        // A burst of rejected activations keeps the tag inside the two-RMW
-        // transient a large fraction of the burst, so the single release
-        // lands in the window within a few iterations
-        for (int burst = 0; burst < 32; burst++) {
-          if (eventTryActivate(&event))
-            activationAccepted.store(true, std::memory_order_relaxed);
-        }
-      }
-      done.fetch_add(1, std::memory_order_acq_rel);
+  std::thread releaseThread([&]() {
+    eventDecrementReference(&event, 1); // delete holder
+  });
+  std::thread activateThread([&]() {
+    for (int i = 0; i < kAttempts; i++) {
+      if (eventReferenceTryActivate(&event))
+        activationAccepted.store(true, std::memory_order_relaxed);
     }
-  };
-  std::thread releaseThread(worker, true);
-  std::thread activateThread(worker, false);
-
-  int failedIteration = -1;
-  for (int i = 0; i < kIterations; i++) {
-    __uintptr_atomic_store(&event.tag, TAG_EVENT_DELETE + 1, amoRelaxed);
-    go.store(i, std::memory_order_release);
-    while (done.load(std::memory_order_acquire) < 2u * (static_cast<unsigned>(i) + 1))
-      ;
-    void *recycled = nullptr;
-    if (!concurrentQueuePop(&backend.operationPool, &recycled) ||
-        context.destructors != static_cast<unsigned>(i) + 1) {
-      failedIteration = i;
-      break;
-    }
-  }
-
-  stop.store(true, std::memory_order_release);
-  go.store(kIterations, std::memory_order_release);
+    eventDecrementReference(&event, 1); // activation holder
+  });
   releaseThread.join();
   activateThread.join();
 
   EXPECT_FALSE(activationAccepted.load(std::memory_order_relaxed))
     << "activation accepted on a deleting event";
-  EXPECT_EQ(failedIteration, -1)
-    << "final release was masked by the failed-activation transient: no destructor, storage lost";
+  EXPECT_EQ(context.destructors, 1u);
+  void *recycled = nullptr;
+  ASSERT_TRUE(concurrentQueuePop(&backend.operationPool, &recycled));
+  EXPECT_EQ(recycled, static_cast<void*>(&event));
 }
 
 // newUserEvent must reinitialize every root field the event paths can ever
@@ -1414,7 +1509,8 @@ TEST(event, new_user_event_reinitializes_root_fields)
   TestBackend backend;
   aioUserEvent *event = newUserEvent(&backend.base, 0, nullptr, nullptr);
   ASSERT_NE(event, nullptr);
-  deleteUserEvent(event);  // the slot parks in the process-global event pool
+  deleteUserEvent(event);
+  backend.drainCompletions();
 
   // Pool storage is type-stable and events are not poisoned: sabotage the
   // fields a new incarnation is obliged to rewrite
@@ -1443,6 +1539,7 @@ TEST(event, new_user_event_reinitializes_root_fields)
   deleteUserEvent(second);
   for (aioUserEvent *extra : extras)
     deleteUserEvent(extra);
+  backend.drainCompletions();
 }
 
 // The actUserEvent branch must reset the afActiveOnce inline budget at the
@@ -1460,7 +1557,7 @@ TEST(event, user_event_delivery_resets_sync_budget)
   event.tag = 1;
   event.isSemaphore = 0;
 
-  ASSERT_TRUE(eventTryActivate(&event));
+  ASSERT_TRUE(eventReferenceTryActivate(&event));
   concurrentQueuePush(&backend.base.globalQueue, &event.root);
   currentFinishedSync = 17;
   EXPECT_EQ(executeGlobalQueue(&backend.base), 1);

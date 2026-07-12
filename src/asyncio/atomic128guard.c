@@ -18,3 +18,21 @@ uint128Pair atomic128GuardExchange(volatile uint128Pair *ptr, uint128Pair value)
 {
   return __uint128_atomic_exchange(ptr, value);
 }
+
+int atomic128GuardCasRelaxed(volatile uint128Pair *ptr,
+                             uint128Pair *expected,
+                             uint128Pair desired)
+{
+  return __uint128_atomic_compare_and_swap_relaxed(ptr, expected, desired);
+}
+
+uint128Pair atomic128GuardLoadRelaxed(const volatile uint128Pair *ptr)
+{
+  return __uint128_atomic_load_relaxed(ptr);
+}
+
+uint128Pair atomic128GuardExchangeRelaxed(volatile uint128Pair *ptr,
+                                          uint128Pair value)
+{
+  return __uint128_atomic_exchange_relaxed(ptr, value);
+}

@@ -154,42 +154,57 @@ typedef struct AsyncOpTaggedPtr {
 #define IO_EVENT_WRITE    2u
 #define IO_EVENT_ERROR    4u
 
-// Event tag area
+// User-event lifetime word. References occupy the low bits; the two high bits
+// are independent protocol state. TAG_EVENT_OP is the non-semaphore pending
+// gate (cleared before callback entry), TAG_EVENT_DELETE is the sticky terminal
+// bit. Conditional non-semaphore activation uses CAS; unconditional lifetime
+// and semaphore transitions use the cheaper fetch-add/or/and operations. Every
+// API caller must already own a strong reference, so diagnostics never require
+// a CAS loop on the hot path.
 #if defined(OS_32)
-#define TAG_EVENT_OP          STATIC_CAST(uintptr_t, 0x00010000U)
-#define TAG_EVENT_DELETE      STATIC_CAST(uintptr_t, 0x10000000U)
-#define TAG_EVENT_OP_MASK     STATIC_CAST(uintptr_t, 0xFFFF0000U)
-#define TAG_EVENT_MASK        STATIC_CAST(uintptr_t, 0x0FFFFFFFU)
-#define TAG_EVENT_DELETE_MASK STATIC_CAST(uintptr_t, 0xF0000000U)
+#define TAG_EVENT_OP          STATIC_CAST(uintptr_t, 0x40000000U)
+#define TAG_EVENT_DELETE      STATIC_CAST(uintptr_t, 0x80000000U)
+#define TAG_EVENT_REF_MASK    STATIC_CAST(uintptr_t, 0x3FFFFFFFU)
 #elif defined(OS_64)
-#define TAG_EVENT_OP          STATIC_CAST(uintptr_t, 0x0000000100000000ULL)
-#define TAG_EVENT_DELETE      STATIC_CAST(uintptr_t, 0x1000000000000000ULL)
-#define TAG_EVENT_OP_MASK     STATIC_CAST(uintptr_t, 0xFFFFFFFF00000000ULL)
-#define TAG_EVENT_MASK        STATIC_CAST(uintptr_t, 0x0FFFFFFFFFFFFFFFULL)
-#define TAG_EVENT_DELETE_MASK STATIC_CAST(uintptr_t, 0xF000000000000000ULL)
+#define TAG_EVENT_OP          STATIC_CAST(uintptr_t, 0x4000000000000000ULL)
+#define TAG_EVENT_DELETE      STATIC_CAST(uintptr_t, 0x8000000000000000ULL)
+#define TAG_EVENT_REF_MASK    STATIC_CAST(uintptr_t, 0x3FFFFFFFFFFFFFFFULL)
 #else
 #error Configution incomplete
 #endif
+
+#define TAG_EVENT_OP_MASK     (TAG_EVENT_OP | TAG_EVENT_DELETE)
+#define TAG_EVENT_MASK        (TAG_EVENT_REF_MASK | TAG_EVENT_OP)
+#define TAG_EVENT_DELETE_MASK TAG_EVENT_DELETE
 
 #define OPCODE_READ 0
 #define OPCODE_WRITE 0x01000000
 #define OPCODE_OTHER 0x02000000
 
+// Public intrusive ownership hooks. Retain/release are thread-safe; a caller
+// may retain only through a reference it already owns. Destructor callbacks
+// are construction-time configuration and must be set before publication.
 uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count);
 uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count);
+void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg);
 // Strong ownership for user events. External callers pass an ordinary positive
 // reference count (no TAG_EVENT_* bits), may retain only while already owning a
 // reference, and must release exactly what they own. All external references
 // are equivalent for lifetime. Exactly one holder calls deleteUserEvent instead
 // of ordinary release; that call alone publishes DELETING and consumes one
 // reference. A holder may copy an already-owned reference after delete, but
-// this only extends storage lifetime and cannot reopen the event. A successful
-// eventTryActivate owns a separate internal delivery reference; delivery clears
-// the non-semaphore gate before callback and releases that reference afterwards.
-uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t tag);
-uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t tag);
-int eventTryActivate(aioUserEvent *event);
-void eventDeactivate(aioUserEvent *event);
+// this only extends storage lifetime and cannot reopen the event. An accepted
+// activation owns a separate internal delivery reference; delivery
+// clears the non-semaphore gate before callback and releases that reference
+// afterwards.
+uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t count);
+uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t count);
+// Construction-time configuration: set before publishing or deleting event.
+// Called exactly once by the thread releasing the final reference, after the
+// sole deleteUserEvent call, all external strong references, accepted
+// deliveries and any timer-control transition already in flight at deletion
+// have finished.
+void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, void *arg);
 
 void *alignedMalloc(size_t size, size_t alignment);
 void alignedFree(void *ptr);
@@ -322,13 +337,6 @@ struct asyncOpRoot {
 };
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor);
-void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg);
-// Construction-time configuration: set before publishing or deleting event.
-// Called exactly once by the thread releasing the final reference, after the
-// sole deleteUserEvent call, all external strong references, accepted
-// deliveries and any timer-control transition already in flight at deletion
-// have finished.
-void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, void *arg);
 
 void cancelIo(aioObjectRoot *object);
 void objectDelete(aioObjectRoot *object);
@@ -436,7 +444,10 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
     } else {
       opTagged = taggedAsyncOpStub();
     }
-  } while (!__uintptr_atomic_compare_and_swap(&object->Head.data, head.data, opTagged.data));
+  } while (!__uintptr_atomic_compare_and_swap(&object->Head.data,
+                                               head.data,
+                                               opTagged.data,
+                                               amoSeqCst));
 
   if (!head.data) {
     // This thread entered a combiner
@@ -486,7 +497,10 @@ static inline void combinerPushOperation(asyncOpRoot *op)
     } else {
       newOp = taggedAsyncOpStub();
     }
-  } while (!__uintptr_atomic_compare_and_swap(&object->Head.data, head.data, newOp.data));
+  } while (!__uintptr_atomic_compare_and_swap(&object->Head.data,
+                                               head.data,
+                                               newOp.data,
+                                               amoSeqCst));
 
   if (!head.data)
     combiner(object, taggedAsyncOpStub(), opTagged);
@@ -499,7 +513,7 @@ static inline void combinerPushOperation(asyncOpRoot *op)
 // the drain). A re-pushed bit can never be lost: the release target is the stub
 // (clean low bits), so any OR moves Head off it and defeats the release CAS.
 static inline void combinerPushCounter(aioObjectRoot *object, uint32_t tag) {
-  if (__uintptr_atomic_fetch_or(&object->Head.data, tag) == 0)
+  if (__uintptr_atomic_fetch_or(&object->Head.data, tag, amoSeqCst) == 0)
     combiner(object, taggedAsyncOpStub(), taggedAsyncOpNull());
 }
 

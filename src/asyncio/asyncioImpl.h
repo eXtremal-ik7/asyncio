@@ -92,7 +92,22 @@ typedef void deleteObjectTy(aioObject*);
 typedef void startTimerTy(asyncOpRoot*);
 typedef void stopTimerTy(asyncOpRoot*);
 typedef void deleteTimerTy(asyncOpRoot*);
-typedef void activateTy(aioUserEvent*);
+typedef int activateTy(aioUserEvent*);
+
+typedef enum EventTimerUpdate {
+  etuStart,
+  etuStop,
+  etuRearm,
+  // Reactor-only readiness probe. The backend consumes its timer channel
+  // under the common applier and returns 2 for a real tick, 1 for stale/EAGAIN.
+  etuConsume
+} EventTimerUpdate;
+
+// User-event timers have a separate serialized control plane. The common
+// event applier is the sole caller; backend callbacks only publish ticks.
+// generation is meaningful for start/rearm and travels back with a tick.
+typedef int updateEventTimerTy(aioUserEvent*, EventTimerUpdate, uintptr_t, uint64_t);
+typedef void releaseUserEventTy(aioUserEvent*);
 
 struct asyncImpl {
   combinerTaskHandlerTy *combinerTaskHandler;
@@ -118,12 +133,17 @@ struct asyncImpl {
   // postEmptyOperation whose empty node is the quit marker): eventfd write /
   // EVFILT_USER trigger / posted completion with a byte count
   loopWakeupTy *wakeupLoop;
+  updateEventTimerTy *updateEventTimer;
+  releaseUserEventTy *releaseUserEvent;
 };
 
 struct asyncBase {
   enum AsyncMethod method;
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
+  // User-event storage is base-local. A pooled slot can therefore never keep
+  // a timer resource or grace domain belonging to another multiplexor.
+  struct ConcurrentQueue eventPool;
   struct timerWheel timerWheel;
   // First monotonic tick whose sweep is not confirmed yet. Moves only by the
   // exact tick->tick+1 CAS in timerWheelSweepTick, performed by whichever
@@ -306,14 +326,166 @@ struct asyncOp {
 
 struct aioUserEvent {
   asyncOpRoot root;
-  uintptr_t tag;
+
+  // Producer/applier hot line. Operation storage is cache-line aligned, and
+  // the compile-time checks below keep every field touched by activation,
+  // timer-signal publication and mailbox election in one cache line. A timer
+  // tick therefore takes ownership of one line instead of bouncing tag and
+  // timerSignals on two different lines.
+  volatile uintptr_t tag;
   asyncBase *base;
-  int counter;
+
+  // {encoded signal count, armed generation}. low = count<<1 | probeKind:
+  // kqueue/IOCP publish confirmed ticks (kind 0), epoll publishes readiness
+  // probes (kind 1) whose timerfd read is serialized by the applier. A signal
+  // may increment only the installed generation; stop/restart changes the
+  // pair first, making a late publisher fail its CAS instead of touching the
+  // next schedule. One backend uses exactly one kind, so both fit one pair.
+  volatile uint128Pair timerSignals;
+
+  // {waiter coroutine pointer, metadata}. With a waiter, metadata is the
+  // ioSleep timer generation (0 for ioWaitUserEvent); without one it is the
+  // accumulated activation-credit count. Changed only by DWCAS.
+  volatile uint128Pair waiter;
+
+  // Coalesced control task state. Its queue node is event->root with the free
+  // low pointer bit set (all operation storage is 64-byte aligned), avoiding a
+  // second full asyncOpRoot in every event.
+  volatile unsigned timerControlState;
   int isSemaphore;
-  int pendingActivations;
+  int timerRemaining;
+  unsigned timerState;
+
+  // Cold configuration/lifetime line. Timer Start/Stop has one external
+  // controller; sequence is even while stable and odd only during the
+  // forbidden overlapping-writer window. Every snapshot field is atomic so
+  // even an observing retry is valid C and TSan-clean.
   userEventDestructorCb *destructorCb;
   void *destructorCbArg;
+  volatile uintptr_t timerConfigSequence;
+  volatile uintptr_t timerConfigPeriod;
+
+  // Consumer-owned applied state (only eventTimerProcess touches it).
+  uintptr_t timerAppliedGeneration;
+  uint64_t timerAppliedPeriod;
+  volatile unsigned timerConfigCounter;
 };
+
+typedef char aioUserEventMustStayFourCacheLines[
+  sizeof(struct aioUserEvent) == 4 * CACHE_LINE_SIZE ? 1 : -1];
+typedef char aioUserEventHotFieldsMustShareOneCacheLine[
+  offsetof(struct aioUserEvent, tag) / CACHE_LINE_SIZE ==
+  offsetof(struct aioUserEvent, timerState) / CACHE_LINE_SIZE ? 1 : -1];
+
+enum EventTimerStateFlags {
+  etsArmed = 1,
+  etsNeedsRearm = 2,
+  etsHasReference = 4
+};
+
+enum EventControlStateFlags {
+  ecsRunning = 1,
+  ecsDirty = 2
+};
+
+// Drop a protocol-local claim while another owner is known to pin the event.
+// Unlike a general release this decrement cannot be final and publishes no
+// payload, so release ordering would only add an unnecessary `l` suffix to
+// ARM64 ldadd. Keep uses limited to paths whose ownership invariant proves
+// refs > count independently of the value observed here.
+static inline void eventReferenceDropNonFinal(aioUserEvent *event, uintptr_t count)
+{
+  assert(count > 0 && count <= TAG_EVENT_REF_MASK);
+  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag,
+                                                  (uintptr_t)0 - count,
+                                                  amoRelaxed);
+  (void)old;
+  assert((old & TAG_EVENT_REF_MASK) > count &&
+         "A supposedly non-final event reference was the last one");
+}
+
+static inline int eventReferenceMarkDeleting(aioUserEvent *event)
+{
+  uintptr_t old = __uintptr_atomic_fetch_or(&event->tag,
+                                             TAG_EVENT_DELETE,
+                                             amoRelaxed);
+  assert((old & TAG_EVENT_REF_MASK) != 0 && "Deleting an already released event");
+  return (old & TAG_EVENT_DELETE) == 0;
+}
+
+static inline int eventReferenceIsDeleting(aioUserEvent *event)
+{
+  // DELETE is only a sticky control bit; no payload is published through it.
+  return (__uintptr_atomic_load(&event->tag, amoRelaxed) & TAG_EVENT_DELETE) != 0;
+}
+
+static inline int eventReferenceTryActivate(aioUserEvent *event)
+{
+  if (event->isSemaphore) {
+    // The caller owns another reference, so rolling back a terminal optimistic
+    // retain cannot itself recycle the event.
+    uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag, 1, amoRelaxed);
+    if (old & TAG_EVENT_DELETE) {
+      __uintptr_atomic_fetch_and_add(&event->tag, (uintptr_t)0 - 1, amoRelaxed);
+      return 0;
+    }
+#ifndef NDEBUG
+    uintptr_t refs = old & TAG_EVENT_REF_MASK;
+    assert(refs != 0 && "Activation without an owned event reference");
+    assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
+#endif
+    return 1;
+  }
+
+  uintptr_t old = __uintptr_atomic_load(&event->tag, amoRelaxed);
+  for (;;) {
+    if (old & (TAG_EVENT_DELETE | TAG_EVENT_OP))
+      return 0;
+#ifndef NDEBUG
+    uintptr_t refs = old & TAG_EVENT_REF_MASK;
+    assert(refs != 0 && "Activation without an owned event reference");
+    assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
+#endif
+    uintptr_t desired = (old + 1) | TAG_EVENT_OP;
+    if (__uintptr_atomic_compare_exchange(&event->tag,
+                                           &old,
+                                           desired,
+                                           amoRelaxed))
+      return 1;
+  }
+}
+
+static inline void eventReferenceDeactivate(aioUserEvent *event)
+{
+  if (event->isSemaphore)
+    return;
+  uintptr_t old = __uintptr_atomic_fetch_and(&event->tag,
+                                              ~TAG_EVENT_OP,
+                                              amoRelaxed);
+  (void)old;
+  assert((old & TAG_EVENT_OP) && "Deactivating an event without a pending delivery");
+}
+
+enum { eventTimerControlTag = 1 };
+
+static inline asyncOpRoot *eventTimerControlNode(aioUserEvent *event)
+{
+  return (asyncOpRoot*)((uintptr_t)&event->root | eventTimerControlTag);
+}
+
+static inline int eventTimerIsControlNode(asyncOpRoot *node)
+{
+  return ((uintptr_t)node & eventTimerControlTag) != 0;
+}
+
+static inline aioUserEvent *eventTimerControlEvent(asyncOpRoot *node)
+{
+  return (aioUserEvent*)((uintptr_t)node & ~(uintptr_t)eventTimerControlTag);
+}
+
+void eventTimerSignalTick(aioUserEvent *event, uintptr_t generation);
+void eventTimerSignalProbe(aioUserEvent *event, uintptr_t generation);
+void eventTimerProcess(aioUserEvent *event);
 
 // Single-threaded wheel lifecycle. Init may run on zeroed or reused storage
 // and seeds every slot's baseTick for the given cursor; teardown recycles

@@ -338,7 +338,10 @@ void aioSslConnect(SSLSocket *socket,
   else
     op->state = sslStProcessing;
 
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, (uintptr_t)&op->root)) {
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
+                                         0,
+                                         (uintptr_t)&op->root,
+                                         amoSeqCst)) {
     // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
@@ -546,7 +549,10 @@ int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlse
   fillContext(&context, connectProc, 0, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afCoroutine, usTimeout, 0, 0, sslOpConnect, &context);
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp, 0, (uintptr_t)&op->root)) {
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
+                                         0,
+                                         (uintptr_t)&op->root,
+                                         amoSeqCst)) {
     // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);

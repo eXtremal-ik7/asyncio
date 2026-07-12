@@ -144,7 +144,7 @@ static NO_SANITIZE_ADDRESS VOID __stdcall fiberEntryPoint(LPVOID lpParameter)
   // the counter, so the write must be atomic; release orders the coroutine's
   // final state before the flag for that reader
   __uint_atomic_store(&coro->finished, 1, amoRelease);
-  __uint_atomic_fetch_and_add(&coro->counter, -1);
+  __uint_atomic_fetch_and_add(&coro->counter, -1, amoSeqCst);
   currentCoroutine = coro->prev;
   assert(currentCoroutine && "Try exit from main coroutine");
   coroutineSwitchFiber(coro, currentCoroutine, 1);
@@ -219,7 +219,7 @@ void coroutineDelete(coroutineTy *coroutine)
 int coroutineCall(coroutineTy *coroutine)
 {
   if (!coroutineFinished(coroutine)) {
-    if (__uint_atomic_fetch_and_add(&coroutine->counter, 2) != 0) {
+    if (__uint_atomic_fetch_and_add(&coroutine->counter, 2, amoSeqCst) != 0) {
       // Don't call active coroutine
       return 1;
     }
@@ -240,7 +240,7 @@ int coroutineCall(coroutineTy *coroutine)
       // runner, finish the coroutine and free it - nothing may be read from
       // the coroutine after our last decrement
       finished = __uint_atomic_load(&coroutine->finished, amoAcquire);
-    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1) != 1 && !finished);
+    } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1, amoSeqCst) != 1 && !finished);
 
     if (finished) {
       coroutineCbTy *finishCb = coroutine->finishCb;
@@ -262,11 +262,11 @@ void coroutineYield()
 {
   if (currentCoroutine && currentCoroutine->prev) {
     coroutineTy *old = currentCoroutine;
-    unsigned counter = __uint_atomic_fetch_and_add(&old->counter, -1);
+    unsigned counter = __uint_atomic_fetch_and_add(&old->counter, -1, amoSeqCst);
     assert(counter >= 2 && "Double yield detected");
     if (counter != 2) {
       // Other thread tried call this coroutine before
-      __uint_atomic_fetch_and_add(&old->counter, -1);
+      __uint_atomic_fetch_and_add(&old->counter, -1, amoSeqCst);
       return;
     }
 

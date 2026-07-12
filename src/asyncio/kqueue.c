@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/event.h>
 #include <sys/time.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -41,7 +42,9 @@ void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void kqueueStartTimer(asyncOpRoot *op);
 void kqueueStopTimer(asyncOpRoot *op);
 void kqueueDeleteTimer(asyncOpRoot *op);
-void kqueueActivate(aioUserEvent *op);
+int kqueueActivate(aioUserEvent *op);
+int kqueueUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uintptr_t generation, uint64_t period);
+void kqueueReleaseUserEvent(aioUserEvent *event);
 AsyncOpStatus kqueueAsyncConnect(asyncOpRoot *opptr);
 AsyncOpStatus kqueueAsyncAccept(asyncOpRoot *opptr);
 AsyncOpStatus kqueueAsyncRead(asyncOpRoot *opptr);
@@ -69,7 +72,9 @@ static struct asyncImpl kqueueImpl = {
   kqueueAsyncWrite,
   kqueueAsyncReadMsg,
   kqueueAsyncWriteMsg,
-  kqueueWakeupLoop
+  kqueueWakeupLoop,
+  kqueueUpdateEventTimer,
+  kqueueReleaseUserEvent
 };
 
 // kevent failures are deliberately swallowed. EV_DELETE races the oneshot
@@ -226,7 +231,9 @@ void kqueueNextFinishedOperation(asyncBase *base)
         // Found quit marker: stamp the grace slot out and drain, strictly
         // before the loop thread counter drops
         graceThreadExit(base);
-        unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 0u-1) - 1;
+        unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
+                                                               0u-1,
+                                                               amoSeqCst) - 1;
         if (threadsRunning)
           kqueueEnqueue(base, 0);
         return;
@@ -262,18 +269,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
           case rteUserEvent: {
             aioUserEvent *event = (aioUserEvent*)timer->op;
-            int activated = eventTryActivate(event);
-            int counterExhausted = activated && event->counter > 0 && --event->counter == 0;
-            // Periodic EVFILT_TIMER stays armed in the kernel: no oneshot
-            // registration to re-arm, a dropped tick needs no action
-            ReactorUserEventTickPlan plan = reactorTimerUserEventTick(activated, counterExhausted, 0);
-            if (plan.stopTimer)
-              kqueueStopTimer(&event->root);
-            if (plan.activate) {
-              eventDeactivate(event);
-              event->root.finishMethod(&event->root);
-              eventDecrementReference(event, 1);
-            }
+            eventTimerSignalTick(event, armedGeneration);
             break;
           }
 
@@ -402,6 +398,23 @@ void kqueueStartTimer(asyncOpRoot *op)
   kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0);
 }
 
+static void kqueueStartTimerGeneration(asyncOpRoot *op,
+                                       uintptr_t generation,
+                                       uint64_t period)
+{
+  struct kevent event;
+  aioTimer *timer = (aioTimer*)op->timerId;
+  void *udata = reactorTimerArmIdentGeneration(timer, op, generation);
+  EV_SET(&event,
+         timer->fd,
+         EVFILT_TIMER,
+         EV_ADD | EV_ENABLE,
+         NOTE_USECONDS,
+         period,
+         udata);
+  kevent(((kqueueBase*)timer->root.base)->kqueueFd, &event, 1, 0, 0, 0);
+}
+
 
 void kqueueStopTimer(asyncOpRoot *op)
 {
@@ -428,9 +441,52 @@ void kqueueDeleteTimer(asyncOpRoot *op)
   graceRetire(timer->root.base, &timer->root, kqueueReleaseTimer);
 }
 
-void kqueueActivate(aioUserEvent *op)
+int kqueueActivate(aioUserEvent *op)
 {
   kqueueEnqueue(op->base, &op->root);
+  return 1;
+}
+
+int kqueueUpdateEventTimer(aioUserEvent *event,
+                           EventTimerUpdate update,
+                           uintptr_t generation,
+                           uint64_t period)
+{
+  switch (update) {
+    case etuStart:
+      kqueueStartTimerGeneration(&event->root, generation, period);
+      break;
+    case etuStop:
+      kqueueStopTimer(&event->root);
+      break;
+    case etuRearm:
+      // EVFILT_TIMER remains active after a periodic delivery.
+      break;
+    case etuConsume:
+      break;
+  }
+  return 1;
+}
+
+static void kqueueRecycleUserEvent(aioObjectRoot *root)
+{
+  aioTimer *timer = (aioTimer*)root;
+  aioUserEvent *event = (aioUserEvent*)timer->op;
+  event->root.timerId = 0;
+  free(timer);
+  concurrentQueuePush(event->root.objectPool, event);
+}
+
+void kqueueReleaseUserEvent(aioUserEvent *event)
+{
+  aioTimer *timer = (aioTimer*)event->root.timerId;
+  if (!timer) {
+    concurrentQueuePush(event->root.objectPool, event);
+    return;
+  }
+  assert(__uintptr_atomic_load(&timer->tag, amoAcquire) == 0 &&
+         "Recycling an armed user-event timer");
+  graceRetire(timer->root.base, &timer->root, kqueueRecycleUserEvent);
 }
 
 

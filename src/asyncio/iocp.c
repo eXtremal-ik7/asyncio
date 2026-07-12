@@ -32,6 +32,7 @@ typedef struct aioTimer {
   HANDLE hTimer;
   PTP_WAIT wait;
   volatile uintptr_t state;
+  volatile uintptr_t generation;
 } aioTimer;
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -55,7 +56,9 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void iocpStartTimer(asyncOpRoot *op);
 void iocpStopTimer(asyncOpRoot *op);
 void iocpDeleteTimer(asyncOpRoot *op);
-void iocpActivate(aioUserEvent *event);
+int iocpActivate(aioUserEvent *event);
+int iocpUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uintptr_t generation, uint64_t period);
+void iocpReleaseUserEvent(aioUserEvent *event);
 AsyncOpStatus iocpAsyncConnect(asyncOpRoot *op);
 AsyncOpStatus iocpAsyncAccept(asyncOpRoot *op);
 AsyncOpStatus iocpAsyncRead(asyncOpRoot *op);
@@ -83,7 +86,9 @@ static struct asyncImpl iocpImpl = {
   iocpAsyncWrite,
   iocpAsyncReadMsg,
   iocpAsyncWriteMsg,
-  iocpWakeupLoop
+  iocpWakeupLoop,
+  iocpUpdateEventTimer,
+  iocpReleaseUserEvent
 };
 
 static aioObject *getObject(iocpOp *op)
@@ -127,16 +132,22 @@ static int iocpArmWaitableTimer(aioTimer *timer, uint64_t timeout)
 {
   LARGE_INTEGER signalTime;
   signalTime.QuadPart = -(int64_t)(timeout * 10);
+  // SetWaitableTimer resets an already-signaled timer. Registering the wait
+  // afterwards cannot miss an early expiration because the handle remains
+  // signaled until the waiter consumes it; it also avoids registering the
+  // previous arm's still-signaled state before the reset.
+  if (!SetWaitableTimer(timer->hTimer, &signalTime, 0, NULL, NULL, FALSE))
+    return 0;
   SetThreadpoolWait(timer->wait, timer->hTimer, NULL);
-  if (SetWaitableTimer(timer->hTimer, &signalTime, 0, NULL, NULL, FALSE))
-    return 1;
-  SetThreadpoolWait(timer->wait, NULL, NULL);
-  return 0;
+  return 1;
 }
 
 static void iocpDisarmWaitableTimer(aioTimer *timer)
 {
-  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
+  // STOPPED is only a gate; callback payload is published through its own
+  // combiner/event mailbox, and WaitForThreadpoolWaitCallbacks is the lifetime
+  // barrier. No data is released through this word.
+  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelaxed);
   CancelWaitableTimer(timer->hTimer);
   SetThreadpoolWait(timer->wait, NULL, NULL);
   WaitForThreadpoolWaitCallbacks(timer->wait, TRUE);
@@ -144,32 +155,17 @@ static void iocpDisarmWaitableTimer(aioTimer *timer)
 
 static void iocpUserEventTimerCb(aioTimer *timer)
 {
-  int needReactivate = 1;
   aioUserEvent *event = (aioUserEvent*)timer->op;
-
-  if (__uintptr_atomic_load(&timer->state, amoAcquire) != IOCP_TIMER_CALLBACK)
-    return;
-
-  if (eventTryActivate(event))
-    iocpActivate(event);
-
-  if (event->counter > 0) {
-    if (--event->counter == 0)
-      needReactivate = 0;
-  }
-
-  if (needReactivate) {
-    if (__uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_CALLBACK, IOCP_TIMER_ARMED)) {
-      if (!iocpArmWaitableTimer(timer, event->root.timeout)) {
-        __uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_ARMED, IOCP_TIMER_STOPPED);
-      } else if (__uintptr_atomic_load(&timer->state, amoAcquire) == IOCP_TIMER_STOPPED) {
-        CancelWaitableTimer(timer->hTimer);
-        SetThreadpoolWait(timer->wait, NULL, NULL);
-      }
-    }
-  } else {
-    __uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_CALLBACK, IOCP_TIMER_STOPPED);
-  }
+  // iocpTimerCb's successful acquire CAS already observes the generation
+  // published before ARMED. Copy it before publishing STOPPED/control; a
+  // later rearm may then update the field while this callback only carries
+  // the old value in its local.
+  uintptr_t generation = __uintptr_atomic_load(&timer->generation, amoRelaxed);
+  // The callback is only a signal producer. In particular it never waits for
+  // or mutates the common timer applier, so an external stop/restart may safely
+  // rendezvous with this callback through WaitForThreadpoolWaitCallbacks.
+  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelaxed);
+  eventTimerSignalTick(event, generation);
 }
 
 
@@ -184,7 +180,7 @@ static void iocpIoFinishedTimerCb(aioTimer *timer)
   // a concurrent completion
   uintptr_t generation = opGetGeneration(op);
 
-  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
+  __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelaxed);
   if (opSetStatus(op, generation, aosTimeout))
     combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
 }
@@ -196,7 +192,11 @@ static VOID CALLBACK iocpTimerCb(PTP_CALLBACK_INSTANCE instance, PVOID context, 
   __UNUSED(wait);
   __UNUSED(waitResult);
 
-  if (!__uintptr_atomic_compare_and_swap(&timer->state, IOCP_TIMER_ARMED, IOCP_TIMER_CALLBACK))
+  uintptr_t expected = IOCP_TIMER_ARMED;
+  if (!__uintptr_atomic_compare_exchange(&timer->state,
+                                                &expected,
+                                                IOCP_TIMER_CALLBACK,
+                                                amoAcquire))
     return;
 
   if (timer->op->opCode == actUserEvent)
@@ -292,7 +292,7 @@ void iocpNextFinishedOperation(asyncBase *base)
   OVERLAPPED_ENTRY entries[128];
   const int maxEntriesNum = sizeof(entries) / sizeof(OVERLAPPED_ENTRY);
   iocpBase *localBase = (iocpBase*)base;
-  messageLoopThreadId = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 1);
+  messageLoopThreadId = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 1, amoSeqCst);
 
   while (1) {
     ULONG N, i;
@@ -314,9 +314,13 @@ void iocpNextFinishedOperation(asyncBase *base)
       OVERLAPPED_ENTRY *entry = &entries[i];
       if (entry->lpCompletionKey) {
         asyncOpRoot *op = (asyncOpRoot*)entry->lpCompletionKey;
-        if (op->opCode == actUserEvent) {
+        if (eventTimerIsControlNode(op)) {
+          currentFinishedSync = 0;
+          eventTimerProcess(eventTimerControlEvent(op));
+        } else if (op->opCode == actUserEvent) {
           aioUserEvent *event = (aioUserEvent*)op;
-          eventDeactivate(event);
+          currentFinishedSync = 0;
+          eventReferenceDeactivate(event);
           op->finishMethod(op);
           eventDecrementReference(event, 1);
         } else {
@@ -396,7 +400,9 @@ void iocpNextFinishedOperation(asyncBase *base)
         // Wakeup kick from a timer producer: the wait already returned and
         // the sweep at the loop top delivers, nothing to do with the entry
       } else {
-        unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, -1) - 1;
+        unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
+                                                               -1,
+                                                               amoSeqCst) - 1;
         if (threadsRunning)
           PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 0, 0, 0);
         return;
@@ -488,6 +494,7 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   timer->op = op;
   timer->state = IOCP_TIMER_STOPPED;
+  timer->generation = 0;
   timer->hTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
   if (!timer->hTimer)
     timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
@@ -499,15 +506,17 @@ void iocpStartTimer(asyncOpRoot *op)
 {
   aioTimer *timer = (aioTimer*)op->timerId;
   timer->op = op;
-  if (__uintptr_atomic_load(&timer->state, amoAcquire) != IOCP_TIMER_STOPPED)
+  if (__uintptr_atomic_load(&timer->state, amoRelaxed) != IOCP_TIMER_STOPPED)
     iocpDisarmWaitableTimer(timer);
   __uintptr_atomic_store(&timer->state, IOCP_TIMER_ARMED, amoRelease);
   if (!timer->hTimer || !timer->wait || !iocpArmWaitableTimer(timer, op->timeout)) {
-    __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelease);
+    __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelaxed);
     if (op->opCode == actUserEvent) {
       aioUserEvent *event = (aioUserEvent*)op;
-      if (eventTryActivate(event))
-        iocpActivate(event);
+      if (eventReferenceTryActivate(event) && !iocpActivate(event)) {
+        eventReferenceDeactivate(event);
+        eventDecrementReference(event, 1);
+      }
     } else if (opSetStatus(op, opGetGeneration(op), aosUnknownError)) {
       combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
     }
@@ -531,12 +540,65 @@ void iocpDeleteTimer(asyncOpRoot *op)
     CloseThreadpoolWait(timer->wait);
   if (timer->hTimer)
     CloseHandle(timer->hTimer);
-  free(timer);
+  alignedFree(timer);
 }
 
-void iocpActivate(aioUserEvent *event)
+int iocpActivate(aioUserEvent *event)
 {
-  iocpEnqueue(event->base, &event->root);
+  return PostQueuedCompletionStatus(((iocpBase*)event->base)->completionPort,
+                                    0,
+                                    (ULONG_PTR)&event->root,
+                                    0) != FALSE;
+}
+
+int iocpUpdateEventTimer(aioUserEvent *event,
+                         EventTimerUpdate update,
+                         uintptr_t generation,
+                         uint64_t period)
+{
+  aioTimer *timer = (aioTimer*)event->root.timerId;
+  switch (update) {
+    case etuStop:
+      if (timer->hTimer && timer->wait)
+        iocpDisarmWaitableTimer(timer);
+      return 1;
+
+    case etuStart:
+    case etuRearm:
+      if (!timer->hTimer || !timer->wait)
+        return 0;
+      // A replacement Start reaches here only after eventTimerStopApplied did
+      // the full callback rendezvous; the first Start has no predecessor.
+      // Rearm is driven by the control task posted at the end of the old
+      // callback, past which that callback never touches timer again. Thus
+      // neither path needs another blocking round-trip. SetThreadpoolWait is
+      // explicitly the re-use operation after a wait callback; Stop and
+      // destruction retain the full lifetime/generation rendezvous.
+      assert(__uintptr_atomic_load(&timer->state, amoRelaxed) == IOCP_TIMER_STOPPED &&
+             "Arming a user-event timer before its predecessor reached STOPPED");
+      // Numeric payload only; the following ARMED release publishes it to
+      // iocpTimerCb's acquire CAS.
+      __uintptr_atomic_store(&timer->generation, generation, amoRelaxed);
+      __uintptr_atomic_store(&timer->state, IOCP_TIMER_ARMED, amoRelease);
+      if (!iocpArmWaitableTimer(timer, period)) {
+        __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelaxed);
+        return 0;
+      }
+      return 1;
+
+    case etuConsume:
+      return 1;
+  }
+  return 0;
+}
+
+void iocpReleaseUserEvent(aioUserEvent *event)
+{
+  if (event->root.timerId) {
+    iocpDeleteTimer(&event->root);
+    event->root.timerId = 0;
+  }
+  concurrentQueuePush(event->root.objectPool, event);
 }
 
 

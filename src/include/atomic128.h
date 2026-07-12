@@ -10,8 +10,11 @@
 // The pair changes ONLY through compare-and-swap — there is no atomic wide
 // store, and the load is deliberately not a full-width snapshot.
 //
-// All operations are full-barrier (seq_cst) equivalents; relaxed/acq_rel
-// variants are a separate patch with per-target asm review.
+// The default operations are full-barrier (seq_cst) equivalents. Explicit
+// relaxed variants are provided only for protocols that publish no payload
+// through the pair itself (the user-event timer signal bucket); on compilers
+// without a proven inline ordered DWCAS they deliberately fall back to the
+// stronger default operation.
 
 #if defined(_MSC_VER) && !defined(__clang__)
 typedef struct __declspec(align(16)) uint128Pair {
@@ -80,6 +83,35 @@ static inline int __uint128_atomic_compare_and_swap(volatile uint128Pair *ptr, u
 #endif
 }
 
+// Same atomic transition without ordering. Clang's lock-free guarantee above
+// makes __atomic_compare_exchange_n an inline cmpxchg16b/casp/LL-SC here. GCC
+// is kept on __sync because some supported GCC targets lower 16-byte
+// __atomic_* to libatomic even when __sync CAS is inline; stronger ordering is
+// preferable to silently reintroducing a lock.
+static inline int __uint128_atomic_compare_and_swap_relaxed(volatile uint128Pair *ptr,
+                                                            uint128Pair *expected,
+                                                            uint128Pair desired)
+{
+#if defined(__clang__)
+  typedef unsigned __int128 uint128Alias __attribute__((may_alias));
+  uint128Alias expectedValue;
+  uint128Alias desiredValue;
+  __builtin_memcpy(&expectedValue, expected, sizeof(uint128Alias));
+  __builtin_memcpy(&desiredValue, &desired, sizeof(uint128Alias));
+  int exchanged = __atomic_compare_exchange_n((volatile uint128Alias*)ptr,
+                                               &expectedValue,
+                                               desiredValue,
+                                               0,
+                                               __ATOMIC_RELAXED,
+                                               __ATOMIC_RELAXED);
+  if (!exchanged)
+    __builtin_memcpy(expected, &expectedValue, sizeof(uint128Alias));
+  return exchanged;
+#else
+  return __uint128_atomic_compare_and_swap(ptr, expected, desired);
+#endif
+}
+
 // Two independent acquire loads, NOT a CAS(0,0) full-width read: the result
 // may be torn by a concurrent CAS. Deliberate: every routing decision made
 // from this read is re-validated by the caller's subsequent CAS on the same
@@ -99,12 +131,36 @@ static inline uint128Pair __uint128_atomic_load(const volatile uint128Pair *ptr)
   return result;
 }
 
+// Like the ordinary routing load this may be torn; the following CAS validates
+// every decision. It is intended for numeric/token pairs only.
+static inline uint128Pair __uint128_atomic_load_relaxed(const volatile uint128Pair *ptr)
+{
+  uint128Pair result;
+#if defined(_MSC_VER) && !defined(__clang__)
+  result.low = (uint64_t)ReadNoFence64((volatile LONG64*)&ptr->low);
+  result.high = (uint64_t)ReadNoFence64((volatile LONG64*)&ptr->high);
+#else
+  result.low = __atomic_load_n(&ptr->low, __ATOMIC_RELAXED);
+  result.high = __atomic_load_n(&ptr->high, __ATOMIC_RELAXED);
+#endif
+  return result;
+}
+
 // CAS loop — there is no native 128-bit exchange. Lock-free, not wait-free:
 // every retry means some other CAS on the pair succeeded.
 static inline uint128Pair __uint128_atomic_exchange(volatile uint128Pair *ptr, uint128Pair value)
 {
   uint128Pair expected = __uint128_atomic_load(ptr);
   while (!__uint128_atomic_compare_and_swap(ptr, &expected, value))
+    continue;
+  return expected;
+}
+
+static inline uint128Pair __uint128_atomic_exchange_relaxed(volatile uint128Pair *ptr,
+                                                            uint128Pair value)
+{
+  uint128Pair expected = __uint128_atomic_load_relaxed(ptr);
+  while (!__uint128_atomic_compare_and_swap_relaxed(ptr, &expected, value))
     continue;
   return expected;
 }

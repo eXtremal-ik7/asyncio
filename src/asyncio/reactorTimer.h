@@ -110,7 +110,9 @@ static inline void reactorTimerDisarm(aioTimer *timer)
 // releases both through the tag. The kernel keeps the ident in the knote and
 // returns it in the delivered event: the arming's identity travels full-width
 // through the kernel, nothing is read back from live mutable state.
-static inline void *reactorTimerArmIdent(aioTimer *timer, asyncOpRoot *op)
+static inline void *reactorTimerArmIdentGeneration(aioTimer *timer,
+                                                   asyncOpRoot *op,
+                                                   uintptr_t generation)
 {
   uintptr_t seqMask = (((uintptr_t)1) << rtIdentSeqBits) - 1;
   uintptr_t base = (uintptr_t)timer->fd & ~seqMask;
@@ -123,9 +125,14 @@ static inline void *reactorTimerArmIdent(aioTimer *timer, asyncOpRoot *op)
   // observed a NEWER generation to also observe a newer tag (the previous
   // stop's tag store travels ahead of this one through the recycle's pool
   // release/acquire chain) - see reactorTimerDecodeIdent.
-  __uintptr_atomic_store(&timer->armedGeneration, opGetGeneration(op), amoRelease);
+  __uintptr_atomic_store(&timer->armedGeneration, generation, amoRelease);
   __uintptr_atomic_store(&timer->tag, (uintptr_t)timer->fd, amoRelease);
   return reactorTimerUdata(timer, op->opCode == actUserEvent);
+}
+
+static inline void *reactorTimerArmIdent(aioTimer *timer, asyncOpRoot *op)
+{
+  return reactorTimerArmIdentGeneration(timer, op, opGetGeneration(op));
 }
 
 // Decode a delivered kqueue timer event. eventIdent is the knote ident that
@@ -150,15 +157,17 @@ static inline ReactorTimerEventAction reactorTimerDecodeIdent(aioTimer *timer,
   uintptr_t armed = __uintptr_atomic_load(&timer->tag, amoAcquire);
   if (armed == 0 || armed != eventIdent)
     return rteIgnore;
-  // The user-event bit rides in the udata tag: op->opCode belongs to the
-  // operation and cannot be read before the event is validated
-  if (udataBits & udataUserEvent)
-    return rteUserEvent;
   uintptr_t generation = __uintptr_atomic_load(&timer->armedGeneration, amoAcquire);
-  if (__uintptr_atomic_load(&timer->tag, amoAcquire) != armed)
+  // If generation came from a newer arm, its acquire pulls the intervening
+  // tag<-0 into happens-before; per-location coherence then makes a relaxed
+  // recheck sufficient to reject the old ident. If it came from this arm, the
+  // first tag acquire already published all of its fields.
+  if (__uintptr_atomic_load(&timer->tag, amoRelaxed) != armed)
     return rteIgnore;
   *armedGeneration = generation;
-  return rteExpireOperation;
+  // The user-event bit rides in the udata tag: op->opCode belongs to the
+  // operation and cannot be read before the event is validated.
+  return (udataBits & udataUserEvent) ? rteUserEvent : rteExpireOperation;
 }
 
 // ---- epoll flavor: the timerfd expiration counter as the arming oracle ---
@@ -170,10 +179,17 @@ static inline ReactorTimerEventAction reactorTimerDecodeIdent(aioTimer *timer,
 // orders the settime (which reset the fd's expiration counter) before that
 // delivery's read(): a counter residue of a previous arming can never be
 // attributed to this one.
+static inline void *reactorTimerArmCountGeneration(aioTimer *timer,
+                                                   asyncOpRoot *op,
+                                                   uintptr_t generation)
+{
+  __uintptr_atomic_store(&timer->tag, (generation << 1) | 1, amoRelease);
+  return reactorTimerUdata(timer, op->opCode == actUserEvent);
+}
+
 static inline void *reactorTimerArmCount(aioTimer *timer, asyncOpRoot *op)
 {
-  __uintptr_atomic_store(&timer->tag, (opGetGeneration(op) << 1) | 1, amoRelease);
-  return reactorTimerUdata(timer, op->opCode == actUserEvent);
+  return reactorTimerArmCountGeneration(timer, op, opGetGeneration(op));
 }
 
 // The armed gate BEFORE the backend touches the fd. On 0 the doorbell is
@@ -202,16 +218,14 @@ static inline ReactorTimerEventAction reactorTimerDecodeCount(uintptr_t armedTag
 {
   if (armedTag == 0 || expirations == 0)
     return rteIgnore;
-  if (udataBits & udataUserEvent)
-    return rteUserEvent;
   *armedGeneration = armedTag >> 1;
-  return rteExpireOperation;
+  return (udataBits & udataUserEvent) ? rteUserEvent : rteExpireOperation;
 }
 
 // ---- user-event tick delivery plan ----------------------------------------
 
 // What the loop must do after a user-event tick was decoded as valid.
-// activated is the eventTryActivate outcome, counterExhausted means this was
+// activated is the eventReferenceTryActivate outcome, counterExhausted means this was
 // the last counted tick. oneshotDelivery describes the backend: epoll's
 // EPOLLONESHOT registration is consumed by every delivery and must be
 // re-armed for the timer to keep reporting (kqueue's periodic EVFILT_TIMER

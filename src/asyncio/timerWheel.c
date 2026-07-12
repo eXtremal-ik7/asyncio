@@ -50,13 +50,15 @@ static inline unsigned lowestBitIndex64(uint64_t value)
 static inline void timerWheelMarkOccupied(asyncBase *base, unsigned level, unsigned index)
 {
   __uintptr_atomic_fetch_or(&base->timerWheel.occupancy[level][index >> 6],
-                            (uintptr_t)1 << (index & 63));
+                            (uintptr_t)1 << (index & 63),
+                            amoSeqCst);
 }
 
 static inline void timerWheelClearOccupied(asyncBase *base, unsigned level, unsigned index)
 {
   __uintptr_atomic_fetch_and(&base->timerWheel.occupancy[level][index >> 6],
-                             ~((uintptr_t)1 << (index & 63)));
+                             ~((uintptr_t)1 << (index & 63)),
+                             amoSeqCst);
 }
 
 // Window width of a level, in ticks
@@ -339,7 +341,10 @@ void timerWheelSweepTick(asyncBase *base, uint64_t tick)
   // tick just swept, so a sweeper resurfacing with a long-confirmed tick
   // cannot rewind it; losing the CAS means a helper sweeping the same tick
   // (all its visits are idempotent) confirmed it first
-  __uintptr_atomic_compare_and_swap(&base->timerCloseCursor, (uintptr_t)tick, (uintptr_t)(tick + 1));
+  __uintptr_atomic_compare_and_swap(&base->timerCloseCursor,
+                                    (uintptr_t)tick,
+                                    (uintptr_t)(tick + 1),
+                                    amoSeqCst);
 }
 
 void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
@@ -389,7 +394,9 @@ static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from, uint64_t h
     if (take > span)
       take = span;
     uintptr_t bits =
-      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[0][slotIndex >> 6], 0);
+      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[0][slotIndex >> 6],
+                                     0,
+                                     amoSeqCst);
     uintptr_t mask = take == 64 ? ~(uintptr_t)0 : ((((uintptr_t)1 << take) - 1) << bitPosition);
     uintptr_t hit = bits & mask;
     if (hit) {
@@ -411,7 +418,9 @@ static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from, uint64_t h
       continue;
     unsigned index = (unsigned)(boundary >> (TIMER_WHEEL_LEVEL_BITS * level)) & (TIMER_WHEEL_SLOTS - 1);
     uintptr_t bits =
-      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[level][index >> 6], 0);
+      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[level][index >> 6],
+                                     0,
+                                     amoSeqCst);
     if (bits & ((uintptr_t)1 << (index & 63)))
       best = boundary + 1;
   }
