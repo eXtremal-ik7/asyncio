@@ -11,6 +11,7 @@ extern "C" {
 #include "coroutine.h"
 #include "macro.h"
 #include "atomic.h"
+#include "atomic128.h"
 #include "ringBuffer.h"
 #include "asyncio/asyncioTypes.h"
 
@@ -150,6 +151,24 @@ typedef struct AsyncOpTaggedPtr {
   uintptr_t data;
 } AsyncOpTaggedPtr;
 
+// The first 16 bytes of every aioObjectRoot. Kernel producers without a
+// strong reference validate both words with one hardware DWCAS; ordinary
+// ref-held producers continue to touch data alone. All accesses to this
+// mixed-size region must be atomic. gen is a monotonic identity token only:
+// it publishes no payload, so its single death-writer and all readers use
+// relaxed 64-bit operations.
+#if defined(_MSC_VER) && !defined(__clang__)
+typedef struct __declspec(align(16)) AsyncObjectHead {
+  volatile uintptr_t data;
+  volatile uintptr_t gen;
+} AsyncObjectHead;
+#else
+typedef struct __attribute__((aligned(16))) AsyncObjectHead {
+  volatile uintptr_t data;
+  volatile uintptr_t gen;
+} AsyncObjectHead;
+#endif
+
 #define IO_EVENT_READ     1u
 #define IO_EVENT_WRITE    2u
 #define IO_EVENT_ERROR    4u
@@ -208,17 +227,25 @@ void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, v
 
 void *alignedMalloc(size_t size, size_t alignment);
 void alignedFree(void *ptr);
+// Type-stable object storage. Every published type embedding aioObjectRoot
+// must recycle its cells exclusively through this pair; returning such a cell
+// to free()/alignedFree() is forbidden because an already-harvested kernel
+// event may still validate its Head. A fresh cell whose construction failed
+// before any publication may still be freed. Fresh cells are zeroed and start
+// at generation one; pooled cells preserve their Head identity. objectFree
+// leaves Head readable and ASAN-poisons only the remainder.
+void *objectAlloc(ConcurrentQueue *pool, size_t size, size_t alignment);
+void objectFree(ConcurrentQueue *pool, void *object, size_t size);
 void *__tagged_pointer_make(void *ptr, uintptr_t data);
 void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData);
 
 // Recycling pools for objects. Pooled memory is never returned to the
 // allocator, in every build: under the address sanitizer a parked object is
 // marked with the manual poisoning API instead, so the allocation pattern
-// stays identical to production while any touch between objectPoolPut and
-// objectPoolGet reports use-after-poison. The put itself runs only after
-// the grace period (graceRetire): kernel event batches hold raw object
-// pointers, and within the grace window their touches are legitimate -
-// poisoning right in the destructor would flag them.
+// stays identical to production while any touch beyond the generation head
+// between objectFree and objectAlloc reports use-after-poison. Kernel event
+// batches carry a compact pointer/generation handle and may inspect only Head
+// before a successful validation.
 // The marks deliberately cover objects only. Operations cannot be marked:
 // the timeout grid keeps op pointers past the operation's lifetime and
 // lazily cancels through them when their second arrives - that is safe
@@ -259,11 +286,13 @@ void eqPushBack(List *list, asyncOpRoot *op);
 
 // Timeout-grid link. The deadline lives here, not in the operation: after
 // publication the operation may complete and be recycled at any moment, and
-// until a generation CAS wins nothing beyond op->tag may be read. 32 bytes,
+// until a generation CAS wins nothing beyond op->tag may be read. 48 bytes,
 // pooled in asyncOpLinkListPool.
 typedef struct asyncOpListLink {
   asyncOpRoot *op;
   uintptr_t generation;
+  aioObjectRoot *object;
+  uintptr_t objectGeneration;
   asyncOpListLink *next;
   uint64_t deadlineTick;
 } asyncOpListLink;
@@ -275,7 +304,7 @@ typedef struct ListImpl {
 
 
 struct aioObjectRoot {
-  AsyncOpTaggedPtr Head;
+  AsyncObjectHead Head;
   asyncBase *base;
   uintptr_t refs;
   List readQueue;
@@ -296,17 +325,29 @@ struct aioObjectRoot {
   // Claimed once by CAS at submission and cleared by the object's combiner.
   volatile uintptr_t initializationOp;
 
-  // Grace-period limbo links (graceRetire/graceReclaim): meaningful only
-  // between the destructor and the memory release, while the dead object may
-  // still be referenced by kernel event batches already copied into loop
-  // thread buffers. Nothing else may touch these fields
-  aioObjectRoot *GraceNext;
-
   IoObjectTy type;
   aioObjectDestructor *destructor;
   aioObjectDestructorCb *destructorCb;
   void *destructorCbArg;
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(AsyncObjectHead) == 16, "AsyncObjectHead must be two 64-bit words");
+static_assert(alignof(AsyncObjectHead) == 16, "AsyncObjectHead must be DWCAS aligned");
+static_assert(offsetof(aioObjectRoot, Head) == 0, "AsyncObjectHead must start aioObjectRoot");
+static_assert(offsetof(AsyncObjectHead, gen) == 8, "Head words must be packed in DWCAS order");
+#elif defined(_MSC_VER) && !defined(__clang__)
+typedef char AsyncObjectHeadMustBe16Bytes[sizeof(AsyncObjectHead) == 16 ? 1 : -1];
+typedef char AsyncObjectHeadMustBe16Aligned[__alignof(AsyncObjectHead) == 16 ? 1 : -1];
+typedef char AsyncObjectHeadMustStartRoot[offsetof(aioObjectRoot, Head) == 0 ? 1 : -1];
+typedef char AsyncObjectHeadWordsMustBePacked[
+  offsetof(AsyncObjectHead, gen) == 8 ? 1 : -1];
+#else
+_Static_assert(sizeof(AsyncObjectHead) == 16, "AsyncObjectHead must be two 64-bit words");
+_Static_assert(_Alignof(AsyncObjectHead) == 16, "AsyncObjectHead must be DWCAS aligned");
+_Static_assert(offsetof(aioObjectRoot, Head) == 0, "AsyncObjectHead must start aioObjectRoot");
+_Static_assert(offsetof(AsyncObjectHead, gen) == 8, "Head words must be packed in DWCAS order");
+#endif
 
 struct asyncOpRoot {
   // Generation (upper bits) + status (lower bits). Operation storage is
@@ -358,7 +399,11 @@ void processInitializationOp(aioObjectRoot *object, uint32_t *needStart);
 void executeOperationList(List *list);
 void cancelOperationList(List *list, AsyncOpStatus status);
 
-void opCancel(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status);
+int opCancel(asyncOpRoot *op,
+             uintptr_t generation,
+             AsyncOpStatus status,
+             aioObjectRoot *object,
+             uintptr_t objectGeneration);
 void resumeParent(asyncOpRoot *op, AsyncOpStatus status);
 
 void addToGlobalQueue(asyncOpRoot *op);
@@ -389,6 +434,77 @@ void initAsyncOpRoot(asyncOpRoot *op,
 void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr forRun);
 
 __NO_UNUSED_FUNCTION_BEGIN
+
+enum { OBJECT_HANDLE_GEN_BITS = 21 };
+
+enum {
+  // ptr[47:6] occupies envelope bits [42:1]; bit 0 remains the reactor-timer
+  // discriminator and the generation occupies [63:43]. Shifting the pointer
+  // once in each direction is cheaper than splitting generation around an
+  // unshifted pointer, especially in the harvest/decode path.
+  OBJECT_HANDLE_GEN_SHIFT = 64 - OBJECT_HANDLE_GEN_BITS,
+  OBJECT_HANDLE_PTR_SHIFT = 5
+};
+
+static inline uintptr_t objectHandleGenMask(void)
+{
+  return (STATIC_CAST(uintptr_t, 1) << OBJECT_HANDLE_GEN_BITS) - 1;
+}
+
+// Checked once by an fd-object constructor. Kernel udata carries ptr[47:6]
+// plus a 21-bit generation; bit 0 stays clear and therefore distinguishes the
+// handle from reactorTimer udata. A cell is tombstoned at the first generation
+// outside that range, so the carried generation is the exact live Head.gen,
+// not merely a lossy low-bit class. Value 0 is reserved for "no object".
+static inline int objectHandleTryEncode(aioObjectRoot *object, uint64_t *encoded)
+{
+  uintptr_t ptr = REINTERPRET_CAST(uintptr_t, object);
+  if (!object || (ptr & 63u) || (uint64_t)ptr >= (UINT64_C(1) << 48)) {
+    *encoded = 0;
+    return 0;
+  }
+  uintptr_t gen = __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
+  if (gen == 0 || gen > objectHandleGenMask()) {
+    *encoded = 0;
+    return 0;
+  }
+  *encoded = ((uint64_t)ptr >> OBJECT_HANDLE_PTR_SHIFT) |
+             ((uint64_t)gen << OBJECT_HANDLE_GEN_SHIFT);
+  return 1;
+}
+
+// Hot registration path after objectHandleTryEncode proved the address model.
+static inline uint64_t objectHandleEncodeKnown(aioObjectRoot *object)
+{
+  uintptr_t ptr = REINTERPRET_CAST(uintptr_t, object);
+  assert(object && !(ptr & 63u) && (uint64_t)ptr < (UINT64_C(1) << 48));
+  uintptr_t gen = __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
+  assert(gen != 0 && gen <= objectHandleGenMask() &&
+         "generation range exhaustion is a permanent fd tombstone");
+  return ((uint64_t)ptr >> OBJECT_HANDLE_PTR_SHIFT) |
+         ((uint64_t)gen << OBJECT_HANDLE_GEN_SHIFT);
+}
+
+static inline int objectHandleDecode(uint64_t encoded,
+                                     aioObjectRoot **object,
+                                     uintptr_t *carriedGen)
+{
+  if (encoded == 0 || (encoded & 1u)) {
+    *object = 0;
+    *carriedGen = 0;
+    return 0;
+  }
+  const uint64_t pointerMask =
+    (UINT64_C(1) << OBJECT_HANDLE_GEN_SHIFT) - 2;
+  *object = REINTERPRET_CAST(
+    aioObjectRoot*,
+    STATIC_CAST(uintptr_t,
+                (encoded & pointerMask) << OBJECT_HANDLE_PTR_SHIFT));
+  *carriedGen = STATIC_CAST(uintptr_t,
+                            encoded >> OBJECT_HANDLE_GEN_SHIFT);
+  return 1;
+}
+
 static inline AsyncOpTaggedPtr taggedAsyncOpNull()
 {
   AsyncOpTaggedPtr result;
@@ -417,6 +533,35 @@ static inline void taggedAsyncOpDecode(AsyncOpTaggedPtr ptr, asyncOpRoot **op, u
   *tag = STATIC_CAST(uint32_t, ptr.data & COMBINER_TAG_MASK);
 }
 
+// Producer without a strong reference. Only the first 16 bytes are touched:
+// pooled storage may have every following byte ASAN-poisoned. Mixed 64/128
+// atomic access is an explicit x86-64/ARM64 hardware contract; no plain access
+// to AsyncObjectHead is permitted.
+static inline int combinerPushValidated(aioObjectRoot *object,
+                                        uintptr_t carriedGen,
+                                        uint32_t tag)
+{
+  assert((tag & COMBINER_TAG_DELETE) == 0 &&
+         "DELETE must use the single-writer combinerPushDelete path");
+  uint128Pair expected = {
+    (uint64_t)__uintptr_atomic_load(&object->Head.data, amoRelaxed),
+    (uint64_t)carriedGen
+  };
+  for (;;) {
+    if ((uintptr_t)expected.high != carriedGen)
+      return 0;
+    uint128Pair desired = { expected.low | tag, expected.high };
+    if (__uint128_atomic_compare_and_swap(
+          (volatile uint128Pair*)(volatile void*)&object->Head,
+          &expected,
+          desired))
+      break;
+  }
+  if (expected.low == 0)
+    combiner(object, taggedAsyncOpStub(), taggedAsyncOpNull());
+  return 1;
+}
+
 static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
                                            List *queue,
                                            CreateAsyncOpProc *newAsyncOp,
@@ -432,7 +577,9 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
   asyncOpRoot *allocated = 0;
 
   do {
-    head.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
+    // Speculative expected only; the successful ownership CAS below is the
+    // acquire edge before any captured node can be dereferenced.
+    head.data = __uintptr_atomic_load(&object->Head.data, amoRelaxed);
     if (head.data) {
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
@@ -490,7 +637,9 @@ static inline void combinerPushOperation(asyncOpRoot *op)
   AsyncOpTaggedPtr newOp;
   AsyncOpTaggedPtr head;
   do {
-    head.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
+    // The value is only linked and compared until the successful CAS acquires
+    // its publisher; no node is dereferenced on this speculative load.
+    head.data = __uintptr_atomic_load(&object->Head.data, amoRelaxed);
     if (head.data) {
       newOp = opTagged;
       op->next = head;
@@ -506,14 +655,30 @@ static inline void combinerPushOperation(asyncOpRoot *op)
     combiner(object, taggedAsyncOpStub(), opTagged);
 }
 
-// Signal push: OR an idempotent tag into Head, wait-free. Ownership is the
-// 0->nonzero transition, exactly as for the op push, so at most one thread
-// enters the combiner. When Head was 0 this thread owns it and drains the bit
-// itself (stackTop = stub, no forRun - the bit sits in Head and is caught by
-// the drain). A re-pushed bit can never be lost: the release target is the stub
-// (clean low bits), so any OR moves Head off it and defeats the release CAS.
+// Signal push: OR an idempotent tag into Head. This is a ref-held path, so its
+// progress guarantee is independent of reclamation; a value-returning fetch-or
+// may compile to a CAS loop on x86. Ownership is the 0->nonzero transition,
+// exactly as for the op push, so at most one thread enters the combiner. When
+// Head was 0 this thread owns it and drains the bit itself (stackTop = stub, no
+// forRun - the bit sits in Head and is caught by the drain). A re-pushed bit can
+// never be lost: the release target is the stub (clean low bits), so any OR
+// moves Head off it and defeats the release CAS.
 static inline void combinerPushCounter(aioObjectRoot *object, uint32_t tag) {
   if (__uintptr_atomic_fetch_or(&object->Head.data, tag, amoSeqCst) == 0)
+    combiner(object, taggedAsyncOpStub(), taggedAsyncOpNull());
+}
+
+// The final reference publishes DELETE exactly once per incarnation. With
+// that invariant addition is equivalent to OR, while xadd/ldadd returns the
+// old ownership word in one wait-free instruction instead of a fetch-or CAS
+// loop on targets without a value-returning memory OR instruction.
+static inline void combinerPushDelete(aioObjectRoot *object) {
+  uintptr_t old = __uintptr_atomic_fetch_and_add(&object->Head.data,
+                                                  COMBINER_TAG_DELETE,
+                                                  amoSeqCst);
+  assert((old & COMBINER_TAG_DELETE) == 0 &&
+         "DELETE published more than once for one object incarnation");
+  if (old == 0)
     combiner(object, taggedAsyncOpStub(), taggedAsyncOpNull());
 }
 

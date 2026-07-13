@@ -440,7 +440,7 @@ static asyncOpRoot *implBtcSendProxy(aioObjectRoot *object, AsyncFlags flags, ui
 void btcSocketDestructor(aioObjectRoot *object)
 {
   deleteAioObject(reinterpret_cast<BTCSocket*>(object)->plainSocket);
-  concurrentQueuePush(&objectPool, object);
+  objectFree(&objectPool, object, sizeof(BTCSocket));
 }
 
 aioObjectRoot *btcSocketHandle(BTCSocket *socket)
@@ -450,9 +450,12 @@ aioObjectRoot *btcSocketHandle(BTCSocket *socket)
 
 BTCSocket *btcSocketNew(asyncBase *base, aioObject *plainSocket)
 {
-  BTCSocket *socket = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&socket))
-    socket = static_cast<BTCSocket*>(malloc(sizeof(BTCSocket)));
+  if (!plainSocket)
+    return nullptr;
+  BTCSocket *socket = static_cast<BTCSocket*>(
+    objectAlloc(&objectPool, sizeof(BTCSocket), 16));
+  if (!socket)
+    return nullptr;
   initObjectRoot(&socket->root, base, ioObjectUserDefined, btcSocketDestructor);
 
   socket->plainSocket = plainSocket;

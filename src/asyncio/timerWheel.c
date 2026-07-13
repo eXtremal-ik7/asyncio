@@ -45,8 +45,9 @@ static inline unsigned lowestBitIndex64(uint64_t value)
 }
 
 // Occupancy bit maintenance (see the protocol comment at struct timerWheel).
-// Both sides are seq-cst RMWs: the set pairs with the RMW reads of the sleep
-// horizon scan, the clear is ordered before the visitor's drain CAS
+// Set participates in the seq-cst lost-wakeup order against the sleeper's
+// ordinary bitmap loads. Clear stays an RMW because it must not erase a set
+// racing the drain/reopen transition.
 static inline void timerWheelMarkOccupied(asyncBase *base, unsigned level, unsigned index)
 {
   __uintptr_atomic_fetch_or(&base->timerWheel.occupancy[level][index >> 6],
@@ -117,7 +118,7 @@ void timerWheelTeardown(asyncBase *base)
   for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; level++) {
     for (unsigned i = 0; i < TIMER_WHEEL_SLOTS; i++) {
       volatile uint128Pair *slot = &base->timerWheel.slots[level][i];
-      uint128Pair observed = __uint128_atomic_load(slot);
+      uint128Pair observed = __uint128_atomic_load_relaxed(slot);
       asyncOpListLink *link = (asyncOpListLink*)(uintptr_t)observed.low;
       slot->low = 0;
       while (link) {
@@ -155,7 +156,9 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
       unsigned index = ((unsigned)(cursor >> (TIMER_WHEEL_LEVEL_BITS * level)) + TIMER_WHEEL_SLOTS - 1) %
                        TIMER_WHEEL_SLOTS;
       volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
-      uint128Pair observed = __uint128_atomic_load(slot);
+      // Routing snapshot only; the successful DWCAS below is the publication
+      // acquire and validates both possibly torn words.
+      uint128Pair observed = __uint128_atomic_load_relaxed(slot);
       for (;;) {
         link->next = (asyncOpListLink*)(uintptr_t)observed.low;
         uint128Pair desired;
@@ -179,7 +182,7 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
     // the head and retries; a loss against a visit changes baseTick and is
     // caught by the incarnation check
     volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
-    uint128Pair observed = __uint128_atomic_load(slot);
+    uint128Pair observed = __uint128_atomic_load_relaxed(slot);
     while (observed.high == expectedBase) {
       link->next = (asyncOpListLink*)(uintptr_t)observed.low;
       uint128Pair desired;
@@ -189,7 +192,7 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
         // Activation (empty -> non-empty) sets the occupancy bit; links
         // stacked onto a live chain ride on the bit already set. The set runs
         // after the publication: the window where the chain exists bitless is
-        // closed by the wakeup check that follows every arm
+        // closed by the wakeup check that follows every arm.
         if (!observed.low)
           timerWheelMarkOccupied(base, level, index);
         return 1;
@@ -214,8 +217,23 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   asyncOpListLink *timerLink = 0;
   if (!objectPoolGet(&asyncOpLinkListPool, (void**)&timerLink, sizeof(asyncOpListLink)))
     timerLink = malloc(sizeof(asyncOpListLink));
+  if (!timerLink) {
+    aioObjectRoot *object = op->object;
+    uintptr_t objectGeneration =
+      __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
+    if (!opCancel(op,
+                  opGetGeneration(op),
+                  aosUnknownError,
+                  object,
+                  objectGeneration))
+      recordStaleHandleDrop(base);
+    return;
+  }
   timerLink->op = op;
   timerLink->generation = opGetGeneration(op);
+  timerLink->object = op->object;
+  timerLink->objectGeneration =
+    __uintptr_atomic_load(&op->object->Head.gen, amoRelaxed);
   timerLink->deadlineTick = timerDeadlineTick(op->endTime);
   // The deadline is read back after the publication for the wakeup check, and
   // a published link belongs to the wheel - keep a local copy
@@ -224,16 +242,35 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   // concurrent sweep may deliver the timeout and recycle the operation, and a
   // late store would corrupt the next incarnation's field
   op->timerId = timerLink;
-  if (!timerWheelInsert(base, timerLink, __uintptr_atomic_load(&base->timerCloseCursor, amoRelaxed))) {
+  // Acquire on the cursor is load-bearing for the refusal path: reading c
+  // synchronizes with the release confirm of tick c-1 and, through the chain
+  // of confirms, happens-after every slot visit of every tick below c. That
+  // pins the slot reads inside the insert - a baseTick the sweep already left
+  // behind cannot surface, so an incarnation mismatch proves the deadline's
+  // window was drained. With a relaxed read the pair load may be satisfied
+  // ahead of the cursor load, and a visit landing between the two would make
+  // a still-open level-0 window look drained - the arm would be refused and
+  // the timeout delivered up to a full level-0 rotation early
+  if (!timerWheelInsert(base,
+                        timerLink,
+                        __uintptr_atomic_load(&base->timerCloseCursor,
+                                              amoAcquire))) {
     // Expired: the deadline's window is already swept. The link never became
     // visible, so it is still producer-owned; recycle it and deliver the
     // timeout through the regular generation-gated cancel. The caller sees a
     // terminal status instead of a started timer (init paths must not issue
     // their I/O after this)
     uintptr_t generation = timerLink->generation;
+    aioObjectRoot *object = timerLink->object;
+    uintptr_t objectGeneration = timerLink->objectGeneration;
     op->timerId = 0;
     objectPoolPut(&asyncOpLinkListPool, timerLink, sizeof(asyncOpListLink));
-    opCancel(op, generation, aosTimeout);
+    if (!opCancel(op,
+                  generation,
+                  aosTimeout,
+                  object,
+                  objectGeneration))
+      recordStaleHandleDrop(base);
     return;
   }
 
@@ -241,13 +278,20 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   // sleeper waking at wakeTick sweeps every tick below it, so a lag of one
   // tick is covered by the sleeper itself and anything longer needs the kick.
   // Awake threads park their slots at UINTPTR_MAX and never attract kicks -
-  // they re-scan the occupancy bitmap before their next sleep. The horizon
-  // loads are ordered after the occupancy RMW inside the insert (or after the
-  // first publisher's RMW when this arm stacked onto a live chain, whose bit
-  // then already covers this deadline: same slot means same wake tick)
+  // they re-scan the occupancy bitmap before their next sleep. For the arm
+  // that activated the slot, the seq-cst order is:
+  //   sleeper horizon store -> missed bitmap load -> producer bit set
+  //                          -> producer horizon load.
+  // Thus a scan that missed this bit forces this load to observe that sleep
+  // episode's sentinel or its later, shorter horizon; a stale awake value is
+  // impossible. An arm
+  // stacked onto a live chain rides on its first publisher's activation:
+  // same slot, same wake tick. Every stale reading errs toward a spurious
+  // kick, never toward a lost wakeup.
   if (base->timerSleep) {
-    for (unsigned i = 0; i < base->graceSlotLimit; i++) {
-      uintptr_t wakeTick = __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoAcquire);
+    for (unsigned i = 0; i < base->loopThreadLimit; i++) {
+      uintptr_t wakeTick =
+        __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoSeqCst);
       if (wakeTick != UINTPTR_MAX && wakeTick > (uintptr_t)(deadline + 1)) {
         base->methodImpl.wakeupLoop(base);
         break;
@@ -267,7 +311,7 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
   unsigned index = (unsigned)(windowStart >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
   volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
 
-  uint128Pair observed = __uint128_atomic_load(slot);
+  uint128Pair observed = __uint128_atomic_load_relaxed(slot);
   for (;;) {
     if (observed.high > windowStart) {
       // Already reopened past this window (a concurrent visit or an
@@ -306,7 +350,12 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
       // here without touching anything beyond the atomic tag
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
     } else if (link->deadlineTick <= windowStart) {
-      opCancel(link->op, link->generation, aosTimeout);
+      if (!opCancel(link->op,
+                    link->generation,
+                    aosTimeout,
+                    link->object,
+                    link->objectGeneration))
+        recordStaleHandleDrop(base);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
     } else if (!timerWheelInsert(base, link, windowStart)) {
       // Cascade: the deadline is inside a narrower window; re-route from the
@@ -314,7 +363,12 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
       // deadline). A refused publication means the lower window is already
       // terminal - a stalled owner resuming an old chain - so the timeout is
       // due right now
-      opCancel(link->op, link->generation, aosTimeout);
+      if (!opCancel(link->op,
+                    link->generation,
+                    aosTimeout,
+                    link->object,
+                    link->objectGeneration))
+        recordStaleHandleDrop(base);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
     }
     link = next;
@@ -340,11 +394,18 @@ void timerWheelSweepTick(asyncBase *base, uint64_t tick)
   // Confirm the tick. The cursor only ever moves forward by 1 from the exact
   // tick just swept, so a sweeper resurfacing with a long-confirmed tick
   // cannot rewind it; losing the CAS means a helper sweeping the same tick
-  // (all its visits are idempotent) confirmed it first
+  // (all its visits are idempotent) confirmed it first. Release on success:
+  // this CAS heads the release sequence every acquire read of the cursor
+  // synchronizes with - reading a confirmed value must prove that every
+  // visit below it happened (the helper loop carries that induction across
+  // threads by re-reading the cursor with acquire before each tick). The
+  // confirmer reads nothing after the CAS that depends on it, and a failed
+  // confirm needs no ordering at all - the helper that won re-synchronizes
+  // through its own acquire read
   __uintptr_atomic_compare_and_swap(&base->timerCloseCursor,
                                     (uintptr_t)tick,
                                     (uintptr_t)(tick + 1),
-                                    amoSeqCst);
+                                    amoRelease);
 }
 
 void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
@@ -374,11 +435,12 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
 // boundary + 1, so a cascade is never overslept - the deadlines inside the
 // window are re-routed by that visit and picked up by the following horizon
 // scans. Every word the "nothing earlier" conclusion rests on is read with a
-// seq-cst RMW: it pairs with the producer's set of the same word (both are
-// RMWs on one address, so they are totally ordered) - either this scan
-// observes the fresh bit, or the producer's set follows the scan's RMW and
-// its horizon read then observes the wakeTick published before the scan,
-// triggering the kick. A word is skipped only when its visit ticks cannot
+// seq-cst load. Together with the seq-cst horizon publication and the
+// producer's seq-cst bit-set/horizon-load, the global order forbids both sides
+// from missing each other: either this scan observes the fresh bit, or the
+// producer observes this sleep episode's horizon and kicks when needed.
+// Unlike the former fetch-add(0) scheme, empty scans never take ownership of
+// the bitmap cache lines. A word is skipped only when its visit ticks cannot
 // beat the best candidate already found - an arithmetic bound, not a read of
 // mutable state, so the litmus still covers every slot the conclusion
 // depends on. The full 68-word sweep runs only on the way into a deep sleep;
@@ -408,9 +470,8 @@ static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from)
       if (take > remaining)
         take = remaining;
       uintptr_t bits =
-        __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[level][slotIndex >> 6],
-                                       0,
-                                       amoSeqCst);
+        __uintptr_atomic_load(&base->timerWheel.occupancy[level][slotIndex >> 6],
+                              amoSeqCst);
       uintptr_t mask = take == 64 ? ~(uintptr_t)0 : ((((uintptr_t)1 << take) - 1) << bitPosition);
       uintptr_t hit = bits & mask;
       if (hit) {
@@ -433,7 +494,7 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
 {
   const uint32_t tickMs = TIMER_TICK_MICROSECONDS / 1000;
   TimerSleepSlot *slot =
-    base->timerSleep && threadId < base->graceSlotLimit ? &base->timerSleep[threadId] : 0;
+    base->timerSleep && threadId < base->loopThreadLimit ? &base->timerSleep[threadId] : 0;
   // A thread beyond the horizon array has no channel for the wakeup kick:
   // cap its wait at one grid tick so a deadline it cannot be told about is
   // late by at most the tick (an out-of-contract configuration; delivery is
@@ -447,7 +508,7 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
   // kick while the scan misses its fresh bit. Every later store only
   // shrinks the horizon - a producer reading a stale larger value kicks
   // spuriously at worst
-  __uintptr_atomic_store(&slot->wakeTick, timerSleepEternal, amoRelease);
+  __uintptr_atomic_store(&slot->wakeTick, timerSleepEternal, amoSeqCst);
 
   // Scan from the confirmed sweep position when it lags the clock (a
   // concurrent sweeper mid-tick): due backlog then wakes immediately instead
@@ -456,23 +517,10 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
   uint64_t from = cursor < currentTick ? cursor : currentTick;
   uint64_t wake = timerWheelNearestWake(base, from);
 
-  // Objects waiting out their grace period need this thread back at the
-  // quiescence tick: cap the wait at the drain period. Both fields, like
-  // graceQuiesce - the scanner may have moved the limbo stack into pending.
-  // Relaxed suffices: these loads only bound how long a ripe batch may sit,
-  // and a retirement racing them wakes a sleeper through the backend kick,
-  // which is a stateful syscall and outlives any interleaving with the wait
-  if (__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed) ||
-      __pointer_atomic_load((void *volatile*)&base->gracePending, amoRelaxed)) {
-    uint64_t capTicks = fallbackMs / tickMs;
-    if (capTicks == 0)
-      capTicks = 1;
-    if (wake > currentTick + capTicks)
-      wake = currentTick + capTicks;
-  } else if (wake == UINT64_MAX) {
+  if (wake == UINT64_MAX) {
     // Nothing parked anywhere: wait with no timeout. The eternal sentinel
-    // stays published - a later arm or an outside grace retirement kicks
-    // through methodImpl.wakeupLoop, queue traffic carries its own doorbell
+    // stays published - a later arm kicks through methodImpl.wakeupLoop,
+    // while queue traffic carries its own doorbell.
     return UINT32_MAX;
   }
 
@@ -493,6 +541,6 @@ void timerLoopCancelSleep(asyncBase *base, unsigned threadId)
   // Awake: the thread sweeps on its own before its next sleep, kicking it
   // would be a wasted syscall. A producer racing this store at worst reads
   // the stale horizon and issues one spurious wakeup
-  if (base->timerSleep && threadId < base->graceSlotLimit)
+  if (base->timerSleep && threadId < base->loopThreadLimit)
     __uintptr_atomic_store(&base->timerSleep[threadId].wakeTick, UINTPTR_MAX, amoRelaxed);
 }

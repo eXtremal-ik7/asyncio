@@ -299,15 +299,5 @@ static inline void *__pointer_atomic_exchange(void *volatile *ptr,
 #endif
 }
 
-static inline void __atomic_thread_fence_order(AtomicMemoryOrder order)
-{
-#ifndef _MSC_VER // Not Microsoft compiler
-  __atomic_thread_fence(order);
-#else
-  (void)order;
-  MemoryBarrier();
-#endif
-}
-
 __NO_UNUSED_FUNCTION_END
 #endif //__ATOMIC_H_

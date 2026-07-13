@@ -11,16 +11,7 @@
 
 __tls unsigned currentFinishedSync;
 __tls unsigned messageLoopThreadId;
-// Set only by a successful slot claim in graceThreadEnter: with an elastic
-// thread pool messageLoopThreadId alone does not prove ownership - an id can
-// be adopted while its previous holder is still inside the message loop.
-// Thread-local, so plain loads/stores suffice
-static __tls unsigned graceSlotOwned;
-// The base whose message loop this thread runs, claimed together with the
-// slot; graceRetire's kick decision keys on it (a loop thread of the base
-// polls the limbo on its own, anyone else must wake a sleeper). Non-static:
-// unit tests reset it between cases, like messageLoopThreadId
-__tls asyncBase *graceLoopBase;
+static __tls unsigned loopThreadSlotOwned;
 
 void eqRemove(List *list, asyncOpRoot *op)
 {
@@ -83,6 +74,39 @@ void alignedFree(void *ptr)
 #endif
 }
 
+void *objectAlloc(ConcurrentQueue *pool, size_t size, size_t alignment)
+{
+  void *object = 0;
+  if (concurrentQueuePop(pool, &object)) {
+    ASAN_UNPOISON_MEMORY_REGION(object, size);
+    return object;
+  }
+  if (size < sizeof(AsyncObjectHead) || alignment < 16 ||
+      (alignment & (alignment - 1)) != 0)
+    return 0;
+  object = alignedMalloc(size, alignment);
+  if (!object)
+    return 0;
+  // Head may later be inspected by a kernel producer without a C-language
+  // publication edge. Keep even fresh initialization atomic; relaxed stores
+  // are plain stores on the supported CPUs and publish no payload.
+  memset((uint8_t*)object + sizeof(AsyncObjectHead),
+         0,
+         size - sizeof(AsyncObjectHead));
+  AsyncObjectHead *head = (AsyncObjectHead*)object;
+  __uintptr_atomic_store(&head->data, 0, amoRelaxed);
+  __uintptr_atomic_store(&head->gen, 1, amoRelaxed);
+  return object;
+}
+
+void objectFree(ConcurrentQueue *pool, void *object, size_t size)
+{
+  assert(object && size >= sizeof(AsyncObjectHead));
+  ASAN_POISON_MEMORY_REGION((uint8_t*)object + sizeof(AsyncObjectHead),
+                            size - sizeof(AsyncObjectHead));
+  concurrentQueuePush(pool, object);
+}
+
 void *__tagged_pointer_make(void *ptr, uintptr_t data)
 {
   return (void*)(((intptr_t)ptr) + ((intptr_t)(data & TAGGED_POINTER_DATA_MASK)));
@@ -97,7 +121,11 @@ void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData)
 
 uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count)
 {
-  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs, count, amoSeqCst);
+  // Retain is legal only through an already-owned reference and publishes no
+  // payload. The final release below is the sole lifetime synchronization
+  // point, so acquire ordering on every increment would only tax ARM64.
+  uintptr_t result =
+    __uintptr_atomic_fetch_and_add(&object->refs, count, amoRelaxed);
   assert(result != 0 && "Removed object access detected");
   return result;
 }
@@ -105,11 +133,19 @@ uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count)
 uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count)
 {
   uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs,
-                                                     (uintptr_t)0-count,
-                                                     amoSeqCst);
+                                                     (uintptr_t)0 - count,
+                                                     amoRelease);
   assert((intptr_t)result > 0 && "Double object release detected");
-  if (result == count)
-    combinerPushCounter(object, COMBINER_TAG_DELETE);
+  if (result == count) {
+    // Only the last releaser pays acquire. This load reads the zero published
+    // by our release RMW and therefore synchronizes with every release whose
+    // RMW belongs to the same release sequence. Besides being cheaper than an
+    // acquire fence on ARM64, an acquire load is understood by GCC TSan.
+    uintptr_t finalRefs = __uintptr_atomic_load(&object->refs, amoAcquire);
+    assert(finalRefs == 0 && "Object reference resurrected from zero");
+    (void)finalRefs;
+    combinerPushDelete(object);
+  }
   return result;
 }
 
@@ -122,6 +158,13 @@ static uintptr_t eventFinalizeReference(aioUserEvent *event, uintptr_t oldTag)
 {
   if (event->destructorCb)
     event->destructorCb(event, event->destructorCbArg);
+
+  // One logical writer, after user code has finished with this incarnation.
+  // Zero is a permanent tombstone on the theoretical full-width wrap; every
+  // backend release path cleans its resource but refuses to pool that cell.
+  uintptr_t incarnation =
+    __uintptr_atomic_load(&event->incarnation, amoRelaxed);
+  __uintptr_atomic_store(&event->incarnation, incarnation + 1, amoRelaxed);
 
   if (event->base && event->base->methodImpl.releaseUserEvent)
     event->base->methodImpl.releaseUserEvent(event);
@@ -158,7 +201,13 @@ uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t count)
   // Before delete every valid release is necessarily non-final. The common
   // producer/delivery path is one release RMW plus one sticky-bit test.
   if ((old & TAG_EVENT_DELETE) && (old & TAG_EVENT_REF_MASK) == count) {
-    __atomic_thread_fence_order(amoAcquire);
+    // Read our final release RMW (and the release sequence leading to it) with
+    // acquire only on the cold finalization path. This is also visible to TSan,
+    // unlike an acquire fence in GCC's current sanitizer instrumentation.
+    uintptr_t finalTag = __uintptr_atomic_load(&event->tag, amoAcquire);
+    assert((finalTag & TAG_EVENT_REF_MASK) == 0 &&
+           "Event reference resurrected from zero");
+    (void)finalTag;
     return eventFinalizeReference(event, old);
   }
   return old;
@@ -166,21 +215,26 @@ uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t count)
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor)
 {
-  // Atomic store: a stale kernel event for the storage's previous incarnation
-  // may concurrently fetch_or readiness bits into Head; the RMW must not mix
-  // with a plain write. The stale bits themselves are harmless - they only
-  // wake the queues, and the woken side re-checks actual readiness
+  // Stale kernel producers may still validate the previous incarnation with
+  // a DWCAS while this type-stable cell is initialized, so every Head access
+  // remains atomic. Their generation cannot match and they cannot write.
+  // Construction is published later by the first ownership transition, not
+  // through this reset, therefore a relaxed store is sufficient here.
   __uintptr_atomic_store(&object->Head.data, taggedAsyncOpNull().data, amoRelaxed);
   object->readQueue.head = object->readQueue.tail = 0;
   object->writeQueue.head = object->writeQueue.tail = 0;
   object->base = base;
   object->type = type;
-  object->refs = 1;
+  // These words remain atomic for their whole pooled lifetime. Relaxed init
+  // is still a plain store on the supported CPUs, but avoids mixed
+  // atomic/plain accesses at the hand-off between object incarnations; the
+  // first Head ownership transition, not these stores, publishes construction.
+  __uintptr_atomic_store(&object->refs, 1, amoRelaxed);
   object->destructor = destructor;
   object->destructorCb = 0;
   object->destructorCbArg = 0;
-  object->CancelIoFlag = 0;
-  object->DeletePending = 0;
+  __uint_atomic_store(&object->CancelIoFlag, 0, amoRelaxed);
+  __uint_atomic_store(&object->DeletePending, 0, amoRelaxed);
   __uintptr_atomic_store(&object->initializationOp, 0, amoRelaxed);
 }
 
@@ -254,6 +308,10 @@ int asyncOpAlloc(asyncBase *base,
   ConcurrentQueue *buffer = !isRealTime ? objectPool : objectTimerPool;
   if (!concurrentQueuePop(buffer, (void**)&op)) {
     op = (asyncOpRoot*)alignedMalloc(size, 1u << COMBINER_TAG_SIZE);
+    if (!op) {
+      *result = 0;
+      return 0;
+    }
     if (isRealTime)
       base->methodImpl.initializeTimer(base, op);
     else
@@ -665,13 +723,24 @@ void cancelOperationList(List *list, AsyncOpStatus status)
   list->tail = keptTail;
 }
 
-void opCancel(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status)
+int opCancel(asyncOpRoot *op,
+             uintptr_t generation,
+             AsyncOpStatus status,
+             aioObjectRoot *object,
+             uintptr_t objectGeneration)
 {
   // Cancel signal, gated on winning the terminal status (the loser is redundant,
   // the winner drives the cancel). The combiner scans and reaps positionally;
   // an in-flight op stays on its head until its late completion releases it.
-  if (opSetStatus(op, generation, status))
-    combinerPushCounter(op->object, COMBINER_TAG_CANCEL);
+  if (!opSetStatus(op, generation, status))
+    return 1;
+  if (!object)
+    return 1;
+  // op storage may recycle immediately after the winning status CAS. The arm
+  // handle is the only legal route to its owner from this point onward.
+  return combinerPushValidated(object,
+                               objectGeneration,
+                               COMBINER_TAG_CANCEL);
 }
 
 void resumeParent(asyncOpRoot *op, AsyncOpStatus status)
@@ -750,287 +819,62 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
 }
 
 
-void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *memoryRelease)
+int loopThreadEnter(asyncBase *base)
 {
-  // The resource half of the destructor already ran; the field is dead from
-  // here on and repurposed to carry the memory half to graceReclaim.
-  // The object is parked unconditionally: with graceFrozen set reclamation
-  // never runs and the limbo only grows. A leak in a pathological thread
-  // configuration is the safe degradation - an immediate release here would
-  // be the original use-after-free while unslotted loop threads still hold
-  // harvested batches
-  object->destructor = memoryRelease;
-  // Lock-free push. Until the CAS succeeds the object is published to nobody,
-  // so rewriting GraceNext on a retry is fine; after it the producer never
-  // touches the grace fields again. The full-barrier CAS both releases
-  // destructor/GraceNext to the scanner's exchange and keeps the publication
-  // ordered after the object's logical detachment from the backend. ABA on
-  // the head is harmless for push-only producers: a stale head value is only
-  // ever written into GraceNext, never dereferenced (this rests on the pools
-  // being type-stable - storage never returns to the allocator)
-  aioObjectRoot *head;
-  do {
-    head = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed);
-    object->GraceNext = head;
-  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo,
-                                               head,
-                                               object,
-                                               amoSeqCst));
-
-  // Liveness kick, once per limbo episode: idle loop threads block with no
-  // timeout, so a retirement they cannot see would wait for an unrelated
-  // event. The push that observed an empty limbo opened the episode and
-  // wakes one sleeper; later retirements see a non-empty head and ride on
-  // that kick - by then a woken loop polls at the drain period, or the kick
-  // is still in flight (the backend doorbell is stateful: it outlives any
-  // interleaving with the sleeper's wait syscall). A retirement from one of
-  // the base's own loop threads skips the kick - the caller is awake and
-  // its next timerLoopPrepareSleep sees the non-empty limbo itself
-  if (!head && graceLoopBase != base)
-    base->methodImpl.wakeupLoop(base);
-}
-
-// Cold path: return a detached chain to the limbo stack (frozen discovered
-// after the detach). One CAS publishes the whole chain
-static void gracePushList(asyncBase *base, aioObjectRoot *first)
-{
-  aioObjectRoot *last = first;
-  while (last->GraceNext)
-    last = last->GraceNext;
-  aioObjectRoot *head;
-  do {
-    head = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed);
-    last->GraceNext = head;
-  } while (!__pointer_atomic_compare_and_swap((void *volatile*)&base->graceLimbo,
-                                               head,
-                                               first,
-                                               amoSeqCst));
-}
-
-// The pending batch is ripe when every slot active at its capture has either
-// ticked its counter past the captured value or exited (the UINTPTR_MAX
-// stamp differs from any captured live counter). Counters move only at
-// quiescent points, so an unchanged counter marks a thread that may still
-// hold a kernel batch copied before the retirements. Threads that claimed a
-// slot after the capture gate nothing: their first kernel wait started after
-// the batch's objects were already detached from the backend, so it cannot
-// return their events
-static int gracePendingRipe(asyncBase *base)
-{
-  for (unsigned i = 0; i < base->gracePendingSlots; i++) {
-    uintptr_t captured = base->gracePendingSeen[i];
-    if (captured == UINTPTR_MAX)
+  assert(!loopThreadSlotOwned && "one thread cannot nest asyncLoop invocations");
+  if (loopThreadSlotOwned)
+    return 0;
+  const unsigned wordBits = (unsigned)(sizeof(uintptr_t) * 8);
+  for (unsigned id = 0; id < base->loopThreadLimit; id++) {
+    unsigned word = id / wordBits;
+    assert(word < base->loopThreadSlotWords);
+    uintptr_t bit = (uintptr_t)1 << (id % wordBits);
+    // Loop entry is cold, but there is no reason to issue an RMW against
+    // every occupied bit. The relaxed prefilter may only cause a harmless
+    // extra attempt; the acquire RMW remains the actual claim.
+    if (__uintptr_atomic_load(&base->loopThreadSlots[word], amoRelaxed) & bit)
       continue;
-    if (__uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire) == captured)
-      return 0;
-  }
-  return 1;
-}
-
-// A batch blocked by a slot whose thread is parked in the kernel wait would
-// wait for an unrelated event - idle waits have no timeout. Wake one such
-// blocker per scan pass: the woken thread finds the non-empty pending at its
-// next timerLoopPrepareSleep, polls at the drain period and ticks its
-// counter, so the set of parked blockers shrinks and the episode converges
-// whichever sleeper the kernel hands each kick to (a kick consumed by a
-// non-blocker turns it into a poller whose own scan passes re-kick). Both
-// arrays are indexed by messageLoopThreadId, so slot i's sleep horizon is
-// timerSleep[i]. The horizon read is a liveness heuristic: a kick lost to a
-// racing wake costs one drain period, an extra kick one empty wakeup
-static void graceKickBlocker(asyncBase *base)
-{
-  if (!base->timerSleep)
-    return;
-  for (unsigned i = 0; i < base->gracePendingSlots; i++) {
-    uintptr_t captured = base->gracePendingSeen[i];
-    if (captured == UINTPTR_MAX)
-      continue;
-    if (__uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire) != captured)
-      continue;
-    if (__uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoAcquire) != UINTPTR_MAX) {
-      base->methodImpl.wakeupLoop(base);
-      return;
+    uintptr_t old = __uintptr_atomic_fetch_or(&base->loopThreadSlots[word],
+                                               bit,
+                                               amoAcquire);
+    if (!(old & bit)) {
+      messageLoopThreadId = id;
+      loopThreadSlotOwned = 1;
+      __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
+                                  1,
+                                  amoSeqCst);
+      return 1;
     }
   }
+
+  assert(0 && "asyncLoop concurrency exceeds createAsyncBase(loopThreads)");
+  return 0;
 }
 
-void graceReclaim(asyncBase *base)
+unsigned loopThreadExit(asyncBase *base)
 {
-  if (__uint_atomic_load(&base->graceFrozen, amoRelaxed))
-    return;
-  // Non-blocking single-scanner gate: the loser leaves instead of waiting, a
-  // preempted owner only delays memory, never producers. One scanner at a
-  // time keeps the pending batch single-owned, so its fields need no locks
-  if (!__uint_atomic_compare_and_swap(&base->graceScanning, 0, 1, amoSeqCst))
-    return;
+  assert(loopThreadSlotOwned && "asyncLoop exit without an owned loop slot");
+  const unsigned wordBits = (unsigned)(sizeof(uintptr_t) * 8);
+  unsigned id = messageLoopThreadId;
+  unsigned word = id / wordBits;
+  assert(id < base->loopThreadLimit && word < base->loopThreadSlotWords);
+  uintptr_t bit = (uintptr_t)1 << (id % wordBits);
 
-  for (;;) {
-    if (base->gracePending) {
-      if (!gracePendingRipe(base)) {
-        graceKickBlocker(base);
-        break;
-      }
-      // Authoritative frozen re-check before every free, mirroring the one
-      // after the exchange below: the relaxed gate at the top may run on a
-      // stale 0, and a freeze that became visible while the batch was
-      // parked here means quiescence bookkeeping is no longer trusted -
-      // park the batch forever (the frozen degradation) instead of acting
-      // on counters that may already be forged
-      if (__uint_atomic_load(&base->graceFrozen, amoSeqCst))
-        break;
-      aioObjectRoot *ripe = base->gracePending;
-      __pointer_atomic_store((void *volatile*)&base->gracePending, 0, amoRelaxed);
-      while (ripe) {
-        aioObjectRoot *next = ripe->GraceNext;
-        ripe->destructor(ripe);
-        ripe = next;
-      }
-    }
-
-    // The full-barrier exchange takes the whole visible stack and pairs with
-    // the producers' release CAS: destructor and GraceNext of every node are
-    // visible past this point
-    aioObjectRoot *batch = (aioObjectRoot*)__pointer_atomic_exchange((void *volatile*)&base->graceLimbo,
-                                                                     0,
-                                                                     amoSeqCst);
-    if (!batch)
-      break;
-
-    // Authoritative frozen check after the detach. An unslotted thread
-    // stores graceFrozen seq-cst before its first kernel wait; reading 0
-    // here linearizes this detach before that wait. Reading 1 means this
-    // batch may already be visible to an untracked thread - push it back
-    // and stop, the relaxed check above (and a repeated seq-cst read on a
-    // racing pass) keeps it parked forever
-    if (__uint_atomic_load(&base->graceFrozen, amoSeqCst)) {
-      gracePushList(base, batch);
-      break;
-    }
-
-    // Capture the quiescence counters of every slot claimed so far. The
-    // capture must follow the exchange: a claim (full-barrier CAS) precedes
-    // the thread's first kernel wait, a batch it harvested precedes the
-    // objects' backend detachment, which precedes the retirements and this
-    // exchange - so any thread whose buffers can reference this batch is
-    // visible to this scan, both in graceSlotCount and in its slot value
-    unsigned slots = __uint_atomic_load(&base->graceSlotCount, amoAcquire);
-    for (unsigned i = 0; i < slots; i++)
-      base->gracePendingSeen[i] = __uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire);
-    base->gracePendingSlots = slots;
-    __pointer_atomic_store((void *volatile*)&base->gracePending, batch, amoRelaxed);
-    // Loop: on the exit path every captured slot is already stamped out, the
-    // fresh batch is ripe immediately and the next pass drains it
-  }
-
-  __uint_atomic_store(&base->graceScanning, 0, amoRelease);
-}
-
-void graceThreadEnter(asyncBase *base)
-{
-  // A quit->restart cycle re-enters with the identity still set from the
-  // previous life (possibly another base); every branch below except a
-  // successful claim must leave both cleared
-  graceSlotOwned = 0;
-  graceLoopBase = 0;
-
-  // Freezing reclamation is the memory-safe degradation for thread
-  // configurations the slots cannot describe: dead objects then stay in
-  // the limbo for the rest of the base's life. The store must be seq-cst
-  // and precede this thread's first kernel wait: graceReclaim's
-  // authoritative check after a detach reads the flag seq-cst, and reading
-  // 0 there must linearize the detach before this thread's first batch
-  if (messageLoopThreadId >= base->graceSlotLimit) {
-    __uint_atomic_store(&base->graceFrozen, 1, amoSeqCst);
-    return;
-  }
-
-  // Claim the slot for this thread's lifetime in the loop; the quiescence
-  // counter starts at zero, UINTPTR_MAX marks a free slot. A failed claim
-  // means the id was adopted while its previous holder is still inside the
-  // message loop (a loop thread started while others were shutting down):
-  // two threads sharing a slot could mask each other's batches, so
-  // reclamation shuts down. A cleanly exited holder leaves UINTPTR_MAX
-  // behind - plain quit-then-restart cycles and mid-run loop thread
-  // additions claim successfully. The claim must happen right at entry: a
-  // check without a reservation would leave a window between the id
-  // assignment and the first tick where the same id handed out again goes
-  // undetected. The full-barrier CAS also orders the claim before the
-  // thread's first kernel wait - the batch capture in graceReclaim relies
-  // on that to never miss a thread whose buffers could hold its objects
-  if (!__uintptr_atomic_compare_and_swap(&base->graceSeen[messageLoopThreadId].seen,
-                                         UINTPTR_MAX,
-                                         0,
-                                         amoSeqCst)) {
-    __uint_atomic_store(&base->graceFrozen, 1, amoSeqCst);  // see the seq-cst note above
-    return;
-  }
-  graceSlotOwned = 1;
-  graceLoopBase = base;
-
-  // High-water mark of claimed slots bounds the reclaim scan, so the slot
-  // array can afford a generous limit. The claim above and this bump are
-  // both ordered before the thread's first kernel wait
-  unsigned needed = messageLoopThreadId + 1;
-  unsigned current = __uint_atomic_load(&base->graceSlotCount, amoRelaxed);
-  while (current < needed &&
-         !__uint_atomic_compare_and_swap(&base->graceSlotCount,
-                                         current,
-                                         needed,
-                                         amoSeqCst))
-    current = __uint_atomic_load(&base->graceSlotCount, amoRelaxed);
-}
-
-void graceQuiesce(asyncBase *base)
-{
-  // Only the thread that actually claimed the slot may tick it (the claim
-  // implies messageLoopThreadId < graceSlotLimit). A thread whose claim
-  // failed froze reclamation, but the freeze takes a moment to reach a
-  // scanner holding a captured batch - a tick from the loser meanwhile is
-  // indistinguishable from the live owner's quiescence and ripens batches
-  // whose objects the owner may still reference
-  if (!graceSlotOwned)
-    return;
-
-  // With nothing parked anywhere a tick has no reader, so the whole
-  // quiescent point reduces to two relaxed loads and a branch. Skipping the
-  // tick can only delay reclamation, never unblock it: freeing requires the
-  // counter to move past the captured value, and an unticked counter stays
-  // put. A retire racing with these loads just waits for the next wakeup
-  if (!__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed) &&
-      !__pointer_atomic_load((void *volatile*)&base->gracePending, amoRelaxed))
-    return;
-
-  // Single-writer counter: only this thread advances its slot, so a plain
-  // read of the previous value is fine. The release store publishes all
-  // processing of the preceding kernel batch to the scanner's acquire load.
-  // UINTPTR_MAX is the free/exited sentinel, step over it on wrap
-  GraceSlot *slot = &base->graceSeen[messageLoopThreadId];
-  uintptr_t next = slot->seen + 1;
-  if (next == UINTPTR_MAX)
-    next = 0;
-  __uintptr_atomic_store(&slot->seen, next, amoRelease);
-  graceReclaim(base);
-}
-
-void graceThreadExit(asyncBase *base)
-{
-  // Stamp the slot out with the free/exited sentinel; the release store
-  // publishes all processing of the thread's final kernel batches to the
-  // scanner's acquire load. Only the claim's owner stamps: an exiting
-  // thread that failed its claim would mark the live owner exited,
-  // removing its batches from the grace gate entirely. The caller must
-  // not have dropped the loop thread counter yet: once it does, a future
-  // loop thread may adopt this id, and a stale live stamp would shield
-  // its batches from the grace period. The last thread out drains the
-  // limbo: with every slot stamped, a captured batch is immediately ripe
-  if (graceSlotOwned) {
-    __uintptr_atomic_store(&base->graceSeen[messageLoopThreadId].seen,
-                           UINTPTR_MAX,
-                           amoRelease);
-    graceSlotOwned = 0;
-    graceLoopBase = 0;
-  }
-  graceReclaim(base);
+  // Publish awake before making the index reusable. The active counter drops
+  // while the bit is still owned, so a new entrant cannot be included in the
+  // returned quit-propagation count by racing reuse of this exact slot.
+  __uintptr_atomic_store(&base->timerSleep[id].wakeTick,
+                         UINTPTR_MAX,
+                         amoRelaxed);
+  unsigned remaining =
+    __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
+                                (unsigned)-1,
+                                amoSeqCst) - 1;
+  __uintptr_atomic_fetch_and(&base->loopThreadSlots[word],
+                             ~bit,
+                             amoRelease);
+  loopThreadSlotOwned = 0;
+  return remaining;
 }
 
 static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
@@ -1043,6 +887,10 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
     cancelInitializationOp(object, aosCanceled);
     cancelOperationList(&object->readQueue, aosCanceled);
     cancelOperationList(&object->writeQueue, aosCanceled);
+    // Ownership serializes the only writer. Generation is an identity token,
+    // not a publication channel, so a relaxed load/store avoids a locked RMW.
+    uintptr_t generation = __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
+    __uintptr_atomic_store(&object->Head.gen, generation + 1, amoRelaxed);
     if (object->destructorCb)
       object->destructorCb(object, object->destructorCbArg);
     object->destructor(object);
@@ -1068,7 +916,7 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
 
   for (;;) {
     AsyncOpTaggedPtr currentHead;
-    while ( (currentHead.data = __uintptr_atomic_load(&object->Head.data, amoAcquire)) == stackTop.data ) {
+    while ( (currentHead.data = __uintptr_atomic_load(&object->Head.data, amoRelaxed)) == stackTop.data ) {
       // A dying object is swept once more at every ownership-release point:
       // this is the only position that is guaranteed to come after every
       // action of the captured chains, so a submission that slipped past the
@@ -1090,7 +938,9 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
                                               currentHead.data,
                                               stackTop.data,
                                               amoSeqCst))
-      currentHead.data = __uintptr_atomic_load(&object->Head.data, amoAcquire);
+      // Still only a CAS expected. The successful capture CAS above acquires
+      // the chain before the first next-pointer is read.
+      currentHead.data = __uintptr_atomic_load(&object->Head.data, amoRelaxed);
 
     // The captured chain is linked newest to oldest (each push points to the
     // previous head); running it as is would invert single-thread submission

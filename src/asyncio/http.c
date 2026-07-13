@@ -285,15 +285,24 @@ static void httpClientDestructor(aioObjectRoot *root)
     sslSocketDelete(client->sslSocket);
   else
     deleteAioObject(client->plainSocket);
-  concurrentQueuePush(&objectPool, client);
+  objectFree(&objectPool, client, sizeof(HTTPClient));
 }
 
 HTTPClient *httpClientNew(asyncBase *base, aioObject *socket)
 {
-  HTTPClient *client = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&client)) {
-    client = (HTTPClient*)malloc(sizeof(HTTPClient));
+  if (!socket)
+    return 0;
+  HTTPClient *client = (HTTPClient*)objectAlloc(&objectPool,
+                                                sizeof(HTTPClient),
+                                                16);
+  if (!client)
+    return 0;
+  if (!client->inBuffer) {
     client->inBuffer = (uint8_t*)malloc(65536);
+    if (!client->inBuffer) {
+      objectFree(&objectPool, client, sizeof(HTTPClient));
+      return 0;
+    }
     client->inBufferSize = 65536;
   }
 
@@ -308,10 +317,19 @@ HTTPClient *httpClientNew(asyncBase *base, aioObject *socket)
 
 HTTPClient *httpsClientNew(asyncBase *base, SSLSocket *socket)
 {
-  HTTPClient *client = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&client)) {
-    client = (HTTPClient*)malloc(sizeof(HTTPClient));
+  if (!socket)
+    return 0;
+  HTTPClient *client = (HTTPClient*)objectAlloc(&objectPool,
+                                                sizeof(HTTPClient),
+                                                16);
+  if (!client)
+    return 0;
+  if (!client->inBuffer) {
     client->inBuffer = (uint8_t*)malloc(65536);
+    if (!client->inBuffer) {
+      objectFree(&objectPool, client, sizeof(HTTPClient));
+      return 0;
+    }
     client->inBufferSize = 65536;
   }
 

@@ -276,7 +276,7 @@ void sslSocketDestructor(aioObjectRoot *root)
   SSL_free(socket->ssl);
   SSL_CTX_free(socket->sslContext);
   deleteAioObject(socket->object);
-  concurrentQueuePush(&objectPool, socket);
+  objectFree(&objectPool, socket, sizeof(SSLSocket));
 }
 
 
@@ -287,13 +287,21 @@ SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket)
   if (!socket)
     return 0;
 
-  SSLSocket *S = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&S)) {
-    S = (SSLSocket*)malloc(sizeof(SSLSocket));
+  SSLSocket *S = (SSLSocket*)objectAlloc(&objectPool, sizeof(SSLSocket), 16);
+  if (!S)
+    return 0;
+  if (!S->sslReadBuffer) {
     S->sslReadBufferSize = DEFAULT_SSL_READ_BUFFER_SIZE;
     S->sslReadBuffer = (uint8_t*)malloc(S->sslReadBufferSize);
     S->sslWriteBufferSize = DEFAULT_SSL_READ_BUFFER_SIZE;
-    S->sslWriteBuffer = (uint8_t*)malloc(S->sslReadBufferSize);
+    S->sslWriteBuffer = (uint8_t*)malloc(S->sslWriteBufferSize);
+    if (!S->sslReadBuffer || !S->sslWriteBuffer) {
+      free(S->sslReadBuffer);
+      free(S->sslWriteBuffer);
+      S->sslReadBuffer = S->sslWriteBuffer = 0;
+      objectFree(&objectPool, S, sizeof(SSLSocket));
+      return 0;
+    }
   }
 
 #ifdef DEPRECATEDIN_1_1_0
@@ -301,10 +309,23 @@ SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket)
 #else
   S->sslContext = SSL_CTX_new (TLS_method());
 #endif
+  if (!S->sslContext) {
+    objectFree(&objectPool, S, sizeof(SSLSocket));
+    return 0;
+  }
   SSL_CTX_set_verify(S->sslContext, SSL_VERIFY_NONE, NULL);
   S->ssl = SSL_new(S->sslContext);
   S->bioIn = BIO_new(BIO_s_mem());
   S->bioOut = BIO_new(BIO_s_mem());
+  if (!S->ssl || !S->bioIn || !S->bioOut) {
+    if (S->ssl)
+      SSL_free(S->ssl);
+    BIO_free(S->bioIn);
+    BIO_free(S->bioOut);
+    SSL_CTX_free(S->sslContext);
+    objectFree(&objectPool, S, sizeof(SSLSocket));
+    return 0;
+  }
   SSL_set_bio(S->ssl, S->bioIn, S->bioOut);
 
   initObjectRoot(&S->root, base, ioObjectUserDefined, sslSocketDestructor);

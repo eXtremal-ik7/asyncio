@@ -217,10 +217,12 @@ TEST(core_user_event, stale_timer_generation_cannot_touch_restarted_schedule)
 
   userEventStartTimer(event, 100, 2);
   uintptr_t firstGeneration = backend.lastEventTimerGeneration;
+  uintptr_t incarnation =
+    __uintptr_atomic_load(&event->incarnation, amoRelaxed);
   ASSERT_NE(firstGeneration, 0u);
   EXPECT_EQ(backend.startTimerCalls, 1u);
 
-  eventTimerSignalTick(event, firstGeneration);
+  eventTimerSignalTick(event, firstGeneration, incarnation);
   backend.drainCompletions();
   EXPECT_EQ(context.finishes, 1u);
   EXPECT_EQ(backend.rearmTimerCalls, 1u);
@@ -234,11 +236,11 @@ TEST(core_user_event, stale_timer_generation_cannot_touch_restarted_schedule)
   // The bucket generation changed before backend restart. Even a kernel
   // delivery which had already copied the old event pointer cannot enqueue a
   // control pass or spend the new counter.
-  eventTimerSignalTick(event, firstGeneration);
+  eventTimerSignalTick(event, firstGeneration, incarnation);
   backend.drainCompletions();
   EXPECT_EQ(context.finishes, 1u);
 
-  eventTimerSignalTick(event, secondGeneration);
+  eventTimerSignalTick(event, secondGeneration, incarnation);
   backend.drainCompletions();
   EXPECT_EQ(context.finishes, 2u);
   EXPECT_EQ(backend.stopTimerCalls, 2u); // finite counter exhausted
@@ -247,7 +249,48 @@ TEST(core_user_event, stale_timer_generation_cannot_touch_restarted_schedule)
   EXPECT_EQ(context.destructors, 1u);
 }
 
-// A POSIX harvested timer envelope may still hold physically grace-protected
+TEST(core_user_event, epoll_probe_requires_confirmation_and_rearms_oneshot)
+{
+  TestBackend backend;
+  EventContext context;
+  aioUserEvent *event =
+    newUserEvent(&backend.base, 1, coreEventCallback, &context);
+  ASSERT_NE(event, nullptr);
+
+  unsigned consumeCalls = 0;
+  backend.eventTimerHook = [&](aioUserEvent*,
+                               EventTimerUpdate update,
+                               uintptr_t,
+                               uint64_t) {
+    if (update != etuConsume)
+      return 1;
+    // First probe models EAGAIN from an old envelope; the second models the
+    // current timerfd being readable. Only the latter is a timer tick.
+    return ++consumeCalls == 1 ? 1 : 2;
+  };
+
+  userEventStartTimer(event, 100, 2);
+  uintptr_t generation = backend.lastEventTimerGeneration;
+  uintptr_t incarnation =
+    __uintptr_atomic_load(&event->incarnation, amoRelaxed);
+
+  eventTimerSignalProbe(event, generation, incarnation);
+  backend.drainCompletions();
+  EXPECT_EQ(consumeCalls, 1u);
+  EXPECT_EQ(context.finishes, 0u);
+  EXPECT_EQ(backend.rearmTimerCalls, 1u)
+    << "even a stale probe consumed the EPOLLONESHOT registration";
+
+  eventTimerSignalProbe(event, generation, incarnation);
+  backend.drainCompletions();
+  EXPECT_EQ(consumeCalls, 2u);
+  EXPECT_EQ(context.finishes, 1u);
+  EXPECT_EQ(backend.rearmTimerCalls, 2u);
+
+  deleteUserEvent(event);
+}
+
+// A POSIX harvested timer envelope may still hold its permanently paired
 // timer/event storage after stop released the last logical reference. Signal
 // publication must fail instead of retaining 0 -> 1 and queuing a second
 // terminal control pass.
@@ -259,14 +302,61 @@ TEST(core_user_event, retired_timer_signal_cannot_resurrect_zero_ref_event)
   event.root.objectPool = &backend.operationPool;
   event.root.opCode = actUserEvent;
   event.tag = TAG_EVENT_DELETE;
-  event.timerSignals.high = 42;
+  __uintptr_atomic_store(
+    reinterpret_cast<volatile uintptr_t*>(&event.timerSignals.high),
+    42,
+    amoRelaxed);
+  event.incarnation = 1;
 
-  eventTimerSignalTick(&event, 42);
+  eventTimerSignalTick(&event, 42, 1);
 
   EXPECT_EQ(event.tag, TAG_EVENT_DELETE);
-  EXPECT_EQ(event.timerSignals.low, 0u);
+  EXPECT_EQ(__uintptr_atomic_load(
+              reinterpret_cast<volatile uintptr_t*>(&event.timerSignals.low),
+              amoRelaxed),
+            0u);
   EXPECT_EQ(event.timerControlState, 0u);
   EXPECT_TRUE(backend.completions.empty());
+}
+
+TEST(core_user_event, stale_timer_incarnation_cannot_claim_recycled_event)
+{
+  TestBackend backend;
+  EventContext firstContext;
+  aioUserEvent *first =
+    newUserEvent(&backend.base, 1, coreEventCallback, &firstContext);
+  ASSERT_NE(first, nullptr);
+
+  userEventStartTimer(first, 100, 1);
+  uintptr_t firstIncarnation =
+    __uintptr_atomic_load(&first->incarnation, amoRelaxed);
+  uintptr_t firstGeneration = backend.lastEventTimerGeneration;
+  void *pairedTimer = first->root.timerId;
+  deleteUserEvent(first);
+
+  EventContext secondContext;
+  aioUserEvent *second =
+    newUserEvent(&backend.base, 1, coreEventCallback, &secondContext);
+  ASSERT_EQ(second, first);
+  EXPECT_EQ(second->root.timerId, pairedTimer);
+  uintptr_t secondIncarnation =
+    __uintptr_atomic_load(&second->incarnation, amoRelaxed);
+  EXPECT_EQ(secondIncarnation, firstIncarnation + 1);
+
+  userEventStartTimer(second, 100, 1);
+  uintptr_t secondGeneration = backend.lastEventTimerGeneration;
+  EXPECT_GT(secondGeneration, firstGeneration);
+
+  // Model a stale kernel envelope whose generation happens to match the live
+  // bucket but whose arm belonged to the previous logical event.
+  eventTimerSignalTick(second, secondGeneration, firstIncarnation);
+  backend.drainCompletions();
+  EXPECT_EQ(secondContext.finishes, 0u);
+
+  eventTimerSignalTick(second, secondGeneration, secondIncarnation);
+  backend.drainCompletions();
+  EXPECT_EQ(secondContext.finishes, 1u);
+  deleteUserEvent(second);
 }
 
 TEST(core_user_event, delete_reconciles_a_start_already_inside_backend_arm)
@@ -1410,8 +1500,9 @@ TEST(event, manual_delivery_releases_reference_and_delete_recycles)
   void *recycled = nullptr;
   EXPECT_TRUE(concurrentQueuePop(&backend.operationPool, &recycled))
     << "event storage never returns to the pool";
-  if (recycled)
+  if (recycled) {
     EXPECT_EQ(recycled, static_cast<void*>(&event));
+  }
 }
 
 // Activation must be rejected once deletion has begun while the caller's

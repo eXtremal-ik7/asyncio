@@ -285,6 +285,15 @@ int main(int argc, char **argv)
   timerWheelInit(sweepBase.get(), 0);
   size_t opCount = static_cast<size_t>(threads) * itemsPerThread;
   std::unique_ptr<asyncOpRoot[]> ops(new asyncOpRoot[opCount]{});
+  // addToTimeoutQueue now captures the operation owner's generation for a
+  // later validated cancel. These stress operations deliberately become stale
+  // before delivery, but they still need a valid owner while they are armed.
+  // One immutable shell is sufficient: opSetStatus loses on every detached
+  // link, so no combiner signal is ever pushed to it.
+  aioObjectRoot sweepOwner{};
+  __uintptr_atomic_store(&sweepOwner.Head.gen, 1, amoRelaxed);
+  for (size_t i = 0; i < opCount; ++i)
+    ops[i].object = &sweepOwner;
   std::atomic<uint64_t> cursorViolations{0};
 
   for (unsigned threadIdx = 0; threadIdx < threads; ++threadIdx) {

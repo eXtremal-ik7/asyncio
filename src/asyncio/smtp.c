@@ -487,7 +487,7 @@ static void smtpClientDestructor(aioObjectRoot *root)
   else
     deleteAioObject(client->PlainSocket);
 
-  concurrentQueuePush(&objectPool, client);
+  objectFree(&objectPool, client, sizeof(SMTPClient));
 }
 
 SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerType type)
@@ -500,9 +500,12 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
     return 0;
   }
 
-  SMTPClient *client = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&client)) {
-    client = (SMTPClient*)malloc(sizeof(SMTPClient));
+  SMTPClient *client = (SMTPClient*)objectAlloc(&objectPool,
+                                                sizeof(SMTPClient),
+                                                16);
+  if (!client) {
+    socketClose(socket);
+    return 0;
   }
 
   initObjectRoot(&client->root, base, ioObjectUserDefined, smtpClientDestructor);
@@ -511,10 +514,26 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
   client->ptr = client->buffer;
   client->end = client->buffer;
   client->Response = 0;
-  if (type == smtpServerPlain)
+  if (type == smtpServerPlain) {
     client->PlainSocket = newSocketIo(base, socket);
-  else if (type == smtpServerSmtps)
-    client->TlsSocket = sslSocketNew(base, newSocketIo(base, socket));
+    if (!client->PlainSocket) {
+      socketClose(socket);
+      objectFree(&objectPool, client, sizeof(SMTPClient));
+      return 0;
+    }
+  } else if (type == smtpServerSmtps) {
+    aioObject *plain = newSocketIo(base, socket);
+    if (plain)
+      client->TlsSocket = sslSocketNew(base, plain);
+    if (!client->TlsSocket) {
+      if (plain)
+        deleteAioObject(plain);
+      else
+        socketClose(socket);
+      objectFree(&objectPool, client, sizeof(SMTPClient));
+      return 0;
+    }
+  }
 
   return client;
 }

@@ -293,7 +293,11 @@ int main(int argc, char **argv)
           fprintf(stderr,
                   "  sock %p: refs=%" PRIuPTR " head=%" PRIxPTR " readQ=%p writeQ=%p"
                   " cancelIoFlag=%u deletePending=%u initialization=%" PRIxPTR " missing=%u\n",
-                  (void*)o, o->refs, o->Head.data, (void*)o->readQueue.head, (void*)o->writeQueue.head,
+                  (void*)o,
+                  o->refs,
+                  __uintptr_atomic_load(&o->Head.data, amoRelaxed),
+                  (void*)o->readQueue.head,
+                  (void*)o->writeQueue.head,
                   o->CancelIoFlag, o->DeletePending, o->initializationOp,
                   ctx.expected.load() - ctx.callbacks.load());
           if (++dumped == 16)

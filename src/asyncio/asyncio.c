@@ -180,6 +180,22 @@ void initializeAsyncIo(AsyncInitFlags flags)
 
 asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
 {
+  unsigned loopThreadLimit = loopThreads ? loopThreads : 1;
+  const size_t wordBits = sizeof(uintptr_t) * 8;
+  size_t loopThreadSlotWords =
+    ((size_t)loopThreadLimit + wordBits - 1) / wordBits;
+  TimerSleepSlot *timerSleep =
+    (TimerSleepSlot*)alignedMalloc(sizeof(TimerSleepSlot) *
+                                     (size_t)loopThreadLimit,
+                                   CACHE_LINE_SIZE);
+  uintptr_t *loopThreadSlots =
+    (uintptr_t*)calloc(loopThreadSlotWords, sizeof(uintptr_t));
+  if (!timerSleep || !loopThreadSlots) {
+    alignedFree(timerSleep);
+    free(loopThreadSlots);
+    return 0;
+  }
+
   asyncBase *base = 0;
   switch (method) {
 #if defined(OS_WINDOWS)
@@ -209,8 +225,11 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
       break;
   }
 
-  if (!base)
+  if (!base) {
+    alignedFree(timerSleep);
+    free(loopThreadSlots);
     return 0;
+  }
 
 #ifndef NDEBUG
   base->opsCount = 0;
@@ -219,20 +238,13 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   memset(&base->globalQueue, 0, sizeof(base->globalQueue));
   memset(&base->eventPool, 0, sizeof(base->eventPool));
   base->messageLoopThreadCounter = 0;
-  base->graceFrozen = 0;
-  base->graceSlotCount = 0;
-  base->graceSlotLimit = loopThreads ? loopThreads : 1;
-  base->graceScanning = 0;
-  base->graceLimbo = 0;
-  base->gracePending = 0;
-  base->gracePendingSlots = 0;
-  base->gracePendingSeen = (uintptr_t*)malloc(sizeof(uintptr_t) * base->graceSlotLimit);
-  base->graceSeen = (GraceSlot*)alignedMalloc(sizeof(GraceSlot) * base->graceSlotLimit, CACHE_LINE_SIZE);
-  base->timerSleep = (TimerSleepSlot*)alignedMalloc(sizeof(TimerSleepSlot) * base->graceSlotLimit, CACHE_LINE_SIZE);
-  for (unsigned i = 0; i < base->graceSlotLimit; i++) {
-    base->graceSeen[i].seen = UINTPTR_MAX;   // empty slots never gate the limbo
-    base->timerSleep[i].wakeTick = UINTPTR_MAX;  // nobody sleeps yet, kicks not needed
-  }
+  base->staleHandleDrops = 0;
+  base->timerSleep = timerSleep;
+  base->loopThreadSlots = loopThreadSlots;
+  base->loopThreadSlotWords = (unsigned)loopThreadSlotWords;
+  base->loopThreadLimit = loopThreadLimit;
+  for (unsigned i = 0; i < loopThreadLimit; i++)
+    base->timerSleep[i].wakeTick = UINTPTR_MAX;
   return base;
 }
 
@@ -300,7 +312,10 @@ static uintptr_t eventTimerPublishConfig(aioUserEvent *event,
     return 0;
   }
   // epoll stores (generation << 1) | armed in its publication word.
-  assert(old <= (UINTPTR_MAX >> 1) - 2 && "User-event timer generation exhausted");
+  if (old > (UINTPTR_MAX >> 1) - 2) {
+    assert(0 && "User-event timer generation exhausted");
+    return 0;
+  }
   // There is exactly one application-side writer by contract. Atomic stores
   // are needed for the concurrent applier reader, but writer arbitration is
   // not library work and must not add another locked RMW to every Start/Stop.
@@ -361,14 +376,21 @@ static void eventTimerSchedule(aioUserEvent *event, int enqueueOnly)
   eventTimerScheduleImpl(event, enqueueOnly, 0);
 }
 
-// A decoded POSIX timer pointer is protected physically by the timer's grace
-// period, but stop may release the last logical arm reference while this loop
-// thread is between generation validation and mailbox publication. Increment
-// only a nonzero refcount: a fetch-add followed by rollback would transiently
-// resurrect zero, allowing another stale publisher to mistake that temporary
-// reference for live ownership and finalize the event twice.
-static int eventTimerTryClaimPublisherReference(aioUserEvent *event)
+// The timer cell stays paired with this storage forever, so a stale kernel
+// envelope can safely read tag/incarnation even after the event was recycled.
+// It may claim only the incarnation carried by its arming and only while that
+// incarnation has a nonzero refcount. The acquire CAS observes the new
+// incarnation's final release-store tag=1; the post-CAS check closes the race
+// where recycle happened between the cheap incarnation prefilter and claim.
+// A fetch-add followed by rollback is not equivalent: it would transiently
+// resurrect a zero refcount and let two stale publishers finalize twice.
+static int eventTimerTryClaimPublisherReference(aioUserEvent *event,
+                                                uintptr_t incarnation)
 {
+  if (incarnation == 0 ||
+      __uintptr_atomic_load(&event->incarnation, amoRelaxed) != incarnation)
+    return 0;
+
   uintptr_t old = __uintptr_atomic_load(&event->tag, amoRelaxed);
   for (;;) {
     uintptr_t refs = old & TAG_EVENT_REF_MASK;
@@ -379,20 +401,28 @@ static int eventTimerTryClaimPublisherReference(aioUserEvent *event)
     if (__uintptr_atomic_compare_exchange(&event->tag,
                                            &old,
                                            desired,
-                                           amoRelaxed))
-      return 1;
+                                           amoAcquire)) {
+      if (__uintptr_atomic_load(&event->incarnation, amoRelaxed) == incarnation)
+        return 1;
+      // This is a real reference to the newer incarnation (the successful
+      // acquire saw its tag publication), so the general release path is the
+      // correct rollback and may legally be final.
+      eventDecrementReference(event, 1);
+      return 0;
+    }
   }
 }
 
 static int eventTimerPublishGenerationSignal(aioUserEvent *event,
                                              uintptr_t generation,
+                                             uintptr_t incarnation,
                                              int probe)
 {
   volatile uint128Pair *bucket = &event->timerSignals;
   uint128Pair expected = __uint128_atomic_load_relaxed(bucket);
   if (generation == 0 || expected.high != (uint64_t)generation)
     return 0;
-  if (!eventTimerTryClaimPublisherReference(event))
+  if (!eventTimerTryClaimPublisherReference(event, incarnation))
     return 0;
 
   for (;;) {
@@ -419,19 +449,25 @@ static int eventTimerPublishGenerationSignal(aioUserEvent *event,
   }
 }
 
-void eventTimerSignalTick(aioUserEvent *event, uintptr_t generation)
+void eventTimerSignalTick(aioUserEvent *event,
+                          uintptr_t generation,
+                          uintptr_t incarnation)
 {
-  eventTimerPublishGenerationSignal(event, generation, 0);
+  eventTimerPublishGenerationSignal(event, generation, incarnation, 0);
 }
 
-void eventTimerSignalProbe(aioUserEvent *event, uintptr_t generation)
+void eventTimerSignalProbe(aioUserEvent *event,
+                           uintptr_t generation,
+                           uintptr_t incarnation)
 {
-  eventTimerPublishGenerationSignal(event, generation, 1);
+  eventTimerPublishGenerationSignal(event, generation, incarnation, 1);
 }
 
 static void eventCoroutineDeliver(aioUserEvent *event)
 {
-  uint128Pair expected = __uint128_atomic_load(&event->waiter);
+  // Expected is not dereferenced before the successful DWCAS acquires the
+  // waiter publication.
+  uint128Pair expected = __uint128_atomic_load_relaxed(&event->waiter);
   for (;;) {
     uint128Pair desired;
     if (expected.low) {
@@ -476,7 +512,7 @@ static int eventTryConsumeCredit(aioUserEvent *event)
 {
   if (eventReferenceIsDeleting(event))
     return 1;
-  uint128Pair expected = __uint128_atomic_load(&event->waiter);
+  uint128Pair expected = __uint128_atomic_load_relaxed(&event->waiter);
   for (;;) {
     assert(expected.low == 0 && "Only one coroutine may wait on a user event");
     if (expected.high == 0)
@@ -496,7 +532,7 @@ static int eventInstallWaiter(aioUserEvent *event, uintptr_t sleepGeneration)
   // delivery/delete path that removes its pointer. This also covers the
   // activate-before-yield handshake implemented by coroutineCall/Yield.
   eventIncrementReference(event, 1);
-  uint128Pair expected = __uint128_atomic_load(&event->waiter);
+  uint128Pair expected = __uint128_atomic_load_relaxed(&event->waiter);
   for (;;) {
     if (eventReferenceIsDeleting(event)) {
       eventReferenceDropNonFinal(event, 1);
@@ -655,22 +691,26 @@ static void eventTimerProcessImpl(aioUserEvent *event, int releaseControlReferen
                 __uintptr_atomic_load(&event->timerConfigSequence, amoAcquire) !=
                   event->timerAppliedGeneration)
               break;
-            if (eventReferenceTryActivate(event)) {
+            // A non-semaphore rejection means one delivery is already
+            // pending, so every remaining tick in this detached batch would
+            // coalesce into it. A semaphore rejection is possible only after
+            // delete. Either way, walking the rest cannot accept anything.
+            if (!eventReferenceTryActivate(event))
+              break;
 #ifdef OS_WINDOWS
-              if (!event->base->methodImpl.activate(event)) {
-                eventReferenceDeactivate(event);
-                eventReferenceDropNonFinal(event, 1);
-                break;
-              }
-#else
-              // Reactor enqueue is an infallible void publication. Keeping
-              // IOCP's rollback branch out of this build removes a branch
-              // after every POSIX timer activation.
-              event->base->methodImpl.activate(event);
-#endif
-              if (event->timerRemaining > 0 && --event->timerRemaining == 0)
-                break;
+            if (!event->base->methodImpl.activate(event)) {
+              eventReferenceDeactivate(event);
+              eventReferenceDropNonFinal(event, 1);
+              break;
             }
+#else
+            // Reactor enqueue is an infallible void publication. Keeping
+            // IOCP's rollback branch out of this build removes a branch
+            // after every POSIX timer activation.
+            event->base->methodImpl.activate(event);
+#endif
+            if (event->timerRemaining > 0 && --event->timerRemaining == 0)
+              break;
           }
 
         }
@@ -718,21 +758,57 @@ void eventTimerProcess(aioUserEvent *event)
 aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback, void *arg)
 {
   aioUserEvent *event = 0;
-  asyncOpAlloc(base, sizeof(aioUserEvent), 0, &base->eventPool, 0, (asyncOpRoot**)&event);
-  // releaseUserEvent returns a slot only after its timer grace/rendezvous and
-  // every logical reference have completed, so the whole opaque object can be
-  // initialized in one contiguous clear. This is both the complete reuse
-  // contract and fewer stores than clearing root then every extension field.
-  memset(event, 0, sizeof(*event));
+  int fresh = asyncOpAlloc(base,
+                           sizeof(aioUserEvent),
+                           0,
+                           &base->eventPool,
+                           0,
+                           (asyncOpRoot**)&event);
+  if (!event)
+    return 0;
+
+  // A stale POSIX timer envelope may inspect incarnation, tag and
+  // timerSignals while this slot is being reused. Keep the timer paired with
+  // the slot, preserve both monotonic identities, and initialize only those
+  // shared fields atomically. waiter has no kernel reader and is unreachable
+  // without a live reference, so ordinary stores are sufficient for it.
+  void *timerId = event->root.timerId;
+  memset(&event->root, 0, sizeof(event->root));
   event->root.opCode = actUserEvent;
   event->root.finishMethod = eventFinish;
   event->root.callback = (void*)callback;
   event->root.arg = arg;
   event->root.objectPool = &base->eventPool;
   event->root.running = arWaiting;
+  event->root.timerId = timerId;
   event->base = base;
   event->isSemaphore = isSemaphore;
-  __uintptr_atomic_store(&event->tag, 1, amoRelaxed);
+  __uintptr_atomic_store((volatile uintptr_t*)&event->timerSignals.low,
+                         0,
+                         amoRelaxed);
+  __uintptr_atomic_store((volatile uintptr_t*)&event->timerSignals.high,
+                         0,
+                         amoRelaxed);
+  event->waiter.low = 0;
+  event->waiter.high = 0;
+  __uint_atomic_store(&event->timerControlState, 0, amoRelaxed);
+  event->timerRemaining = 0;
+  event->timerState = 0;
+  event->destructorCb = 0;
+  event->destructorCbArg = 0;
+  if (fresh)
+    __uintptr_atomic_store(&event->timerConfigSequence, 0, amoRelaxed);
+  __uintptr_atomic_store(&event->timerConfigPeriod, 0, amoRelaxed);
+  event->timerAppliedGeneration = 0;
+  event->timerAppliedPeriod = 0;
+  __uint_atomic_store(&event->timerConfigCounter, 0, amoRelaxed);
+  if (fresh)
+    __uintptr_atomic_store(&event->incarnation, 1, amoRelaxed);
+
+  // Publish every field above and the incarnation bump performed by the
+  // preceding final release. Kernel claims acquire this word before accepting
+  // an incarnation, so it must be the last initialization store.
+  __uintptr_atomic_store(&event->tag, 1, amoRelease);
   return event;
 }
 
@@ -747,6 +823,8 @@ aioObject *newSocketIo(asyncBase *base, socketTy hSocket)
   setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
 #endif
   aioObject *object = base->methodImpl.newAioObject(base, ioObjectSocket, &hSocket);
+  if (!object)
+    return 0;
   object->needSigpipeGuard = 0;
   return object;
 }
@@ -770,6 +848,8 @@ aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice)
 #endif
 #endif
   aioObject *object = base->methodImpl.newAioObject(base, ioObjectDevice, &hDevice);
+  if (!object)
+    return 0;
   object->needSigpipeGuard = needGuard;
   return object;
 }

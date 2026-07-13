@@ -4,17 +4,24 @@
 #include "asyncio/asyncioTypes.h"
 #include "macro.h"
 
-// 128-bit atomic pair for DWCAS-based protocols (timer wheel slots).
+// 128-bit atomic pair for DWCAS-based protocols (timer-wheel slots, object
+// generation heads and user-event mailboxes).
 // Hardware contract: x86-64 with cmpxchg16b (-mcx16 outside MSVC), 64-bit
 // ARMv8 (casp on LSE, ldxp/stxp otherwise); 32-bit targets are not supported.
 // The pair changes ONLY through compare-and-swap — there is no atomic wide
 // store, and the load is deliberately not a full-width snapshot.
 //
-// The default operations are full-barrier (seq_cst) equivalents. Explicit
-// relaxed variants are provided only for protocols that publish no payload
-// through the pair itself (the user-event timer signal bucket); on compilers
-// without a proven inline ordered DWCAS they deliberately fall back to the
-// stronger default operation.
+// The default operations are full-barrier (seq_cst) equivalents, and that is
+// deliberate: on every supported target the strongest CAS ordering costs the
+// same instruction as the weakest sound one - x86-64 has a single encoding,
+// lock cmpxchg16b, for every ordering; ARMv8 LSE lowers seq-cst and acq-rel
+// CAS alike to caspal (LL/SC targets to a ldaxp/stlxp loop) - with no
+// separate fence emitted, reviewed on the generated code of both ISAs. An
+// ordering parameter would buy nothing, so none is exposed. Explicit relaxed
+// variants are provided only for protocols that publish no payload through
+// the pair itself (the user-event timer signal bucket); on compilers without
+// a proven inline ordered DWCAS they deliberately fall back to the stronger
+// default operation.
 
 #if defined(_MSC_VER) && !defined(__clang__)
 typedef struct __declspec(align(16)) uint128Pair {
@@ -150,7 +157,9 @@ static inline uint128Pair __uint128_atomic_load_relaxed(const volatile uint128Pa
 // every retry means some other CAS on the pair succeeded.
 static inline uint128Pair __uint128_atomic_exchange(volatile uint128Pair *ptr, uint128Pair value)
 {
-  uint128Pair expected = __uint128_atomic_load(ptr);
+  // The seed is only a CAS expected. A successful full-barrier CAS acquires
+  // the returned value; a failure replaces it with the CAS's atomic snapshot.
+  uint128Pair expected = __uint128_atomic_load_relaxed(ptr);
   while (!__uint128_atomic_compare_and_swap(ptr, &expected, value))
     continue;
   return expected;

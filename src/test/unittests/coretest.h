@@ -32,6 +32,7 @@ struct TestObject {
   aioObjectRoot root{};
   TestBackend *backend;
   unsigned destructorCallbacks = 0;
+  uintptr_t destructorGeneration = 0;
   unsigned resourceDestructors = 0;
   unsigned memoryReleases = 0;
 
@@ -90,17 +91,15 @@ struct TestBackend : asyncBase {
   unsigned stopTimerCalls = 0;
   unsigned rearmTimerCalls = 0;
   unsigned initializeTimerCalls = 0;
-  unsigned deleteTimerCalls = 0;
   unsigned wakeupCalls = 0;
   uintptr_t nextTimerTag = 1;
   uintptr_t lastEventTimerGeneration = 0;
   uint64_t lastEventTimerPeriod = 0;
   std::function<int(aioUserEvent*, EventTimerUpdate, uintptr_t, uint64_t)> eventTimerHook;
-  // Backs base.graceSeen/gracePendingSeen/timerSleep: production bases get
-  // the arrays from createAsyncBase
-  alignas(CACHE_LINE_SIZE) std::array<GraceSlot, 8> graceSlots{};
+  // Backs the loop-slot bitmap and timerSleep array that createAsyncBase
+  // allocates for production bases.
+  std::array<uintptr_t, 1> loopSlots{};
   alignas(CACHE_LINE_SIZE) std::array<TimerSleepSlot, 8> sleepSlots{};
-  std::array<uintptr_t, 8> gracePendingSlotsSeen{};
 
   TestBackend() : asyncBase{}, base(*this)
   {
@@ -112,24 +111,18 @@ struct TestBackend : asyncBase {
     base.methodImpl.initializeTimer = initializeTimer;
     base.methodImpl.startTimer = startTimer;
     base.methodImpl.stopTimer = stopTimer;
-    base.methodImpl.deleteTimer = deleteTimer;
     base.methodImpl.activate = activateEvent;
     base.methodImpl.wakeupLoop = wakeupLoop;
     base.methodImpl.updateEventTimer = updateEventTimer;
     base.methodImpl.releaseUserEvent = releaseUserEvent;
-    base.graceSeen = graceSlots.data();
-    base.gracePendingSeen = gracePendingSlotsSeen.data();
-    base.graceSlotLimit = static_cast<unsigned>(graceSlots.size());
     base.timerSleep = sleepSlots.data();
-    for (GraceSlot &slot : graceSlots)
-      slot.seen = UINTPTR_MAX;
+    base.loopThreadSlots = loopSlots.data();
+    base.loopThreadSlotWords = static_cast<unsigned>(loopSlots.size());
+    base.loopThreadLimit = static_cast<unsigned>(sleepSlots.size());
     for (TimerSleepSlot &slot : sleepSlots)
       slot.wakeTick = UINTPTR_MAX;
     currentFinishedSync = 0;
     messageLoopThreadId = 0;
-    // A previous case's graceThreadEnter may have left the loop identity
-    // pointing at a dead backend whose stack address this one can reuse
-    graceLoopBase = nullptr;
   }
 
   ~TestBackend()
@@ -230,11 +223,6 @@ struct TestBackend : asyncBase {
     from(timerBase(op)).stopTimerCalls++;
   }
 
-  static void deleteTimer(asyncOpRoot *op)
-  {
-    from(timerBase(op)).deleteTimerCalls++;
-  }
-
   static int activateEvent(aioUserEvent *event)
   {
     enqueue(event->base, &event->root);
@@ -262,7 +250,6 @@ struct TestBackend : asyncBase {
 
   static void releaseUserEvent(aioUserEvent *event)
   {
-    event->root.timerId = nullptr;
     concurrentQueuePush(event->root.objectPool, event);
   }
 
@@ -285,7 +272,10 @@ inline void TestObject::resourceDestructor(aioObjectRoot *root)
 
 inline void TestObject::destructorCallback(aioObjectRoot*, void *arg)
 {
-  static_cast<TestObject*>(arg)->destructorCallbacks++;
+  TestObject *object = static_cast<TestObject*>(arg);
+  object->destructorGeneration =
+    __uintptr_atomic_load(&object->root.Head.gen, amoRelaxed);
+  object->destructorCallbacks++;
 }
 
 inline void TestObject::memoryRelease(aioObjectRoot *root)

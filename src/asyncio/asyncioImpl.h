@@ -40,6 +40,10 @@ typedef struct timerWheel {
   // instead of polling at the grid tick while links are parked. Protocol:
   // a producer sets the bit with a seq-cst RMW after publishing into a slot
   // it observed empty (activation pays the extra RMW, not every link); a
+  // sleeper publishes its horizon seq-cst before scanning the words with
+  // seq-cst loads, and the producer reads those horizons seq-cst after the
+  // bit set. The resulting store/load order closes the lost-wakeup race
+  // without a locked fetch-add(0) for every scanned bitmap word. A
   // visitor clears the bit right before its drain CAS, so a publication into
   // the reopened incarnation is ordered after the clear and its set wins, and
   // an idempotent visitor that lost the drain race re-sets the bit when it
@@ -52,21 +56,13 @@ typedef struct timerWheel {
 
 #define CACHE_LINE_SIZE 64
 
-// One quiescence stamp per loop thread, padded to a cache line so the
-// per-iteration stamps of neighbour threads do not false-share; the padding
-// is byte-sized so 32-bit targets get the full line too
-typedef struct GraceSlot {
-  volatile uintptr_t seen;
-  uint8_t pad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
-} GraceSlot;
-
 // Published sleep horizon of one loop thread: the absolute grid tick it will
 // wake at on its own, UINTPTR_MAX while awake, timerSleepEternal while
 // blocked in a wait without a timeout. A producer arming a deadline no
 // sleeper would meet in time kicks one loop through the backend wakeup; the
 // eternal sentinel is farther than any real tick, so any published deadline
-// finds it late and kicks. Padded like GraceSlot: the slot is rewritten
-// around every wait syscall
+// finds it late and kicks. Cache-line padding prevents neighbouring loop
+// threads from false-sharing their per-wait publications.
 typedef struct TimerSleepSlot {
   volatile uintptr_t wakeTick;
   uint8_t pad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
@@ -96,7 +92,6 @@ typedef aioObject *newAioObjectTy(asyncBase*, IoObjectTy, void*);
 typedef void deleteObjectTy(aioObject*);
 typedef void startTimerTy(asyncOpRoot*);
 typedef void stopTimerTy(asyncOpRoot*);
-typedef void deleteTimerTy(asyncOpRoot*);
 typedef int activateTy(aioUserEvent*);
 
 typedef enum EventTimerUpdate {
@@ -126,7 +121,6 @@ struct asyncImpl {
   initializeTimerTy *initializeTimer;
   startTimerTy *startTimer;
   stopTimerTy *stopTimer;
-  deleteTimerTy *deleteTimer;
   activateTy *activate;
   aioExecuteProc *connect;
   aioExecuteProc *accept;
@@ -147,7 +141,7 @@ struct asyncBase {
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
   // User-event storage is base-local. A pooled slot can therefore never keep
-  // a timer resource or grace domain belonging to another multiplexor.
+  // a timer resource belonging to another multiplexor.
   struct ConcurrentQueue eventPool;
   struct timerWheel timerWheel;
   // First monotonic tick whose sweep is not confirmed yet. Moves only by the
@@ -158,41 +152,22 @@ struct asyncBase {
   // available and wrap is out of scope. The byte pads give the cursor a cache
   // line of its own whatever the base allocation's alignment: the confirm CAS
   // must not ping-pong the lines holding the wheel's last slots or the
-  // per-iteration loads of messageLoopThreadCounter
+  // per-iteration timer-wheel traffic
   uint8_t timerCloseCursorPadBefore[CACHE_LINE_SIZE - sizeof(uintptr_t)];
   uintptr_t timerCloseCursor;
   uint8_t timerCloseCursorPadAfter[CACHE_LINE_SIZE - sizeof(uintptr_t)];
-  // One published sleep horizon per loop thread, graceSlotLimit entries;
-  // allocated with the base (freed at 0.6 teardown, like graceSeen)
+  // One published sleep horizon per loop thread. loopThreadSlots owns the
+  // same index space and hands every concurrent asyncLoop invocation a unique
+  // slot with one fetch-or at entry and one fetch-and at exit. Entry is
+  // rejected before either array is indexed when the declared limit is full.
   TimerSleepSlot *timerSleep;
+  uintptr_t *loopThreadSlots;
+  unsigned loopThreadSlotWords;
+  unsigned loopThreadLimit;
   volatile unsigned messageLoopThreadCounter;
-
-  // Grace-period reclamation for dead aio objects. epoll_wait/kevent batches
-  // hold raw object pointers that cannot be recalled, so releasing the memory
-  // right in the destructor lets a stale batch entry touch the pool's next
-  // incarnation of the object (spurious disconnect, lost event) - a use after
-  // free veiled by the type-stable pool, or a plain one with instrumented
-  // pools. A dead object waits in the limbo list instead until every loop
-  // thread passes the top of its message loop: batches copied before the
-  // retirement are fully dispatched by then. A thread parked in the kernel
-  // wait cannot pass that point on its own schedule - idle waits have no
-  // timeout - so the retirement that finds the limbo empty kicks one sleeper
-  // through methodImpl.wakeupLoop (skipped when the caller is a loop thread
-  // of this base: it is awake and polls the limbo before its next sleep),
-  // a reclaim pass blocked by a sleeping slot kicks again, and while
-  // anything is parked here every timerLoopPrepareSleep caps the wait at
-  // the backend fallback - the drain period. Windows is not involved: IOCP
-  // packets reference operations, and operation pools are permanently
-  // type-stable.
-  volatile unsigned graceFrozen;    // slots exhausted or id collision: reclamation is off, the limbo only grows
-  volatile unsigned graceSlotCount; // high-water mark of claimed slots, bounds the batch capture
-  unsigned graceSlotLimit;          // slot array capacity, from the createAsyncBase loopThreads argument
-  volatile unsigned graceScanning;  // non-blocking single-scanner gate: losers leave, nobody waits
-  aioObjectRoot *graceLimbo;        // lock-free intrusive stack of fresh retirements (CAS push, exchange detach)
-  aioObjectRoot *gracePending;      // scanner-owned batch waiting out its grace period; read-only NULL check elsewhere
-  unsigned gracePendingSlots;       // slot high-water captured together with the pending batch
-  uintptr_t *gracePendingSeen;      // per-slot counters captured together with the pending batch, scanner-owned
-  GraceSlot *graceSeen;             // cache-line aligned, graceSlotLimit entries; alignedFree with the base (0.6 teardown)
+  // Diagnostics for generation-rejected kernel/timer handles. Incremented
+  // only on the cold stale path; successful publications pay no RMW.
+  volatile uintptr_t staleHandleDrops;
 
 #ifndef NDEBUG
   int opsCount;
@@ -380,6 +355,12 @@ struct aioUserEvent {
   uintptr_t timerAppliedGeneration;
   uint64_t timerAppliedPeriod;
   volatile unsigned timerConfigCounter;
+
+  // Lifetime identity carried by every kernel timer arming. Only the final
+  // reference path advances it, after the user's destructor and before the
+  // event/timer pair returns to eventPool. It deliberately occupies the
+  // eight bytes of tail padding in the fourth cache line.
+  volatile uintptr_t incarnation;
 };
 
 typedef char aioUserEventMustStayFourCacheLines[
@@ -494,8 +475,12 @@ static inline aioUserEvent *eventTimerControlEvent(asyncOpRoot *node)
   return (aioUserEvent*)((uintptr_t)node & ~(uintptr_t)eventTimerControlTag);
 }
 
-void eventTimerSignalTick(aioUserEvent *event, uintptr_t generation);
-void eventTimerSignalProbe(aioUserEvent *event, uintptr_t generation);
+void eventTimerSignalTick(aioUserEvent *event,
+                          uintptr_t generation,
+                          uintptr_t incarnation);
+void eventTimerSignalProbe(aioUserEvent *event,
+                           uintptr_t generation,
+                           uintptr_t incarnation);
 void eventTimerProcess(aioUserEvent *event);
 
 // Single-threaded wheel lifecycle. Init may run on zeroed or reused storage
@@ -538,9 +523,7 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
 // shrinks to the exact wake tick, or the producer sees the published horizon
 // and wakes one loop through methodImpl.wakeupLoop. An empty bitmap makes
 // the wait unbounded - UINT32_MAX, which the backends pass to the kernel as
-// "no timeout" - unless retired objects sit in the grace limbo/pending:
-// those need the quiescence tick to ripen, so the wait is then capped at
-// fallbackMs, turning it from a heartbeat into the grace drain period.
+// "no timeout".
 // After the wait returns, the slot is parked at UINTPTR_MAX (awake threads
 // sweep on their own and must not attract kicks). Returns the wait bound in
 // milliseconds; currentTick is the caller's getMonotonicTicks() reading.
@@ -563,35 +546,16 @@ static inline uint64_t timerDeadlineTick(uint64_t endTime)
 }
 __NO_UNUSED_FUNCTION_END
 
-// Grace period (see the asyncBase comment). graceThreadEnter runs once per
-// loop thread right after the messageLoopThreadId assignment and freezes
-// reclamation on slot overflow or on an id collision. graceQuiesce ticks
-// the calling thread's quiescence counter and drives reclamation; call it
-// at the top of the message loop, right before blocking in the kernel
-// wait. graceRetire parks a dead object in the limbo stack; memoryRelease
-// is the memory half of its destructor and runs once every loop thread
-// active at the batch capture has passed a quiescent point. The retirement
-// that finds the limbo empty additionally kicks one sleeper through
-// methodImpl.wakeupLoop unless the caller is a loop thread of this base
-// (graceLoopBase below) - see the liveness notes at graceRetire and
-// graceKickBlocker. graceThreadExit is the loop exit path: it stamps the
-// slot out with UINTPTR_MAX and drains via graceReclaim - the last thread
-// out drains both the pending batch and the stack. Call it BEFORE
-// decrementing the loop thread counter: once the counter drops, a future
-// loop thread may adopt this id, and a stale live stamp would shield its
-// batches from the grace period.
-void graceThreadEnter(asyncBase *base);
-void graceQuiesce(asyncBase *base);
-void graceThreadExit(asyncBase *base);
-void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *memoryRelease);
-void graceReclaim(asyncBase *base);
+// Claims/releases the unique timerSleep slot for one asyncLoop invocation.
+// Enter returns zero when callers exceed createAsyncBase(loopThreads);
+// release returns the number of loop invocations still active after exit.
+int loopThreadEnter(asyncBase *base);
+unsigned loopThreadExit(asyncBase *base);
 
-// The base whose message loop this thread runs; claimed and cleared together
-// with the grace slot in graceThreadEnter/graceThreadExit, 0 elsewhere.
-// graceRetire consults it to tell a delete issued by one of the base's own
-// loop threads (awake, polls the limbo before its next sleep) from an
-// outside one, whose retirement must kick a sleeper
-extern __tls asyncBase *graceLoopBase;
+static inline void recordStaleHandleDrop(asyncBase *base)
+{
+  __uintptr_atomic_fetch_and_add(&base->staleHandleDrops, 1, amoRelaxed);
+}
 
 int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size);
 #ifdef __cplusplus

@@ -114,7 +114,7 @@ RlpxOperation *initWriteOp(aioExecuteProc *start,
 static void rlpxSocketDestructor(aioObjectRoot *object)
 {
   deleteAioObject(reinterpret_cast<rlpxSocket*>(object)->plainSocket);
-  concurrentQueuePush(&objectPool, object);
+  objectFree(&objectPool, object, sizeof(rlpxSocket));
 }
 
 static AsyncOpStatus startRlpxConnect(asyncOpRoot *opptr)
@@ -144,10 +144,12 @@ static AsyncOpStatus startRlpxConnect(asyncOpRoot *opptr)
 
 rlpxSocket *rlpxSocketNew(asyncBase *base, aioObject *plainSocket)
 {
-  rlpxSocket *socket = 0;
-  if (!concurrentQueuePop(&objectPool, (void**)&socket)) {
-    socket = static_cast<rlpxSocket*>(malloc(sizeof(rlpxSocket)));
-  }
+  if (!plainSocket)
+    return nullptr;
+  rlpxSocket *socket = static_cast<rlpxSocket*>(
+    objectAlloc(&objectPool, sizeof(rlpxSocket), 16));
+  if (!socket)
+    return nullptr;
   initObjectRoot(&socket->root, base, ioObjectUserDefined, rlpxSocketDestructor);
   socket->plainSocket = plainSocket;
   return socket;

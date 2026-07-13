@@ -702,15 +702,17 @@ static asyncOpRoot *implZmtpSendProxy(aioObjectRoot *object, AsyncFlags flags, u
 void zmtpSocketDestructor(aioObjectRoot *object)
 {
   deleteAioObject(reinterpret_cast<zmtpSocket*>(object)->plainSocket);
-  concurrentQueuePush(&objectPool, object);
+  objectFree(&objectPool, object, sizeof(zmtpSocket));
 }
 
 zmtpSocket *zmtpSocketNew(asyncBase *base, aioObject *plainSocket, zmtpSocketTy type)
 {
-  zmtpSocket *socket = nullptr;
-  if (!concurrentQueuePop(&objectPool, (void**)&socket)) {
-    socket = static_cast<zmtpSocket*>(malloc(sizeof(zmtpSocket)));
-  }
+  if (!plainSocket)
+    return nullptr;
+  zmtpSocket *socket = static_cast<zmtpSocket*>(
+    objectAlloc(&objectPool, sizeof(zmtpSocket), 16));
+  if (!socket)
+    return nullptr;
 
   initObjectRoot(&socket->root, base, ioObjectUserDefined, zmtpSocketDestructor);
   socket->plainSocket = plainSocket;

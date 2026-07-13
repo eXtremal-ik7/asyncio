@@ -21,10 +21,9 @@ aioObjectRoot *aioObjectHandle(aioObject *object);
 void initializeAsyncIo(AsyncInitFlags flags);
 
 // loopThreads is the maximum number of threads that will run asyncLoop() on
-// this base concurrently (0 is treated as 1). It sizes the grace-period slot
-// array - one cache line per thread. Exceeding it is memory-safe but disables
-// reclamation of dead objects for the rest of the base's life, so err on the
-// high side when the count is not exact.
+// this base concurrently (0 is treated as 1). It sizes the timer-wakeup slot
+// array - one cache line per thread. An asyncLoop invocation beyond the
+// declared concurrency limit is rejected before entering the backend wait.
 // Returns 0 when the OS multiplexor cannot be created (descriptor or handle
 // exhaustion) or memory allocation fails.
 asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads);

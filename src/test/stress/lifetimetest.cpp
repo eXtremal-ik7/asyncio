@@ -17,6 +17,7 @@
 
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
+#include "asyncioImpl.h"
 
 #include <atomic>
 #include <chrono>
@@ -234,7 +235,11 @@ int main(int argc, char **argv)
           fprintf(stderr,
                   "  obj %p: refs=%" PRIuPTR " head=%" PRIxPTR " readQ=%p writeQ=%p"
                   " cancelIoFlag=%u deletePending=%u initialization=%" PRIxPTR " missing=%u\n",
-                  (void*)o, o->refs, o->Head.data, (void*)o->readQueue.head, (void*)o->writeQueue.head,
+                  (void*)o,
+                  o->refs,
+                  __uintptr_atomic_load(&o->Head.data, amoRelaxed),
+                  (void*)o->readQueue.head,
+                  (void*)o->writeQueue.head,
                   o->CancelIoFlag, o->DeletePending, o->initializationOp,
                   ctx.expected.load() - ctx.callbacks.load());
           if (++dumped == 16)
@@ -262,10 +267,12 @@ int main(int argc, char **argv)
   }
 
   double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count();
+  uintptr_t staleHandleDrops =
+    __uintptr_atomic_load(&gBase->staleHandleDrops, amoRelaxed);
   printf("objects %u, ops %" PRIu64 ", callbacks %" PRIu64 ", after-destructor %" PRIu64
-         ", exactly-once violations %" PRIu64 ", %.1fs\n",
+         ", exactly-once violations %" PRIu64 ", stale-handle drops %" PRIuPTR ", %.1fs\n",
          expectedObjects, expectedOps, callbacksDelivered.load(),
-         afterDestructorTotal.load(), exactlyOnceViolations, elapsed);
+         afterDestructorTotal.load(), exactlyOnceViolations, staleHandleDrops, elapsed);
   if (afterDestructorTotal.load() || exactlyOnceViolations) {
     fprintf(stderr, "FAILED\n");
     return 1;

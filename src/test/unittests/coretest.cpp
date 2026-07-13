@@ -16,6 +16,8 @@ static_assert(COMBINER_TAG_PROGRESS_WRITE == IO_EVENT_WRITE, "WRITE tag must map
 static_assert(COMBINER_TAG_ERROR == IO_EVENT_ERROR, "ERROR tag must map directly to backend events");
 static_assert(COMBINER_TAG_CANCEL == (1u << 3), "CANCEL must precede DELETE");
 static_assert(COMBINER_TAG_DELETE == (1u << 4), "DELETE must remain the final Head tag");
+static_assert(sizeof(asyncOpListLink) == 48,
+              "timeout links carry a full object generation handle");
 
 TEST(core_decision, active_io_event_selection_covers_complete_boolean_table)
 {
@@ -213,7 +215,11 @@ TEST(core_combiner, terminal_result_losing_timeout_race_is_released_once)
   TestOp op(object);
   op.setResults({aosSuccess});
   op.executeHook = [](TestOp &current) {
-    opCancel(&current.root, opGetGeneration(&current.root), aosTimeout);
+    opCancel(&current.root,
+             opGetGeneration(&current.root),
+             aosTimeout,
+             current.root.object,
+             __uintptr_atomic_load(&current.root.object->Head.gen, amoRelaxed));
   };
 
   combinerPushOperation(&op.root);
@@ -362,11 +368,43 @@ TEST(core_cancel, stale_generation_does_not_cancel_reused_operation)
   uintptr_t staleGeneration = opGetGeneration(&op.root);
   op.root.tag = ((staleGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
 
-  opCancel(&op.root, staleGeneration, aosTimeout);
+  opCancel(&op.root,
+           staleGeneration,
+           aosTimeout,
+           &object.root,
+           __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed));
 
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
-  EXPECT_EQ(object.root.Head.data, 0u);
+  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
   objectDecrementReference(&object.root, 1);
+  deleteOwner(backend, object);
+}
+
+TEST(core_cancel, winning_cancel_does_not_read_operation_after_status_cas)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+  uintptr_t generation = opGetGeneration(&op.root);
+  uintptr_t objectGeneration =
+    __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed);
+
+  // A timer producer owns only the operation tag. Once its terminal CAS wins,
+  // the combiner may release/recycle the operation immediately; every route
+  // to the object must therefore come from the arm-time handle passed below.
+  ASAN_POISON_MEMORY_REGION(
+    reinterpret_cast<uint8_t*>(&op.root) + sizeof(op.root.tag),
+    sizeof(op.root) - sizeof(op.root.tag));
+  EXPECT_TRUE(opCancel(&op.root,
+                       generation,
+                       aosTimeout,
+                       &object.root,
+                       objectGeneration));
+  ASAN_UNPOISON_MEMORY_REGION(&op.root, sizeof(op.root));
+
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  objectDecrementReference(&object.root, 1); // TestOp's retained reference
   deleteOwner(backend, object);
 }
 
@@ -446,7 +484,11 @@ TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submit
     // A grid timeout fires while the combiner is busy: its CANCEL bit lands
     // on the chain position of the moment...
     combinerPushOperation(&timedOut.root);
-    opCancel(&timedOut.root, opGetGeneration(&timedOut.root), aosTimeout);
+    opCancel(&timedOut.root,
+             opGetGeneration(&timedOut.root),
+             aosTimeout,
+             &object.root,
+             __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed));
     // ...then the user submits two more operations and only afterwards
     // cancels everything submitted so far
     combinerPushOperation(&first.root);
@@ -479,7 +521,7 @@ TEST(core_cancel, repeated_request_while_flag_is_set_does_not_push_second_signal
 
   EXPECT_EQ(object.root.CancelIoFlag, 2u);
   EXPECT_TRUE(backend.handledSignals.empty());
-  EXPECT_EQ(object.root.Head.data, 0u);
+  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
   object.root.CancelIoFlag = 0;
   deleteOwner(backend, object);
 }
@@ -949,6 +991,44 @@ TEST(core_operation_allocation, regular_and_realtime_pools_reuse_aligned_storage
   destroyConcurrentQueue(&realtimePool);
 }
 
+TEST(core_object_storage, pool_reuses_the_same_aligned_cell_and_preserves_head)
+{
+  struct alignas(64) Cell {
+    AsyncObjectHead Head;
+    std::array<uint8_t, 96> payload;
+  };
+  ConcurrentQueue pool{};
+
+  Cell *first = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(first) & 63u, 0u);
+  EXPECT_EQ(__uintptr_atomic_load(&first->Head.data, amoRelaxed), 0u);
+  EXPECT_EQ(__uintptr_atomic_load(&first->Head.gen, amoRelaxed), 1u);
+  __uintptr_atomic_store(&first->Head.gen, 37, amoRelaxed);
+  objectFree(&pool, first, sizeof(Cell));
+
+  Cell *second = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
+  ASSERT_EQ(second, first);
+  EXPECT_EQ(__uintptr_atomic_load(&second->Head.gen, amoRelaxed), 37u);
+
+  alignedFree(second);
+  destroyConcurrentQueue(&pool);
+}
+
+TEST(core_object_storage, generation_advances_before_user_destructor)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  uintptr_t before =
+    __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed);
+
+  objectDelete(&object.root);
+
+  EXPECT_EQ(object.destructorCallbacks, 1u);
+  EXPECT_EQ(object.destructorGeneration, before + 1);
+  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.gen, amoRelaxed), before + 1);
+}
+
 TEST(core_global_queue, callbacks_release_operations_and_quit_marker_stops_drain)
 {
   TestBackend backend;
@@ -1009,268 +1089,76 @@ TEST(core_buffer, copy_handles_complete_and_partial_source_ranges)
   EXPECT_EQ(destination[1], 6u);
 }
 
-TEST(core_grace_period, active_thread_holds_retired_batch_until_quiescence)
+TEST(core_loop_slots, exited_slot_is_immediately_reusable)
 {
   TestBackend backend;
-  TestObject first(backend), second(backend);
-  messageLoopThreadId = 0;
-  graceThreadEnter(&backend.base);        // claims slot 0: counter 0, high water 1
 
-  graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
-  graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
+  ASSERT_TRUE(loopThreadEnter(&backend.base));
+  EXPECT_EQ(messageLoopThreadId, 0u);
+  EXPECT_EQ(backend.base.messageLoopThreadCounter, 1u);
+  EXPECT_EQ(backend.loopSlots[0] & 1u, 1u);
+  EXPECT_EQ(loopThreadExit(&backend.base), 0u);
+  EXPECT_EQ(backend.loopSlots[0] & 1u, 0u);
 
-  // First pass captures the batch against the unmoved counter: nothing frees
-  graceReclaim(&backend.base);
-  EXPECT_EQ(first.memoryReleases, 0u);
-  EXPECT_EQ(second.memoryReleases, 0u);
-  EXPECT_EQ(backend.base.graceLimbo, nullptr);
-  EXPECT_EQ(backend.base.gracePending, &second.root);
-
-  // The quiescent tick ripens the whole batch at once
-  graceQuiesce(&backend.base);
-  EXPECT_EQ(first.memoryReleases, 1u);
-  EXPECT_EQ(second.memoryReleases, 1u);
-  EXPECT_EQ(backend.base.gracePending, nullptr);
+  ASSERT_TRUE(loopThreadEnter(&backend.base));
+  EXPECT_EQ(messageLoopThreadId, 0u);
+  EXPECT_EQ(loopThreadExit(&backend.base), 0u);
 }
 
-TEST(core_grace_period, objects_retired_after_capture_wait_for_the_next_batch)
+TEST(core_loop_slots, concurrent_loops_receive_distinct_indices)
 {
   TestBackend backend;
-  TestObject first(backend), second(backend);
-  messageLoopThreadId = 0;
-  graceThreadEnter(&backend.base);        // claims slot 0: counter 0, high water 1
+  constexpr unsigned count = 8;
+  std::array<unsigned, count> ids{};
+  std::array<int, count> entered{};
+  std::atomic<unsigned> ready{0};
+  std::atomic<bool> release{false};
+  std::array<std::thread, count> threads;
 
-  graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
-  graceReclaim(&backend.base);            // captures batch {first}
-  graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
+  for (unsigned i = 0; i < count; i++) {
+    threads[i] = std::thread([&, i]() {
+      entered[i] = loopThreadEnter(&backend.base);
+      if (entered[i])
+        ids[i] = messageLoopThreadId;
+      ready.fetch_add(1, std::memory_order_release);
+      while (!release.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      if (entered[i])
+        (void)loopThreadExit(&backend.base);
+    });
+  }
 
-  // The tick ripens the captured batch only; second was pushed after the
-  // capture and needs a full grace period of its own
-  graceQuiesce(&backend.base);
-  EXPECT_EQ(first.memoryReleases, 1u);
-  EXPECT_EQ(second.memoryReleases, 0u);
-  EXPECT_EQ(backend.base.gracePending, &second.root);
+  while (ready.load(std::memory_order_acquire) != count)
+    std::this_thread::yield();
 
-  graceQuiesce(&backend.base);
-  EXPECT_EQ(second.memoryReleases, 1u);
-  EXPECT_EQ(backend.base.gracePending, nullptr);
+  EXPECT_EQ(backend.base.messageLoopThreadCounter, count);
+  EXPECT_EQ(backend.loopSlots[0] & 0xffu, 0xffu);
+  for (int value : entered)
+    EXPECT_EQ(value, 1);
+  std::sort(ids.begin(), ids.end());
+  for (unsigned i = 0; i < count; i++)
+    EXPECT_EQ(ids[i], i);
+
+  release.store(true, std::memory_order_release);
+  for (std::thread &thread : threads)
+    thread.join();
+
+  EXPECT_EQ(backend.base.messageLoopThreadCounter, 0u);
+  EXPECT_EQ(backend.loopSlots[0] & 0xffu, 0u);
 }
 
-TEST(core_grace_period, exited_slot_does_not_gate_the_pending_batch)
+TEST(core_loop_slots, overflow_is_rejected_before_timer_sleep_indexing)
 {
   TestBackend backend;
-  TestObject object(backend);
-  messageLoopThreadId = 0;
-  graceThreadEnter(&backend.base);        // claims slot 0
-  backend.base.graceSeen[1].seen = 5;     // a live foreign thread in slot 1
-  backend.base.graceSlotCount = 2;
-
-  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
-  graceReclaim(&backend.base);            // captured against {0, 5}
-  EXPECT_EQ(object.memoryReleases, 0u);
-
-  // Slot 1 exits (quit path stamp), slot 0 ticks: the batch ripens
-  backend.base.graceSeen[1].seen = UINTPTR_MAX;
-  graceQuiesce(&backend.base);
-  EXPECT_EQ(object.memoryReleases, 1u);
-}
-
-TEST(core_grace_period, frozen_reclamation_keeps_limbo_intact)
-{
-  TestBackend backend;
-  TestObject object(backend);
-  backend.base.graceFrozen = 1;
-  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
-
-  graceReclaim(&backend.base);
-
-  EXPECT_EQ(object.memoryReleases, 0u);
-  EXPECT_EQ(backend.base.graceLimbo, &object.root);
-  backend.base.graceLimbo = nullptr;
-}
-
-TEST(core_grace_period, slot_claim_tracks_high_water_and_collision_freezes)
-{
-  TestBackend backend;
-  messageLoopThreadId = 3;
-
-  graceThreadEnter(&backend.base);
-  EXPECT_EQ(backend.base.graceSeen[3].seen, 0u);   // counters start at zero
-  EXPECT_EQ(backend.base.graceSlotCount, 4u);
-  EXPECT_EQ(backend.base.graceFrozen, 0u);
-
-  graceThreadEnter(&backend.base);
-  EXPECT_EQ(backend.base.graceFrozen, 1u);
-}
-
-// TDD regression: graceQuiesce gates only on the slot limit,
-// not on whether THIS thread's claim in graceThreadEnter succeeded. A loop
-// thread that adopted an id whose slot is still owned by a live thread
-// (elastic pool: an exiting thread decremented the counter while an older
-// thread still runs) freezes reclamation but keeps ticking the owner's
-// single-writer counter every loop turn - and stamps UINTPTR_MAX into it on
-// exit - forging the owner's quiescence for any scanner still holding a
-// captured batch: the exact use-after-free the freeze exists to prevent.
-// Intentionally red until the tick (and the backend exit stamp) require a
-// successful claim.
-TEST(core_grace_period, failed_slot_claim_must_not_tick_the_owners_counter)
-{
-  TestBackend backend;
-  TestObject object(backend);
-  messageLoopThreadId = 3;
-  graceThreadEnter(&backend.base);              // the owner claims slot 3
-  ASSERT_EQ(backend.base.graceSeen[3].seen, 0u);
-  ASSERT_EQ(backend.base.graceFrozen, 0u);
-
-  graceThreadEnter(&backend.base);              // adopted id, owner still live
-  ASSERT_EQ(backend.base.graceFrozen, 1u);
-
-  // Something must be parked, or the tick fast path returns before writing
-  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
-  graceQuiesce(&backend.base);                  // the loser's loop tick
-
-  EXPECT_EQ(backend.base.graceSeen[3].seen, 0u)
-    << "a thread that failed its slot claim forged the owner's quiescence counter";
-  EXPECT_EQ(object.memoryReleases, 0u);
-  backend.base.graceLimbo = nullptr;            // parked object lives on the test stack
-}
-
-// TDD regression, exit-path half of the failed-claim defect: the stamp is gated only by the
-// slot limit, not by claim ownership - a thread whose claim failed stamps
-// UINTPTR_MAX into the live owner's slot on its way out, marking the owner
-// exited: from then on the owner's kernel batches stop gating reclamation at
-// all and every captured batch ripens under its feet. Intentionally red until
-// the stamp requires a successful claim.
-TEST(core_grace_period, failed_slot_claim_must_not_stamp_the_owners_slot_on_exit)
-{
-  TestBackend backend;
-  messageLoopThreadId = 3;
-  graceThreadEnter(&backend.base);              // the owner claims slot 3
-  ASSERT_EQ(backend.base.graceSeen[3].seen, 0u);
-  graceThreadEnter(&backend.base);              // adopted id, owner still live
-  ASSERT_EQ(backend.base.graceFrozen, 1u);
-
-  graceThreadExit(&backend.base);               // the loser leaves the loop
-
-  EXPECT_EQ(backend.base.graceSeen[3].seen, 0u)
-    << "an exiting thread that never owned the slot stamped the live owner out";
-}
-
-TEST(core_grace_period, out_of_range_thread_freezes_without_touching_slots)
-{
-  TestBackend backend;
-  messageLoopThreadId = backend.base.graceSlotLimit;
-
-  graceThreadEnter(&backend.base);
-  graceQuiesce(&backend.base);
-
-  EXPECT_EQ(backend.base.graceFrozen, 1u);
-  EXPECT_EQ(backend.base.graceSlotCount, 0u);
-}
-
-TEST(core_grace_period, retirement_kicks_a_loop_only_from_outside_and_once_per_episode)
-{
-  TestBackend backend;
-  TestObject first(backend), second(backend), third(backend);
-
-  // graceLoopBase is unset (an application thread): the retirement that
-  // finds the limbo empty opens the episode and wakes one sleeper - parked
-  // loops wait with no timeout and cannot notice the limbo on their own
-  graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
-  EXPECT_EQ(backend.wakeupCalls, 1u);
-
-  // A follow-up retirement rides on the episode's kick: a woken loop polls
-  // at the drain period until the limbo is empty
-  graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
-  EXPECT_EQ(backend.wakeupCalls, 1u);
-
-  // No slot was ever claimed, so the batch ripens within one scan
-  graceReclaim(&backend.base);
-  EXPECT_EQ(first.memoryReleases, 1u);
-  EXPECT_EQ(second.memoryReleases, 1u);
-
-  // The next retirement after the drain opens a new episode
-  graceRetire(&backend.base, &third.root, TestObject::memoryRelease);
-  EXPECT_EQ(backend.wakeupCalls, 2u);
-  graceReclaim(&backend.base);
-  EXPECT_EQ(third.memoryReleases, 1u);
-}
-
-TEST(core_grace_period, retirement_from_the_bases_own_loop_thread_does_not_kick)
-{
-  TestBackend backend;
-  TestObject object(backend);
-  graceThreadEnter(&backend.base);   // claims slot 0, takes the loop identity
-
-  // The caller is a loop thread of this base: it is awake and its next
-  // sleep decision sees the non-empty limbo itself - a kick would be a
-  // wasted syscall on the hot delete path
-  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
-  EXPECT_EQ(backend.wakeupCalls, 0u);
-
-  graceThreadExit(&backend.base);    // stamps out and drains as the last thread
-  EXPECT_EQ(object.memoryReleases, 1u);
-}
-
-TEST(core_grace_period, retirement_into_a_foreign_base_counts_as_outside)
-{
-  TestBackend own, foreign;
-  TestObject object(foreign);
-  graceThreadEnter(&own.base);       // a loop thread - but of another base
-
-  graceRetire(&foreign.base, &object.root, TestObject::memoryRelease);
-  EXPECT_EQ(foreign.wakeupCalls, 1u);
-  EXPECT_EQ(own.wakeupCalls, 0u);
-
-  graceThreadExit(&own.base);
-  graceReclaim(&foreign.base);
-  EXPECT_EQ(object.memoryReleases, 1u);
-}
-
-TEST(core_grace_period, reclaim_chases_a_blocked_batch_with_one_kick_per_pass)
-{
-  TestBackend backend;
-  TestObject object(backend);
-
-  // Claim slots 0 and 1 (the mock plays both loop threads from this one):
-  // a captured batch then waits on both quiescence counters
-  messageLoopThreadId = 0;
-  graceThreadEnter(&backend.base);
-  messageLoopThreadId = 1;
-  graceThreadEnter(&backend.base);
-
-  // Both loops park in unbounded waits; the delete comes from an
-  // application thread and opens the episode with a kick
-  backend.sleepSlots[0].wakeTick = timerSleepEternal;
-  backend.sleepSlots[1].wakeTick = timerSleepEternal;
-  graceLoopBase = nullptr;
-  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
-  EXPECT_EQ(backend.wakeupCalls, 1u);
-
-  // The scan captures the batch against both live counters and cannot ripen
-  // it: one chase kick per pass, aimed only while a blocker actually sleeps
-  graceReclaim(&backend.base);
-  ASSERT_EQ(backend.base.gracePending, &object.root);
-  EXPECT_EQ(backend.wakeupCalls, 2u);
-  EXPECT_EQ(object.memoryReleases, 0u);
-
-  // Thread 0 wakes on the kick, ticks and scans: the batch is still blocked
-  // by sleeping thread 1, so the chain passes the kick on
-  messageLoopThreadId = 0;
-  backend.sleepSlots[0].wakeTick = UINTPTR_MAX;
-  graceQuiesce(&backend.base);
-  EXPECT_EQ(backend.wakeupCalls, 3u);
-  EXPECT_EQ(object.memoryReleases, 0u);
-
-  // Thread 1 wakes and ticks: every captured counter has moved, the batch
-  // ripens and an unblocked grace attracts no further kicks
-  messageLoopThreadId = 1;
-  backend.sleepSlots[1].wakeTick = UINTPTR_MAX;
-  graceQuiesce(&backend.base);
-  EXPECT_EQ(object.memoryReleases, 1u);
-  EXPECT_EQ(backend.wakeupCalls, 3u);
-
-  graceThreadExit(&backend.base);    // stamps out slot 1, the identity held
+  backend.loopSlots[0] = 0xffu;
+#ifndef NDEBUG
+  EXPECT_DEATH((void)loopThreadEnter(&backend.base),
+               "asyncLoop concurrency exceeds");
+#else
+  EXPECT_FALSE(loopThreadEnter(&backend.base));
+#endif
+  EXPECT_EQ(backend.base.messageLoopThreadCounter, 0u);
+  EXPECT_EQ(backend.loopSlots[0], 0xffu);
 }
 
 TEST(core_delete_lifecycle, destructor_callback_is_optional)
@@ -1535,7 +1423,7 @@ TEST(core_sync_path, speculative_allocation_is_released_after_combiner_handoff)
   SyncScenario scenario(object);
   std::atomic<unsigned> phase{0};
   AsyncOpTaggedPtr busy = taggedAsyncOpStub();
-  object.root.Head = busy;
+  __uintptr_atomic_store(&object.root.Head.data, busy.data, amoRelaxed);
   scenario.createHook = [&]() {
     phase.store(1, std::memory_order_release);
     while (phase.load(std::memory_order_acquire) != 2)
@@ -1729,6 +1617,99 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
   EXPECT_EQ(opGetStatus(&scenario.operation->root), aosCanceled);
   EXPECT_EQ(scenario.operation->finishCalls, 1u);
   objectDecrementReference(&object.root, 1);
+}
+
+TEST(core_head, fd_handle_roundtrips_pointer_and_generation)
+{
+  auto *object = static_cast<aioObjectRoot*>(alignedMalloc(sizeof(aioObjectRoot), 64));
+  ASSERT_NE(object, nullptr);
+  __uintptr_atomic_store(&object->Head.data, 0, amoRelaxed);
+  __uintptr_atomic_store(&object->Head.gen, 0x155555u, amoRelaxed);
+
+  uint64_t encoded = 0;
+  ASSERT_TRUE(objectHandleTryEncode(object, &encoded));
+  EXPECT_NE(encoded, 0u);
+  EXPECT_EQ(encoded & 1u, 0u);
+
+  aioObjectRoot *decoded = nullptr;
+  uintptr_t generation = 0;
+  ASSERT_TRUE(objectHandleDecode(encoded, &decoded, &generation));
+  EXPECT_EQ(decoded, object);
+  EXPECT_EQ(generation,
+            __uintptr_atomic_load(&object->Head.gen, amoRelaxed) &
+              objectHandleGenMask());
+  alignedFree(object);
+}
+
+TEST(core_head, fd_handle_rejects_unsupported_addresses_and_timer_tags)
+{
+  uint64_t encoded = 123;
+  EXPECT_FALSE(objectHandleTryEncode(nullptr, &encoded));
+  EXPECT_EQ(encoded, 0u);
+  EXPECT_FALSE(objectHandleTryEncode(reinterpret_cast<aioObjectRoot*>(uintptr_t{64} + 1),
+                                    &encoded));
+  EXPECT_FALSE(objectHandleTryEncode(
+    reinterpret_cast<aioObjectRoot*>(UINT64_C(1) << 48), &encoded));
+
+  auto *tombstone =
+    static_cast<aioObjectRoot*>(alignedMalloc(sizeof(aioObjectRoot), 64));
+  ASSERT_NE(tombstone, nullptr);
+  __uintptr_atomic_store(&tombstone->Head.gen,
+                         objectHandleGenMask() + 1,
+                         amoRelaxed);
+  EXPECT_FALSE(objectHandleTryEncode(tombstone, &encoded));
+  EXPECT_EQ(encoded, 0u);
+  alignedFree(tombstone);
+
+  aioObjectRoot *decoded = reinterpret_cast<aioObjectRoot*>(1);
+  uintptr_t generation = 1;
+  EXPECT_FALSE(objectHandleDecode(0, &decoded, &generation));
+  EXPECT_EQ(decoded, nullptr);
+  EXPECT_FALSE(objectHandleDecode(1u, &decoded, &generation)); // reactor timer discriminator
+  EXPECT_EQ(decoded, nullptr);
+}
+
+TEST(core_head, validated_push_drops_generation_mismatch_without_touching_word0)
+{
+  struct alignas(64) Cell {
+    AsyncObjectHead Head;
+    std::array<uint8_t, 112> payload;
+  };
+  ConcurrentQueue pool{};
+  Cell *object = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
+  ASSERT_NE(object, nullptr);
+  __uintptr_atomic_store(&object->Head.gen, 17, amoRelaxed);
+  __uintptr_atomic_store(&object->Head.data,
+                         taggedAsyncOpStub().data,
+                         amoRelaxed);
+  uintptr_t before =
+    __uintptr_atomic_load(&object->Head.data, amoRelaxed);
+  objectFree(&pool, object, sizeof(Cell)); // payload is poisoned; Head stays live
+
+  EXPECT_FALSE(combinerPushValidated(reinterpret_cast<aioObjectRoot*>(object),
+                                     16,
+                                     COMBINER_TAG_PROGRESS_READ));
+  EXPECT_EQ(__uintptr_atomic_load(&object->Head.data, amoRelaxed), before);
+
+  Cell *recovered = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
+  ASSERT_EQ(recovered, object);
+  alignedFree(recovered);
+  destroyConcurrentQueue(&pool);
+}
+
+TEST(core_head, validated_push_delivers_matching_signal)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  __uintptr_atomic_store(&object.root.Head.gen, 29, amoRelaxed);
+
+  EXPECT_TRUE(combinerPushValidated(&object.root,
+                                    29,
+                                    COMBINER_TAG_PROGRESS_READ));
+  ASSERT_EQ(backend.handledSignals.size(), 1u);
+  EXPECT_NE(backend.handledSignals.front() & COMBINER_TAG_PROGRESS_READ, 0u);
+  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  deleteOwner(backend, object);
 }
 
 

@@ -52,7 +52,6 @@ void epollDeleteObject(aioObject *object);
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void epollStartTimer(asyncOpRoot *op);
 void epollStopTimer(asyncOpRoot *op);
-void epollDeleteTimer(asyncOpRoot *op);
 int epollActivate(aioUserEvent *op);
 int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uintptr_t generation, uint64_t period);
 void epollReleaseUserEvent(aioUserEvent *event);
@@ -62,6 +61,8 @@ AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *op);
 AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *op);
+static int epollMonotonicNow(uintptr_t *nowNs);
+static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata);
 
 static struct asyncImpl epollImpl = {
   combinerTaskHandler,
@@ -75,7 +76,6 @@ static struct asyncImpl epollImpl = {
   epollInitializeTimer,
   epollStartTimer,
   epollStopTimer,
-  epollDeleteTimer,
   epollActivate,
   epollAsyncConnect,
   epollAsyncAccept,
@@ -88,17 +88,17 @@ static struct asyncImpl epollImpl = {
   epollReleaseUserEvent
 };
 
-// epoll_ctl failures are deliberately swallowed, mirroring kqueueControl.
-// The Registered flag keeps the ADD/MOD/DEL choice exact, so a failure here
-// means kernel resource exhaustion (ENOMEM, or ENOSPC against
-// max_user_watches) with no recovery path from combiner context - parked
-// operations are then left to their timeouts
-static void epollControl(int epollFd, int action, uint32_t events, int fd, void *ptr)
+static int epollControl(int epollFd, int action, uint32_t events, int fd, void *ptr)
 {
   struct epoll_event ev;
+  memset(&ev, 0, sizeof(ev));
   ev.events = events;
   ev.data.ptr = ptr;
-  epoll_ctl(epollFd, action, fd, &ev);
+  int result;
+  do {
+    result = epoll_ctl(epollFd, action, fd, &ev);
+  } while (result == -1 && errno == EINTR);
+  return result;
 }
 
 static int getFd(EPollObject *object)
@@ -143,10 +143,28 @@ asyncBase *epollNewAsyncBase()
     }
 
     base->eventObject = epollNewAioObject(&base->B, ioObjectDevice, &base->eventFd);
+    if (!base->eventObject) {
+      close(base->eventFd);
+      close(base->epollFd);
+      free(base);
+      return 0;
+    }
 
     // The event fd bypasses the combiner re-arm logic (the message loop
     // re-arms it directly), so register it here explicitly
-    epollControl(base->epollFd, EPOLL_CTL_ADD, EPOLLIN | EPOLLONESHOT, base->eventFd, base->eventObject);
+    if (epollControl(base->epollFd,
+                     EPOLL_CTL_ADD,
+                     EPOLLIN | EPOLLONESHOT,
+                     base->eventFd,
+                     (void*)(uintptr_t)objectHandleEncodeKnown(
+                       &base->eventObject->root)) == -1) {
+      close(base->eventFd);
+      base->eventObject->hDevice = -1;
+      objectFree(&objectPool, base->eventObject, sizeof(EPollObject));
+      close(base->epollFd);
+      free(base);
+      return 0;
+    }
     ((EPollObject*)base->eventObject)->Registered = 1;
   }
 
@@ -183,9 +201,8 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
     : 0;
 
   // A dying object gets no fd readiness processing: its operations are being
-  // cancelled wholesale anyway, and for a stale batch entry landing here
-  // within the grace period the descriptor is already closed - the error
-  // path ioctl and the rearm epoll_ctl would run on a dead or reused fd
+  // cancelled wholesale anyway, and its descriptor may already be closed;
+  // the error path ioctl and a rearm epoll_ctl must not run on a reused fd.
   if (fdObject && __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
     ioEvents = 0;
     progress = 0;
@@ -242,10 +259,18 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 
     if (newEvents) {
       if (!fdObject->Registered) {
-        epollControl(base->epollFd, EPOLL_CTL_ADD, newEvents | EPOLLONESHOT | EPOLLRDHUP, fd, object);
+        epollControl(base->epollFd,
+                     EPOLL_CTL_ADD,
+                     newEvents | EPOLLONESHOT | EPOLLRDHUP,
+                     fd,
+                     (void*)(uintptr_t)objectHandleEncodeKnown(object));
         fdObject->Registered = 1;
       } else if (currentEvents != newEvents) {
-        epollControl(base->epollFd, EPOLL_CTL_MOD, newEvents | EPOLLONESHOT | EPOLLRDHUP, fd, object);
+        epollControl(base->epollFd,
+                     EPOLL_CTL_MOD,
+                     newEvents | EPOLLONESHOT | EPOLLRDHUP,
+                     fd,
+                     (void*)(uintptr_t)objectHandleEncodeKnown(object));
       }
     } else if (currentEvents) {
       // No operation left on an armed fd: remove it from the set instead of
@@ -253,7 +278,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
       // would wake every epoll_wait for as long as the error condition holds.
       // An fd disarmed by a delivered EPOLLONESHOT shot stays fully silent,
       // so that state is left in the set as is
-      epollControl(base->epollFd, EPOLL_CTL_DEL, 0, fd, object);
+      epollControl(base->epollFd, EPOLL_CTL_DEL, 0, fd, 0);
       fdObject->Registered = 0;
     }
   }
@@ -264,27 +289,20 @@ void epollNextFinishedOperation(asyncBase *base)
   int nfds, n;
   struct epoll_event events[MAX_EVENTS];
   epollBase *localBase = (epollBase *)base;
-  messageLoopThreadId = __sync_fetch_and_add(&base->messageLoopThreadCounter, 1);
-  graceThreadEnter(base);
+  if (!loopThreadEnter(base))
+    return;
 
   while (1) {
     do {
       if (!executeGlobalQueue(base)) {
-        // Found quit marker: stamp the grace slot out and drain, strictly
-        // before the loop thread counter drops
-        graceThreadExit(base);
-        unsigned threadsRunning = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
-                                                               0u-1,
-                                                               amoSeqCst) - 1;
+        unsigned threadsRunning = loopThreadExit(base);
         if (threadsRunning)
           epollEnqueue(base, 0);
         return;
       }
 
-      graceQuiesce(base);
-      // UINT32_MAX = wait with no timeout: an idle base (empty occupancy
-      // bitmap, empty grace limbo/pending) blocks until a doorbell - the
-      // enqueue eventfd write, the arm kick or the grace retirement kick
+      // UINT32_MAX = wait with no timeout: an idle base blocks until queue
+      // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
       uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS,
                         sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
@@ -296,56 +314,99 @@ void epollNextFinishedOperation(asyncBase *base)
     } while (nfds <= 0 && errno == EINTR);
 
     for (n = 0; n < nfds; n++) {
-      uintptr_t timerId;
-      aioObjectRoot *object;
-      __tagged_pointer_decode(events[n].data.ptr, (void**)&object, &timerId);
-      if (object == &localBase->eventObject->root) {
-        eventfd_t eventValue;
-        eventfd_read(localBase->eventFd, &eventValue);
-        epollControl(localBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, localBase->eventFd, object);
-      } else if (timerId & udataTimer) {
-        aioTimer *timer = (aioTimer*)object;
+      uint64_t envelope = (uint64_t)(uintptr_t)events[n].data.ptr;
+      if (envelope & udataTimer) {
+        uintptr_t timerId;
+        aioObjectRoot *decoded;
+        __tagged_pointer_decode(events[n].data.ptr, (void**)&decoded, &timerId);
+        aioTimer *timer = (aioTimer*)decoded;
         if (timerId & udataUserEvent) {
           // Do not read timerfd here. A harvested envelope can overlap a
           // restart, and reading the shared fd in the loop would be able to
           // consume the next arm's expiration. Publish only a generation-
           // tagged probe; the event timer applier serializes read/settime/
           // disarm and re-arms the consumed EPOLLONESHOT shot.
-          uintptr_t armedTag = reactorTimerArmedCountTag(timer);
-          if (armedTag)
-            eventTimerSignalProbe((aioUserEvent*)timer->op, armedTag >> 1);
+          uintptr_t armedGeneration;
+          uintptr_t armedIncarnation;
+          if (reactorTimerDecodeCountProbe(timer,
+                                           &armedGeneration,
+                                           &armedIncarnation))
+            eventTimerSignalProbe((aioUserEvent*)timer->op,
+                                  armedGeneration,
+                                  armedIncarnation);
           continue;
         }
-        // Armed gate strictly before the read: a doorbell of a stopped timer
-        // must not drain the fd - the count belongs to whatever arming comes
-        // next, and the stop path owns the drain. The read result is the
-        // oracle: settime at arm time reset the counter, so a positive count
-        // proves the CURRENT arming expired, EAGAIN marks a stale doorbell
-        // of a re-armed timer
-        uintptr_t armedTag = reactorTimerArmedCountTag(timer);
-        uint64_t expirations = 0;
-        if (armedTag != 0) {
-          uint64_t data;
-          if (read((int)timer->fd, &data, sizeof(data)) == sizeof(data))
-            expirations = data;
-        }
         uintptr_t armedGeneration = 0;
-        switch (reactorTimerDecodeCount(armedTag, timerId, expirations, &armedGeneration)) {
+        uintptr_t now;
+        if (!epollMonotonicNow(&now)) {
+          // The one-shot was consumed and without the matching monotonic
+          // reading the backend cannot prove a timeout. Fail the CURRENT arm
+          // terminally instead of silently stranding it behind a failed MOD.
+          // UINTPTR_MAX selects any live deadline while the side-field triple
+          // still rejects a concurrent rearm; opCancel then validates the
+          // captured object generation before entering its combiner.
+          aioObjectRoot *armedObject = 0;
+          uintptr_t armedObjectGeneration = 0;
+          if (reactorTimerDecodeDeadlineHandle(timer,
+                                               timerId,
+                                               UINTPTR_MAX,
+                                               &armedGeneration,
+                                               &armedObject,
+                                               &armedObjectGeneration) ==
+                rteExpireOperation &&
+              !opCancel(timer->op,
+                        armedGeneration,
+                        aosUnknownError,
+                        armedObject,
+                        armedObjectGeneration))
+            recordStaleHandleDrop(base);
+          continue;
+        }
+        aioObjectRoot *armedObject = 0;
+        uintptr_t armedObjectGeneration = 0;
+        switch (reactorTimerDecodeDeadlineHandle(timer,
+                                                 timerId,
+                                                 now,
+                                                 &armedGeneration,
+                                                 &armedObject,
+                                                 &armedObjectGeneration)) {
           case rteIgnore:
-            // stale doorbell: timer disarmed, or re-armed with its deadline ahead
+            // Stale doorbell: timer disarmed, or the current absolute deadline
+            // is still ahead. Nothing reads the shared timerfd.
             break;
 
           case rteUserEvent: {
             aioUserEvent *event = (aioUserEvent*)timer->op;
-            eventTimerSignalTick(event, armedGeneration);
+            // Deadline timers are operation-only; keep the exhaustive enum
+            // branch defensive, but incarnation zero makes it a no-op.
+            eventTimerSignalTick(event, armedGeneration, 0);
             break;
           }
 
           case rteExpireOperation:
-            opCancel(timer->op, armedGeneration, aosTimeout);
+            if (!opCancel(timer->op,
+                          armedGeneration,
+                          aosTimeout,
+                          armedObject,
+                          armedObjectGeneration))
+              recordStaleHandleDrop(base);
             break;
         }
       } else {
+        aioObjectRoot *object;
+        uintptr_t carriedGen;
+        if (!objectHandleDecode(envelope, &object, &carriedGen))
+          continue;
+        if (object == &localBase->eventObject->root) {
+          eventfd_t eventValue;
+          eventfd_read(localBase->eventFd, &eventValue);
+          epollControl(localBase->epollFd,
+                       EPOLL_CTL_MOD,
+                       EPOLLIN | EPOLLONESHOT,
+                       localBase->eventFd,
+                       (void*)(uintptr_t)envelope);
+          continue;
+        }
         uint32_t eventMask = 0;
         if (events[n].events & EPOLLIN)
           eventMask |= IO_EVENT_READ;
@@ -369,7 +430,10 @@ void epollNextFinishedOperation(asyncBase *base)
           // the readiness bits, so no object-side mailbox is needed.
           if (eventMask & IO_EVENT_ERROR)
             bits |= COMBINER_TAG_ERROR | COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
-          combinerPushCounter(object, bits);
+          if (!combinerPushValidated(object,
+                                     carriedGen,
+                                     bits))
+            recordStaleHandleDrop(base);
         }
       }
     }
@@ -379,11 +443,18 @@ void epollNextFinishedOperation(asyncBase *base)
 
 aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
-  EPollObject *object = 0;
-  if (!objectPoolGet(&objectPool, (void**)&object, sizeof(EPollObject))) {
-    object = alignedMalloc(sizeof(EPollObject), TAGGED_POINTER_ALIGNMENT);
-    object->Object.buffer.ptr = 0;
-    object->Object.buffer.totalSize = 0;
+  EPollObject *object = (EPollObject*)objectAlloc(&objectPool,
+                                                  sizeof(EPollObject),
+                                                  TAGGED_POINTER_ALIGNMENT);
+  if (!object)
+    return 0;
+  uint64_t encoded;
+  if (!objectHandleTryEncode(&object->Object.root, &encoded)) {
+    // Every pooled fd cell was encodable when first published, keeps the same
+    // address, and generation-range exhaustion is tombstoned instead of pooled.
+    // Failure therefore proves this is a fresh, unpublished allocation.
+    alignedFree(object);
+    return 0;
   }
 
   initObjectRoot(&object->Object.root, base, type, (aioObjectDestructor*)epollDeleteObject);
@@ -421,11 +492,20 @@ int epollCancelAsyncOp(asyncOpRoot *opptr)
   return 1;
 }
 
-// Memory half of the object destructor, runs via graceRetire once no loop
-// thread can hold the object in an already-harvested event batch
+// Return the generation-headed cell immediately. Harvested events validate
+// only Head and cannot enter the combiner after the generation bump.
 static void epollReleaseObject(aioObject *object)
 {
-  objectPoolPut(&objectPool, object, sizeof(EPollObject));
+  if (__uintptr_atomic_load(&object->root.Head.gen, amoRelaxed) >
+      objectHandleGenMask()) {
+    free(object->buffer.ptr);
+    object->buffer.ptr = 0;
+    object->buffer.totalSize = 0;
+    ASAN_POISON_MEMORY_REGION((uint8_t*)object + sizeof(AsyncObjectHead),
+                              sizeof(EPollObject) - sizeof(AsyncObjectHead));
+    return; // permanent tombstone: exhausted generation is never published
+  }
+  objectFree(&objectPool, object, sizeof(EPollObject));
 }
 
 void epollDeleteObject(aioObject *object)
@@ -449,108 +529,197 @@ void epollDeleteObject(aioObject *object)
       break;
   }
 
-  // The descriptor is gone from the epoll set: batches harvested from now on
-  // cannot reference the object, batches already in loop thread buffers gate
-  // the memory release through the grace period
-  graceRetire(object->root.base, &object->root, (aioObjectDestructor*)epollReleaseObject);
+  // Already-harvested epoll entries carry the old generation and may touch
+  // only Head. The rest of the cell can return to its type-stable pool now.
+  epollReleaseObject(object);
 }
 
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
 {
-  epollBase *localBase = (epollBase*)base;
+  op->timerId = 0;
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
-  timer->root.base = base;
-  timer->root.type = ioObjectTimer;
-  timer->tag = 0;
-  timer->armedGeneration = 0;
-  timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  if (!timer)
+    return;
+  timer->base = base;
+  reactorTimerInitializeSharedState(timer);
+  timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  if (timer->fd == -1) {
+    alignedFree(timer);
+    return;
+  }
   timer->op = op;
-  // Even this disabled registration must carry the udataTimer bit:
-  // EPOLLERR/EPOLLHUP are mask-exempt, and a bare timer pointer would route
-  // them into the fd-object branch through the timer's uninitialized Head
-  epollControl(localBase->epollFd,
-               EPOLL_CTL_ADD,
-               0,
-               (int)timer->fd,
-               reactorTimerUdata(timer, op->opCode == actUserEvent));
+  timer->registeredBase = 0;
+  timer->kind = rtkUnknown;
+  timer->broken = 0;
+  // Registration is lazy. asyncOpAlloc reaches this constructor before
+  // initAsyncOpRoot has initialized opCode, so reading it here is invalid;
+  // the first arm binds the immutable timer kind and publishes an active ADD.
   op->timerId = timer;
+}
+
+static int epollMonotonicDeadline(uint64_t timeout,
+                                  struct itimerspec *its,
+                                  uintptr_t *deadline)
+{
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1 || now.tv_sec < 0)
+    return 0;
+  if ((uint64_t)now.tv_sec > UINTPTR_MAX / 1000000000ULL ||
+      timeout > UINTPTR_MAX / 1000ULL)
+    return 0;
+  uintptr_t nowNs = (uintptr_t)now.tv_sec * 1000000000ULL +
+                    (uintptr_t)now.tv_nsec;
+  uintptr_t delta = (uintptr_t)(timeout * 1000ULL);
+  if (nowNs > UINTPTR_MAX - delta)
+    return 0;
+  *deadline = nowNs + delta;
+  memset(its, 0, sizeof(*its));
+  its->it_value.tv_sec = (time_t)(*deadline / 1000000000ULL);
+  its->it_value.tv_nsec = (long)(*deadline % 1000000000ULL);
+  return 1;
+}
+
+static int epollMonotonicNow(uintptr_t *nowNs)
+{
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1 || now.tv_sec < 0 ||
+      (uint64_t)now.tv_sec > UINTPTR_MAX / 1000000000ULL)
+    return 0;
+  *nowNs = (uintptr_t)now.tv_sec * 1000000000ULL + (uintptr_t)now.tv_nsec;
+  return 1;
+}
+
+static int epollTimerSettime(aioTimer *timer, int flags, const struct itimerspec *its)
+{
+  int result;
+  do {
+    result = timerfd_settime((int)timer->fd, flags, its, 0);
+  } while (result == -1 && errno == EINTR);
+  return result == 0;
+}
+
+static int epollTimerEnsureFd(aioTimer *timer)
+{
+  if (timer->fd != -1)
+    return 1;
+  timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  return timer->fd != -1;
+}
+
+static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata)
+{
+  asyncBase *old = timer->registeredBase;
+  epollBase *targetBase = (epollBase*)target;
+  int action = old == target && old ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+  int result = epollControl(targetBase->epollFd,
+                            action,
+                            EPOLLIN | EPOLLONESHOT,
+                            (int)timer->fd,
+                            udata);
+  if (result == -1 && action == EPOLL_CTL_MOD && errno == ENOENT)
+    result = epollControl(targetBase->epollFd,
+                          EPOLL_CTL_ADD,
+                          EPOLLIN | EPOLLONESHOT,
+                          (int)timer->fd,
+                          udata);
+  else if (result == -1 && action == EPOLL_CTL_ADD && errno == EEXIST)
+    result = epollControl(targetBase->epollFd,
+                          EPOLL_CTL_MOD,
+                          EPOLLIN | EPOLLONESHOT,
+                          (int)timer->fd,
+                          udata);
+  if (result == -1)
+    return 0;
+
+  timer->registeredBase = target;
+  timer->base = target;
+  if (old && old != target)
+    (void)epollControl(((epollBase*)old)->epollFd,
+                       EPOLL_CTL_DEL,
+                       0,
+                       (int)timer->fd,
+                       0);
+  return 1;
+}
+
+static void epollTimerRollbackArm(aioTimer *timer)
+{
+  struct itimerspec disarm;
+  memset(&disarm, 0, sizeof(disarm));
+  reactorTimerDisarm(timer);
+  (void)epollTimerSettime(timer, 0, &disarm);
 }
 
 void epollStartTimer(asyncOpRoot *op)
 {
-  struct itimerspec its;
-  int periodic = op->opCode == actUserEvent;
-  its.it_value.tv_sec = op->timeout / 1000000;
-  its.it_value.tv_nsec = (op->timeout % 1000000) * 1000;
-  its.it_interval.tv_sec = periodic ? its.it_value.tv_sec : 0;
-  its.it_interval.tv_nsec = periodic ? its.it_value.tv_nsec : 0;
-
   aioTimer *timer = (aioTimer*)op->timerId;
-  // Order contract of the count protocol (reactorTimer.h): settime resets
-  // the fd's expiration counter BEFORE the tag publishes the arming, and the
-  // MOD that re-enables delivery comes last - a delivery that acquired this
-  // arming's tag can then never attribute a previous arming's residue to it
-  timerfd_settime((int)timer->fd, 0, &its, 0);
-  void *udata = reactorTimerArmCount(timer, op);
-  epollControl(((epollBase*)timer->root.base)->epollFd,
-               EPOLL_CTL_MOD,
-               EPOLLIN | EPOLLONESHOT,
-               (int)timer->fd,
-               udata);
+  if (!timer || !reactorTimerBindKind(timer, rtkOperation)) {
+    (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
+    return;
+  }
+
+  struct itimerspec its;
+  uintptr_t deadline;
+  if (!epollMonotonicDeadline(op->timeout, &its, &deadline) ||
+      !epollTimerSettime(timer, TFD_TIMER_ABSTIME, &its)) {
+    epollTimerRollbackArm(timer);
+    (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
+    return;
+  }
+
+  void *udata = reactorTimerArmDeadlineGeneration(timer,
+                                                  op,
+                                                  opGetGeneration(op),
+                                                  deadline);
+  if (!epollTimerPublish(timer, op->object->base, udata)) {
+    epollTimerRollbackArm(timer);
+    (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
+  }
 }
 
-static void epollStartTimerGeneration(asyncOpRoot *op,
-                                      uintptr_t generation,
-                                      uint64_t period)
+static int epollStartTimerGeneration(asyncOpRoot *op,
+                                     uintptr_t generation,
+                                     uint64_t period)
 {
   struct itimerspec its;
+  memset(&its, 0, sizeof(its));
   its.it_value.tv_sec = period / 1000000;
   its.it_value.tv_nsec = (period % 1000000) * 1000;
   its.it_interval = its.it_value;
 
   aioTimer *timer = (aioTimer*)op->timerId;
-  timerfd_settime((int)timer->fd, 0, &its, 0);
+  if (!timer || !reactorTimerBindKind(timer, rtkUserEvent) ||
+      !epollTimerEnsureFd(timer) ||
+      !epollTimerSettime(timer, 0, &its)) {
+    if (timer)
+      epollTimerRollbackArm(timer);
+    return 0;
+  }
   void *udata = reactorTimerArmCountGeneration(timer, op, generation);
-  epollControl(((epollBase*)timer->root.base)->epollFd,
-               EPOLL_CTL_MOD,
-               EPOLLIN | EPOLLONESHOT,
-               (int)timer->fd,
-               udata);
+  if (!epollTimerPublish(timer, ((aioUserEvent*)op)->base, udata)) {
+    epollTimerRollbackArm(timer);
+    return 0;
+  }
+  return 1;
 }
 
-
-void epollStopTimer(asyncOpRoot *op)
+static int epollStopTimerInternal(asyncOpRoot *op)
 {
-  uint64_t data;
   struct itimerspec its;
   memset(&its, 0, sizeof(its));
   aioTimer *timer = (aioTimer*)op->timerId;
+  if (!timer)
+    return 1;
   reactorTimerDisarm(timer);
-  timerfd_settime((int)timer->fd, 0, &its, 0);
-  // The disabled registration keeps the udataTimer bit for the same reason
-  // as in epollInitializeTimer (mask-exempt EPOLLERR/EPOLLHUP)
-  epollControl(((epollBase*)timer->root.base)->epollFd,
-               EPOLL_CTL_MOD,
-               0,
-               (int)timer->fd,
-               reactorTimerUdata(timer, op->opCode == actUserEvent));
-  while (read((int)timer->fd, &data, sizeof(data)) > 0)
-    continue;
+  // settime starts a new timerfd epoch and clears the expiration count. The
+  // delivered EPOLLONESHOT shot may stay registered but cannot wake again
+  // until the next arm's checked MOD/ADD; no drain or empty-mask MOD needed.
+  return epollTimerSettime(timer, 0, &its);
 }
 
-// Memory half only: the timer pointer is published to the kernel as epoll_data
-// and may still sit in another loop thread's harvested batch, so the release
-// goes through the grace period like any other kernel-published object
-static void epollReleaseTimer(aioObjectRoot *object)
+void epollStopTimer(asyncOpRoot *op)
 {
-  free(object);
-}
-
-void epollDeleteTimer(asyncOpRoot *op)
-{
-  aioTimer *timer = (aioTimer*)op->timerId;
-  close((int)timer->fd);
-  graceRetire(timer->root.base, &timer->root, epollReleaseTimer);
+  (void)epollStopTimerInternal(op);
 }
 
 int epollActivate(aioUserEvent *op)
@@ -567,18 +736,13 @@ int epollUpdateEventTimer(aioUserEvent *event,
   aioTimer *timer = (aioTimer*)event->root.timerId;
   switch (update) {
     case etuStart:
-      epollStartTimerGeneration(&event->root, generation, period);
-      break;
+      return epollStartTimerGeneration(&event->root, generation, period);
     case etuStop:
-      epollStopTimer(&event->root);
-      break;
+      return epollStopTimerInternal(&event->root);
     case etuRearm:
-      epollControl(((epollBase*)timer->root.base)->epollFd,
-                   EPOLL_CTL_MOD,
-                   EPOLLIN | EPOLLONESHOT,
-                   (int)timer->fd,
-                   reactorTimerUdata(timer, 1));
-      break;
+      return timer && epollTimerPublish(timer,
+                                        event->base,
+                                        reactorTimerUdata(timer));
     case etuConsume: {
       uint64_t expirations;
       ssize_t bytes;
@@ -591,32 +755,31 @@ int epollUpdateEventTimer(aioUserEvent *event,
   return 1;
 }
 
-static void epollRecycleUserEvent(aioObjectRoot *root)
-{
-  aioTimer *timer = (aioTimer*)root;
-  aioUserEvent *event = (aioUserEvent*)timer->op;
-  event->root.timerId = 0;
-  free(timer);
-  concurrentQueuePush(event->root.objectPool, event);
-}
-
 void epollReleaseUserEvent(aioUserEvent *event)
 {
   aioTimer *timer = (aioTimer*)event->root.timerId;
   if (!timer) {
-    concurrentQueuePush(event->root.objectPool, event);
+    if (__uintptr_atomic_load(&event->incarnation, amoRelaxed) != 0)
+      concurrentQueuePush(event->root.objectPool, event);
     return;
   }
   assert(__uintptr_atomic_load(&timer->tag, amoAcquire) == 0 &&
          "Recycling an armed user-event timer");
-  epollControl(((epollBase*)timer->root.base)->epollFd,
-               EPOLL_CTL_DEL,
-               0,
-               (int)timer->fd,
-               0);
-  close((int)timer->fd);
+  if (timer->registeredBase && timer->fd != -1)
+    (void)epollControl(((epollBase*)timer->registeredBase)->epollFd,
+                       EPOLL_CTL_DEL,
+                       0,
+                       (int)timer->fd,
+                       0);
+  if (timer->fd != -1)
+    close((int)timer->fd);
   timer->fd = -1;
-  graceRetire(timer->root.base, &timer->root, epollRecycleUserEvent);
+  timer->registeredBase = 0;
+  timer->base = event->base;
+  // The timer cell is the physical lifetime anchor for stale epoll batches;
+  // keep event<->timer immutable and return them to the pool as one unit.
+  if (__uintptr_atomic_load(&event->incarnation, amoRelaxed) != 0)
+    concurrentQueuePush(event->root.objectPool, event);
 }
 
 
