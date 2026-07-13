@@ -297,6 +297,10 @@ void iocpNextFinishedOperation(asyncBase *base)
   while (1) {
     ULONG N, i;
 
+    // An idle base (empty occupancy bitmap; the grace fields never fill on
+    // Windows) gets UINT32_MAX from timerLoopPrepareSleep, which is exactly
+    // INFINITE: the port then blocks until a completion, a posted kick or
+    // the quit packet
     BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N,
                                               timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500), FALSE);
     timerLoopCancelSleep(base, messageLoopThreadId);

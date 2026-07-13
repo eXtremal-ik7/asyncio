@@ -282,8 +282,12 @@ void epollNextFinishedOperation(asyncBase *base)
       }
 
       graceQuiesce(base);
+      // UINT32_MAX = wait with no timeout: an idle base (empty occupancy
+      // bitmap, empty grace limbo/pending) blocks until a doorbell - the
+      // enqueue eventfd write, the arm kick or the grace retirement kick
+      uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS,
-                        (int)timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500));
+                        sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
       timerLoopCancelSleep(base, messageLoopThreadId);
       // Unconditional sweep (the modulo election is gone): an idle pass costs
       // one relaxed load, and the wakeup handshake relies on whichever thread

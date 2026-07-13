@@ -366,63 +366,64 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
 }
 
 // Earliest tick a sleeping loop must wake at to serve the parked timers, or
-// `horizon` when nothing inside the window needs it. A level-0 bit at tick t
-// asks for a wake at t+1 (the sweep of t runs on the first call with now > t);
-// an occupied upper-level slot asks for its next visit boundary + 1, so a
-// cascade is never overslept - the deadlines inside the window are re-routed
-// by that visit and picked up by the following horizon scans. Every word the
-// "nothing earlier" conclusion rests on is read with a seq-cst RMW: it pairs
-// with the producer's set of the same word (both are RMWs on one address, so
-// they are totally ordered) - either this scan observes the fresh bit, or the
-// producer's set follows the scan's RMW and its horizon read then observes
-// the wakeTick published before the scan, triggering the kick. Words beyond
-// `horizon` may be skipped safely: their deadlines wake later than the
-// fallback does, and the loop re-scans after every wait
-static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from, uint64_t horizon)
+// UINT64_MAX when the whole wheel is empty. Each level is scanned in visit
+// order - a full circular pass over its slots starting at the level's next
+// visit boundary - and the earliest visit across levels wins: a level-0 bit
+// at tick t asks for a wake at t+1 (the sweep of t runs on the first call
+// with now > t); an occupied upper-level slot asks for its next visit
+// boundary + 1, so a cascade is never overslept - the deadlines inside the
+// window are re-routed by that visit and picked up by the following horizon
+// scans. Every word the "nothing earlier" conclusion rests on is read with a
+// seq-cst RMW: it pairs with the producer's set of the same word (both are
+// RMWs on one address, so they are totally ordered) - either this scan
+// observes the fresh bit, or the producer's set follows the scan's RMW and
+// its horizon read then observes the wakeTick published before the scan,
+// triggering the kick. A word is skipped only when its visit ticks cannot
+// beat the best candidate already found - an arithmetic bound, not a read of
+// mutable state, so the litmus still covers every slot the conclusion
+// depends on. The full 68-word sweep runs only on the way into a deep sleep;
+// a busy wheel terminates the level-0 pass on its first occupied word
+static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from)
 {
-  uint64_t best = horizon;
+  uint64_t best = UINT64_MAX;
 
-  // Level 0: the slots of ticks [from, horizon-1], in wrap-around order
-  uint64_t span = horizon - from;
-  if (span > TIMER_WHEEL_SLOTS)
-    span = TIMER_WHEEL_SLOTS;
-  uint64_t chunkTick = from;
-  unsigned slotIndex = (unsigned)(from & (TIMER_WHEEL_SLOTS - 1));
-  while (span) {
-    unsigned bitPosition = slotIndex & 63;
-    uint64_t take = 64 - bitPosition;
-    if (take > span)
-      take = span;
-    uintptr_t bits =
-      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[0][slotIndex >> 6],
-                                     0,
-                                     amoSeqCst);
-    uintptr_t mask = take == 64 ? ~(uintptr_t)0 : ((((uintptr_t)1 << take) - 1) << bitPosition);
-    uintptr_t hit = bits & mask;
-    if (hit) {
-      best = chunkTick + (lowestBitIndex64(hit) - bitPosition) + 1;
-      break;
-    }
-    chunkTick += take;
-    span -= take;
-    slotIndex = (slotIndex + (unsigned)take) & (TIMER_WHEEL_SLOTS - 1);
-  }
-
-  // Upper levels: at most one visit boundary of each level fits into the
-  // window (their widths start at a full level-0 rotation), a single bit test
-  // per level decides whether the boundary needs the wake
-  for (unsigned level = 1; level < TIMER_WHEEL_LEVELS; level++) {
+  for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; level++) {
+    unsigned shift = TIMER_WHEEL_LEVEL_BITS * level;
     uint64_t width = timerWheelWidth(level);
+    // Visit boundaries only grow with the level (a coarser round-up of the
+    // same position): once one cannot beat the best, none of the higher ones
+    // can
     uint64_t boundary = (from + width - 1) & ~(width - 1);
     if (boundary + 1 >= best)
-      continue;
-    unsigned index = (unsigned)(boundary >> (TIMER_WHEEL_LEVEL_BITS * level)) & (TIMER_WHEEL_SLOTS - 1);
-    uintptr_t bits =
-      __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[level][index >> 6],
-                                     0,
-                                     amoSeqCst);
-    if (bits & ((uintptr_t)1 << (index & 63)))
-      best = boundary + 1;
+      break;
+
+    unsigned slotIndex = (unsigned)(boundary >> shift) & (TIMER_WHEEL_SLOTS - 1);
+    uint64_t visitTick = boundary;
+    unsigned remaining = TIMER_WHEEL_SLOTS;
+    while (remaining) {
+      if (visitTick + 1 >= best)
+        break;
+      unsigned bitPosition = slotIndex & 63;
+      unsigned take = 64 - bitPosition;
+      if (take > remaining)
+        take = remaining;
+      uintptr_t bits =
+        __uintptr_atomic_fetch_and_add(&base->timerWheel.occupancy[level][slotIndex >> 6],
+                                       0,
+                                       amoSeqCst);
+      uintptr_t mask = take == 64 ? ~(uintptr_t)0 : ((((uintptr_t)1 << take) - 1) << bitPosition);
+      uintptr_t hit = bits & mask;
+      if (hit) {
+        // The first occupied slot in visit order is the level's minimum
+        uint64_t candidate = visitTick + ((uint64_t)(lowestBitIndex64(hit) - bitPosition) << shift) + 1;
+        if (candidate < best)
+          best = candidate;
+        break;
+      }
+      visitTick += (uint64_t)take << shift;
+      remaining -= take;
+      slotIndex = (slotIndex + take) & (TIMER_WHEEL_SLOTS - 1);
+    }
   }
 
   return best;
@@ -440,28 +441,51 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
   if (!slot)
     return tickMs < fallbackMs ? tickMs : fallbackMs;
 
-  uint64_t capTicks = fallbackMs / tickMs;
-  if (capTicks == 0)
-    capTicks = 1;
-  uint64_t horizon = currentTick + capTicks;
-  // The fallback horizon goes out first: the scan below must run with a
-  // published wakeTick, or a producer racing it would see an awake thread and
-  // skip the kick while the scan misses its fresh bit. Shrinking afterwards
-  // is one-directional - a producer reading the stale larger value kicks
+  // The worst case this call may commit to goes out first: the scan below
+  // must run with a published wakeTick no earlier than the final decision,
+  // or a producer racing the scan would see an awake thread and skip the
+  // kick while the scan misses its fresh bit. Every later store only
+  // shrinks the horizon - a producer reading a stale larger value kicks
   // spuriously at worst
-  __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)horizon, amoRelease);
+  __uintptr_atomic_store(&slot->wakeTick, timerSleepEternal, amoRelease);
 
   // Scan from the confirmed sweep position when it lags the clock (a
   // concurrent sweeper mid-tick): due backlog then wakes immediately instead
   // of hiding behind a full window
   uint64_t cursor = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire);
   uint64_t from = cursor < currentTick ? cursor : currentTick;
-  uint64_t wake = timerWheelNearestWake(base, from, horizon);
-  if (wake >= horizon)
-    return fallbackMs;
+  uint64_t wake = timerWheelNearestWake(base, from);
 
+  // Objects waiting out their grace period need this thread back at the
+  // quiescence tick: cap the wait at the drain period. Both fields, like
+  // graceQuiesce - the scanner may have moved the limbo stack into pending.
+  // Relaxed suffices: these loads only bound how long a ripe batch may sit,
+  // and a retirement racing them wakes a sleeper through the backend kick,
+  // which is a stateful syscall and outlives any interleaving with the wait
+  if (__pointer_atomic_load((void *volatile*)&base->graceLimbo, amoRelaxed) ||
+      __pointer_atomic_load((void *volatile*)&base->gracePending, amoRelaxed)) {
+    uint64_t capTicks = fallbackMs / tickMs;
+    if (capTicks == 0)
+      capTicks = 1;
+    if (wake > currentTick + capTicks)
+      wake = currentTick + capTicks;
+  } else if (wake == UINT64_MAX) {
+    // Nothing parked anywhere: wait with no timeout. The eternal sentinel
+    // stays published - a later arm or an outside grace retirement kicks
+    // through methodImpl.wakeupLoop, queue traffic carries its own doorbell
+    return UINT32_MAX;
+  }
+
+  // Far wakes are clamped to the kernel timeout range (epoll takes int
+  // milliseconds); waking early is harmless, the loop re-scans and sleeps on
+  uint64_t sleepTicks = wake > currentTick ? wake - currentTick : 0;
+  const uint64_t sleepTicksLimit = 0x7FFFFFFFu / tickMs;
+  if (sleepTicks > sleepTicksLimit) {
+    sleepTicks = sleepTicksLimit;
+    wake = currentTick + sleepTicks;
+  }
   __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)wake, amoRelease);
-  return wake > currentTick ? (uint32_t)((wake - currentTick) * tickMs) : 0;
+  return (uint32_t)(sleepTicks * tickMs);
 }
 
 void timerLoopCancelSleep(asyncBase *base, unsigned threadId)

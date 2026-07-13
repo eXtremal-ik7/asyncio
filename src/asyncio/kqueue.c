@@ -239,12 +239,18 @@ void kqueueNextFinishedOperation(asyncBase *base)
         return;
       }
 
+      // Quiesce first: a batch reclaimed here empties the grace fields and
+      // lets the sleep decision go unbounded right away
+      graceQuiesce(base);
+      // UINT32_MAX = wait with no timeout: an idle base (empty occupancy
+      // bitmap, empty grace limbo/pending) blocks until a doorbell - the
+      // enqueue trigger, the arm kick or the grace retirement kick
       uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 1000);
       struct timespec timeout;
       timeout.tv_sec = sleepMs / 1000;
       timeout.tv_nsec = (long)(sleepMs % 1000) * 1000000;
-      graceQuiesce(base);
-      nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, &timeout);
+      nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS,
+                    sleepMs == UINT32_MAX ? 0 : &timeout);
       timerLoopCancelSleep(base, messageLoopThreadId);
 
       // Unconditional sweep (the modulo election is gone): an idle pass costs

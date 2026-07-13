@@ -127,6 +127,9 @@ struct TestBackend : asyncBase {
       slot.wakeTick = UINTPTR_MAX;
     currentFinishedSync = 0;
     messageLoopThreadId = 0;
+    // A previous case's graceThreadEnter may have left the loop identity
+    // pointing at a dead backend whose stack address this one can reuse
+    graceLoopBase = nullptr;
   }
 
   ~TestBackend()

@@ -16,6 +16,11 @@ __tls unsigned messageLoopThreadId;
 // be adopted while its previous holder is still inside the message loop.
 // Thread-local, so plain loads/stores suffice
 static __tls unsigned graceSlotOwned;
+// The base whose message loop this thread runs, claimed together with the
+// slot; graceRetire's kick decision keys on it (a loop thread of the base
+// polls the limbo on its own, anyone else must wake a sleeper). Non-static:
+// unit tests reset it between cases, like messageLoopThreadId
+__tls asyncBase *graceLoopBase;
 
 void eqRemove(List *list, asyncOpRoot *op)
 {
@@ -771,6 +776,18 @@ void graceRetire(asyncBase *base, aioObjectRoot *object, aioObjectDestructor *me
                                                head,
                                                object,
                                                amoSeqCst));
+
+  // Liveness kick, once per limbo episode: idle loop threads block with no
+  // timeout, so a retirement they cannot see would wait for an unrelated
+  // event. The push that observed an empty limbo opened the episode and
+  // wakes one sleeper; later retirements see a non-empty head and ride on
+  // that kick - by then a woken loop polls at the drain period, or the kick
+  // is still in flight (the backend doorbell is stateful: it outlives any
+  // interleaving with the sleeper's wait syscall). A retirement from one of
+  // the base's own loop threads skips the kick - the caller is awake and
+  // its next timerLoopPrepareSleep sees the non-empty limbo itself
+  if (!head && graceLoopBase != base)
+    base->methodImpl.wakeupLoop(base);
 }
 
 // Cold path: return a detached chain to the limbo stack (frozen discovered
@@ -810,6 +827,33 @@ static int gracePendingRipe(asyncBase *base)
   return 1;
 }
 
+// A batch blocked by a slot whose thread is parked in the kernel wait would
+// wait for an unrelated event - idle waits have no timeout. Wake one such
+// blocker per scan pass: the woken thread finds the non-empty pending at its
+// next timerLoopPrepareSleep, polls at the drain period and ticks its
+// counter, so the set of parked blockers shrinks and the episode converges
+// whichever sleeper the kernel hands each kick to (a kick consumed by a
+// non-blocker turns it into a poller whose own scan passes re-kick). Both
+// arrays are indexed by messageLoopThreadId, so slot i's sleep horizon is
+// timerSleep[i]. The horizon read is a liveness heuristic: a kick lost to a
+// racing wake costs one drain period, an extra kick one empty wakeup
+static void graceKickBlocker(asyncBase *base)
+{
+  if (!base->timerSleep)
+    return;
+  for (unsigned i = 0; i < base->gracePendingSlots; i++) {
+    uintptr_t captured = base->gracePendingSeen[i];
+    if (captured == UINTPTR_MAX)
+      continue;
+    if (__uintptr_atomic_load(&base->graceSeen[i].seen, amoAcquire) != captured)
+      continue;
+    if (__uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoAcquire) != UINTPTR_MAX) {
+      base->methodImpl.wakeupLoop(base);
+      return;
+    }
+  }
+}
+
 void graceReclaim(asyncBase *base)
 {
   if (__uint_atomic_load(&base->graceFrozen, amoRelaxed))
@@ -822,8 +866,10 @@ void graceReclaim(asyncBase *base)
 
   for (;;) {
     if (base->gracePending) {
-      if (!gracePendingRipe(base))
+      if (!gracePendingRipe(base)) {
+        graceKickBlocker(base);
         break;
+      }
       // Authoritative frozen re-check before every free, mirroring the one
       // after the exchange below: the relaxed gate at the top may run on a
       // stale 0, and a freeze that became visible while the batch was
@@ -881,10 +927,11 @@ void graceReclaim(asyncBase *base)
 
 void graceThreadEnter(asyncBase *base)
 {
-  // A quit->restart cycle re-enters with the flag still set from the
-  // previous life; every branch below except a successful claim must
-  // leave it clear
+  // A quit->restart cycle re-enters with the identity still set from the
+  // previous life (possibly another base); every branch below except a
+  // successful claim must leave both cleared
   graceSlotOwned = 0;
+  graceLoopBase = 0;
 
   // Freezing reclamation is the memory-safe degradation for thread
   // configurations the slots cannot describe: dead objects then stay in
@@ -918,6 +965,7 @@ void graceThreadEnter(asyncBase *base)
     return;
   }
   graceSlotOwned = 1;
+  graceLoopBase = base;
 
   // High-water mark of claimed slots bounds the reclaim scan, so the slot
   // array can afford a generous limit. The claim above and this bump are
@@ -980,6 +1028,7 @@ void graceThreadExit(asyncBase *base)
                            UINTPTR_MAX,
                            amoRelease);
     graceSlotOwned = 0;
+    graceLoopBase = 0;
   }
   graceReclaim(base);
 }

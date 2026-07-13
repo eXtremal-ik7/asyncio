@@ -363,20 +363,25 @@ static void eventTimerSchedule(aioUserEvent *event, int enqueueOnly)
 
 // A decoded POSIX timer pointer is protected physically by the timer's grace
 // period, but stop may release the last logical arm reference while this loop
-// thread is between generation validation and mailbox publication. Claim a
-// reference first. The zero-ref rollback is safe because that same grace
-// period prevents storage reuse; on IOCP the callback rendezvous means the
-// arm reference cannot reach zero until the callback returns.
+// thread is between generation validation and mailbox publication. Increment
+// only a nonzero refcount: a fetch-add followed by rollback would transiently
+// resurrect zero, allowing another stale publisher to mistake that temporary
+// reference for live ownership and finalize the event twice.
 static int eventTimerTryClaimPublisherReference(aioUserEvent *event)
 {
-  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag, 1, amoRelaxed);
-  uintptr_t refs = old & TAG_EVENT_REF_MASK;
-  if (refs == 0) {
-    __uintptr_atomic_fetch_and_add(&event->tag, (uintptr_t)0 - 1, amoRelaxed);
-    return 0;
+  uintptr_t old = __uintptr_atomic_load(&event->tag, amoRelaxed);
+  for (;;) {
+    uintptr_t refs = old & TAG_EVENT_REF_MASK;
+    if (refs == 0)
+      return 0;
+    assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
+    uintptr_t desired = old + 1;
+    if (__uintptr_atomic_compare_exchange(&event->tag,
+                                           &old,
+                                           desired,
+                                           amoRelaxed))
+      return 1;
   }
-  assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
-  return 1;
 }
 
 static int eventTimerPublishGenerationSignal(aioUserEvent *event,

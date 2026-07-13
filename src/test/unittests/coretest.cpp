@@ -1168,6 +1168,111 @@ TEST(core_grace_period, out_of_range_thread_freezes_without_touching_slots)
   EXPECT_EQ(backend.base.graceSlotCount, 0u);
 }
 
+TEST(core_grace_period, retirement_kicks_a_loop_only_from_outside_and_once_per_episode)
+{
+  TestBackend backend;
+  TestObject first(backend), second(backend), third(backend);
+
+  // graceLoopBase is unset (an application thread): the retirement that
+  // finds the limbo empty opens the episode and wakes one sleeper - parked
+  // loops wait with no timeout and cannot notice the limbo on their own
+  graceRetire(&backend.base, &first.root, TestObject::memoryRelease);
+  EXPECT_EQ(backend.wakeupCalls, 1u);
+
+  // A follow-up retirement rides on the episode's kick: a woken loop polls
+  // at the drain period until the limbo is empty
+  graceRetire(&backend.base, &second.root, TestObject::memoryRelease);
+  EXPECT_EQ(backend.wakeupCalls, 1u);
+
+  // No slot was ever claimed, so the batch ripens within one scan
+  graceReclaim(&backend.base);
+  EXPECT_EQ(first.memoryReleases, 1u);
+  EXPECT_EQ(second.memoryReleases, 1u);
+
+  // The next retirement after the drain opens a new episode
+  graceRetire(&backend.base, &third.root, TestObject::memoryRelease);
+  EXPECT_EQ(backend.wakeupCalls, 2u);
+  graceReclaim(&backend.base);
+  EXPECT_EQ(third.memoryReleases, 1u);
+}
+
+TEST(core_grace_period, retirement_from_the_bases_own_loop_thread_does_not_kick)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  graceThreadEnter(&backend.base);   // claims slot 0, takes the loop identity
+
+  // The caller is a loop thread of this base: it is awake and its next
+  // sleep decision sees the non-empty limbo itself - a kick would be a
+  // wasted syscall on the hot delete path
+  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
+  EXPECT_EQ(backend.wakeupCalls, 0u);
+
+  graceThreadExit(&backend.base);    // stamps out and drains as the last thread
+  EXPECT_EQ(object.memoryReleases, 1u);
+}
+
+TEST(core_grace_period, retirement_into_a_foreign_base_counts_as_outside)
+{
+  TestBackend own, foreign;
+  TestObject object(foreign);
+  graceThreadEnter(&own.base);       // a loop thread - but of another base
+
+  graceRetire(&foreign.base, &object.root, TestObject::memoryRelease);
+  EXPECT_EQ(foreign.wakeupCalls, 1u);
+  EXPECT_EQ(own.wakeupCalls, 0u);
+
+  graceThreadExit(&own.base);
+  graceReclaim(&foreign.base);
+  EXPECT_EQ(object.memoryReleases, 1u);
+}
+
+TEST(core_grace_period, reclaim_chases_a_blocked_batch_with_one_kick_per_pass)
+{
+  TestBackend backend;
+  TestObject object(backend);
+
+  // Claim slots 0 and 1 (the mock plays both loop threads from this one):
+  // a captured batch then waits on both quiescence counters
+  messageLoopThreadId = 0;
+  graceThreadEnter(&backend.base);
+  messageLoopThreadId = 1;
+  graceThreadEnter(&backend.base);
+
+  // Both loops park in unbounded waits; the delete comes from an
+  // application thread and opens the episode with a kick
+  backend.sleepSlots[0].wakeTick = timerSleepEternal;
+  backend.sleepSlots[1].wakeTick = timerSleepEternal;
+  graceLoopBase = nullptr;
+  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
+  EXPECT_EQ(backend.wakeupCalls, 1u);
+
+  // The scan captures the batch against both live counters and cannot ripen
+  // it: one chase kick per pass, aimed only while a blocker actually sleeps
+  graceReclaim(&backend.base);
+  ASSERT_EQ(backend.base.gracePending, &object.root);
+  EXPECT_EQ(backend.wakeupCalls, 2u);
+  EXPECT_EQ(object.memoryReleases, 0u);
+
+  // Thread 0 wakes on the kick, ticks and scans: the batch is still blocked
+  // by sleeping thread 1, so the chain passes the kick on
+  messageLoopThreadId = 0;
+  backend.sleepSlots[0].wakeTick = UINTPTR_MAX;
+  graceQuiesce(&backend.base);
+  EXPECT_EQ(backend.wakeupCalls, 3u);
+  EXPECT_EQ(object.memoryReleases, 0u);
+
+  // Thread 1 wakes and ticks: every captured counter has moved, the batch
+  // ripens and an unblocked grace attracts no further kicks
+  messageLoopThreadId = 1;
+  backend.sleepSlots[1].wakeTick = UINTPTR_MAX;
+  graceQuiesce(&backend.base);
+  EXPECT_EQ(object.memoryReleases, 1u);
+  EXPECT_EQ(backend.wakeupCalls, 3u);
+
+  graceThreadExit(&backend.base);    // stamps out slot 1, the identity held
+}
+
 TEST(core_delete_lifecycle, destructor_callback_is_optional)
 {
   TestBackend backend;

@@ -7,10 +7,14 @@
 #include "coretest.h"
 
 #include "reactorTimer.h"
+#include "atomic.h"
 
 #include "asyncio/asyncio.h"
+#include "asyncio/socket.h"
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #ifdef __linux__
 #include <sys/timerfd.h>
@@ -690,22 +694,25 @@ TEST(timer_wakeup, prepare_sleep_is_tickless_and_wakes_right_after_nearest_deadl
   TestObject object(backend);
   TestOp nearOp(object), farOp(object);
 
-  // Empty wheel: the full fallback wait, the horizon spans all of it
-  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 1000u);
-  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 8u);
+  // Empty wheel, empty grace fields: the wait is unbounded and the slot
+  // carries the eternal sentinel - farther than any tick, so any arm kicks
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), UINT32_MAX);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, timerSleepEternal);
   timerLoopCancelSleep(&backend.base, 0);
   EXPECT_EQ(backend.sleepSlots[0].wakeTick, UINTPTR_MAX);
 
-  // A deadline beyond the window keeps the fallback: a parked long timer no
-  // longer forces tick-rate polling (the point of the occupancy bitmap)
+  // A faraway deadline sleeps up to the visit of its slot, not the fallback:
+  // tick 5000 parks in level-1 slot 4, whose window [4096, 5120) is visited
+  // at tick 4096 (the cascade boundary must not be overslept)
   farOp.root.endTime = 5000 * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &farOp.root);
-  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 1000u);
-  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 8u);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 4097u * 125u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 4097u);
   timerLoopCancelSleep(&backend.base, 0);
 
-  // A deadline inside the window shrinks the wait to its exact wake tick
-  // (deadline + 1: the sweep of a tick runs on the first call past it)
+  // A deadline inside the level-0 rotation shrinks the wait to its exact
+  // wake tick (deadline + 1: the sweep of a tick runs on the first call
+  // past it)
   nearOp.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &nearOp.root);
   EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 750u);
@@ -716,11 +723,12 @@ TEST(timer_wakeup, prepare_sleep_is_tickless_and_wakes_right_after_nearest_deadl
   EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 6, 1000), 0u);
   timerLoopCancelSleep(&backend.base, 0);
 
-  // Delivery clears the slot and the sleep returns to the fallback
+  // Delivery clears the near slot and the sleep stretches back out to the
+  // far link's cascade boundary
   processTimeoutQueue(&backend.base, 6);
   EXPECT_EQ(opGetStatus(&nearOp.root), aosTimeout);
-  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 6, 1000), 1000u);
-  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 14u);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 6, 1000), (4097u - 6u) * 125u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 4097u);
   timerLoopCancelSleep(&backend.base, 0);
 
   // A thread beyond the horizon array has no channel for the kick: its wait
@@ -729,6 +737,137 @@ TEST(timer_wakeup, prepare_sleep_is_tickless_and_wakes_right_after_nearest_deadl
 
   objectDecrementReference(&object.root, 2);
   objectDelete(&object.root);
+}
+
+TEST(timer_wakeup, prepare_sleep_holds_the_drain_period_while_grace_is_busy)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  graceThreadEnter(&backend.base);  // claims slot 0: the batch needs its tick
+
+  // A retired object needs the quiescence ticks of the loop threads: the
+  // idle wait turns from unbounded into the drain period (the fallback)
+  graceRetire(&backend.base, &object.root, TestObject::memoryRelease);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 1000u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 8u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // The scanner may have moved the limbo stack into the pending batch: the
+  // drain period must key on both fields, or the last grace period of an
+  // episode would wait for an unrelated event
+  graceReclaim(&backend.base);
+  EXPECT_EQ(backend.base.graceLimbo, nullptr);
+  ASSERT_EQ(backend.base.gracePending, &object.root);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), 1000u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // The quiescence tick ripens the batch; with the grace fields empty the
+  // wait is unbounded again
+  graceQuiesce(&backend.base);
+  EXPECT_EQ(object.memoryReleases, 1u);
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), UINT32_MAX);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  graceThreadExit(&backend.base);
+}
+
+TEST(timer_wakeup, prepare_sleep_scans_the_full_rotation_in_wrap_around_order)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+
+  // A deadline beyond the wheel range clamps into the farthest future
+  // top-level slot: index 1023, one position BEHIND the scan's start - only
+  // the circular wrap-around pass sees its bit (a horizon-capped scan never
+  // could). Its visit is millennia out, so the wait meets the kernel-range
+  // clamp; the published horizon matches the actual wake, waking early just
+  // re-scans
+  op.root.endTime = (((uint64_t)1 << 40) + 5) * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_TRUE(wheelSlotOccupied(backend, 3, TIMER_WHEEL_SLOTS - 1));
+  const uint64_t limitTicks = 0x7FFFFFFFu / 125u;
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), (uint32_t)(limitTicks * 125u));
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, limitTicks);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // The link belongs to the wheel: recover it without a 2^40-tick sweep
+  asyncOpListLink *link = drainWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1);
+  ASSERT_NE(link, nullptr);
+  EXPECT_EQ(link->next, nullptr);
+  op.root.timerId = nullptr;
+  free(link);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wakeup, prepare_sleep_clamps_far_wakes_to_the_kernel_timeout_range)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object);
+
+  // Tick 2^25 parks on level 2 (slot 32); its visit is ~48 days away, past
+  // what epoll accepts as an int millisecond timeout. The wait is clamped
+  // and the published horizon matches the actual wake
+  op.root.endTime = ((uint64_t)1 << 25) * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_TRUE(wheelSlotOccupied(backend, 2, 32));
+  const uint64_t limitTicks = 0x7FFFFFFFu / 125u;
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 0, 1000), (uint32_t)(limitTicks * 125u));
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, limitTicks);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // The link belongs to the wheel: recover it without a 2^25-tick sweep
+  asyncOpListLink *link = drainWheelSlot(backend, 2, 32);
+  ASSERT_NE(link, nullptr);
+  op.root.timerId = nullptr;
+  free(link);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+// Grace liveness against unbounded idle waits, end to end on the real
+// backend: with the wheel empty both loop threads block with no timeout, so
+// an object deleted from an application thread is invisible to them - the
+// retirement kick must wake one loop and the reclaim chain-kick must chase
+// the batch past the other sleeper. On Windows the grace fields never fill
+// and the check passes vacuously; the quit still exercises waking a loop
+// parked with no timeout
+TEST(timer_wakeup, external_delete_drains_grace_from_unbounded_idle_sleep)
+{
+  asyncBase *base = createAsyncBase(amOSDefault, 2);
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  socketTy udpSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  ASSERT_NE(udpSocket, INVALID_SOCKET);
+  ASSERT_EQ(socketBind(udpSocket, &address), 0);
+  aioObject *object = newSocketIo(base, udpSocket);
+
+  std::thread first([base] { asyncLoop(base); });
+  std::thread second([base] { asyncLoop(base); });
+  // Let both loops settle into the no-timeout wait
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  deleteAioObject(object);
+
+  bool drained = false;
+  for (int i = 0; i < 100 && !drained; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    drained =
+      !__pointer_atomic_load(reinterpret_cast<void *volatile*>(&base->graceLimbo), amoAcquire) &&
+      !__pointer_atomic_load(reinterpret_cast<void *volatile*>(&base->gracePending), amoAcquire);
+  }
+  EXPECT_TRUE(drained)
+    << "a retirement against idle-parked loops was never reclaimed: the kick chain is broken";
+
+  postQuitOperation(base);
+  first.join();
+  second.join();
 }
 
 TEST(timer_wakeup, prepare_sleep_wakes_at_cascade_boundary_of_occupied_upper_slot)
