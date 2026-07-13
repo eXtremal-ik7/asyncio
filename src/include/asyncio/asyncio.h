@@ -27,6 +27,9 @@ void initializeAsyncIo(AsyncInitFlags flags);
 // Returns 0 when the OS multiplexor cannot be created (descriptor or handle
 // exhaustion) or memory allocation fails.
 asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads);
+// Return 0 on allocation failure or an address outside the supported kernel
+// handle model; the descriptor is then still owned by the caller, who closes
+// it. On success the object owns the descriptor until deleteAioObject.
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket);
 aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice);
 void deleteAioObject(aioObject *object);

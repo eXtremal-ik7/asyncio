@@ -326,6 +326,8 @@ static AsyncOpStatus smtpStartTlsStart(asyncOpRoot *opptr)
   } else if (op->State == stStartTls) {
     op->State = stFinished;
     client->TlsSocket = sslSocketNew(aioGetBase(client->PlainSocket), client->PlainSocket);
+    if (!client->TlsSocket)
+      return aosUnknownError;
     aioSslConnect(client->TlsSocket, 0, 0, 0, smtpsConnectProc, op);
     return aosPending;
   } else {
@@ -396,6 +398,8 @@ static AsyncOpStatus smtpSendMailStart(asyncOpRoot *opptr)
     case stStartTls : {
       op->State = stEhlo2;
       client->TlsSocket = sslSocketNew(aioGetBase(client->PlainSocket), client->PlainSocket);
+      if (!client->TlsSocket)
+        return aosUnknownError;
       aioSslConnect(client->TlsSocket, 0, 0, 0, smtpsConnectProc, op);
       break;
     }

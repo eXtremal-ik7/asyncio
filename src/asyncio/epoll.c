@@ -647,12 +647,19 @@ static void epollTimerRollbackArm(aioTimer *timer)
   struct itimerspec disarm;
   memset(&disarm, 0, sizeof(disarm));
   reactorTimerDisarm(timer);
-  (void)epollTimerSettime(timer, 0, &disarm);
+  if (timer->fd != -1)
+    (void)epollTimerSettime(timer, 0, &disarm);
 }
 
 void epollStartTimer(asyncOpRoot *op)
 {
   aioTimer *timer = (aioTimer*)op->timerId;
+  if (!timer) {
+    // The paired cell is created once per pooled slot; a constructor-time
+    // allocation failure must not disable this slot's timeouts forever.
+    epollInitializeTimer(op->object->base, op);
+    timer = (aioTimer*)op->timerId;
+  }
   if (!timer || !reactorTimerBindKind(timer, rtkOperation)) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;

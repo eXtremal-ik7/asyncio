@@ -449,8 +449,14 @@ static void wakeBlockingReceivers(uint16_t port, unsigned receiverThreads)
   address.sin_addr.s_addr = inet_addr("127.0.0.1");
   address.sin_port = htons(port);
   char byte = 0;
-  for (unsigned i = 0; i < receiverThreads; i++)
-    sendto(wakeSocket, &byte, sizeof(byte), 0, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+  for (unsigned i = 0; i < receiverThreads; i++) {
+    // A dropped wake datagram (EINTR/ENOBUFS under load) leaves one receiver
+    // blocked in recvfrom forever and the join below never returns.
+    while (sendto(wakeSocket, &byte, sizeof(byte), 0,
+                  reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != sizeof(byte))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   socketClose(wakeSocket);
 }
 

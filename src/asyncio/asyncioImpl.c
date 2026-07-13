@@ -470,6 +470,16 @@ static void cancelInitializationOp(aioObjectRoot *object, AsyncOpStatus status)
   }
 }
 
+// The one bulk-cancel of everything parked on an object: the initialization
+// slot and both queues. Shared by the three sweep positions (CANCELIO flag,
+// DELETE tag, DeletePending at ownership release), which must stay in sync.
+static void cancelAllObjectOperations(aioObjectRoot *object)
+{
+  cancelInitializationOp(object, aosCanceled);
+  cancelOperationList(&object->readQueue, aosCanceled);
+  cancelOperationList(&object->writeQueue, aosCanceled);
+}
+
 // Start an op-node captured by the combiner (submission). The former
 // processAction(aaStart): the initialization-slot owner is armed and driven in place,
 // an ordinary operation is queued; the combiner reconciles the rest by status.
@@ -583,11 +593,8 @@ void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
   // CANCELIO pass - a coalesced request cannot be lost
   if ((tag & COMBINER_TAG_CANCELIO) &&
       __uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
-      __uint_atomic_exchange(&object->CancelIoFlag, 0, amoSeqCst) != 0) {
-    cancelInitializationOp(object, aosCanceled);
-    cancelOperationList(&object->readQueue, aosCanceled);
-    cancelOperationList(&object->writeQueue, aosCanceled);
-  }
+      __uint_atomic_exchange(&object->CancelIoFlag, 0, amoSeqCst) != 0)
+    cancelAllObjectOperations(object);
 
   asyncOpRoot *ex = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
   if (ex) {
@@ -884,9 +891,7 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
   // the captured submissions are started and let an operation submitted
   // before the cancelIo() call escape it
   if (tag & COMBINER_TAG_DELETE) {
-    cancelInitializationOp(object, aosCanceled);
-    cancelOperationList(&object->readQueue, aosCanceled);
-    cancelOperationList(&object->writeQueue, aosCanceled);
+    cancelAllObjectOperations(object);
     // Ownership serializes the only writer. Generation is an identity token,
     // not a publication channel, so a relaxed load/store avoids a locked RMW.
     uintptr_t generation = __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
@@ -922,11 +927,8 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       // action of the captured chains, so a submission that slipped past the
       // CancelIoFlag pass cannot survive the delete and pin the object
       // (sticky flag; the sweep is idempotent, re-runs only cost a re-check)
-      if (__uint_atomic_load(&object->DeletePending, amoRelaxed)) {
-        cancelInitializationOp(object, aosCanceled);
-        cancelOperationList(&object->readQueue, aosCanceled);
-        cancelOperationList(&object->writeQueue, aosCanceled);
-      }
+      if (__uint_atomic_load(&object->DeletePending, amoRelaxed))
+        cancelAllObjectOperations(object);
       if (__uintptr_atomic_compare_and_swap(&object->Head.data,
                                             stackTop.data,
                                             0,

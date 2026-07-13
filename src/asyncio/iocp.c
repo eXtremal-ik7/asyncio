@@ -531,9 +531,13 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
   if (!timer->hTimer)
     timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
   timer->wait = timer->hTimer ? CreateThreadpoolWait(iocpTimerCb, timer, NULL) : NULL;
-  if (timer->hTimer && !timer->wait) {
-    CloseHandle(timer->hTimer);
-    timer->hTimer = NULL;
+  if (!timer->wait) {
+    // A published timer always carries both handles; a partial cell is freed
+    // here so the next arm retries the whole construction.
+    if (timer->hTimer)
+      CloseHandle(timer->hTimer);
+    alignedFree(timer);
+    return;
   }
   op->timerId = timer;
 }
@@ -541,6 +545,12 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
 void iocpStartTimer(asyncOpRoot *op)
 {
   aioTimer *timer = (aioTimer*)op->timerId;
+  if (!timer && op->opCode != actUserEvent) {
+    // The paired cell is created once per pooled slot; a constructor-time
+    // allocation failure must not disable this slot's timeouts forever.
+    iocpInitializeTimer(op->object->base, op);
+    timer = (aioTimer*)op->timerId;
+  }
   if (!timer) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
@@ -556,7 +566,7 @@ void iocpStartTimer(asyncOpRoot *op)
   if (__uintptr_atomic_load(&timer->state, amoRelaxed) != IOCP_TIMER_STOPPED)
     iocpDisarmWaitableTimer(timer);
   __uintptr_atomic_store(&timer->state, IOCP_TIMER_ARMED, amoRelease);
-  if (!timer->hTimer || !timer->wait || !iocpArmWaitableTimer(timer, op->timeout)) {
+  if (!iocpArmWaitableTimer(timer, op->timeout)) {
     __uintptr_atomic_store(&timer->state, IOCP_TIMER_STOPPED, amoRelaxed);
     if (op->opCode == actUserEvent) {
       aioUserEvent *event = (aioUserEvent*)op;
@@ -580,7 +590,7 @@ void iocpStartTimer(asyncOpRoot *op)
 void iocpStopTimer(asyncOpRoot *op)
 {
   aioTimer *timer = (aioTimer*)op->timerId;
-  if (timer && timer->hTimer && timer->wait)
+  if (timer)
     iocpDisarmWaitableTimer(timer);
 }
 
@@ -589,12 +599,9 @@ void iocpDestroyTimer(asyncOpRoot *op)
   aioTimer *timer = (aioTimer*)op->timerId;
   if (!timer)
     return;
-  if (timer->hTimer && timer->wait)
-    iocpDisarmWaitableTimer(timer);
-  if (timer->wait)
-    CloseThreadpoolWait(timer->wait);
-  if (timer->hTimer)
-    CloseHandle(timer->hTimer);
+  iocpDisarmWaitableTimer(timer);
+  CloseThreadpoolWait(timer->wait);
+  CloseHandle(timer->hTimer);
   alignedFree(timer);
 }
 
@@ -612,16 +619,15 @@ int iocpUpdateEventTimer(aioUserEvent *event,
                          uint64_t period)
 {
   aioTimer *timer = (aioTimer*)event->root.timerId;
+  if (!timer)
+    return update == etuStop;
   switch (update) {
     case etuStop:
-      if (timer->hTimer && timer->wait)
-        iocpDisarmWaitableTimer(timer);
+      iocpDisarmWaitableTimer(timer);
       return 1;
 
     case etuStart:
     case etuRearm:
-      if (!timer->hTimer || !timer->wait)
-        return 0;
       // A replacement Start reaches here only after eventTimerStopApplied did
       // the full callback rendezvous; the first Start has no predecessor.
       // Rearm is driven by the control task posted at the end of the old

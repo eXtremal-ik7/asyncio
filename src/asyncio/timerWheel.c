@@ -277,26 +277,36 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   // Wake one loop if no published sleeper would meet the deadline in time: a
   // sleeper waking at wakeTick sweeps every tick below it, so a lag of one
   // tick is covered by the sleeper itself and anything longer needs the kick.
-  // Awake threads park their slots at UINTPTR_MAX and never attract kicks -
-  // they re-scan the occupancy bitmap before their next sleep. For the arm
-  // that activated the slot, the seq-cst order is:
+  // The decision is the MINIMUM over the published horizons - one sleeper
+  // due at wakeTick <= deadline+1 serves this deadline no matter how late
+  // the others sleep, so kicking on the first late slot would only wake a
+  // thread whose work is already scheduled. Awake threads park their slots
+  // at UINTPTR_MAX and never attract kicks - they re-scan the occupancy
+  // bitmap before their next sleep. For the arm that activated the slot,
+  // the seq-cst order is:
   //   sleeper horizon store -> missed bitmap load -> producer bit set
   //                          -> producer horizon load.
   // Thus a scan that missed this bit forces this load to observe that sleep
   // episode's sentinel or its later, shorter horizon; a stale awake value is
-  // impossible. An arm
+  // impossible. The same order legitimizes trusting a covering horizon: it
+  // is either the slot's current episode (that sleeper wakes in time and its
+  // sweep delivers this deadline, or wakes earlier and re-scans), or a stale
+  // value - and reading a stale value here proves this bit's set precedes
+  // that thread's next bitmap scan in the seq-cst order, so the scan sees
+  // the bit and the recomputed horizon covers the deadline again. An arm
   // stacked onto a live chain rides on its first publisher's activation:
   // same slot, same wake tick. Every stale reading errs toward a spurious
   // kick, never toward a lost wakeup.
   if (base->timerSleep) {
+    uintptr_t earliest = UINTPTR_MAX;
     for (unsigned i = 0; i < base->loopThreadLimit; i++) {
       uintptr_t wakeTick =
         __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoSeqCst);
-      if (wakeTick != UINTPTR_MAX && wakeTick > (uintptr_t)(deadline + 1)) {
-        base->methodImpl.wakeupLoop(base);
-        break;
-      }
+      if (wakeTick < earliest)
+        earliest = wakeTick;
     }
+    if (earliest != UINTPTR_MAX && earliest > (uintptr_t)(deadline + 1))
+      base->methodImpl.wakeupLoop(base);
   }
 }
 
