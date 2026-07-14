@@ -48,7 +48,11 @@ void setSocketBuffer(aioObject *socket, size_t bufferSize);
 // All strong references are equivalent for lifetime. Exactly one holder closes
 // the event with deleteUserEvent instead of ordinary release; ordinary release
 // changes lifetime only. Retain is valid only while the caller already owns a
-// strong reference.
+// strong reference. Manual activation uses a personal kernel doorbell; delete
+// is allowed to discard a signal which the loop has not yet claimed, even if
+// userEventActivate returned before deleteUserEvent was called. Once readiness
+// has claimed its delivery reference, the complete accepted callback batch is
+// delivered even if deleteUserEvent runs before or during that batch.
 aioUserEvent *newUserEvent(asyncBase* base, int isSemaphore, aioEventCb callback, void* arg);
 
 // Starts a periodic timer and replaces the previous timer schedule. usTimeout
@@ -60,9 +64,9 @@ aioUserEvent *newUserEvent(asyncBase* base, int isSemaphore, aioEventCb callback
 // a safe no-op and cannot revive the event.
 void userEventStartTimer(aioUserEvent *event, uint64_t usTimeout, int counter);
 
-// Stops the current timer schedule. It does not cancel manual or already
-// accepted activations. Subject to the external-serialization rule above,
-// Stop is idempotent.
+// Stops the current timer schedule. It does not cancel an already accepted
+// callback delivery holding its lifetime reference. Subject to the external-
+// serialization rule above, Stop is idempotent.
 void userEventStopTimer(aioUserEvent *event);
 
 // Thread-safe cross-thread activation; see newUserEvent for coalescing rules.
@@ -75,7 +79,8 @@ void userEventActivate(aioUserEvent *event);
 // eventDecrementReference; no separate kind of reference is stored. Other
 // strong references keep storage alive, while their operations observe the
 // terminal state and become no-ops. Final destruction follows their release
-// plus accepted deliveries/control.
+// plus readiness/timer-control work which had already claimed a reference.
+// Callback batches accepted before close are not retracted.
 void deleteUserEvent(aioUserEvent *event);
 
 asyncOpRoot *implRead(aioObject *object,
@@ -155,8 +160,12 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
 ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 // Coroutine-only helpers for a dedicated event created with callback == NULL.
-// Only one coroutine may wait on the event at a time; activation may still
-// come from any thread. A pending activation is consumed without suspending.
+// Calls on that event are serialized by the coroutine; only activation and the
+// single delete may overlap from other threads. The caller must own a strong
+// reference for the complete call, including suspension inside Yield. Thus a
+// concurrent delete must consume a different strong reference; sharing the
+// sole reference between a waiting coroutine and a deleting thread is a
+// contract violation. A pending activation is consumed without suspending.
 void ioSleep(aioUserEvent *event, uint64_t usTimeout);
 void ioWaitUserEvent(aioUserEvent *event);
 

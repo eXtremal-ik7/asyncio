@@ -124,7 +124,7 @@ static SMTPOp *allocSmtpOp(aioExecuteProc executeProc,
                            uint64_t timeout)
 {
   SMTPOp *op = 0;
-  asyncOpAlloc(client->root.base, sizeof(SMTPOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op);
+  asyncOpAlloc(client->root.header.base, sizeof(SMTPOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op);
   dynamicBufferInit(&op->Buffer, 1024);
 
   initAsyncOpRoot(&op->Root, executeProc, cancel, finishProc, releaseProc, &client->root, callback, arg, flags, type, timeout);

@@ -4,35 +4,35 @@
 // TSan builds route it through __tsan_atomic128_*.
 #include "atomic128.h"
 
-int atomic128GuardCas(volatile uint128Pair *ptr, uint128Pair *expected, uint128Pair desired)
+int atomic128GuardCas(volatile uint128 *ptr, uint128 *expected, uint128 desired)
 {
   return __uint128_atomic_compare_and_swap(ptr, expected, desired);
 }
 
-uint128Pair atomic128GuardLoad(const volatile uint128Pair *ptr)
+uint128 atomic128GuardLoad(const volatile uint128 *ptr)
 {
   return __uint128_atomic_load(ptr);
 }
 
-uint128Pair atomic128GuardExchange(volatile uint128Pair *ptr, uint128Pair value)
+uint128 atomic128GuardExchange(volatile uint128 *ptr, uint128 value)
 {
   return __uint128_atomic_exchange(ptr, value);
 }
 
-int atomic128GuardCasRelaxed(volatile uint128Pair *ptr,
-                             uint128Pair *expected,
-                             uint128Pair desired)
+int atomic128GuardCasRelaxed(volatile uint128 *ptr,
+                             uint128 *expected,
+                             uint128 desired)
 {
   return __uint128_atomic_compare_and_swap_relaxed(ptr, expected, desired);
 }
 
-uint128Pair atomic128GuardLoadRelaxed(const volatile uint128Pair *ptr)
+uint128 atomic128GuardLoadRelaxed(const volatile uint128 *ptr)
 {
   return __uint128_atomic_load_relaxed(ptr);
 }
 
-uint128Pair atomic128GuardExchangeRelaxed(volatile uint128Pair *ptr,
-                                          uint128Pair value)
+uint128 atomic128GuardExchangeRelaxed(volatile uint128 *ptr,
+                                      uint128 value)
 {
   return __uint128_atomic_exchange_relaxed(ptr, value);
 }

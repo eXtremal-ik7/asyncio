@@ -104,7 +104,7 @@ uint64_t occupancyViolations(asyncBase *base)
   uint64_t violations = 0;
   for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; ++level) {
     for (unsigned index = 0; index < TIMER_WHEEL_SLOTS; ++index) {
-      uint128Pair pair = __uint128_atomic_load(&base->timerWheel.slots[level][index]);
+      uint128 pair = __uint128_atomic_load(&base->timerWheel.slots[level][index]);
       if (pair.low &&
           !(base->timerWheel.occupancy[level][index >> 6] & (static_cast<uintptr_t>(1) << (index & 63))))
         ++violations;
@@ -291,7 +291,7 @@ int main(int argc, char **argv)
   // One immutable shell is sufficient: opSetStatus loses on every detached
   // link, so no combiner signal is ever pushed to it.
   aioObjectRoot sweepOwner{};
-  __uintptr_atomic_store(&sweepOwner.Head.gen, 1, amoRelaxed);
+  __uint64_atomic_store(&sweepOwner.header.tag.high, 1, amoRelaxed);
   for (size_t i = 0; i < opCount; ++i)
     ops[i].object = &sweepOwner;
   std::atomic<uint64_t> cursorViolations{0};
@@ -466,7 +466,7 @@ int main(int argc, char **argv)
 
     // Nothing may be parked in the reopened incarnations
     for (uint64_t s = 0; s < distinctSlots; ++s) {
-      uint128Pair observed = __uint128_atomic_load(
+      uint128 observed = __uint128_atomic_load(
         &lateBase->timerWheel.slots[0][(roundBase + s) % TIMER_WHEEL_SLOTS]);
       if (observed.low != 0)
         stranded++;

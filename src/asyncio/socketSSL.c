@@ -99,7 +99,7 @@ static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
 {
   SSLOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
     op->internalBuffer = 0;
     op->internalBufferSize = 0;
   }
@@ -122,7 +122,7 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
 {
   SSLOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
     op->internalBuffer = 0;
     op->internalBufferSize = 0;
   }

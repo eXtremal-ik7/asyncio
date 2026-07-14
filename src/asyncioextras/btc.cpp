@@ -171,7 +171,7 @@ static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
 {
   btcOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(btcOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(btcOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
     op->internalBuffer = nullptr;
     op->internalBufferSize = 0;
   }
@@ -194,7 +194,7 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
 {
   btcOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(btcOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(btcOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
     op->internalBuffer = nullptr;
     op->internalBufferSize = 0;
   }

@@ -203,7 +203,7 @@ static HTTPOp *allocHttpOp(aioExecuteProc executeProc,
                            uint64_t timeout)
 {
   HTTPOp *op = 0;
-  if (asyncOpAlloc(client->root.base, sizeof(HTTPOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(client->root.header.base, sizeof(HTTPOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
     op->internalBuffer = 0;
     op->dataSize = 0;
     op->internalBufferSize = 0;

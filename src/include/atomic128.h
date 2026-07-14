@@ -19,31 +19,34 @@
 // separate fence emitted, reviewed on the generated code of both ISAs. An
 // ordering parameter would buy nothing, so none is exposed. Explicit relaxed
 // variants are provided only for protocols that publish no payload through
-// the pair itself (the user-event timer signal bucket); on compilers without
+// the pair itself (for example numeric timer control words); on compilers without
 // a proven inline ordered DWCAS they deliberately fall back to the stronger
 // default operation.
 
 #if defined(_MSC_VER) && !defined(__clang__)
-typedef struct __declspec(align(16)) uint128Pair {
+typedef struct __declspec(align(16)) uint128 {
   uint64_t low;
   uint64_t high;
-} uint128Pair;
+} uint128;
 #else
-typedef struct __attribute__((aligned(16))) uint128Pair {
+typedef struct __attribute__((aligned(16))) uint128 {
   uint64_t low;
   uint64_t high;
-} uint128Pair;
+} uint128;
 #endif
 
 // The pair must stay two packed 64-bit words: CAS compares every bit
 #ifdef __cplusplus
-static_assert(sizeof(uint128Pair) == 16, "uint128Pair must be two packed 64-bit words");
+static_assert(sizeof(uint128) == 16, "uint128 must be two packed 64-bit words");
+static_assert(alignof(uint128) == 16, "uint128 must be DWCAS aligned");
 #elif defined(_MSC_VER) && !defined(__clang__)
 // MSVC C mode runs without /std:c11 here and lacks _Static_assert; a
 // negative array size fails the build the same way
-typedef char uint128PairMustBeTwoPackedWords[sizeof(uint128Pair) == 16 ? 1 : -1];
+typedef char uint128MustBeTwoPackedWords[sizeof(uint128) == 16 ? 1 : -1];
+typedef char uint128MustBe16Aligned[__alignof(uint128) == 16 ? 1 : -1];
 #else
-_Static_assert(sizeof(uint128Pair) == 16, "uint128Pair must be two packed 64-bit words");
+_Static_assert(sizeof(uint128) == 16, "uint128 must be two packed 64-bit words");
+_Static_assert(_Alignof(uint128) == 16, "uint128 must be DWCAS aligned");
 #endif
 
 // Build-time guard against silent non-lock-free degradation (a mutex inside
@@ -69,7 +72,7 @@ __NO_UNUSED_FUNCTION_BEGIN
 // Strong CAS. On failure *expected receives the observed pair — that value is
 // an atomic snapshot, unlike __uint128_atomic_load below. Returns non-zero on
 // success.
-static inline int __uint128_atomic_compare_and_swap(volatile uint128Pair *ptr, uint128Pair *expected, uint128Pair desired)
+static inline int __uint128_atomic_compare_and_swap(volatile uint128 *ptr, uint128 *expected, uint128 desired)
 {
 #if defined(_MSC_VER) && !defined(__clang__)
   return InterlockedCompareExchange128((volatile LONG64*)ptr, (LONG64)desired.high, (LONG64)desired.low, (LONG64*)expected);
@@ -95,9 +98,7 @@ static inline int __uint128_atomic_compare_and_swap(volatile uint128Pair *ptr, u
 // is kept on __sync because some supported GCC targets lower 16-byte
 // __atomic_* to libatomic even when __sync CAS is inline; stronger ordering is
 // preferable to silently reintroducing a lock.
-static inline int __uint128_atomic_compare_and_swap_relaxed(volatile uint128Pair *ptr,
-                                                            uint128Pair *expected,
-                                                            uint128Pair desired)
+static inline int __uint128_atomic_compare_and_swap_relaxed(volatile uint128 *ptr, uint128 *expected, uint128 desired)
 {
 #if defined(__clang__)
   typedef unsigned __int128 uint128Alias __attribute__((may_alias));
@@ -105,12 +106,7 @@ static inline int __uint128_atomic_compare_and_swap_relaxed(volatile uint128Pair
   uint128Alias desiredValue;
   __builtin_memcpy(&expectedValue, expected, sizeof(uint128Alias));
   __builtin_memcpy(&desiredValue, &desired, sizeof(uint128Alias));
-  int exchanged = __atomic_compare_exchange_n((volatile uint128Alias*)ptr,
-                                               &expectedValue,
-                                               desiredValue,
-                                               0,
-                                               __ATOMIC_RELAXED,
-                                               __ATOMIC_RELAXED);
+  int exchanged = __atomic_compare_exchange_n((volatile uint128Alias*)ptr, &expectedValue, desiredValue, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
   if (!exchanged)
     __builtin_memcpy(expected, &expectedValue, sizeof(uint128Alias));
   return exchanged;
@@ -125,9 +121,9 @@ static inline int __uint128_atomic_compare_and_swap_relaxed(volatile uint128Pair
 // pair, and payload publication is synchronized exclusively through CAS —
 // never through this load. Readers stay write-free (no cache-line ownership
 // transfer, works on read-only mappings).
-static inline uint128Pair __uint128_atomic_load(const volatile uint128Pair *ptr)
+static inline uint128 __uint128_atomic_load(const volatile uint128 *ptr)
 {
-  uint128Pair result;
+  uint128 result;
 #if defined(_MSC_VER) && !defined(__clang__)
   result.low = (uint64_t)ReadAcquire64((volatile LONG64*)&ptr->low);
   result.high = (uint64_t)ReadAcquire64((volatile LONG64*)&ptr->high);
@@ -140,9 +136,9 @@ static inline uint128Pair __uint128_atomic_load(const volatile uint128Pair *ptr)
 
 // Like the ordinary routing load this may be torn; the following CAS validates
 // every decision. It is intended for numeric/token pairs only.
-static inline uint128Pair __uint128_atomic_load_relaxed(const volatile uint128Pair *ptr)
+static inline uint128 __uint128_atomic_load_relaxed(const volatile uint128 *ptr)
 {
-  uint128Pair result;
+  uint128 result;
 #if defined(_MSC_VER) && !defined(__clang__)
   result.low = (uint64_t)ReadNoFence64((volatile LONG64*)&ptr->low);
   result.high = (uint64_t)ReadNoFence64((volatile LONG64*)&ptr->high);
@@ -155,20 +151,19 @@ static inline uint128Pair __uint128_atomic_load_relaxed(const volatile uint128Pa
 
 // CAS loop — there is no native 128-bit exchange. Lock-free, not wait-free:
 // every retry means some other CAS on the pair succeeded.
-static inline uint128Pair __uint128_atomic_exchange(volatile uint128Pair *ptr, uint128Pair value)
+static inline uint128 __uint128_atomic_exchange(volatile uint128 *ptr, uint128 value)
 {
   // The seed is only a CAS expected. A successful full-barrier CAS acquires
   // the returned value; a failure replaces it with the CAS's atomic snapshot.
-  uint128Pair expected = __uint128_atomic_load_relaxed(ptr);
+  uint128 expected = __uint128_atomic_load_relaxed(ptr);
   while (!__uint128_atomic_compare_and_swap(ptr, &expected, value))
     continue;
   return expected;
 }
 
-static inline uint128Pair __uint128_atomic_exchange_relaxed(volatile uint128Pair *ptr,
-                                                            uint128Pair value)
+static inline uint128 __uint128_atomic_exchange_relaxed(volatile uint128 *ptr, uint128 value)
 {
-  uint128Pair expected = __uint128_atomic_load_relaxed(ptr);
+  uint128 expected = __uint128_atomic_load_relaxed(ptr);
   while (!__uint128_atomic_compare_and_swap_relaxed(ptr, &expected, value))
     continue;
   return expected;

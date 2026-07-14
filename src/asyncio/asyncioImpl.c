@@ -59,7 +59,7 @@ void *alignedMalloc(size_t size, size_t alignment)
 {
 #ifdef OS_COMMONUNIX
   void *memptr;
-  return posix_memalign(&memptr, alignment, size) == 0 ? memptr: 0;
+  return posix_memalign(&memptr, alignment, size) == 0 ? memptr : 0;
 #else
   return _aligned_malloc(size, alignment);
 #endif
@@ -81,29 +81,29 @@ void *objectAlloc(ConcurrentQueue *pool, size_t size, size_t alignment)
     ASAN_UNPOISON_MEMORY_REGION(object, size);
     return object;
   }
-  if (size < sizeof(AsyncObjectHead) || alignment < 16 ||
-      (alignment & (alignment - 1)) != 0)
+  if (size < sizeof(objectHeader) || alignment < 16 || (alignment & (alignment - 1)) != 0)
     return 0;
   object = alignedMalloc(size, alignment);
   if (!object)
     return 0;
-  // Head may later be inspected by a kernel producer without a C-language
+  // The header may later be inspected by a kernel producer without a
+  // C-language
   // publication edge. Keep even fresh initialization atomic; relaxed stores
   // are plain stores on the supported CPUs and publish no payload.
-  memset((uint8_t*)object + sizeof(AsyncObjectHead),
-         0,
-         size - sizeof(AsyncObjectHead));
-  AsyncObjectHead *head = (AsyncObjectHead*)object;
-  __uintptr_atomic_store(&head->data, 0, amoRelaxed);
-  __uintptr_atomic_store(&head->gen, 1, amoRelaxed);
+  memset((uint8_t*)object + sizeof(uint128), 0, size - sizeof(uint128));
+  objectHeader *header = (objectHeader*)object;
+  __uint64_atomic_store(&header->tag.low, 0, amoRelaxed);
+  __uint64_atomic_store(&header->tag.high, 1, amoRelaxed);
   return object;
 }
 
 void objectFree(ConcurrentQueue *pool, void *object, size_t size)
 {
-  assert(object && size >= sizeof(AsyncObjectHead));
-  ASAN_POISON_MEMORY_REGION((uint8_t*)object + sizeof(AsyncObjectHead),
-                            size - sizeof(AsyncObjectHead));
+  assert(object && size >= sizeof(objectHeader));
+  // A stale envelope still reads tag.high and the immutable category. The
+  // per-incarnation detail and base remain protected by the type-specific
+  // claim, so poison them together with the rest of the dead object.
+  ASAN_POISON_MEMORY_REGION((uint8_t*)object + offsetof(objectHeader, base), size - offsetof(objectHeader, base));
   concurrentQueuePush(pool, object);
 }
 
@@ -112,7 +112,7 @@ void *__tagged_pointer_make(void *ptr, uintptr_t data)
   return (void*)(((intptr_t)ptr) + ((intptr_t)(data & TAGGED_POINTER_DATA_MASK)));
 }
 
-void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData)
+void __tagged_pointer_decode(void *ptr, void**outPtr, uintptr_t *outData)
 {
   intptr_t p = (intptr_t)ptr;
   *outPtr = (void*)(p & TAGGED_POINTER_PTR_MASK);
@@ -124,17 +124,14 @@ uintptr_t objectIncrementReference(aioObjectRoot *object, uintptr_t count)
   // Retain is legal only through an already-owned reference and publishes no
   // payload. The final release below is the sole lifetime synchronization
   // point, so acquire ordering on every increment would only tax ARM64.
-  uintptr_t result =
-    __uintptr_atomic_fetch_and_add(&object->refs, count, amoRelaxed);
+  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs, count, amoRelaxed);
   assert(result != 0 && "Removed object access detected");
   return result;
 }
 
 uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count)
 {
-  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs,
-                                                     (uintptr_t)0 - count,
-                                                     amoRelease);
+  uintptr_t result = __uintptr_atomic_fetch_and_add(&object->refs, (uintptr_t)0 - count, amoRelease);
   assert((intptr_t)result > 0 && "Double object release detected");
   if (result == count) {
     // Only the last releaser pays acquire. This load reads the zero published
@@ -149,82 +146,45 @@ uintptr_t objectDecrementReference(aioObjectRoot *object, uintptr_t count)
   return result;
 }
 
-#if defined(_MSC_VER)
-__declspec(noinline)
-#else
-__attribute__((noinline, cold))
-#endif
-static uintptr_t eventFinalizeReference(aioUserEvent *event, uintptr_t oldTag)
+void eventIncrementReference(aioUserEvent *event, uintptr_t count)
 {
-  if (event->destructorCb)
-    event->destructorCb(event, event->destructorCbArg);
-
-  // One logical writer, after user code has finished with this incarnation.
-  // Zero is a permanent tombstone on the theoretical full-width wrap; every
-  // backend release path cleans its resource but refuses to pool that cell.
-  uintptr_t incarnation =
-    __uintptr_atomic_load(&event->incarnation, amoRelaxed);
-  __uintptr_atomic_store(&event->incarnation, incarnation + 1, amoRelaxed);
-
-  if (event->base && event->base->methodImpl.releaseUserEvent)
-    event->base->methodImpl.releaseUserEvent(event);
-  else
-    concurrentQueuePush(event->root.objectPool, event);
-
-  return oldTag;
+  (void)__uint64_atomic_fetch_and_add(&event->header.tag.low, count, amoRelaxed);
 }
 
-uintptr_t eventIncrementReference(aioUserEvent *event, uintptr_t count)
+void eventDecrementReference(aioUserEvent *event, uintptr_t count)
 {
-  assert(count > 0 && count <= TAG_EVENT_REF_MASK && "Invalid event retain count");
-  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag, count, amoRelaxed);
-#ifndef NDEBUG
+  uintptr_t old = __uint64_atomic_fetch_and_add(&event->header.tag.low, 0ULL - count, amoRelease);
   uintptr_t refs = old & TAG_EVENT_REF_MASK;
-  assert(refs != 0 && "Removed event access detected");
-  assert(refs <= TAG_EVENT_REF_MASK - count && "Event reference overflow");
-#endif
-  return old;
-}
-
-uintptr_t eventDecrementReference(aioUserEvent *event, uintptr_t count)
-{
-  assert(count > 0 && count <= TAG_EVENT_REF_MASK && "Invalid event release count");
-  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag,
-                                                  (uintptr_t)0 - count,
-                                                  amoRelease);
 #ifndef NDEBUG
-  uintptr_t refs = old & TAG_EVENT_REF_MASK;
   assert(refs >= count && "Double event release detected");
-  assert((refs != count || (old & TAG_EVENT_DELETE)) &&
-         "Final event reference released without deleteUserEvent");
+  assert((refs != count || (old & TAG_EVENT_DELETE)) && "Final event reference released without deleteUserEvent");
 #endif
-  // Before delete every valid release is necessarily non-final. The common
-  // producer/delivery path is one release RMW plus one sticky-bit test.
-  if ((old & TAG_EVENT_DELETE) && (old & TAG_EVENT_REF_MASK) == count) {
-    // Read our final release RMW (and the release sequence leading to it) with
-    // acquire only on the cold finalization path. This is also visible to TSan,
-    // unlike an acquire fence in GCC's current sanitizer instrumentation.
-    uintptr_t finalTag = __uintptr_atomic_load(&event->tag, amoAcquire);
-    assert((finalTag & TAG_EVENT_REF_MASK) == 0 &&
-           "Event reference resurrected from zero");
-    (void)finalTag;
-    return eventFinalizeReference(event, old);
+  // The last release finalizes; the contract requires a preceding Delete.
+  if (refs == count) {
+    __atomic_fence(amoAcquire);
+    if (event->destructorCb)
+      event->destructorCb(event, event->destructorCbArg);
+
+    // Atomic generation increment and full event release
+    uintptr_t generation = __uint64_atomic_load(&event->header.tag.high, amoRelaxed);
+    __uint64_atomic_store(&event->header.tag.high, generation + 1, amoRelaxed);
+    event->header.base->methodImpl.releaseUserEvent(event);
   }
-  return old;
 }
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor)
 {
   // Stale kernel producers may still validate the previous incarnation with
-  // a DWCAS while this type-stable cell is initialized, so every Head access
+  // a DWCAS while this type-stable cell is initialized, so every tag access
   // remains atomic. Their generation cannot match and they cannot write.
   // Construction is published later by the first ownership transition, not
   // through this reset, therefore a relaxed store is sufficient here.
-  __uintptr_atomic_store(&object->Head.data, taggedAsyncOpNull().data, amoRelaxed);
+  __uint64_atomic_store(&object->header.tag.low, taggedAsyncOpNull().data, amoRelaxed);
   object->readQueue.head = object->readQueue.tail = 0;
   object->writeQueue.head = object->writeQueue.tail = 0;
-  object->base = base;
-  object->type = type;
+  objectHeaderSetType(&object->header, ohtObject);
+  object->header.objectType = type;
+  object->header.base = base;
   // These words remain atomic for their whole pooled lifetime. Relaxed init
   // is still a plain store on the supported CPUs, but avoids mixed
   // atomic/plain accesses at the hand-off between object incarnations; the
@@ -284,16 +244,14 @@ AsyncOpStatus opGetStatus(asyncOpRoot *op)
 int opSetStatus(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status)
 {
   return __uintptr_atomic_compare_and_swap(&op->tag,
-                                          (generation<<TAG_STATUS_SIZE) | aosPending,
-                                          (generation<<TAG_STATUS_SIZE) | (uintptr_t)status,
-                                          amoSeqCst);
+                                           (generation << TAG_STATUS_SIZE) | aosPending,
+                                           (generation << TAG_STATUS_SIZE) | (uintptr_t)status,
+                                           amoSeqCst);
 }
 
 void opForceStatus(asyncOpRoot *op, AsyncOpStatus status)
 {
-  __uintptr_atomic_store(&op->tag,
-                         (__uintptr_atomic_load(&op->tag, amoRelaxed) & TAG_GENERATION_MASK) | (uintptr_t)status,
-                         amoRelaxed);
+  __uintptr_atomic_store(&op->tag, (__uintptr_atomic_load(&op->tag, amoRelaxed) & TAG_GENERATION_MASK) | (uintptr_t)status, amoRelaxed);
 }
 
 int asyncOpAlloc(asyncBase *base,
@@ -301,7 +259,7 @@ int asyncOpAlloc(asyncBase *base,
                  int isRealTime,
                  ConcurrentQueue *objectPool,
                  ConcurrentQueue *objectTimerPool,
-                 asyncOpRoot **result)
+                 asyncOpRoot**result)
 {
   int hasAllocatedNew = 0;
   asyncOpRoot *op = 0;
@@ -368,13 +326,13 @@ void initAsyncOpRoot(asyncOpRoot *op,
   // every field written above — this is the only synchronization edge for
   // consumers whose op pointer travelled through the kernel (kevent udata /
   // epoll_data), a path the memory model knows nothing about.
-  __uintptr_atomic_store(&op->tag, ((opGetGeneration(op)+1) << TAG_STATUS_SIZE) | aosPending, amoRelease);
+  __uintptr_atomic_store(&op->tag, ((opGetGeneration(op) + 1) << TAG_STATUS_SIZE) | aosPending, amoRelease);
 }
 
 static void opArmTimer(asyncOpRoot *op)
 {
   if (op->timeout) {
-    asyncBase *base = op->object->base;
+    asyncBase *base = op->object->header.base;
     if (op->flags & afRealtime) {
       // start timer for this operation
       base->methodImpl.startTimer(op);
@@ -438,8 +396,7 @@ void processInitializationOp(aioObjectRoot *object, uint32_t *needStart)
     return;
   AsyncOpStatus status = opGetStatus(op);
   switch (combinerSelectInitializationAction(op->running, status)) {
-    case ciaNone:
-      return;
+    case ciaNone: return;
 
     case ciaRelease:
       // Either a proactor completion arrived after cancellation, or a child
@@ -448,9 +405,7 @@ void processInitializationOp(aioObjectRoot *object, uint32_t *needStart)
       initializationRelease(op, status, needStart);
       return;
 
-    case ciaExecute:
-      initializationTryComplete(op, op->executeMethod(op), needStart);
-      return;
+    case ciaExecute: initializationTryComplete(op, op->executeMethod(op), needStart); return;
   }
 }
 
@@ -537,21 +492,17 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
     int keep = 0, release = 0;
     AsyncOpStatus status = opGetStatus(op);
     switch (combinerSelectReapAction(op->running, status)) {
-      case craKeep:
-        keep = 1;
-        break;
+      case craKeep: keep = 1; break;
 
       case craCancel:
         op->running = arCancelling;
         if (op->cancelMethod(op))
           release = 1;
         else
-          keep = 1;   // in-flight: hold positional for the late completion
+          keep = 1; // in-flight: hold positional for the late completion
         break;
 
-      case craRelease:
-        release = 1;
-        break;
+      case craRelease: release = 1; break;
     }
 
     op->executeQueue.prev = op->executeQueue.next = 0;
@@ -606,9 +557,7 @@ void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
           initializationRelease(ex, status, needStart);
         break;
 
-      case craRelease:
-        initializationRelease(ex, status, needStart);
-        break;
+      case craRelease: initializationRelease(ex, status, needStart); break;
 
       case craKeep:
         // Pending, or already cancelling an in-flight operation: wait for its
@@ -624,7 +573,7 @@ void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList)
 {
   if (op->timerId && status != aosTimeout) {
     if (op->flags & afRealtime)
-      op->object->base->methodImpl.stopTimer(op);
+      op->object->header.base->methodImpl.stopTimer(op);
   }
 
   if (executeList)
@@ -700,9 +649,9 @@ void cancelOperationList(List *list, AsyncOpStatus status)
         if (op->cancelMethod(op))
           release = 1;
         else
-          keep = 1;   // in-flight: hold positional for the late completion
+          keep = 1; // in-flight: hold positional for the late completion
       } else {
-        release = 1;  // queued, not started: no I/O in flight, release now
+        release = 1; // queued, not started: no I/O in flight, release now
       }
     } else {
       // Status race lost: the winner (a concurrent completion/timeout) drives
@@ -730,11 +679,7 @@ void cancelOperationList(List *list, AsyncOpStatus status)
   list->tail = keptTail;
 }
 
-int opCancel(asyncOpRoot *op,
-             uintptr_t generation,
-             AsyncOpStatus status,
-             aioObjectRoot *object,
-             uintptr_t objectGeneration)
+int opCancel(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status, aioObjectRoot *object, uintptr_t objectGeneration)
 {
   // Cancel signal, gated on winning the terminal status (the loser is redundant,
   // the winner drives the cancel). The combiner scans and reaps positionally;
@@ -745,9 +690,7 @@ int opCancel(asyncOpRoot *op,
     return 1;
   // op storage may recycle immediately after the winning status CAS. The arm
   // handle is the only legal route to its owner from this point onward.
-  return combinerPushValidated(object,
-                               objectGeneration,
-                               COMBINER_TAG_CANCEL);
+  return combinerPushValidated(object, objectGeneration, COMBINER_TAG_CANCEL);
 }
 
 void resumeParent(asyncOpRoot *op, AsyncOpStatus status)
@@ -763,7 +706,7 @@ void resumeParent(asyncOpRoot *op, AsyncOpStatus status)
 
 void addToGlobalQueue(asyncOpRoot *op)
 {
-  op->object->base->methodImpl.enqueue(op->object->base, op);
+  op->object->header.base->methodImpl.enqueue(op->object->header.base, op);
 }
 
 int executeGlobalQueue(asyncBase *base)
@@ -773,23 +716,13 @@ int executeGlobalQueue(asyncBase *base)
     if (!op)
       return 0;
 
-    if (eventTimerIsControlNode(op)) {
-      currentFinishedSync = 0;
-      eventTimerProcess(eventTimerControlEvent(op));
+    if (eventIsQueueTask(op)) {
+      eventExecuteQueuedTask(op);
       continue;
     }
 
     switch (op->opCode) {
-      case actUserEvent : {
-        aioUserEvent *event = (aioUserEvent*)op;
-        currentFinishedSync = 0;
-        eventReferenceDeactivate(event);
-        op->finishMethod(op);
-        eventDecrementReference(event, 1);
-        break;
-      }
-
-      default : {
+      default: {
         assert(opGetStatus(op) != aosPending && "finishing pending operation!");
         currentFinishedSync = 0;
         if (op->flags & afCoroutine) {
@@ -825,7 +758,6 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
   }
 }
 
-
 int loopThreadEnter(asyncBase *base)
 {
   assert(!loopThreadSlotOwned && "one thread cannot nest asyncLoop invocations");
@@ -841,15 +773,11 @@ int loopThreadEnter(asyncBase *base)
     // extra attempt; the acquire RMW remains the actual claim.
     if (__uintptr_atomic_load(&base->loopThreadSlots[word], amoRelaxed) & bit)
       continue;
-    uintptr_t old = __uintptr_atomic_fetch_or(&base->loopThreadSlots[word],
-                                               bit,
-                                               amoAcquire);
+    uintptr_t old = __uintptr_atomic_fetch_or(&base->loopThreadSlots[word], bit, amoAcquire);
     if (!(old & bit)) {
       messageLoopThreadId = id;
       loopThreadSlotOwned = 1;
-      __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
-                                  1,
-                                  amoSeqCst);
+      __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 1, amoSeqCst);
       return 1;
     }
   }
@@ -870,16 +798,9 @@ unsigned loopThreadExit(asyncBase *base)
   // Publish awake before making the index reusable. The active counter drops
   // while the bit is still owned, so a new entrant cannot be included in the
   // returned quit-propagation count by racing reuse of this exact slot.
-  __uintptr_atomic_store(&base->timerSleep[id].wakeTick,
-                         UINTPTR_MAX,
-                         amoRelaxed);
-  unsigned remaining =
-    __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter,
-                                (unsigned)-1,
-                                amoSeqCst) - 1;
-  __uintptr_atomic_fetch_and(&base->loopThreadSlots[word],
-                             ~bit,
-                             amoRelease);
+  __uintptr_atomic_store(&base->timerSleep[id].wakeTick, UINTPTR_MAX, amoRelaxed);
+  unsigned remaining = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, (unsigned)-1, amoSeqCst) - 1;
+  __uintptr_atomic_fetch_and(&base->loopThreadSlots[word], ~bit, amoRelease);
   loopThreadSlotOwned = 0;
   return remaining;
 }
@@ -894,8 +815,8 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
     cancelAllObjectOperations(object);
     // Ownership serializes the only writer. Generation is an identity token,
     // not a publication channel, so a relaxed load/store avoids a locked RMW.
-    uintptr_t generation = __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
-    __uintptr_atomic_store(&object->Head.gen, generation + 1, amoRelaxed);
+    uintptr_t generation = objectHeaderGeneration(&object->header);
+    __uint64_atomic_store(&object->header.tag.high, generation + 1, amoRelaxed);
     if (object->destructorCb)
       object->destructorCb(object, object->destructorCbArg);
     object->destructor(object);
@@ -908,7 +829,7 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr forRun)
 {
   AsyncOpTaggedPtr stubOp = taggedAsyncOpStub();
-  combinerTaskHandlerTy *combinerTaskHandler = object->base->methodImpl.combinerTaskHandler;
+  combinerTaskHandlerTy *combinerTaskHandler = object->header.base->methodImpl.combinerTaskHandler;
 
   if (forRun.data) {
     asyncOpRoot *op;
@@ -921,7 +842,7 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
 
   for (;;) {
     AsyncOpTaggedPtr currentHead;
-    while ( (currentHead.data = __uintptr_atomic_load(&object->Head.data, amoRelaxed)) == stackTop.data ) {
+    while ((currentHead.data = __uint64_atomic_load(&object->header.tag.low, amoRelaxed)) == stackTop.data) {
       // A dying object is swept once more at every ownership-release point:
       // this is the only position that is guaranteed to come after every
       // action of the captured chains, so a submission that slipped past the
@@ -929,20 +850,14 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       // (sticky flag; the sweep is idempotent, re-runs only cost a re-check)
       if (__uint_atomic_load(&object->DeletePending, amoRelaxed))
         cancelAllObjectOperations(object);
-      if (__uintptr_atomic_compare_and_swap(&object->Head.data,
-                                            stackTop.data,
-                                            0,
-                                            amoSeqCst))
+      if (__uint64_atomic_compare_and_swap(&object->header.tag.low, stackTop.data, 0, amoSeqCst))
         return;
     }
 
-    while (!__uintptr_atomic_compare_and_swap(&object->Head.data,
-                                              currentHead.data,
-                                              stackTop.data,
-                                              amoSeqCst))
+    while (!__uint64_atomic_compare_and_swap(&object->header.tag.low, currentHead.data, stackTop.data, amoSeqCst))
       // Still only a CAS expected. The successful capture CAS above acquires
       // the chain before the first next-pointer is read.
-      currentHead.data = __uintptr_atomic_load(&object->Head.data, amoRelaxed);
+      currentHead.data = __uint64_atomic_load(&object->header.tag.low, amoRelaxed);
 
     // The captured chain is linked newest to oldest (each push points to the
     // previous head); running it as is would invert single-thread submission

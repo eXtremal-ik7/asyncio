@@ -291,11 +291,11 @@ int main(int argc, char **argv)
             continue;
           aioObjectRoot *o = ctx.handle;
           fprintf(stderr,
-                  "  sock %p: refs=%" PRIuPTR " head=%" PRIxPTR " readQ=%p writeQ=%p"
+                  "  sock %p: refs=%" PRIuPTR " head=%" PRIx64 " readQ=%p writeQ=%p"
                   " cancelIoFlag=%u deletePending=%u initialization=%" PRIxPTR " missing=%u\n",
                   (void*)o,
                   o->refs,
-                  __uintptr_atomic_load(&o->Head.data, amoRelaxed),
+                  __uint64_atomic_load(&o->header.tag.low, amoRelaxed),
                   (void*)o->readQueue.head,
                   (void*)o->writeQueue.head,
                   o->CancelIoFlag, o->DeletePending, o->initializationOp,

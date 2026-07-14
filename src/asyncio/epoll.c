@@ -1,5 +1,5 @@
 #include "asyncioImpl.h"
-#include "reactorTimer.h"
+#include "reactor.h"
 #include "asyncio/coroutine.h"
 #include "atomic.h"
 
@@ -52,8 +52,9 @@ void epollDeleteObject(aioObject *object);
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void epollStartTimer(asyncOpRoot *op);
 void epollStopTimer(asyncOpRoot *op);
+int epollInitializeUserEvent(aioUserEvent *event);
 int epollActivate(aioUserEvent *op);
-int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uintptr_t generation, uint64_t period);
+int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period);
 void epollReleaseUserEvent(aioUserEvent *event);
 AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr);
@@ -61,32 +62,15 @@ AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *op);
 AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *op);
-static int epollMonotonicNow(uintptr_t *nowNs);
+static int epollMonotonicNow(uint64_t *nowNs);
 static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata);
 
-static struct asyncImpl epollImpl = {
-  combinerTaskHandler,
-  epollEnqueue,
-  epollPostEmptyOperation,
-  epollNextFinishedOperation,
-  epollNewAioObject,
-  epollNewAsyncOp,
-  epollCancelAsyncOp,
-  epollDeleteObject,
-  epollInitializeTimer,
-  epollStartTimer,
-  epollStopTimer,
-  epollActivate,
-  epollAsyncConnect,
-  epollAsyncAccept,
-  epollAsyncRead,
-  epollAsyncWrite,
-  epollAsyncReadMsg,
-  epollAsyncWriteMsg,
-  epollWakeupLoop,
-  epollUpdateEventTimer,
-  epollReleaseUserEvent
-};
+static struct asyncImpl epollImpl = {combinerTaskHandler,   epollEnqueue,         epollPostEmptyOperation, epollNextFinishedOperation,
+                                     epollNewAioObject,     epollNewAsyncOp,      epollCancelAsyncOp,      epollDeleteObject,
+                                     epollInitializeTimer,  epollStartTimer,      epollStopTimer,          epollInitializeUserEvent,
+                                     epollActivate,         epollAsyncConnect,    epollAsyncAccept,        epollAsyncRead,
+                                     epollAsyncWrite,       epollAsyncReadMsg,    epollAsyncWriteMsg,      epollWakeupLoop,
+                                     epollUpdateEventTimer, epollReleaseUserEvent};
 
 static int epollControl(int epollFd, int action, uint32_t events, int fd, void *ptr)
 {
@@ -103,13 +87,10 @@ static int epollControl(int epollFd, int action, uint32_t events, int fd, void *
 
 static int getFd(EPollObject *object)
 {
-  switch (object->Object.root.type) {
-    case ioObjectDevice :
-      return object->Object.hDevice;
-    case ioObjectSocket :
-      return object->Object.hSocket;
-    default :
-      return -1;
+  switch (object->Object.root.header.objectType) {
+    case ioObjectDevice: return object->Object.hDevice;
+    case ioObjectSocket: return object->Object.hSocket;
+    default: return -1;
   }
 }
 
@@ -156,8 +137,7 @@ asyncBase *epollNewAsyncBase()
                      EPOLL_CTL_ADD,
                      EPOLLIN | EPOLLONESHOT,
                      base->eventFd,
-                     (void*)(uintptr_t)objectHandleEncodeKnown(
-                       &base->eventObject->root)) == -1) {
+                     (void*)(uintptr_t)reactorHandleEncode(&base->eventObject->root.header)) == -1) {
       close(base->eventFd);
       base->eventObject->hDevice = -1;
       objectFree(&objectPool, base->eventObject, sizeof(EPollObject));
@@ -168,7 +148,7 @@ asyncBase *epollNewAsyncBase()
     ((EPollObject*)base->eventObject)->Registered = 1;
   }
 
-  return (asyncBase *)base;
+  return (asyncBase*)base;
 }
 
 void epollEnqueue(asyncBase *base, asyncOpRoot *op)
@@ -193,12 +173,11 @@ void epollWakeupLoop(asyncBase *base)
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
-  EPollObject *fdObject = (object->type == ioObjectDevice || object->type == ioObjectSocket) ? (EPollObject*)object : 0;
+  EPollObject *fdObject =
+      (object->header.objectType == ioObjectDevice || object->header.objectType == ioObjectSocket) ? (EPollObject*)object : 0;
   uint32_t oldIoEvents = fdObject ? combinerActiveIoEvents(object) : 0;
   uint32_t progress = sig & COMBINER_TAG_PROGRESS_MASK;
-  uint32_t ioEvents = fdObject
-    ? progress | ((sig & COMBINER_TAG_ERROR) ? IO_EVENT_ERROR : 0)
-    : 0;
+  uint32_t ioEvents = fdObject ? progress | ((sig & COMBINER_TAG_ERROR) ? IO_EVENT_ERROR : 0) : 0;
 
   // A dying object gets no fd readiness processing: its operations are being
   // cancelled wholesale anyway, and its descriptor may already be closed;
@@ -246,7 +225,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 
   if (fdObject && !__uint_atomic_load(&object->DeletePending, amoRelaxed)) {
     int fd = getFd(fdObject);
-    epollBase *base = (epollBase*)object->base;
+    epollBase *base = (epollBase*)object->header.base;
     uint32_t currentEvents = epollEvents(oldIoEvents);
     uint32_t newEvents;
 
@@ -263,14 +242,14 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
                      EPOLL_CTL_ADD,
                      newEvents | EPOLLONESHOT | EPOLLRDHUP,
                      fd,
-                     (void*)(uintptr_t)objectHandleEncodeKnown(object));
+                     (void*)(uintptr_t)reactorHandleEncode(&fdObject->Object.root.header));
         fdObject->Registered = 1;
       } else if (currentEvents != newEvents) {
         epollControl(base->epollFd,
                      EPOLL_CTL_MOD,
                      newEvents | EPOLLONESHOT | EPOLLRDHUP,
                      fd,
-                     (void*)(uintptr_t)objectHandleEncodeKnown(object));
+                     (void*)(uintptr_t)reactorHandleEncode(&fdObject->Object.root.header));
       }
     } else if (currentEvents) {
       // No operation left on an armed fd: remove it from the set instead of
@@ -288,7 +267,7 @@ void epollNextFinishedOperation(asyncBase *base)
 {
   int nfds, n;
   struct epoll_event events[MAX_EVENTS];
-  epollBase *localBase = (epollBase *)base;
+  epollBase *localBase = (epollBase*)base;
   if (!loopThreadEnter(base))
     return;
 
@@ -304,8 +283,7 @@ void epollNextFinishedOperation(asyncBase *base)
       // UINT32_MAX = wait with no timeout: an idle base blocks until queue
       // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
       uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500);
-      nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS,
-                        sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
+      nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
       timerLoopCancelSleep(base, messageLoopThreadId);
       // Unconditional sweep (the modulo election is gone): an idle pass costs
       // one relaxed load, and the wakeup handshake relies on whichever thread
@@ -314,159 +292,105 @@ void epollNextFinishedOperation(asyncBase *base)
     } while (nfds <= 0 && errno == EINTR);
 
     for (n = 0; n < nfds; n++) {
-      uint64_t envelope = (uint64_t)(uintptr_t)events[n].data.ptr;
-      if (envelope & udataTimer) {
-        uintptr_t timerId;
-        aioObjectRoot *decoded;
-        __tagged_pointer_decode(events[n].data.ptr, (void**)&decoded, &timerId);
-        aioTimer *timer = (aioTimer*)decoded;
-        if (timerId & udataUserEvent) {
-          // Do not read timerfd here. A harvested envelope can overlap a
-          // restart, and reading the shared fd in the loop would be able to
-          // consume the next arm's expiration. Publish only a generation-
-          // tagged probe; the event timer applier serializes read/settime/
-          // disarm and re-arms the consumed EPOLLONESHOT shot.
-          uintptr_t armedGeneration;
-          uintptr_t armedIncarnation;
-          if (reactorTimerDecodeCountProbe(timer,
-                                           &armedGeneration,
-                                           &armedIncarnation))
-            eventTimerSignalProbe((aioUserEvent*)timer->op,
-                                  armedGeneration,
-                                  armedIncarnation);
-          continue;
-        }
-        uintptr_t armedGeneration = 0;
-        uintptr_t now;
-        if (!epollMonotonicNow(&now)) {
-          // The one-shot was consumed and without the matching monotonic
-          // reading the backend cannot prove a timeout. Fail the CURRENT arm
-          // terminally instead of silently stranding it behind a failed MOD.
-          // UINTPTR_MAX selects any live deadline while the side-field triple
-          // still rejects a concurrent rearm; opCancel then validates the
-          // captured object generation before entering its combiner.
-          aioObjectRoot *armedObject = 0;
-          uintptr_t armedObjectGeneration = 0;
-          if (reactorTimerDecodeDeadlineHandle(timer,
-                                               timerId,
-                                               UINTPTR_MAX,
-                                               &armedGeneration,
-                                               &armedObject,
-                                               &armedObjectGeneration) ==
-                rteExpireOperation &&
-              !opCancel(timer->op,
-                        armedGeneration,
-                        aosUnknownError,
-                        armedObject,
-                        armedObjectGeneration))
-            recordStaleHandleDrop(base);
-          continue;
-        }
-        aioObjectRoot *armedObject = 0;
-        uintptr_t armedObjectGeneration = 0;
-        switch (reactorTimerDecodeDeadlineHandle(timer,
-                                                 timerId,
-                                                 now,
-                                                 &armedGeneration,
-                                                 &armedObject,
-                                                 &armedObjectGeneration)) {
-          case rteIgnore:
-            // Stale doorbell: timer disarmed, or the current absolute deadline
-            // is still ahead. Nothing reads the shared timerfd.
-            break;
+      uint64_t generation;
+      uint64_t envelope = events[n].data.u64;
+      objectHeader *header = reactorHandleDecode(envelope, &generation);
 
-          case rteUserEvent: {
-            aioUserEvent *event = (aioUserEvent*)timer->op;
-            // Deadline timers are operation-only; keep the exhaustive enum
-            // branch defensive, but incarnation zero makes it a no-op.
-            eventTimerSignalTick(event, armedGeneration, 0);
+      switch (objectHeaderGetType(header)) {
+        case ohtUserEvent: {
+          aioUserEvent *event = (aioUserEvent*)header;
+          if (!eventTimerTryClaimReference(event, generation))
+            break;
+          eventfd_t eventValue;
+          int result;
+          do {
+            result = eventfd_read((int)event->activationId, &eventValue);
+          } while (result == -1 && errno == EINTR);
+          if (result == 0 || errno == EAGAIN)
+            eventManualReady(event);
+          eventDecrementReference(event, 1);
+          break;
+        }
+
+        case ohtTimer: {
+          aioTimer *timer = (aioTimer*)header;
+          if (timer->header.timer.kind == rtkUserEvent) {
+            // Do not read timerfd here. The event owner serializes its
+            // read/settime/disarm sequence and rearms the consumed shot.
+            uint64_t armedGeneration;
+            uint64_t armedIncarnation;
+            if (reactorTimerDecodeCountProbe(timer, generation, &armedGeneration, &armedIncarnation))
+              eventTimerSignalProbe((aioUserEvent*)timer->target, armedGeneration, armedIncarnation);
             break;
           }
 
-          case rteExpireOperation:
-            if (!opCancel(timer->op,
-                          armedGeneration,
-                          aosTimeout,
-                          armedObject,
-                          armedObjectGeneration))
-              recordStaleHandleDrop(base);
+          uint64_t armedGeneration = 0;
+          aioObjectRoot *armedObject = 0;
+          uint64_t armedObjectGeneration = 0;
+          uint64_t now;
+          if (!epollMonotonicNow(&now)) {
+            if (reactorTimerDecodeDeadlineHandle(timer, generation, UINT64_MAX, &armedGeneration, &armedObject, &armedObjectGeneration) ==
+                rteExpireOperation)
+              (void)opCancel((asyncOpRoot*)timer->target, armedGeneration, aosUnknownError, armedObject, armedObjectGeneration);
             break;
-        }
-      } else {
-        aioObjectRoot *object;
-        uintptr_t carriedGen;
-        if (!objectHandleDecode(envelope, &object, &carriedGen))
-          continue;
-        if (object == &localBase->eventObject->root) {
-          eventfd_t eventValue;
-          eventfd_read(localBase->eventFd, &eventValue);
-          epollControl(localBase->epollFd,
-                       EPOLL_CTL_MOD,
-                       EPOLLIN | EPOLLONESHOT,
-                       localBase->eventFd,
-                       (void*)(uintptr_t)envelope);
-          continue;
-        }
-        uint32_t eventMask = 0;
-        if (events[n].events & EPOLLIN)
-          eventMask |= IO_EVENT_READ;
-        if (events[n].events & EPOLLOUT)
-          eventMask |= IO_EVENT_WRITE;
-        if (events[n].events & EPOLLRDHUP)
-          eventMask |= IO_EVENT_ERROR;
-        // EPOLLERR/EPOLLHUP are reported regardless of the requested mask and
-        // consume the EPOLLONESHOT shot like any other event. Wake both queues
-        // so parked operations retry their syscall and report the real errno.
-        // IO_EVENT_ERROR does not fit here: its contract is "peer closed"
-        // (EPOLLRDHUP) and it would misreport e.g. ECONNREFUSED as aosDisconnected
-        if (events[n].events & (EPOLLERR | EPOLLHUP))
-          eventMask |= IO_EVENT_READ | IO_EVENT_WRITE;
+          }
 
-        if (eventMask) {
-          uint32_t bits = 0;
-          if (eventMask & IO_EVENT_READ)  bits |= COMBINER_TAG_PROGRESS_READ;
-          if (eventMask & IO_EVENT_WRITE) bits |= COMBINER_TAG_PROGRESS_WRITE;
-          // EPOLLRDHUP alone carries no direction. ERROR is passed in Head with
-          // the readiness bits, so no object-side mailbox is needed.
-          if (eventMask & IO_EVENT_ERROR)
-            bits |= COMBINER_TAG_ERROR | COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
-          if (!combinerPushValidated(object,
-                                     carriedGen,
-                                     bits))
-            recordStaleHandleDrop(base);
+          switch (reactorTimerDecodeDeadlineHandle(timer, generation, now, &armedGeneration, &armedObject, &armedObjectGeneration)) {
+            case rteIgnore: break;
+            case rteUserEvent: eventTimerSignalTick((aioUserEvent*)timer->target, armedGeneration, 0); break;
+            case rteExpireOperation:
+              (void)opCancel((asyncOpRoot*)timer->target, armedGeneration, aosTimeout, armedObject, armedObjectGeneration);
+              break;
+          }
+          break;
+        }
+
+        case ohtObject: {
+          aioObject *object = (aioObject*)header;
+          if (object == localBase->eventObject) {
+            eventfd_t eventValue;
+            eventfd_read(localBase->eventFd, &eventValue);
+            epollControl(localBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, localBase->eventFd, (void*)(uintptr_t)envelope);
+            break;
+          }
+
+          uint32_t eventMask = 0;
+          if (events[n].events & EPOLLIN)
+            eventMask |= IO_EVENT_READ;
+          if (events[n].events & EPOLLOUT)
+            eventMask |= IO_EVENT_WRITE;
+          if (events[n].events & EPOLLRDHUP)
+            eventMask |= IO_EVENT_ERROR;
+          if (events[n].events & (EPOLLERR | EPOLLHUP))
+            eventMask |= IO_EVENT_READ | IO_EVENT_WRITE;
+          if (eventMask) {
+            uint32_t bits = 0;
+            if (eventMask & IO_EVENT_READ)
+              bits |= COMBINER_TAG_PROGRESS_READ;
+            if (eventMask & IO_EVENT_WRITE)
+              bits |= COMBINER_TAG_PROGRESS_WRITE;
+            if (eventMask & IO_EVENT_ERROR)
+              bits |= COMBINER_TAG_ERROR | COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
+            (void)combinerPushValidated(&object->root, generation, bits);
+          }
+          break;
         }
       }
     }
   }
 }
 
-
 aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 {
-  EPollObject *object = (EPollObject*)objectAlloc(&objectPool,
-                                                  sizeof(EPollObject),
-                                                  TAGGED_POINTER_ALIGNMENT);
+  EPollObject *object = (EPollObject*)objectAlloc(&objectPool, sizeof(EPollObject), TAGGED_POINTER_ALIGNMENT);
   if (!object)
     return 0;
-  uint64_t encoded;
-  if (!objectHandleTryEncode(&object->Object.root, &encoded)) {
-    // Every pooled fd cell was encodable when first published, keeps the same
-    // address, and generation-range exhaustion is tombstoned instead of pooled.
-    // Failure therefore proves this is a fresh, unpublished allocation.
-    alignedFree(object);
-    return 0;
-  }
 
   initObjectRoot(&object->Object.root, base, type, (aioObjectDestructor*)epollDeleteObject);
   switch (type) {
-    case ioObjectDevice :
-      object->Object.hDevice = *(iodevTy *)data;
-      break;
-    case ioObjectSocket :
-      object->Object.hSocket = *(socketTy *)data;
-      break;
-    default :
-      break;
+    case ioObjectDevice: object->Object.hDevice = *(iodevTy*)data; break;
+    case ioObjectSocket: object->Object.hSocket = *(socketTy*)data; break;
+    default: break;
   }
 
   object->Registered = 0;
@@ -492,46 +416,27 @@ int epollCancelAsyncOp(asyncOpRoot *opptr)
   return 1;
 }
 
-// Return the generation-headed cell immediately. Harvested events validate
-// only Head and cannot enter the combiner after the generation bump.
-static void epollReleaseObject(aioObject *object)
-{
-  if (__uintptr_atomic_load(&object->root.Head.gen, amoRelaxed) >
-      objectHandleGenMask()) {
-    free(object->buffer.ptr);
-    object->buffer.ptr = 0;
-    object->buffer.totalSize = 0;
-    ASAN_POISON_MEMORY_REGION((uint8_t*)object + sizeof(AsyncObjectHead),
-                              sizeof(EPollObject) - sizeof(AsyncObjectHead));
-    return; // permanent tombstone: exhausted generation is never published
-  }
-  objectFree(&objectPool, object, sizeof(EPollObject));
-}
-
 void epollDeleteObject(aioObject *object)
 {
-  epollBase *localBase = (epollBase*)object->root.base;
+  epollBase *localBase = (epollBase*)object->root.header.base;
   int registered = ((EPollObject*)object)->Registered;
-  switch (object->root.type) {
-    case ioObjectDevice :
+  switch (object->root.header.objectType) {
+    case ioObjectDevice:
       if (registered)
         epollControl(localBase->epollFd, EPOLL_CTL_DEL, 0, object->hDevice, 0);
       close(object->hDevice);
       object->hDevice = -1;
       break;
-    case ioObjectSocket :
+    case ioObjectSocket:
       if (registered)
         epollControl(localBase->epollFd, EPOLL_CTL_DEL, 0, object->hSocket, 0);
       close(object->hSocket);
       object->hSocket = -1;
       break;
-    default :
-      break;
+    default: break;
   }
 
-  // Already-harvested epoll entries carry the old generation and may touch
-  // only Head. The rest of the cell can return to its type-stable pool now.
-  epollReleaseObject(object);
+  objectFree(&objectPool, object, sizeof(EPollObject));
 }
 
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
@@ -540,37 +445,29 @@ void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   if (!timer)
     return;
-  timer->base = base;
   reactorTimerInitializeSharedState(timer);
+  timer->header.base = base;
   timer->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   if (timer->fd == -1) {
     alignedFree(timer);
     return;
   }
-  timer->op = op;
-  timer->registeredBase = 0;
-  timer->kind = rtkUnknown;
-  timer->broken = 0;
-  // Registration is lazy. asyncOpAlloc reaches this constructor before
-  // initAsyncOpRoot has initialized opCode, so reading it here is invalid;
-  // the first arm binds the immutable timer kind and publishes an active ADD.
+  timer->target = op;
+  timer->header.timer.kind = rtkOperation;
+  // Registration stays lazy until the first active arm.
   op->timerId = timer;
 }
 
-static int epollMonotonicDeadline(uint64_t timeout,
-                                  struct itimerspec *its,
-                                  uintptr_t *deadline)
+static int epollMonotonicDeadline(uint64_t timeout, struct itimerspec *its, uint64_t *deadline)
 {
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) == -1 || now.tv_sec < 0)
     return 0;
-  if ((uint64_t)now.tv_sec > UINTPTR_MAX / 1000000000ULL ||
-      timeout > UINTPTR_MAX / 1000ULL)
+  if ((uint64_t)now.tv_sec > UINT64_MAX / 1000000000ULL || timeout > UINT64_MAX / 1000ULL)
     return 0;
-  uintptr_t nowNs = (uintptr_t)now.tv_sec * 1000000000ULL +
-                    (uintptr_t)now.tv_nsec;
-  uintptr_t delta = (uintptr_t)(timeout * 1000ULL);
-  if (nowNs > UINTPTR_MAX - delta)
+  uint64_t nowNs = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+  uint64_t delta = timeout * 1000ULL;
+  if (nowNs > UINT64_MAX - delta)
     return 0;
   *deadline = nowNs + delta;
   memset(its, 0, sizeof(*its));
@@ -579,13 +476,12 @@ static int epollMonotonicDeadline(uint64_t timeout,
   return 1;
 }
 
-static int epollMonotonicNow(uintptr_t *nowNs)
+static int epollMonotonicNow(uint64_t *nowNs)
 {
   struct timespec now;
-  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1 || now.tv_sec < 0 ||
-      (uint64_t)now.tv_sec > UINTPTR_MAX / 1000000000ULL)
+  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1 || now.tv_sec < 0 || (uint64_t)now.tv_sec > UINT64_MAX / 1000000000ULL)
     return 0;
-  *nowNs = (uintptr_t)now.tv_sec * 1000000000ULL + (uintptr_t)now.tv_nsec;
+  *nowNs = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
   return 1;
 }
 
@@ -608,37 +504,21 @@ static int epollTimerEnsureFd(aioTimer *timer)
 
 static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata)
 {
-  asyncBase *old = timer->registeredBase;
+  asyncBase *old = timer->header.timer.registered ? timer->header.base : 0;
   epollBase *targetBase = (epollBase*)target;
   int action = old == target && old ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-  int result = epollControl(targetBase->epollFd,
-                            action,
-                            EPOLLIN | EPOLLONESHOT,
-                            (int)timer->fd,
-                            udata);
+  int result = epollControl(targetBase->epollFd, action, EPOLLIN | EPOLLONESHOT, (int)timer->fd, udata);
   if (result == -1 && action == EPOLL_CTL_MOD && errno == ENOENT)
-    result = epollControl(targetBase->epollFd,
-                          EPOLL_CTL_ADD,
-                          EPOLLIN | EPOLLONESHOT,
-                          (int)timer->fd,
-                          udata);
+    result = epollControl(targetBase->epollFd, EPOLL_CTL_ADD, EPOLLIN | EPOLLONESHOT, (int)timer->fd, udata);
   else if (result == -1 && action == EPOLL_CTL_ADD && errno == EEXIST)
-    result = epollControl(targetBase->epollFd,
-                          EPOLL_CTL_MOD,
-                          EPOLLIN | EPOLLONESHOT,
-                          (int)timer->fd,
-                          udata);
+    result = epollControl(targetBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, (int)timer->fd, udata);
   if (result == -1)
     return 0;
 
-  timer->registeredBase = target;
-  timer->base = target;
+  timer->header.base = target;
+  timer->header.timer.registered = 1;
   if (old && old != target)
-    (void)epollControl(((epollBase*)old)->epollFd,
-                       EPOLL_CTL_DEL,
-                       0,
-                       (int)timer->fd,
-                       0);
+    (void)epollControl(((epollBase*)old)->epollFd, EPOLL_CTL_DEL, 0, (int)timer->fd, 0);
   return 1;
 }
 
@@ -657,36 +537,31 @@ void epollStartTimer(asyncOpRoot *op)
   if (!timer) {
     // The paired cell is created once per pooled slot; a constructor-time
     // allocation failure must not disable this slot's timeouts forever.
-    epollInitializeTimer(op->object->base, op);
+    epollInitializeTimer(op->object->header.base, op);
     timer = (aioTimer*)op->timerId;
   }
-  if (!timer || !reactorTimerBindKind(timer, rtkOperation)) {
+  if (!timer) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
   }
+  assert(timer->header.timer.kind == rtkOperation);
 
   struct itimerspec its;
-  uintptr_t deadline;
-  if (!epollMonotonicDeadline(op->timeout, &its, &deadline) ||
-      !epollTimerSettime(timer, TFD_TIMER_ABSTIME, &its)) {
+  uint64_t deadline;
+  if (!epollMonotonicDeadline(op->timeout, &its, &deadline) || !epollTimerSettime(timer, TFD_TIMER_ABSTIME, &its)) {
     epollTimerRollbackArm(timer);
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
   }
 
-  void *udata = reactorTimerArmDeadlineGeneration(timer,
-                                                  op,
-                                                  opGetGeneration(op),
-                                                  deadline);
-  if (!epollTimerPublish(timer, op->object->base, udata)) {
+  void *udata = reactorTimerArmDeadlineGeneration(timer, op, opGetGeneration(op), deadline);
+  if (!epollTimerPublish(timer, op->object->header.base, udata)) {
     epollTimerRollbackArm(timer);
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
   }
 }
 
-static int epollStartTimerGeneration(asyncOpRoot *op,
-                                     uintptr_t generation,
-                                     uint64_t period)
+static int epollStartTimerGeneration(aioUserEvent *event, aioTimer *timer, uint32_t generation, uint64_t period)
 {
   struct itimerspec its;
   memset(&its, 0, sizeof(its));
@@ -694,29 +569,23 @@ static int epollStartTimerGeneration(asyncOpRoot *op,
   its.it_value.tv_nsec = (period % 1000000) * 1000;
   its.it_interval = its.it_value;
 
-  aioTimer *timer = (aioTimer*)op->timerId;
-  if (!timer || !reactorTimerBindKind(timer, rtkUserEvent) ||
-      !epollTimerEnsureFd(timer) ||
-      !epollTimerSettime(timer, 0, &its)) {
-    if (timer)
-      epollTimerRollbackArm(timer);
+  assert(timer->header.timer.kind == rtkUserEvent);
+  if (!epollTimerEnsureFd(timer) || !epollTimerSettime(timer, 0, &its)) {
+    epollTimerRollbackArm(timer);
     return 0;
   }
-  void *udata = reactorTimerArmCountGeneration(timer, op, generation);
-  if (!epollTimerPublish(timer, ((aioUserEvent*)op)->base, udata)) {
+  void *udata = reactorTimerArmEventCountGeneration(timer, event, generation);
+  if (!epollTimerPublish(timer, event->header.base, udata)) {
     epollTimerRollbackArm(timer);
     return 0;
   }
   return 1;
 }
 
-static int epollStopTimerInternal(asyncOpRoot *op)
+static int epollDisarmTimer(aioTimer *timer)
 {
   struct itimerspec its;
   memset(&its, 0, sizeof(its));
-  aioTimer *timer = (aioTimer*)op->timerId;
-  if (!timer)
-    return 1;
   reactorTimerDisarm(timer);
   // settime starts a new timerfd epoch and clears the expiration count. The
   // delivered EPOLLONESHOT shot may stay registered but cannot wake again
@@ -726,37 +595,73 @@ static int epollStopTimerInternal(asyncOpRoot *op)
 
 void epollStopTimer(asyncOpRoot *op)
 {
-  (void)epollStopTimerInternal(op);
+  aioTimer *timer = (aioTimer*)op->timerId;
+  if (timer)
+    (void)epollDisarmTimer(timer);
 }
 
-int epollActivate(aioUserEvent *op)
+int epollInitializeUserEvent(aioUserEvent *event)
 {
-  epollEnqueue(op->base, &op->root);
-  return 1;
+  uint64_t encoded = reactorHandleEncode(&event->header);
+  int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (fd == -1)
+    return 0;
+  event->activationId = fd;
+  if (epollControl(((epollBase*)event->header.base)->epollFd, EPOLL_CTL_ADD, EPOLLIN | EPOLLET, fd, (void*)(uintptr_t)encoded) == 0)
+    return 1;
+  close(fd);
+  event->activationId = UINT64_MAX;
+  return 0;
 }
 
-int epollUpdateEventTimer(aioUserEvent *event,
-                          EventTimerUpdate update,
-                          uintptr_t generation,
-                          uint64_t period)
+int epollActivate(aioUserEvent *event)
 {
-  aioTimer *timer = (aioTimer*)event->root.timerId;
+  eventfd_t value = 1;
+  int result;
+  do {
+    result = eventfd_write((int)event->activationId, value);
+  } while (result == -1 && errno == EINTR);
+  // EAGAIN means the eventfd counter is saturated and therefore already
+  // readable; the manual signalState, not the kernel counter, carries exact
+  // multiplicity.
+  return result == 0 || errno == EAGAIN;
+}
+
+int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period)
+{
+  // OWNER acquired the config publication which made this lazy block usable.
+  aioEventTimerState *timerData = eventTimerDataLoad(event, amoRelaxed);
+  assert(timerData);
+  aioTimer *timer = (aioTimer*)timerData->timerId;
   switch (update) {
     case etuStart:
-      return epollStartTimerGeneration(&event->root, generation, period);
-    case etuStop:
-      return epollStopTimerInternal(&event->root);
+      if (!timer) {
+        timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
+        if (!timer)
+          return 0;
+        reactorTimerInitializeSharedState(timer);
+        timer->header.base = event->header.base;
+        timer->fd = -1;
+        timer->target = event;
+        timer->header.timer.kind = rtkUserEvent;
+        timerData->timerId = timer;
+      }
+      return epollStartTimerGeneration(event, timer, generation, period);
+    case etuStop: {
+      assert(timer && "Stopping a user-event timer which was never armed");
+      return epollDisarmTimer(timer);
+    }
     case etuRearm:
-      return timer && epollTimerPublish(timer,
-                                        event->base,
-                                        reactorTimerUdata(timer));
+      assert(timer && "Rearming a user-event timer which was never armed");
+      return epollTimerPublish(timer, event->header.base, reactorTimerUdata(timer));
     case etuConsume: {
+      assert(timer && "Consuming a user-event timer which was never armed");
       uint64_t expirations;
       ssize_t bytes;
       do {
         bytes = read((int)timer->fd, &expirations, sizeof(expirations));
       } while (bytes < 0 && errno == EINTR);
-      return bytes == (ssize_t)sizeof(expirations) && expirations != 0 ? 2 : 1;
+      return bytes == (ssize_t)sizeof(expirations) && expirations != 0 ? eturTick : eturApplied;
     }
   }
   return 1;
@@ -764,31 +669,29 @@ int epollUpdateEventTimer(aioUserEvent *event,
 
 void epollReleaseUserEvent(aioUserEvent *event)
 {
-  aioTimer *timer = (aioTimer*)event->root.timerId;
+  if (event->activationId != UINT64_MAX) {
+    (void)epollControl(((epollBase*)event->header.base)->epollFd, EPOLL_CTL_DEL, 0, (int)event->activationId, 0);
+    close((int)event->activationId);
+    event->activationId = UINT64_MAX;
+  }
+  aioEventTimerState *timerData = eventTimerDataLoad(event, amoAcquire);
+  aioTimer *timer = timerData ? (aioTimer*)timerData->timerId : 0;
   if (!timer) {
-    if (__uintptr_atomic_load(&event->incarnation, amoRelaxed) != 0)
-      concurrentQueuePush(event->root.objectPool, event);
+    objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
     return;
   }
-  assert(__uintptr_atomic_load(&timer->tag, amoAcquire) == 0 &&
-         "Recycling an armed user-event timer");
-  if (timer->registeredBase && timer->fd != -1)
-    (void)epollControl(((epollBase*)timer->registeredBase)->epollFd,
-                       EPOLL_CTL_DEL,
-                       0,
-                       (int)timer->fd,
-                       0);
+  assert(__uint64_atomic_load(&timer->header.tag.low, amoAcquire) == 0 && "Recycling an armed user-event timer");
+  if (timer->header.timer.registered && timer->fd != -1)
+    (void)epollControl(((epollBase*)timer->header.base)->epollFd, EPOLL_CTL_DEL, 0, (int)timer->fd, 0);
   if (timer->fd != -1)
     close((int)timer->fd);
   timer->fd = -1;
-  timer->registeredBase = 0;
-  timer->base = event->base;
+  timer->header.timer.registered = 0;
+  timer->header.base = event->header.base;
   // The timer cell is the physical lifetime anchor for stale epoll batches;
   // keep event<->timer immutable and return them to the pool as one unit.
-  if (__uintptr_atomic_load(&event->incarnation, amoRelaxed) != 0)
-    concurrentQueuePush(event->root.objectPool, event);
+  objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
 }
-
 
 AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr)
 {
@@ -798,7 +701,7 @@ AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr)
     op->state = 1;
     struct sockaddr_storage sa;
     socklen_t saLen = hostAddressToSockaddr(&op->host, &sa);
-    int result = connect(fd, (struct sockaddr *)&sa, saLen);
+    int result = connect(fd, (struct sockaddr*)&sa, saLen);
     if (result == -1 && errno != EINPROGRESS)
       return aosUnknownError;
     else
@@ -811,15 +714,13 @@ AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr)
   }
 }
 
-
 AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr)
 {
   struct sockaddr_storage clientAddr;
   asyncOp *op = (asyncOp*)opptr;
   int fd = getFd((EPollObject*)op->root.object);
   socklen_t clientAddrSize = sizeof(clientAddr);
-  op->acceptSocket =
-    accept(fd, (struct sockaddr *)&clientAddr, &clientAddrSize);
+  op->acceptSocket = accept(fd, (struct sockaddr*)&clientAddr, &clientAddrSize);
 
   if (op->acceptSocket != -1) {
     int current = fcntl(op->acceptSocket, F_GETFL);
@@ -837,7 +738,6 @@ AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr)
   }
 }
 
-
 AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
@@ -854,7 +754,7 @@ AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr)
       if (bytesRead == 0)
         return aosDisconnected;
       else if (bytesRead < 0)
-        return errno == EAGAIN ? aosPending : aosUnknownError;
+        return socketStatusFromErrno(errno);
       sb->dataSize = (size_t)bytesRead;
 
       if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize) || !(opptr->flags & afWaitAll))
@@ -863,9 +763,7 @@ AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr)
 
     return aosSuccess;
   } else {
-    ssize_t bytesRead = read(fd,
-                             (uint8_t *)op->buffer + op->bytesTransferred,
-                             op->transactionSize - op->bytesTransferred);
+    ssize_t bytesRead = read(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
 
     if (bytesRead > 0) {
       op->bytesTransferred += (size_t)bytesRead;
@@ -876,11 +774,10 @@ AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr)
     } else if (bytesRead == 0) {
       return op->transactionSize - op->bytesTransferred > 0 ? aosDisconnected : aosSuccess;
     } else {
-      return errno == EAGAIN ? aosPending : aosUnknownError;
+      return socketStatusFromErrno(errno);
     }
   }
 }
-
 
 AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr)
 {
@@ -889,15 +786,15 @@ AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr)
   int fd = getFd(object);
 
   ssize_t bytesWritten;
-  if (object->Object.root.type == ioObjectSocket) {
-    bytesWritten = send(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred, MSG_NOSIGNAL);
+  if (object->Object.root.header.objectType == ioObjectSocket) {
+    bytesWritten = send(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred, MSG_NOSIGNAL);
   } else if (object->Object.needSigpipeGuard && !sigpipeIgnored) {
     struct SigpipeGuard guard;
     sigpipeGuardEnter(&guard);
-    bytesWritten = write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+    bytesWritten = write(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
     sigpipeGuardLeave(&guard, bytesWritten == -1 && errno == EPIPE);
   } else {
-    bytesWritten = write(fd, (uint8_t *)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+    bytesWritten = write(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
   }
   if (bytesWritten > 0) {
     op->bytesTransferred += (size_t)bytesWritten;
@@ -908,10 +805,9 @@ AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr)
   } else if (bytesWritten == 0) {
     return op->transactionSize - op->bytesTransferred > 0 ? aosDisconnected : aosSuccess;
   } else {
-    return errno == EAGAIN ? aosPending : aosUnknownError;
+    return socketStatusFromErrno(errno);
   }
 }
-
 
 AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *opptr)
 {
@@ -935,10 +831,9 @@ AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *opptr)
     // MSG_TRUNC: the datagram did not fit, the kernel dropped its tail
     return (msg.msg_flags & MSG_TRUNC) ? aosBufferTooSmall : aosSuccess;
   } else {
-    return errno == EAGAIN ? aosPending : aosUnknownError;
+    return socketStatusFromErrno(errno);
   }
 }
-
 
 AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *opptr)
 {
@@ -947,10 +842,10 @@ AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *opptr)
 
   struct sockaddr_storage remoteAddress;
   socklen_t addrLen = hostAddressToSockaddr(&op->host, &remoteAddress);
-  ssize_t result = sendto(fd, op->buffer, op->transactionSize, 0, (struct sockaddr *)&remoteAddress, addrLen);
+  ssize_t result = sendto(fd, op->buffer, op->transactionSize, 0, (struct sockaddr*)&remoteAddress, addrLen);
   if (result != -1) {
     return aosSuccess;
   }
 
-  return errno == EAGAIN ? aosPending : aosUnknownError;
+  return socketStatusFromErrno(errno);
 }

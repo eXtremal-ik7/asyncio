@@ -6,7 +6,7 @@
 
 #include "coretest.h"
 
-#include "reactorTimer.h"
+#include "reactor.h"
 #include "atomic.h"
 
 #include "asyncio/asyncio.h"
@@ -25,12 +25,16 @@
 
 namespace {
 
-static_assert(sizeof(aioTimer) <= 2 * CACHE_LINE_SIZE,
-              "POSIX reactor timer must not regain aioObjectRoot-sized storage");
-static_assert(offsetof(aioTimer, base) == 0,
-              "compact reactor timer starts with its backend owner");
+static_assert(sizeof(aioTimer) <= 2 * CACHE_LINE_SIZE, "POSIX reactor timer must not regain aioObjectRoot-sized storage");
+static_assert(offsetof(aioTimer, header) == 0, "reactor timer must start with the common header");
 
-inline uint128Pair peekWheelSlot(TestBackend &backend, unsigned level, unsigned index)
+void initializeReactorTimer(aioTimer &timer, asyncBase *base = nullptr)
+{
+  reactorTimerInitializeSharedState(&timer);
+  timer.header.base = base;
+}
+
+inline uint128 peekWheelSlot(TestBackend &backend, unsigned level, unsigned index)
 {
   return __uint128_atomic_load(&backend.base.timerWheel.slots[level][index]);
 }
@@ -39,9 +43,9 @@ inline uint128Pair peekWheelSlot(TestBackend &backend, unsigned level, unsigned 
 // that deliberately leave a link behind the checkpoint
 inline asyncOpListLink *drainWheelSlot(TestBackend &backend, unsigned level, unsigned index)
 {
-  volatile uint128Pair *slot = &backend.base.timerWheel.slots[level][index];
-  uint128Pair observed = __uint128_atomic_load(slot);
-  uint128Pair desired;
+  volatile uint128 *slot = &backend.base.timerWheel.slots[level][index];
+  uint128 observed = __uint128_atomic_load(slot);
+  uint128 desired;
   do {
     desired.low = 0;
     desired.high = observed.high;
@@ -140,10 +144,8 @@ TEST(timer_grid, late_arm_after_swept_checkpoint_expires_instead_of_being_strand
 
   AsyncOpStatus statusAfterArm = opGetStatus(&op.root);
   asyncOpListLink *stranded = drainWheelSlot(backend, 0, 100);
-  EXPECT_EQ(statusAfterArm, aosTimeout)
-    << "a timer armed after its window was swept was not expired immediately";
-  EXPECT_EQ(stranded, nullptr)
-    << "the late timer was published into the reopened slot and will fire a rotation late";
+  EXPECT_EQ(statusAfterArm, aosTimeout) << "a timer armed after its window was swept was not expired immediately";
+  EXPECT_EQ(stranded, nullptr) << "the late timer was published into the reopened slot and will fire a rotation late";
 
   // Keep the known-red test hygienic on the current implementation. The
   // diagnostic drain above recovered ownership of the physical link; it must
@@ -186,8 +188,7 @@ TEST(timer_grid, stale_generation_link_does_not_cancel_reused_operation)
   link->op = &op.root;
   link->generation = staleGeneration;
   link->object = &object.root;
-  link->objectGeneration =
-    __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed);
+  link->objectGeneration = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
   link->next = nullptr;
   link->deadlineTick = 7;
   timerWheelInsert(&backend.base, link, 7);
@@ -195,7 +196,7 @@ TEST(timer_grid, stale_generation_link_does_not_cancel_reused_operation)
   processTimeoutQueue(&backend.base, 8);
 
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
 }
@@ -235,7 +236,7 @@ TEST(timer_wheel, detach_reopens_and_is_idempotent_per_incarnation)
   // next rotation
   asyncOpListLink *chain = timerWheelDetach(&backend.base, 0, 5);
   ASSERT_EQ(chain, link);
-  uint128Pair slotPair = peekWheelSlot(backend, 0, 5);
+  uint128 slotPair = peekWheelSlot(backend, 0, 5);
   EXPECT_EQ(slotPair.low, 0u);
   EXPECT_EQ(slotPair.high, 5u + TIMER_WHEEL_SLOTS);
 
@@ -300,13 +301,11 @@ TEST(timer_wheel, publication_descends_into_open_lower_window_of_drained_upper)
   link->op = &op.root;
   link->generation = opGetGeneration(&op.root);
   link->object = &object.root;
-  link->objectGeneration =
-    __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed);
+  link->objectGeneration = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
   link->next = nullptr;
   link->deadlineTick = 1030;
   ASSERT_EQ(timerWheelInsert(&backend.base, link, 0), 1);
-  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).low,
-            reinterpret_cast<uint64_t>(link));
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).low, reinterpret_cast<uint64_t>(link));
   EXPECT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
 
   // Delivered by the normal sweep in its exact tick
@@ -329,14 +328,11 @@ TEST(timer_wheel, expired_arm_never_starts_initialization_io)
   // combiner: the deadline computed from the monotonic clock lies behind the
   // confirmed sweep position
   backend.base.timerCloseCursor = static_cast<uintptr_t>(getMonotonicTicks() + 1024);
-  ASSERT_TRUE(__uintptr_atomic_compare_and_swap(&object.root.initializationOp, 0,
-                                                reinterpret_cast<uintptr_t>(&op.root),
-                                                amoSeqCst));
+  ASSERT_TRUE(__uintptr_atomic_compare_and_swap(&object.root.initializationOp, 0, reinterpret_cast<uintptr_t>(&op.root), amoSeqCst));
 
   combinerPushOperation(&op.root);
 
-  EXPECT_EQ(op.executeCalls, 0u)
-    << "initialization I/O was issued after its timeout had already won";
+  EXPECT_EQ(op.executeCalls, 0u) << "initialization I/O was issued after its timeout had already won";
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
   EXPECT_EQ(__uintptr_atomic_load(&object.root.initializationOp, amoRelaxed), 0u);
   backend.drainCompletions();
@@ -422,8 +418,7 @@ TEST(timer_wheel, boundary_deadline_migrates_and_fires_in_its_exact_tick)
   processTimeoutQueue(&backend.base, 1025);
   EXPECT_EQ(opGetStatus(&boundary.root), aosTimeout);
   EXPECT_EQ(opGetStatus(&inWindow.root), aosPending);
-  EXPECT_EQ(peekWheelSlot(backend, 0, 1).low,
-            reinterpret_cast<uint64_t>(inWindow.root.timerId));
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1).low, reinterpret_cast<uint64_t>(inWindow.root.timerId));
 
   processTimeoutQueue(&backend.base, 1026);
   EXPECT_EQ(opGetStatus(&inWindow.root), aosTimeout);
@@ -446,8 +441,7 @@ TEST(timer_wheel, cascade_chain_migrates_l2_to_l1_to_l0_and_fires_in_its_exact_t
   chained.root.endTime = chainedDeadline * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &boundary.root);
   addToTimeoutQueue(&backend.base, &chained.root);
-  ASSERT_EQ(peekWheelSlot(backend, 2, 1).low,
-            reinterpret_cast<uint64_t>(chained.root.timerId));
+  ASSERT_EQ(peekWheelSlot(backend, 2, 1).low, reinterpret_cast<uint64_t>(chained.root.timerId));
   ASSERT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
 
   // Catching up a whole level-1 rotation in one call (a base resuming from
@@ -463,8 +457,7 @@ TEST(timer_wheel, cascade_chain_migrates_l2_to_l1_to_l0_and_fires_in_its_exact_t
   EXPECT_EQ(opGetStatus(&boundary.root), aosTimeout);
   EXPECT_EQ(opGetStatus(&chained.root), aosPending);
   EXPECT_EQ(peekWheelSlot(backend, 2, 1).low, 0u);
-  ASSERT_EQ(peekWheelSlot(backend, 1, 1).low,
-            reinterpret_cast<uint64_t>(chained.root.timerId));
+  ASSERT_EQ(peekWheelSlot(backend, 1, 1).low, reinterpret_cast<uint64_t>(chained.root.timerId));
   EXPECT_EQ(peekWheelSlot(backend, 1, 1).high, l2Window + TIMER_WHEEL_SLOTS);
 
   // The level-1 boundary tick migrates it again, into the level-0 slot whose
@@ -472,8 +465,7 @@ TEST(timer_wheel, cascade_chain_migrates_l2_to_l1_to_l0_and_fires_in_its_exact_t
   processTimeoutQueue(&backend.base, chainedDeadline);
   EXPECT_EQ(opGetStatus(&chained.root), aosPending);
   EXPECT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
-  ASSERT_EQ(peekWheelSlot(backend, 0, 1).low,
-            reinterpret_cast<uint64_t>(chained.root.timerId));
+  ASSERT_EQ(peekWheelSlot(backend, 0, 1).low, reinterpret_cast<uint64_t>(chained.root.timerId));
   EXPECT_EQ(peekWheelSlot(backend, 0, 1).high, chainedDeadline);
 
   // The last hop is the delivery itself, in the exact deadline tick
@@ -495,8 +487,7 @@ TEST(timer_wheel, boundary_deadline_at_top_level_window_start_fires_at_its_visit
   const uint64_t l3Window = uint64_t{1} << (3 * TIMER_WHEEL_LEVEL_BITS);
   op.root.endTime = l3Window * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &op.root);
-  ASSERT_EQ(peekWheelSlot(backend, 3, 1).low,
-            reinterpret_cast<uint64_t>(op.root.timerId));
+  ASSERT_EQ(peekWheelSlot(backend, 3, 1).low, reinterpret_cast<uint64_t>(op.root.timerId));
 
   // Sweeping 2^30 ticks one by one is out of unit-test reach; the visit units
   // run directly at the exact window-start tick, as the contiguous sweep
@@ -522,8 +513,7 @@ TEST(timer_wheel, beyond_range_deadline_clamps_and_reclamps_keeping_its_exact_ti
   op.root.endTime = (wheelRange + 5) * TIMER_TICK_MICROSECONDS;
   addToTimeoutQueue(&backend.base, &op.root);
   auto *link = static_cast<asyncOpListLink*>(op.root.timerId);
-  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low,
-            reinterpret_cast<uint64_t>(link));
+  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low, reinterpret_cast<uint64_t>(link));
 
   // The far slot's visit re-cascades; from this window's position the
   // deadline is still beyond range, so it clamps again - parked with its
@@ -532,8 +522,7 @@ TEST(timer_wheel, beyond_range_deadline_clamps_and_reclamps_keeping_its_exact_ti
   timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 3, farWindow), farWindow);
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
   EXPECT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low, 0u);
-  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low,
-            reinterpret_cast<uint64_t>(link));
+  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low, reinterpret_cast<uint64_t>(link));
   EXPECT_EQ(link->deadlineTick, wheelRange + 5);
 
   // Still pending and parked: the wheel teardown recycles the link without
@@ -562,8 +551,7 @@ TEST(timer_wheel, stalled_cascade_into_swept_window_delivers_exactly_once)
   ASSERT_EQ(ownedChain, link);
   processTimeoutQueue(&backend.base, 1031);
   ASSERT_EQ(backend.base.timerCloseCursor, 1031u);
-  ASSERT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).high,
-            1030u + TIMER_WHEEL_SLOTS);
+  ASSERT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).high, 1030u + TIMER_WHEEL_SLOTS);
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
 
   // The resumed cascade observes the terminal window and must deliver right
@@ -572,8 +560,7 @@ TEST(timer_wheel, stalled_cascade_into_swept_window_delivers_exactly_once)
   timerWheelProcessDetached(&backend.base, ownedChain, 1024);
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
   EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).low, 0u);
-  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).high,
-            1030u + TIMER_WHEEL_SLOTS);
+  EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).high, 1030u + TIMER_WHEEL_SLOTS);
 
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
@@ -598,9 +585,7 @@ TEST(timer_wheel, stale_detach_restores_live_occupancy_bit)
 
   // Simulate the lost race: the stale visitor's pre-clear landing after the
   // fresh publication
-  __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][0],
-                             ~(static_cast<uintptr_t>(1) << 5),
-                             amoSeqCst);
+  __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][0], ~(static_cast<uintptr_t>(1) << 5), amoSeqCst);
 
   // The stale visitor re-reads the pair, sees the advanced incarnation with
   // a live chain and restores the bit while claiming nothing
@@ -868,11 +853,7 @@ TEST(timer_realtime, timeout_completion_does_not_stop_fired_timer)
   op.setResults({aosPending});
   combinerPushOperation(&op.root);
 
-  opCancel(&op.root,
-           opGetGeneration(&op.root),
-           aosTimeout,
-           &object.root,
-           __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed));
+  opCancel(&op.root, opGetGeneration(&op.root), aosTimeout, &object.root, __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed));
 
   EXPECT_EQ(backend.startTimerCalls, 1u);
   EXPECT_EQ(backend.stopTimerCalls, 0u);
@@ -892,38 +873,37 @@ TEST(timer_reactor, stale_doorbell_must_not_expire_a_rearmed_operation)
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
-  timer.base = &backend.base;
-  timer.op = &op.root;
-  timer.fd = static_cast<intptr_t>(uintptr_t{7} << rtIdentSeqBits);  // creation seeds the base id
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(timer, &backend.base);
+  timer.target = &op.root;
+  timer.fd = static_cast<intptr_t>(uintptr_t{7} << rtIdentSeqBits); // creation seeds the base id
   op.root.timerId = &timer;
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkOperation));
 
   // The first incarnation arms its realtime timer; the kernel keeps both the
   // udata and the ident of this arming inside the harvested event
   void *udata = reactorTimerArmIdent(&timer, &op.root);
-  uintptr_t staleIdent = static_cast<uintptr_t>(timer.fd);
-  void *decodedTimer = nullptr;
-  uintptr_t staleBits = 0;
-  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
-  ASSERT_EQ(decodedTimer, &timer);
-  EXPECT_EQ(staleBits & udataUserEvent, 0u);
+  uint64_t staleIdent = static_cast<uint64_t>(timer.fd);
+  uint64_t staleGeneration = 0;
+  objectHeader *decoded = reactorHandleDecode((uint64_t)(uintptr_t)udata, &staleGeneration);
+  ASSERT_EQ(decoded, &timer.header);
 
   // The operation completes; its storage is recycled and re-armed for a new
   // submission with a fresh deadline before the doorbell gets processed
   uintptr_t firstGeneration = opGetGeneration(&op.root);
   op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
-  reactorTimerArmIdent(&timer, &op.root);
+  void *currentUdata = reactorTimerArmIdent(&timer, &op.root);
+  uint64_t currentGeneration = 0;
+  EXPECT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)currentUdata, &currentGeneration), &timer.header);
 
   // Another loop thread finally processes the stale doorbell
-  uintptr_t armedGeneration = 0;
-  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, staleIdent, &armedGeneration), rteIgnore)
-    << "a doorbell carrying the previous arming's ident matched the re-armed timer";
+  uint64_t armedGeneration = 0;
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleGeneration, staleIdent, &armedGeneration), rteIgnore)
+      << "a doorbell carrying the previous arming's ident matched the re-armed timer";
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
 
   // The current arming's own doorbell still expires it, with its generation
-  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, static_cast<uintptr_t>(timer.fd), &armedGeneration),
-            rteExpireOperation);
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, currentGeneration, static_cast<uint64_t>(timer.fd), &armedGeneration), rteExpireOperation);
   EXPECT_EQ(armedGeneration, opGetGeneration(&op.root));
 
   reactorTimerDisarm(&timer);
@@ -940,35 +920,26 @@ TEST(timer_reactor, stale_epoll_doorbell_uses_the_current_absolute_deadline)
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
-  timer.base = &backend.base;
-  timer.op = &op.root;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(timer, &backend.base);
+  timer.target = &op.root;
   op.root.timerId = &timer;
 
-  void *udata = reactorTimerArmDeadlineGeneration(&timer,
-                                                  &op.root,
-                                                  opGetGeneration(&op.root),
-                                                  100);
-  void *decodedTimer = nullptr;
-  uintptr_t staleBits = 0;
-  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
-  ASSERT_EQ(decodedTimer, &timer);
-  EXPECT_EQ(staleBits & udataUserEvent, 0u);
+  void *udata = reactorTimerArmDeadlineGeneration(&timer, &op.root, opGetGeneration(&op.root), 100);
+  uint64_t staleGeneration = 0;
+  ASSERT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)udata, &staleGeneration), &timer.header);
 
   uintptr_t firstGeneration = opGetGeneration(&op.root);
   op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
-  reactorTimerArmDeadlineGeneration(&timer,
-                                    &op.root,
-                                    opGetGeneration(&op.root),
-                                    200);
+  void *currentUdata = reactorTimerArmDeadlineGeneration(&timer, &op.root, opGetGeneration(&op.root), 200);
+  uint64_t currentGeneration = 0;
+  ASSERT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)currentUdata, &currentGeneration), &timer.header);
 
-  uintptr_t armedGeneration = 0;
-  EXPECT_EQ(reactorTimerDecodeDeadline(&timer, staleBits, 199, &armedGeneration), rteIgnore)
-    << "a stale doorbell of the re-armed timer expired an operation whose deadline is ahead";
+  uint64_t armedGeneration = 0;
+  EXPECT_EQ(reactorTimerDecodeDeadline(&timer, staleGeneration, 199, &armedGeneration), rteIgnore);
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
 
-  EXPECT_EQ(reactorTimerDecodeDeadline(&timer, staleBits, 200, &armedGeneration),
-            rteExpireOperation);
+  EXPECT_EQ(reactorTimerDecodeDeadline(&timer, currentGeneration, 200, &armedGeneration), rteExpireOperation);
   EXPECT_EQ(armedGeneration, opGetGeneration(&op.root));
 
   reactorTimerDisarm(&timer);
@@ -982,17 +953,18 @@ TEST(timer_reactor, side_snapshot_rejects_fields_from_a_newer_arm)
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};
-  timer.kind = rtkOperation;
+  initializeReactorTimer(timer, &backend.base);
+  timer.header.timer.kind = rtkOperation;
   reactorTimerArmDeadlineGeneration(&timer, &op.root, 7, 100);
 
   // Model a reader paused after t1 while the serialized writer publishes the
   // next arm. The mandatory zero store is what the acquire side-field load
   // pulls ahead of the final coherent tag recheck.
-  uintptr_t first = __uintptr_atomic_load(&timer.tag, amoAcquire);
+  uint64_t first = __uint64_atomic_load(&timer.header.tag.high, amoAcquire);
   ASSERT_NE(first, 0u);
   reactorTimerArmDeadlineGeneration(&timer, &op.root, 8, 200);
-  uintptr_t newerDeadline = __uintptr_atomic_load(&timer.armedDeadline, amoAcquire);
-  uintptr_t second = __uintptr_atomic_load(&timer.tag, amoRelaxed);
+  uint64_t newerDeadline = __uint64_atomic_load(&timer.armedDeadline, amoAcquire);
+  uint64_t second = objectHeaderGeneration(&timer.header);
 
   EXPECT_EQ(newerDeadline, 200u);
   EXPECT_NE(first, second);
@@ -1007,76 +979,78 @@ TEST(timer_reactor, side_snapshot_rejects_fields_from_a_newer_arm)
 TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
 {
   aioUserEvent event{};
-  event.root.opCode = actUserEvent;
-  event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;  // generation 1, stable across restarts
-  event.tag = 1;
-  event.incarnation = 5;
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
-  timer.op = &event.root;
+  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
+  __uint64_atomic_store(&event.header.tag.high, (UINT64_C(1) << 40) | 5, amoRelaxed);
+  aioEventTimerState timerData{};
+  event.timerData = &timerData;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(timer);
+  timer.target = &event;
   timer.fd = static_cast<intptr_t>(uintptr_t{2} << rtIdentSeqBits);
-  event.root.timerId = &timer;
+  timerData.timerId = &timer;
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkUserEvent));
 
-  void *udata = reactorTimerArmIdent(&timer, &event.root);   // first arming
-  uintptr_t staleIdent = static_cast<uintptr_t>(timer.fd);
-  void *decodedTimer = nullptr;
-  uintptr_t staleBits = 0;
-  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
+  void *udata = reactorTimerArmEventIdentGeneration(&timer, &event, 1);
+  uint64_t staleIdent = static_cast<uint64_t>(timer.fd);
+  uint64_t staleGeneration = 0;
+  ASSERT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)udata, &staleGeneration), &timer.header);
 
-  reactorTimerDisarm(&timer);                                // userEventStopTimer
-  reactorTimerArmIdent(&timer, &event.root);                 // userEventStartTimer again
+  reactorTimerDisarm(&timer);                                                  // userEventStopTimer
+  void *currentUdata = reactorTimerArmEventIdentGeneration(&timer, &event, 2); // restart
+  uint64_t currentGeneration = 0;
+  ASSERT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)currentUdata, &currentGeneration), &timer.header);
 
-  uintptr_t armedGeneration = 0;
-  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleBits, staleIdent, &armedGeneration), rteIgnore)
-    << "a doorbell of the previous arming would activate the restarted user event and consume its tick";
+  uint64_t armedGeneration = 0;
+  EXPECT_EQ(reactorTimerDecodeIdent(&timer, staleGeneration, staleIdent, &armedGeneration), rteIgnore)
+      << "a doorbell of the previous arming would activate the restarted user event and consume its tick";
 
   // The current arming's own tick still delivers
   aioObjectRoot *armedObject = nullptr;
-  uintptr_t armedObjectGeneration = 0;
-  uintptr_t armedIncarnation = 0;
+  uint64_t armedObjectGeneration = 0;
+  uint64_t armedIncarnation = 0;
   EXPECT_EQ(reactorTimerDecodeIdentHandle(&timer,
-                                          staleBits,
-                                          static_cast<uintptr_t>(timer.fd),
+                                          currentGeneration,
+                                          static_cast<uint64_t>(timer.fd),
                                           &armedGeneration,
                                           &armedObject,
                                           &armedObjectGeneration,
                                           &armedIncarnation),
             rteUserEvent);
-  EXPECT_EQ(armedIncarnation, 5u);
+  EXPECT_EQ(armedGeneration, 2u);
+  EXPECT_EQ(armedIncarnation, (UINT64_C(1) << 40) | 5u);
 }
 
 // Same restart through the epoll/probe protocol: a loop delivery snapshots
-// only the current schedule. The applier later reads timerfd under its serial
+// only the current schedule. The owner later reads timerfd under its serial
 // ownership; eventtest covers the EAGAIN/confirmed-expiration decisions.
 TEST(timer_reactor, count_probe_snapshots_the_restarted_user_event)
 {
   aioUserEvent event{};
-  event.root.opCode = actUserEvent;
-  event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;
-  event.tag = 1;
-  event.incarnation = 9;
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
-  timer.op = &event.root;
-  event.root.timerId = &timer;
+  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
+  __uint64_atomic_store(&event.header.tag.high, (UINT64_C(1) << 40) | 9, amoRelaxed);
+  aioEventTimerState timerData{};
+  event.timerData = &timerData;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(timer);
+  timer.target = &event;
+  timerData.timerId = &timer;
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkUserEvent));
 
-  void *udata = reactorTimerArmCount(&timer, &event.root);   // first arming
-  void *decodedTimer = nullptr;
-  uintptr_t staleBits = 0;
-  __tagged_pointer_decode(udata, &decodedTimer, &staleBits);
-  EXPECT_EQ(decodedTimer, &timer);
-  EXPECT_NE(staleBits & udataUserEvent, 0u);
+  void *udata = reactorTimerArmEventCountGeneration(&timer, &event, 1);
+  uint64_t staleGeneration = 0;
+  EXPECT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)udata, &staleGeneration), &timer.header);
 
-  reactorTimerDisarm(&timer);                                // userEventStopTimer
-  reactorTimerArmCount(&timer, &event.root);                 // userEventStartTimer again
+  reactorTimerDisarm(&timer);                                                  // userEventStopTimer
+  void *currentUdata = reactorTimerArmEventCountGeneration(&timer, &event, 2); // restart
+  uint64_t currentGeneration = 0;
+  EXPECT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)currentUdata, &currentGeneration), &timer.header);
 
-  uintptr_t armedGeneration = 0;
-  uintptr_t armedIncarnation = 0;
-  ASSERT_TRUE(reactorTimerDecodeCountProbe(&timer,
-                                           &armedGeneration,
-                                           &armedIncarnation));
-  EXPECT_EQ(armedIncarnation, 9u);
-  EXPECT_EQ(armedGeneration, opGetGeneration(&event.root));
+  uint64_t armedGeneration = 0;
+  uint64_t armedIncarnation = 0;
+  EXPECT_FALSE(reactorTimerDecodeCountProbe(&timer, staleGeneration, &armedGeneration, &armedIncarnation));
+  ASSERT_TRUE(reactorTimerDecodeCountProbe(&timer, currentGeneration, &armedGeneration, &armedIncarnation));
+  EXPECT_EQ(armedIncarnation, (UINT64_C(1) << 40) | 9u);
+  EXPECT_EQ(armedGeneration, 2u);
 }
 
 // The "tag == 0 means disarmed" sentinel must not collide with a legally
@@ -1091,9 +1065,10 @@ TEST(timer_reactor, arming_a_wrapped_generation_must_not_publish_the_disarmed_se
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
-  timer.op = &op.root;
-  timer.fd = 0;  // even a zero base id must not let the composite ident hit 0
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(timer, &backend.base);
+  timer.target = &op.root;
+  timer.fd = 0; // even a zero base id must not let the composite ident hit 0
   op.root.timerId = &timer;
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkOperation));
 
@@ -1101,32 +1076,28 @@ TEST(timer_reactor, arming_a_wrapped_generation_must_not_publish_the_disarmed_se
   // 32-bit target)
   op.root.tag = (uintptr_t{0} << TAG_STATUS_SIZE) | aosPending;
   void *udata = reactorTimerArmIdent(&timer, &op.root);
-  void *decodedTimer = nullptr;
-  uintptr_t udataBits = 0;
-  __tagged_pointer_decode(udata, &decodedTimer, &udataBits);
+  uint64_t envelopeGeneration = ~uint64_t{0};
+  EXPECT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)udata, &envelopeGeneration), &timer.header);
 
-  uintptr_t armedGeneration = ~uintptr_t{0};
-  EXPECT_NE(static_cast<uintptr_t>(timer.fd), 0u);
-  EXPECT_NE(reactorTimerDecodeIdent(&timer, udataBits, static_cast<uintptr_t>(timer.fd), &armedGeneration),
-            rteIgnore)
-    << "an armed timer with generation 0 is indistinguishable from a disarmed one: its timeout is lost";
+  uint64_t armedGeneration = ~uint64_t{0};
+  EXPECT_NE(static_cast<uint64_t>(timer.fd), 0u);
+  EXPECT_NE(reactorTimerDecodeIdent(&timer, envelopeGeneration, static_cast<uint64_t>(timer.fd), &armedGeneration), rteIgnore)
+      << "an armed timer with generation 0 is indistinguishable from a disarmed one: its timeout is lost";
   EXPECT_EQ(armedGeneration, 0u);
   reactorTimerDisarm(&timer);
 
   // epoll flavor: the armed bit keeps generation 0 away from the sentinel.
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer deadlineTimer{};
-  deadlineTimer.op = &op.root;
+  initializeReactorTimer(deadlineTimer, &backend.base);
+  deadlineTimer.target = &op.root;
   op.root.timerId = &deadlineTimer;
-  reactorTimerArmDeadlineGeneration(&deadlineTimer, &op.root, 0, 10);
-  uintptr_t armedTag = __uintptr_atomic_load(&deadlineTimer.tag, amoAcquire);
-  EXPECT_NE(armedTag, 0u)
-    << "the armed deadline encoding of generation 0 collided with the disarmed sentinel";
-  armedGeneration = ~uintptr_t{0};
-  EXPECT_EQ(reactorTimerDecodeDeadline(&deadlineTimer,
-                                       udataBits,
-                                       10,
-                                       &armedGeneration),
-            rteExpireOperation);
+  void *deadlineUdata = reactorTimerArmDeadlineGeneration(&deadlineTimer, &op.root, 0, 10);
+  envelopeGeneration = ~uint64_t{0};
+  EXPECT_EQ(reactorHandleDecode((uint64_t)(uintptr_t)deadlineUdata, &envelopeGeneration), &deadlineTimer.header);
+  uint64_t armedTag = __uint64_atomic_load(&deadlineTimer.header.tag.low, amoAcquire);
+  EXPECT_NE(armedTag, 0u) << "the armed deadline encoding of generation 0 collided with the disarmed sentinel";
+  armedGeneration = ~uint64_t{0};
+  EXPECT_EQ(reactorTimerDecodeDeadline(&deadlineTimer, envelopeGeneration, 10, &armedGeneration), rteExpireOperation);
   EXPECT_EQ(armedGeneration, 0u);
   reactorTimerDisarm(&deadlineTimer);
 
@@ -1135,8 +1106,8 @@ TEST(timer_reactor, arming_a_wrapped_generation_must_not_publish_the_disarmed_se
 }
 
 #ifdef __linux__
-// The kernel dependency the probe/applier protocol stands on: timerfd_settime
-// with a new value RESETS the fd's expiration counter, so the applier reading
+// The kernel dependency the probe/owner protocol stands on: timerfd_settime
+// with a new value RESETS the fd's expiration counter, so the owner reading
 // after a restart gets EAGAIN instead of inheriting the previous schedule's
 // expiration. If this ever changes, a stale probe could spend a new counter.
 TEST(timer_reactor, timerfd_settime_resets_the_expiration_counter)
@@ -1144,7 +1115,7 @@ TEST(timer_reactor, timerfd_settime_resets_the_expiration_counter)
   int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
   ASSERT_NE(fd, -1);
   itimerspec its{};
-  its.it_value.tv_nsec = 1000000;  // 1ms
+  its.it_value.tv_nsec = 1000000; // 1ms
   ASSERT_EQ(timerfd_settime(fd, 0, &its, nullptr), 0);
   pollfd waiter{fd, POLLIN, 0};
   ASSERT_EQ(poll(&waiter, 1, 1000), 1) << "the armed timerfd never expired";
@@ -1156,9 +1127,8 @@ TEST(timer_reactor, timerfd_settime_resets_the_expiration_counter)
   ASSERT_EQ(timerfd_settime(fd, 0, &its, nullptr), 0);
   uint64_t expirations = 0;
   ssize_t result = read(fd, &expirations, sizeof(expirations));
-  EXPECT_TRUE(result == -1 && errno == EAGAIN)
-    << "settime did not reset the expiration counter: read returned " << result
-    << " with count " << expirations << " - a stale doorbell would expire the fresh arming";
+  EXPECT_TRUE(result == -1 && errno == EAGAIN) << "settime did not reset the expiration counter: read returned " << result << " with count "
+                                               << expirations << " - a stale doorbell would expire the fresh arming";
 
   // And a genuine expiration of the current arming still reads back
   its.it_value.tv_sec = 0;
@@ -1172,112 +1142,57 @@ TEST(timer_reactor, timerfd_settime_resets_the_expiration_counter)
 }
 #endif
 
-// Regression: a user-event tick whose activation collided with a concurrent
-// userEventActivate (the AIOPing pattern) is dropped - but on a backend whose
-// registration is consumed by every delivery (epoll EPOLLONESHOT) the
-// registration must still be re-armed. Losing the only oneshot registration
-// silences the periodic event forever: the kernel timer keeps ticking, epoll
-// never reports it again until a manual userEventStartTimer.
-TEST(timer_reactor, failed_activation_must_still_rearm_a_oneshot_registration)
-{
-  ReactorUserEventTickPlan plan = reactorTimerUserEventTick(0, 0, 1);
-  EXPECT_EQ(plan.activate, 0);
-  EXPECT_EQ(plan.stopTimer, 0);
-  EXPECT_EQ(plan.rearm, 1)
-    << "a dropped tick consumed the oneshot registration without re-arming it";
-
-  // kqueue: the periodic kernel timer stays armed, a dropped tick needs no action
-  plan = reactorTimerUserEventTick(0, 0, 0);
-  EXPECT_EQ(plan.activate, 0);
-  EXPECT_EQ(plan.stopTimer, 0);
-  EXPECT_EQ(plan.rearm, 0);
-}
-
-// Pins the green user-event delivery paths of both backends around the plan.
-TEST(timer_reactor, user_event_tick_plan_pins_the_green_paths)
-{
-  // Counted tick with ticks remaining: deliver, re-arm the consumed oneshot
-  ReactorUserEventTickPlan plan = reactorTimerUserEventTick(1, 0, 1);
-  EXPECT_EQ(plan.activate, 1);
-  EXPECT_EQ(plan.stopTimer, 0);
-  EXPECT_EQ(plan.rearm, 1);
-
-  // Final counted tick: stop the timer, the dead registration is not re-armed
-  plan = reactorTimerUserEventTick(1, 1, 1);
-  EXPECT_EQ(plan.activate, 1);
-  EXPECT_EQ(plan.stopTimer, 1);
-  EXPECT_EQ(plan.rearm, 0);
-
-  // kqueue twins: never re-arm, the kernel-side periodic timer is standing
-  plan = reactorTimerUserEventTick(1, 0, 0);
-  EXPECT_EQ(plan.activate, 1);
-  EXPECT_EQ(plan.stopTimer, 0);
-  EXPECT_EQ(plan.rearm, 0);
-  plan = reactorTimerUserEventTick(1, 1, 0);
-  EXPECT_EQ(plan.activate, 1);
-  EXPECT_EQ(plan.stopTimer, 1);
-  EXPECT_EQ(plan.rearm, 0);
-}
-
-// Every kernel publication of a timer pointer must carry the udataTimer
-// discriminator - including the disabled registrations (epoll InitializeTimer
-// CTL_ADD with mask 0, StopTimer CTL_MOD to mask 0): EPOLLERR/EPOLLHUP are
-// mask-exempt, and a bare timer pointer would route such an event into the
-// fd-object branch, pushing a combiner signal through the aioTimer's
-// never-initialized Head. The seam owns the single udata constructor; this
-// pins its bits for every flavor.
-TEST(timer_reactor, every_timer_udata_publication_carries_the_timer_bit)
+// Every timer publication uses the same compact objectHeader envelope as
+// objects and user events. The immutable header type, rather than pointer tag
+// bits, selects the timer decoder after the address/generation expansion.
+TEST(timer_reactor, every_timer_udata_is_a_common_header_handle)
 {
   TestBackend backend;
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{};  // production timers come from alignedMalloc
-  timer.op = &op.root;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(timer, &backend.base);
+  timer.target = &op.root;
   op.root.timerId = &timer;
 
-  auto bitsOf = [](void *udata, aioTimer *expected) {
-    void *ptr = nullptr;
-    uintptr_t bits = 0;
-    __tagged_pointer_decode(udata, &ptr, &bits);
-    EXPECT_EQ(ptr, expected) << "udata does not point back at the timer";
-    return bits;
+  auto generationOf = [](void *udata, aioTimer *expected) {
+    uint64_t generation = 0;
+    objectHeader *header = reactorHandleDecode((uint64_t)(uintptr_t)udata, &generation);
+    EXPECT_EQ(header, &expected->header);
+    EXPECT_EQ(objectHeaderGetType(header), ohtTimer);
+    return generation;
   };
 
   // Kind is bound only at the first arm; timer construction itself does not
   // read the operation's not-yet-initialized opCode.
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkOperation));
-  EXPECT_EQ(bitsOf(reactorTimerUdata(&timer), &timer) & udataTimer,
-            uintptr_t{udataTimer});
+  EXPECT_EQ(generationOf(reactorTimerUdata(&timer), &timer), 0u);
 
-  // Both arm flavors of a realtime operation: timer bit set, user-event bit clear
-  uintptr_t identBits = bitsOf(reactorTimerArmIdent(&timer, &op.root), &timer);
-  EXPECT_EQ(identBits & udataTimer, uintptr_t{udataTimer});
-  EXPECT_EQ(identBits & udataUserEvent, 0u);
+  // Both arm flavors preserve the operation generation.
+  EXPECT_EQ(generationOf(reactorTimerArmIdent(&timer, &op.root), &timer), opGetGeneration(&op.root));
   reactorTimerDisarm(&timer);
-  uintptr_t countBits = bitsOf(reactorTimerArmCount(&timer, &op.root), &timer);
-  EXPECT_EQ(countBits & udataTimer, uintptr_t{udataTimer});
-  EXPECT_EQ(countBits & udataUserEvent, 0u);
+  EXPECT_EQ(generationOf(reactorTimerArmCount(&timer, &op.root), &timer), opGetGeneration(&op.root));
   reactorTimerDisarm(&timer);
 
-  // User-event arms additionally mark the udata so the decode can branch
-  // without touching the operation's memory
+  // User-event timer kind lives in the common-header union and the schedule
+  // generation follows the same encoding.
   aioUserEvent event{};
-  event.root.opCode = actUserEvent;
-  event.root.tag = uintptr_t{1} << TAG_STATUS_SIZE;
-  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer eventTimer{};  // production timers come from alignedMalloc
-  eventTimer.op = &event.root;
+  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
+  __uint64_atomic_store(&event.header.tag.high, 1, amoRelaxed);
+  aioEventTimerState timerData{};
+  event.timerData = &timerData;
+  alignas(TAGGED_POINTER_ALIGNMENT) aioTimer eventTimer{}; // production timers come from alignedMalloc
+  initializeReactorTimer(eventTimer);
+  eventTimer.target = &event;
   ASSERT_TRUE(reactorTimerBindKind(&eventTimer, rtkUserEvent));
-  event.root.timerId = &eventTimer;
-  EXPECT_EQ(bitsOf(reactorTimerArmIdent(&eventTimer, &event.root), &eventTimer) & (udataTimer | udataUserEvent),
-            uintptr_t{udataTimer | udataUserEvent});
+  timerData.timerId = &eventTimer;
+  EXPECT_EQ(generationOf(reactorTimerArmEventIdentGeneration(&eventTimer, &event, 1), &eventTimer), 1u);
   reactorTimerDisarm(&eventTimer);
-  EXPECT_EQ(bitsOf(reactorTimerArmCount(&eventTimer, &event.root), &eventTimer) & (udataTimer | udataUserEvent),
-            uintptr_t{udataTimer | udataUserEvent});
+  EXPECT_EQ(generationOf(reactorTimerArmEventCountGeneration(&eventTimer, &event, 2), &eventTimer), 2u);
   reactorTimerDisarm(&eventTimer);
 
   objectDecrementReference(&object.root, 1);
   deleteOwner(backend, object);
 }
-
 
 } // namespace

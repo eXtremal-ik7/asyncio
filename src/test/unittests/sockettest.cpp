@@ -348,7 +348,7 @@ TEST(SocketDeathTest, write_after_peer_reset)
 // ahead of it. On epoll/kqueue the kernel provides this gate (read() during
 // SYN_SENT returns EAGAIN, the op parks and later times out - after the
 // connect did); on iocp WSARecv on a not-yet-connected socket fails
-// synchronously with WSAENOTCONN, so the read completes with aosUnknownError
+// synchronously with WSAENOTCONN, so the read completes with aosNotConnected
 // while the connect is still in flight. The connect target is a TEST-NET-1
 // blackhole (RFC 5737, never answers), which keeps the connect pending until
 // its timeout; if the local network answers it with an ICMP error instead,

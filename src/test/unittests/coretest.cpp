@@ -1,4 +1,5 @@
 #include "coretest.h"
+#include "reactor.h"
 
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
@@ -15,7 +16,7 @@ static_assert(COMBINER_TAG_PROGRESS_READ == IO_EVENT_READ, "READ tag must map di
 static_assert(COMBINER_TAG_PROGRESS_WRITE == IO_EVENT_WRITE, "WRITE tag must map directly to backend events");
 static_assert(COMBINER_TAG_ERROR == IO_EVENT_ERROR, "ERROR tag must map directly to backend events");
 static_assert(COMBINER_TAG_CANCEL == (1u << 3), "CANCEL must precede DELETE");
-static_assert(COMBINER_TAG_DELETE == (1u << 4), "DELETE must remain the final Head tag");
+static_assert(COMBINER_TAG_DELETE == (1u << 4), "DELETE must remain the final header.tag tag");
 static_assert(sizeof(asyncOpListLink) == 48,
               "timeout links carry a full object generation handle");
 
@@ -219,7 +220,7 @@ TEST(core_combiner, terminal_result_losing_timeout_race_is_released_once)
              opGetGeneration(&current.root),
              aosTimeout,
              current.root.object,
-             __uintptr_atomic_load(&current.root.object->Head.gen, amoRelaxed));
+             __uint64_atomic_load(&current.root.object->header.tag.high, amoRelaxed));
   };
 
   combinerPushOperation(&op.root);
@@ -372,10 +373,10 @@ TEST(core_cancel, stale_generation_does_not_cancel_reused_operation)
            staleGeneration,
            aosTimeout,
            &object.root,
-           __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed));
+           __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed));
 
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
   objectDecrementReference(&object.root, 1);
   deleteOwner(backend, object);
 }
@@ -387,7 +388,7 @@ TEST(core_cancel, winning_cancel_does_not_read_operation_after_status_cas)
   TestOp op(object);
   uintptr_t generation = opGetGeneration(&op.root);
   uintptr_t objectGeneration =
-    __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed);
+    __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
 
   // A timer producer owns only the operation tag. Once its terminal CAS wins,
   // the combiner may release/recycle the operation immediately; every route
@@ -403,7 +404,7 @@ TEST(core_cancel, winning_cancel_does_not_read_operation_after_status_cas)
   ASAN_UNPOISON_MEMORY_REGION(&op.root, sizeof(op.root));
 
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
   objectDecrementReference(&object.root, 1); // TestOp's retained reference
   deleteOwner(backend, object);
 }
@@ -488,7 +489,7 @@ TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submit
              opGetGeneration(&timedOut.root),
              aosTimeout,
              &object.root,
-             __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed));
+             __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed));
     // ...then the user submits two more operations and only afterwards
     // cancels everything submitted so far
     combinerPushOperation(&first.root);
@@ -521,7 +522,7 @@ TEST(core_cancel, repeated_request_while_flag_is_set_does_not_push_second_signal
 
   EXPECT_EQ(object.root.CancelIoFlag, 2u);
   EXPECT_TRUE(backend.handledSignals.empty());
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
   object.root.CancelIoFlag = 0;
   deleteOwner(backend, object);
 }
@@ -994,7 +995,7 @@ TEST(core_operation_allocation, regular_and_realtime_pools_reuse_aligned_storage
 TEST(core_object_storage, pool_reuses_the_same_aligned_cell_and_preserves_head)
 {
   struct alignas(64) Cell {
-    AsyncObjectHead Head;
+    objectHeader header;
     std::array<uint8_t, 96> payload;
   };
   ConcurrentQueue pool{};
@@ -1002,14 +1003,14 @@ TEST(core_object_storage, pool_reuses_the_same_aligned_cell_and_preserves_head)
   Cell *first = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
   ASSERT_NE(first, nullptr);
   EXPECT_EQ(reinterpret_cast<uintptr_t>(first) & 63u, 0u);
-  EXPECT_EQ(__uintptr_atomic_load(&first->Head.data, amoRelaxed), 0u);
-  EXPECT_EQ(__uintptr_atomic_load(&first->Head.gen, amoRelaxed), 1u);
-  __uintptr_atomic_store(&first->Head.gen, 37, amoRelaxed);
+  EXPECT_EQ(__uint64_atomic_load(&first->header.tag.low, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&first->header.tag.high, amoRelaxed), 1u);
+  __uint64_atomic_store(&first->header.tag.high, 37, amoRelaxed);
   objectFree(&pool, first, sizeof(Cell));
 
   Cell *second = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
   ASSERT_EQ(second, first);
-  EXPECT_EQ(__uintptr_atomic_load(&second->Head.gen, amoRelaxed), 37u);
+  EXPECT_EQ(__uint64_atomic_load(&second->header.tag.high, amoRelaxed), 37u);
 
   alignedFree(second);
   destroyConcurrentQueue(&pool);
@@ -1020,13 +1021,13 @@ TEST(core_object_storage, generation_advances_before_user_destructor)
   TestBackend backend;
   TestObject object(backend);
   uintptr_t before =
-    __uintptr_atomic_load(&object.root.Head.gen, amoRelaxed);
+    __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
 
   objectDelete(&object.root);
 
   EXPECT_EQ(object.destructorCallbacks, 1u);
   EXPECT_EQ(object.destructorGeneration, before + 1);
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.gen, amoRelaxed), before + 1);
+  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.high, amoRelaxed), before + 1);
 }
 
 TEST(core_global_queue, callbacks_release_operations_and_quit_marker_stops_drain)
@@ -1423,7 +1424,7 @@ TEST(core_sync_path, speculative_allocation_is_released_after_combiner_handoff)
   SyncScenario scenario(object);
   std::atomic<unsigned> phase{0};
   AsyncOpTaggedPtr busy = taggedAsyncOpStub();
-  __uintptr_atomic_store(&object.root.Head.data, busy.data, amoRelaxed);
+  __uint64_atomic_store(&object.root.header.tag.low, busy.data, amoRelaxed);
   scenario.createHook = [&]() {
     phase.store(1, std::memory_order_release);
     while (phase.load(std::memory_order_acquire) != 2)
@@ -1435,10 +1436,10 @@ TEST(core_sync_path, speculative_allocation_is_released_after_combiner_handoff)
   });
   while (phase.load(std::memory_order_acquire) != 1)
     std::this_thread::yield();
-  bool handedOff = __uintptr_atomic_compare_and_swap(&object.root.Head.data,
-                                                      busy.data,
-                                                      0,
-                                                      amoSeqCst);
+  bool handedOff = __uint64_atomic_compare_and_swap(&object.root.header.tag.low,
+                                                     busy.data,
+                                                     0,
+                                                     amoSeqCst);
   phase.store(2, std::memory_order_release);
   submitter.join();
 
@@ -1621,75 +1622,89 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
 
 TEST(core_head, fd_handle_roundtrips_pointer_and_generation)
 {
-  auto *object = static_cast<aioObjectRoot*>(alignedMalloc(sizeof(aioObjectRoot), 64));
+  auto *object = static_cast<aioObject*>(alignedMalloc(sizeof(aioObject), 64));
   ASSERT_NE(object, nullptr);
-  __uintptr_atomic_store(&object->Head.data, 0, amoRelaxed);
-  __uintptr_atomic_store(&object->Head.gen, 0x155555u, amoRelaxed);
+  __uint64_atomic_store(&object->root.header.tag.low, 0, amoRelaxed);
+  __uint64_atomic_store(&object->root.header.tag.high, 0x055555u, amoRelaxed);
+  objectHeaderSetType(&object->root.header, ohtObject);
 
-  uint64_t encoded = 0;
-  ASSERT_TRUE(objectHandleTryEncode(object, &encoded));
+  uint64_t encoded = reactorHandleEncode(&object->root.header);
   EXPECT_NE(encoded, 0u);
-  EXPECT_EQ(encoded & 1u, 0u);
 
-  aioObjectRoot *decoded = nullptr;
-  uintptr_t generation = 0;
-  ASSERT_TRUE(objectHandleDecode(encoded, &decoded, &generation));
-  EXPECT_EQ(decoded, object);
+  uint64_t generation = 0;
+  objectHeader *decoded = reactorHandleDecode(encoded, &generation);
+  EXPECT_EQ(decoded, &object->root.header);
   EXPECT_EQ(generation,
-            __uintptr_atomic_load(&object->Head.gen, amoRelaxed) &
-              objectHandleGenMask());
+            __uint64_atomic_load(&object->root.header.tag.high, amoRelaxed));
   alignedFree(object);
 }
 
-TEST(core_head, fd_handle_rejects_unsupported_addresses_and_timer_tags)
+TEST(core_head, user_event_handle_roundtrips_pointer_and_generation)
 {
-  uint64_t encoded = 123;
-  EXPECT_FALSE(objectHandleTryEncode(nullptr, &encoded));
-  EXPECT_EQ(encoded, 0u);
-  EXPECT_FALSE(objectHandleTryEncode(reinterpret_cast<aioObjectRoot*>(uintptr_t{64} + 1),
-                                    &encoded));
-  EXPECT_FALSE(objectHandleTryEncode(
-    reinterpret_cast<aioObjectRoot*>(UINT64_C(1) << 48), &encoded));
-
-  auto *tombstone =
-    static_cast<aioObjectRoot*>(alignedMalloc(sizeof(aioObjectRoot), 64));
-  ASSERT_NE(tombstone, nullptr);
-  __uintptr_atomic_store(&tombstone->Head.gen,
-                         objectHandleGenMask() + 1,
+  auto *event =
+    static_cast<aioUserEvent*>(alignedMalloc(sizeof(aioUserEvent), 64));
+  ASSERT_NE(event, nullptr);
+  __uint64_atomic_store(&event->header.tag.low, 1, amoRelaxed);
+  __uint64_atomic_store(&event->header.tag.high,
+                         (UINT64_C(1) << 40) | 0x12345u,
                          amoRelaxed);
-  EXPECT_FALSE(objectHandleTryEncode(tombstone, &encoded));
-  EXPECT_EQ(encoded, 0u);
-  alignedFree(tombstone);
+  objectHeaderSetType(&event->header, ohtUserEvent);
 
-  aioObjectRoot *decoded = reinterpret_cast<aioObjectRoot*>(1);
-  uintptr_t generation = 1;
-  EXPECT_FALSE(objectHandleDecode(0, &decoded, &generation));
-  EXPECT_EQ(decoded, nullptr);
-  EXPECT_FALSE(objectHandleDecode(1u, &decoded, &generation)); // reactor timer discriminator
-  EXPECT_EQ(decoded, nullptr);
+  uint64_t encoded = reactorHandleEncode(&event->header);
+  uint64_t generation = 0;
+  objectHeader *decoded = reactorHandleDecode(encoded, &generation);
+  EXPECT_EQ(decoded, &event->header);
+  EXPECT_EQ(generation, (UINT64_C(1) << 40) | 0x12345u);
+  alignedFree(event);
+}
+
+TEST(core_head, nonnull_header_never_encodes_as_zero)
+{
+  auto *header =
+    static_cast<objectHeader*>(alignedMalloc(sizeof(objectHeader), 64));
+  ASSERT_NE(header, nullptr);
+  __uint64_atomic_store(&header->tag.high, 0, amoRelaxed);
+  EXPECT_NE(reactorHandleEncode(header), 0u);
+  alignedFree(header);
+}
+
+TEST(core_head, fd_handle_generation_wraps_modulo_compact_field)
+{
+  auto *object =
+    static_cast<aioObject*>(alignedMalloc(sizeof(aioObject), 64));
+  ASSERT_NE(object, nullptr);
+  uint64_t fullGeneration = REACTOR_HANDLE_GENERATION_MASK + 18;
+  __uint64_atomic_store(&object->root.header.tag.high, fullGeneration, amoRelaxed);
+
+  uint64_t encoded = reactorHandleEncode(&object->root.header);
+  uint64_t decodedGeneration = 0;
+  objectHeader *decoded = reactorHandleDecode(encoded, &decodedGeneration);
+  EXPECT_EQ(decoded, &object->root.header);
+  EXPECT_EQ(decodedGeneration, fullGeneration);
+  alignedFree(object);
 }
 
 TEST(core_head, validated_push_drops_generation_mismatch_without_touching_word0)
 {
   struct alignas(64) Cell {
-    AsyncObjectHead Head;
+    objectHeader header;
     std::array<uint8_t, 112> payload;
   };
   ConcurrentQueue pool{};
   Cell *object = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
   ASSERT_NE(object, nullptr);
-  __uintptr_atomic_store(&object->Head.gen, 17, amoRelaxed);
-  __uintptr_atomic_store(&object->Head.data,
+  __uint64_atomic_store(&object->header.tag.high, 17, amoRelaxed);
+  __uint64_atomic_store(&object->header.tag.low,
                          taggedAsyncOpStub().data,
                          amoRelaxed);
   uintptr_t before =
-    __uintptr_atomic_load(&object->Head.data, amoRelaxed);
-  objectFree(&pool, object, sizeof(Cell)); // payload is poisoned; Head stays live
+    __uint64_atomic_load(&object->header.tag.low, amoRelaxed);
+  objectFree(&pool, object, sizeof(Cell)); // payload is poisoned; header.tag stays live
 
   EXPECT_FALSE(combinerPushValidated(reinterpret_cast<aioObjectRoot*>(object),
                                      16,
                                      COMBINER_TAG_PROGRESS_READ));
-  EXPECT_EQ(__uintptr_atomic_load(&object->Head.data, amoRelaxed), before);
+  EXPECT_EQ(__uint64_atomic_load(&object->header.tag.low, amoRelaxed), before);
 
   Cell *recovered = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
   ASSERT_EQ(recovered, object);
@@ -1701,16 +1716,55 @@ TEST(core_head, validated_push_delivers_matching_signal)
 {
   TestBackend backend;
   TestObject object(backend);
-  __uintptr_atomic_store(&object.root.Head.gen, 29, amoRelaxed);
+  __uint64_atomic_store(&object.root.header.tag.high, 29, amoRelaxed);
 
   EXPECT_TRUE(combinerPushValidated(&object.root,
                                     29,
                                     COMBINER_TAG_PROGRESS_READ));
   ASSERT_EQ(backend.handledSignals.size(), 1u);
   EXPECT_NE(backend.handledSignals.front() & COMBINER_TAG_PROGRESS_READ, 0u);
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.Head.data, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
   deleteOwner(backend, object);
 }
+
+TEST(core_head, validated_push_accepts_matching_compact_generation_after_wrap)
+{
+  struct alignas(64) Cell {
+    objectHeader header;
+  } cell{};
+  uint64_t fullGeneration = REACTOR_HANDLE_GENERATION_MASK + 30;
+  __uint64_atomic_store(&cell.header.tag.high, fullGeneration, amoRelaxed);
+  __uint64_atomic_store(&cell.header.tag.low,
+                         taggedAsyncOpStub().data,
+                         amoRelaxed);
+
+  aioObject *object = reinterpret_cast<aioObject*>(&cell);
+  uint64_t encoded = reactorHandleEncode(&object->root.header);
+  uint64_t decodedGeneration = 0;
+  objectHeader *decoded = reactorHandleDecode(encoded, &decodedGeneration);
+  EXPECT_EQ(decodedGeneration, fullGeneration);
+  EXPECT_TRUE(combinerPushValidated((aioObjectRoot*)decoded,
+                                    decodedGeneration,
+                                    COMBINER_TAG_PROGRESS_READ));
+  EXPECT_NE(__uint64_atomic_load(&cell.header.tag.low, amoRelaxed) &
+              COMBINER_TAG_PROGRESS_READ,
+            0u);
+}
+
+#ifndef OS_WINDOWS
+// socketStatusFromErrno centralizes the errno->status mapping shared by the
+// epoll and kqueue read/write/recvmsg/sendto paths. Pin the normalization:
+// EAGAIN parks the operation (retry), EPIPE and ENOTCONN both surface as the
+// unified aosNotConnected, and any other errno stays opaque as aosUnknownError.
+TEST(core_status, errno_maps_retry_and_broken_connection_distinctly)
+{
+  EXPECT_EQ(socketStatusFromErrno(EAGAIN), aosPending);
+  EXPECT_EQ(socketStatusFromErrno(EPIPE), aosNotConnected);
+  EXPECT_EQ(socketStatusFromErrno(ENOTCONN), aosNotConnected);
+  EXPECT_EQ(socketStatusFromErrno(ECONNREFUSED), aosUnknownError);
+  EXPECT_EQ(socketStatusFromErrno(EINVAL), aosUnknownError);
+}
+#endif
 
 
 } // namespace

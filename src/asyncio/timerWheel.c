@@ -117,8 +117,8 @@ void timerWheelTeardown(asyncBase *base)
   // their operations are dead or dying with the base
   for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; level++) {
     for (unsigned i = 0; i < TIMER_WHEEL_SLOTS; i++) {
-      volatile uint128Pair *slot = &base->timerWheel.slots[level][i];
-      uint128Pair observed = __uint128_atomic_load_relaxed(slot);
+      volatile uint128 *slot = &base->timerWheel.slots[level][i];
+      uint128 observed = __uint128_atomic_load_relaxed(slot);
       asyncOpListLink *link = (asyncOpListLink*)(uintptr_t)observed.low;
       slot->low = 0;
       while (link) {
@@ -155,13 +155,13 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
       unsigned level = TIMER_WHEEL_LEVELS - 1;
       unsigned index = ((unsigned)(cursor >> (TIMER_WHEEL_LEVEL_BITS * level)) + TIMER_WHEEL_SLOTS - 1) %
                        TIMER_WHEEL_SLOTS;
-      volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
+      volatile uint128 *slot = &base->timerWheel.slots[level][index];
       // Routing snapshot only; the successful DWCAS below is the publication
       // acquire and validates both possibly torn words.
-      uint128Pair observed = __uint128_atomic_load_relaxed(slot);
+      uint128 observed = __uint128_atomic_load_relaxed(slot);
       for (;;) {
         link->next = (asyncOpListLink*)(uintptr_t)observed.low;
-        uint128Pair desired;
+        uint128 desired;
         desired.low = (uint64_t)(uintptr_t)link;
         desired.high = observed.high;
         if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
@@ -181,11 +181,11 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
     // rotation" cannot happen. A CAS loss against a concurrent push reloads
     // the head and retries; a loss against a visit changes baseTick and is
     // caught by the incarnation check
-    volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
-    uint128Pair observed = __uint128_atomic_load_relaxed(slot);
+    volatile uint128 *slot = &base->timerWheel.slots[level][index];
+    uint128 observed = __uint128_atomic_load_relaxed(slot);
     while (observed.high == expectedBase) {
       link->next = (asyncOpListLink*)(uintptr_t)observed.low;
-      uint128Pair desired;
+      uint128 desired;
       desired.low = (uint64_t)(uintptr_t)link;
       desired.high = expectedBase;
       if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
@@ -220,20 +220,19 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   if (!timerLink) {
     aioObjectRoot *object = op->object;
     uintptr_t objectGeneration =
-      __uintptr_atomic_load(&object->Head.gen, amoRelaxed);
-    if (!opCancel(op,
-                  opGetGeneration(op),
-                  aosUnknownError,
-                  object,
-                  objectGeneration))
-      recordStaleHandleDrop(base);
+      objectHeaderGeneration(&object->header);
+    (void)opCancel(op,
+                   opGetGeneration(op),
+                   aosUnknownError,
+                   object,
+                   objectGeneration);
     return;
   }
   timerLink->op = op;
   timerLink->generation = opGetGeneration(op);
   timerLink->object = op->object;
   timerLink->objectGeneration =
-    __uintptr_atomic_load(&op->object->Head.gen, amoRelaxed);
+    objectHeaderGeneration(&op->object->header);
   timerLink->deadlineTick = timerDeadlineTick(op->endTime);
   // The deadline is read back after the publication for the wakeup check, and
   // a published link belongs to the wheel - keep a local copy
@@ -265,12 +264,11 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
     uintptr_t objectGeneration = timerLink->objectGeneration;
     op->timerId = 0;
     objectPoolPut(&asyncOpLinkListPool, timerLink, sizeof(asyncOpListLink));
-    if (!opCancel(op,
-                  generation,
-                  aosTimeout,
-                  object,
-                  objectGeneration))
-      recordStaleHandleDrop(base);
+    (void)opCancel(op,
+                   generation,
+                   aosTimeout,
+                   object,
+                   objectGeneration);
     return;
   }
 
@@ -319,9 +317,9 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
 asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t windowStart)
 {
   unsigned index = (unsigned)(windowStart >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
-  volatile uint128Pair *slot = &base->timerWheel.slots[level][index];
+  volatile uint128 *slot = &base->timerWheel.slots[level][index];
 
-  uint128Pair observed = __uint128_atomic_load_relaxed(slot);
+  uint128 observed = __uint128_atomic_load_relaxed(slot);
   for (;;) {
     if (observed.high > windowStart) {
       // Already reopened past this window (a concurrent visit or an
@@ -339,7 +337,7 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
     // cannot be erased by this clear; a bit re-set by a producer pushing into
     // the closing window survives past the drain as a spurious one
     timerWheelClearOccupied(base, level, index);
-    uint128Pair desired;
+    uint128 desired;
     desired.low = 0;
     desired.high = windowStart + timerWheelPeriod(level);
     if (__uint128_atomic_compare_and_swap(slot, &observed, desired))
@@ -360,12 +358,11 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
       // here without touching anything beyond the atomic tag
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
     } else if (link->deadlineTick <= windowStart) {
-      if (!opCancel(link->op,
-                    link->generation,
-                    aosTimeout,
-                    link->object,
-                    link->objectGeneration))
-        recordStaleHandleDrop(base);
+      (void)opCancel(link->op,
+                     link->generation,
+                     aosTimeout,
+                     link->object,
+                     link->objectGeneration);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
     } else if (!timerWheelInsert(base, link, windowStart)) {
       // Cascade: the deadline is inside a narrower window; re-route from the
@@ -373,12 +370,11 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
       // deadline). A refused publication means the lower window is already
       // terminal - a stalled owner resuming an old chain - so the timeout is
       // due right now
-      if (!opCancel(link->op,
-                    link->generation,
-                    aosTimeout,
-                    link->object,
-                    link->objectGeneration))
-        recordStaleHandleDrop(base);
+      (void)opCancel(link->op,
+                     link->generation,
+                     aosTimeout,
+                     link->object,
+                     link->objectGeneration);
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
     }
     link = next;

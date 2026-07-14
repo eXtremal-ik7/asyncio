@@ -19,12 +19,11 @@
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
 
-static void eventCoroutineDeliver(aioUserEvent *event);
-static void eventTimerScheduleImpl(aioUserEvent *event,
-                                   int enqueueOnly,
-                                   int transferReference);
-static void eventTimerSchedule(aioUserEvent *event, int enqueueOnly);
-static void eventTimerProcessImpl(aioUserEvent *event, int releaseControlReference);
+static void eventQueueTimerDelivery(aioUserEvent *event, aioEventTimerState *timer);
+static void eventProcessQueuedTask(aioUserEvent *event, int cancellation);
+static void eventProcessCoroutineDeliveries(aioUserEvent *event, aioEventTimerState *timer);
+static void eventProcessCancellation(aioUserEvent *event);
+static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint64_t expectedGeneration, int terminal);
 
 #ifdef OS_WINDOWS
 asyncBase *iocpNewAsyncBase();
@@ -32,7 +31,7 @@ asyncBase *iocpNewAsyncBase();
 #ifdef OS_LINUX
 asyncBase *epollNewAsyncBase(void);
 #endif
-#if defined(OS_DARWIN) || defined (OS_FREEBSD)
+#if defined(OS_DARWIN) || defined(OS_FREEBSD)
 asyncBase *kqueueNewAsyncBase(void);
 #endif
 
@@ -59,18 +58,18 @@ static inline void fillContext(struct Context *context,
   context->Result = -aosPending;
 }
 
-static void connectFinish(asyncOpRoot* opptr)
+static void connectFinish(asyncOpRoot *opptr)
 {
   ((aioConnectCb*)opptr->callback)(opGetStatus(opptr), (aioObject*)opptr->object, opptr->arg);
 }
 
-static void acceptFinish(asyncOpRoot* opptr)
+static void acceptFinish(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
   ((aioAcceptCb*)opptr->callback)(opGetStatus(opptr), (aioObject*)opptr->object, op->host, op->acceptSocket, opptr->arg);
 }
 
-static void rwFinish(asyncOpRoot* opptr)
+static void rwFinish(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
   ((aioCb*)opptr->callback)(opGetStatus(opptr), (aioObject*)opptr->object, op->bytesTransferred, opptr->arg);
@@ -82,12 +81,12 @@ static void readMsgFinish(asyncOpRoot *opptr)
   ((aioReadMsgCb*)opptr->callback)(opGetStatus(opptr), (aioObject*)opptr->object, op->host, op->bytesTransferred, opptr->arg);
 }
 
-static void eventFinish(asyncOpRoot *root)
+void eventExecuteQueuedTask(asyncOpRoot *node)
 {
-  if (root->callback)
-    ((aioEventCb*)root->callback)((aioUserEvent*)root, root->arg);
-  else
-    eventCoroutineDeliver((aioUserEvent*)root);
+  aioUserEvent *event = eventQueueTaskEvent(node);
+  currentFinishedSync = 0;
+  eventProcessQueuedTask(event, eventIsCancellationNode(node));
+  eventDecrementReference(event, 1);
 }
 
 static void releaseOp(asyncOpRoot *opptr)
@@ -109,8 +108,19 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
                                void *contextPtr)
 {
   struct Context *context = (struct Context*)contextPtr;
-  asyncOp *op = (asyncOp*)object->base->methodImpl.newAsyncOp(object->base, flags & afRealtime, &opPool, &opTimerPool);
-  initAsyncOpRoot(&op->root, context->StartProc, object->base->methodImpl.cancelAsyncOp, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
+  asyncBase *base = object->header.base;
+  asyncOp *op = (asyncOp*)base->methodImpl.newAsyncOp(base, flags & afRealtime, &opPool, &opTimerPool);
+  initAsyncOpRoot(&op->root,
+                  context->StartProc,
+                  base->methodImpl.cancelAsyncOp,
+                  context->FinishProc,
+                  releaseOp,
+                  object,
+                  callback,
+                  arg,
+                  flags,
+                  opCode,
+                  usTimeout);
 
   op->state = 0;
   op->transactionSize = context->TransactionSize;
@@ -182,14 +192,9 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
 {
   unsigned loopThreadLimit = loopThreads ? loopThreads : 1;
   const size_t wordBits = sizeof(uintptr_t) * 8;
-  size_t loopThreadSlotWords =
-    ((size_t)loopThreadLimit + wordBits - 1) / wordBits;
-  TimerSleepSlot *timerSleep =
-    (TimerSleepSlot*)alignedMalloc(sizeof(TimerSleepSlot) *
-                                     (size_t)loopThreadLimit,
-                                   CACHE_LINE_SIZE);
-  uintptr_t *loopThreadSlots =
-    (uintptr_t*)calloc(loopThreadSlotWords, sizeof(uintptr_t));
+  size_t loopThreadSlotWords = ((size_t)loopThreadLimit + wordBits - 1) / wordBits;
+  TimerSleepSlot *timerSleep = (TimerSleepSlot*)alignedMalloc(sizeof(TimerSleepSlot) * (size_t)loopThreadLimit, CACHE_LINE_SIZE);
+  uintptr_t *loopThreadSlots = (uintptr_t*)calloc(loopThreadSlotWords, sizeof(uintptr_t));
   if (!timerSleep || !loopThreadSlots) {
     alignedFree(timerSleep);
     free(loopThreadSlots);
@@ -199,19 +204,13 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   asyncBase *base = 0;
   switch (method) {
 #if defined(OS_WINDOWS)
-    case amIOCP :
-      base = iocpNewAsyncBase();
-      break;
+    case amIOCP: base = iocpNewAsyncBase(); break;
 #elif defined(OS_LINUX)
-    case amEPoll :
-      base = epollNewAsyncBase();
-      break;
+    case amEPoll: base = epollNewAsyncBase(); break;
 #elif defined(OS_DARWIN) || defined(OS_FREEBSD)
-   case amKQueue :
-      base = kqueueNewAsyncBase();
-     break;
+    case amKQueue: base = kqueueNewAsyncBase(); break;
 #endif
-    case amOSDefault :
+    case amOSDefault:
     default:
 #if defined(OS_WINDOWS)
       base = iocpNewAsyncBase();
@@ -238,7 +237,6 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   memset(&base->globalQueue, 0, sizeof(base->globalQueue));
   memset(&base->eventPool, 0, sizeof(base->eventPool));
   base->messageLoopThreadCounter = 0;
-  base->staleHandleDrops = 0;
   base->timerSleep = timerSleep;
   base->loopThreadSlots = loopThreadSlots;
   base->loopThreadSlotWords = (unsigned)loopThreadSlotWords;
@@ -253,7 +251,6 @@ void asyncLoop(asyncBase *base)
   base->methodImpl.nextFinishedOperation(base);
 }
 
-
 void postQuitOperation(asyncBase *base)
 {
   base->methodImpl.postEmptyOperation(base);
@@ -262,556 +259,510 @@ void postQuitOperation(asyncBase *base)
 void setSocketBuffer(aioObject *socket, size_t bufferSize)
 {
   if (bufferSize > socket->buffer.totalSize) {
-    socket->buffer.ptr= realloc(socket->buffer.ptr, bufferSize);
+    socket->buffer.ptr = realloc(socket->buffer.ptr, bufferSize);
     socket->buffer.totalSize = bufferSize;
   }
 }
 
-static int eventTimerSnapshot(aioUserEvent *event,
-                              uintptr_t *generation,
-                              uint64_t *period,
-                              int *counter)
+static void eventTimerDeliveryReset(aioEventTimerState *timer)
 {
-  // Atomic payload fields make this a conforming single-writer seqlock without
-  // seq-cst stores. Seeing a new period/counter through its acquire load also
-  // acquires the preceding odd sequence store; coherence then prevents the
-  // final recheck from reading the older even value. Conversely, acquiring a
-  // new final even value publishes both payload stores. A reader never spins
-  // on odd: the writer schedules a fresh pass after publishing matching even.
-  uintptr_t first = __uintptr_atomic_load(&event->timerConfigSequence, amoAcquire);
-  if (first & 1)
+  __uintptr_atomic_store(&timer->deliveryState, 0, amoRelaxed);
+  __uint_atomic_store(&timer->deliveryControl, 0, amoRelaxed);
+  timer->armed = 0;
+}
+
+static aioEventTimerState *eventTimerEnsure(aioUserEvent *event)
+{
+  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
+  if (timer)
+    return timer;
+
+  // Timer control is single-controller, so only Delete can overlap this first
+  // allocation. Delete publishes a sticky terminal bit in the embedded DWCAS
+  // word; a delayed Start may leave this paired block allocated but cannot arm
+  // the event after that publication.
+  timer = (aioEventTimerState*)alignedMalloc(sizeof(*timer), TAGGED_POINTER_ALIGNMENT);
+  if (!timer)
     return 0;
-  uintptr_t snapshotPeriod = __uintptr_atomic_load(&event->timerConfigPeriod, amoAcquire);
-  unsigned snapshotCounter = __uint_atomic_load(&event->timerConfigCounter, amoAcquire);
-  uintptr_t second = __uintptr_atomic_load(&event->timerConfigSequence, amoRelaxed);
-  if (first != second)
+  memset(timer, 0, sizeof(*timer));
+  __pointer_atomic_store((void* volatile*)&event->timerData, timer, amoRelease);
+  return timer;
+}
+
+static uint32_t eventTimerNextGeneration(uint32_t generation)
+{
+  generation++;
+  return generation ? generation : 1;
+}
+
+static uint128 eventTimerControlSetCounter(uint128 control, uint32_t counter)
+{
+  control.high = (control.high & EVENT_TIMER_GENERATION_MASK) | ((uint64_t)counter << EVENT_TIMER_COUNTER_SHIFT);
+  return control;
+}
+
+static int eventTimerStopApplied(aioUserEvent *event, aioEventTimerState *timer, uint32_t generation)
+{
+  if (!timer || !timer->armed)
+    return 1;
+
+  if (!event->header.base->methodImpl.updateEventTimer(event, etuStop, generation, 0))
     return 0;
-  *generation = first;
-  *period = (uint64_t)snapshotPeriod;
-  *counter = (int)snapshotCounter;
+
+  timer->armed = 0;
+  eventReferenceDropNonFinal(event, 1);
   return 1;
 }
 
-static uintptr_t eventTimerPublishConfig(aioUserEvent *event,
-                                         uint64_t period,
-                                         int counter,
-                                         uintptr_t expectedGeneration)
+static void eventTimerStartApplied(aioUserEvent *event, aioEventTimerState *timer, uint32_t generation, uint64_t period)
 {
-  if (eventReferenceIsDeleting(event))
-    return 0;
-
-  // Timer control for one event is a single-controller API. The odd value is
-  // therefore a diagnostic for a forbidden overlapping Start/Stop, not a
-  // lock on which another caller waits.
-  // Single-controller ordering (including hand-off between controller
-  // threads) already happens outside this API; only the monotonic token is
-  // needed here, so no payload acquire belongs on the writer path.
-  uintptr_t old = __uintptr_atomic_load(&event->timerConfigSequence, amoRelaxed);
-  if ((old & 1) || (expectedGeneration != UINTPTR_MAX && old != expectedGeneration)) {
-    assert(!(old & 1) && "Overlapping user-event timer control calls");
-    return 0;
+  assert(timer);
+  eventIncrementReference(event, 1);
+  if (!event->header.base->methodImpl.updateEventTimer(event, etuStart, generation, period)) {
+    eventReferenceDropNonFinal(event, 1);
+    return;
   }
-  // epoll stores (generation << 1) | armed in its publication word.
-  if (old > (UINTPTR_MAX >> 1) - 2) {
-    assert(0 && "User-event timer generation exhausted");
-    return 0;
-  }
-  // There is exactly one application-side writer by contract. Atomic stores
-  // are needed for the concurrent applier reader, but writer arbitration is
-  // not library work and must not add another locked RMW to every Start/Stop.
-  __uintptr_atomic_store(&event->timerConfigSequence, old + 1, amoRelaxed);
-
-  // A non-positive public counter means unlimited repetition and is encoded
-  // as zero in the desired snapshot.
-  unsigned finiteCounter = counter > 0 ? (unsigned)counter : 0;
-  __uintptr_atomic_store(&event->timerConfigPeriod, (uintptr_t)period, amoRelease);
-  __uint_atomic_store(&event->timerConfigCounter, finiteCounter, amoRelease);
-  __uintptr_atomic_store(&event->timerConfigSequence, old + 2, amoRelease);
-  eventTimerSchedule(event, 0);
-  return old + 2;
+  timer->armed = 1;
 }
 
-static void eventTimerCancelGeneration(aioUserEvent *event, uintptr_t generation)
+static void eventTimerProcessOwner(aioUserEvent *event, uint128 applied, uint128 current)
+{
+  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
+  uint32_t appliedGeneration = eventTimerControlGeneration(applied);
+  uint64_t appliedPeriod = eventTimerControlPeriod(applied);
+  uint32_t appliedCounter = eventTimerControlCounter(applied);
+  int appliedFinite = eventTimerControlIsFinite(applied);
+  int probeNeedsRearm = 0;
+
+  for (;;) {
+    uint32_t generation = eventTimerControlGeneration(current);
+    uint32_t counter = eventTimerControlCounter(current);
+
+    if (generation != appliedGeneration) {
+      probeNeedsRearm = 0;
+      if (!eventTimerStopApplied(event, timer, appliedGeneration))
+        continue;
+
+      appliedGeneration = generation;
+      appliedPeriod = eventTimerControlPeriod(current);
+      appliedCounter = counter;
+      appliedFinite = eventTimerControlIsFinite(current);
+      if (appliedPeriod && !(current.low & EVENT_TIMER_TERMINAL))
+        eventTimerStartApplied(event, timer, generation, appliedPeriod);
+    }
+
+    if ((current.low & EVENT_TIMER_PROBE) && generation == appliedGeneration) {
+      int consumed = eturApplied;
+      if (timer && timer->armed) {
+        consumed = event->header.base->methodImpl.updateEventTimer(event, etuConsume, generation, appliedPeriod);
+        if (consumed == eturFailed)
+          continue;
+        probeNeedsRearm = 1;
+      }
+
+      uint32_t accepted = consumed == eturTick;
+      for (;;) {
+        uint128 desired = current;
+        desired.low &= ~EVENT_TIMER_PROBE;
+        if (accepted) {
+          uint32_t desiredCounter = eventTimerControlCounter(desired);
+          if (eventTimerControlIsFinite(desired)) {
+            if (desiredCounter)
+              desiredCounter--;
+            else
+              accepted = 0;
+          } else {
+            desiredCounter++;
+          }
+          desired = eventTimerControlSetCounter(desired, desiredCounter);
+        }
+
+        uint128 expected = current;
+        if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired)) {
+          current = desired;
+          if (accepted)
+            eventQueueTimerDelivery(event, timer);
+          break;
+        }
+        current = expected;
+        if (eventTimerControlGeneration(current) != generation) {
+          accepted = 0;
+          probeNeedsRearm = 0;
+          break;
+        }
+      }
+      continue;
+    }
+
+    counter = eventTimerControlCounter(current);
+    if (counter != appliedCounter || probeNeedsRearm) {
+      if (appliedFinite && counter == 0) {
+        if (!eventTimerStopApplied(event, timer, generation))
+          continue;
+      } else if (timer && timer->armed) {
+        if (!event->header.base->methodImpl.updateEventTimer(event, etuRearm, generation, appliedPeriod))
+          continue;
+      }
+      appliedCounter = counter;
+      probeNeedsRearm = 0;
+    }
+
+    uint128 unlocked = current;
+    unlocked.low &= ~EVENT_TIMER_OWNER;
+    uint128 expected = current;
+    if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, unlocked))
+      return;
+    current = expected;
+  }
+}
+
+static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint64_t expectedGeneration, int terminal)
+{
+  if (period && !eventTimerEnsure(event))
+    return 0;
+
+  for (;;) {
+    uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
+    if ((old.low & EVENT_TIMER_TERMINAL) && !terminal)
+      return 0;
+
+    uint32_t generation = eventTimerControlGeneration(old);
+    if (expectedGeneration != UINT64_MAX && generation != expectedGeneration)
+      return 0;
+
+    uint32_t nextGeneration = eventTimerNextGeneration(generation);
+    uint32_t finiteCounter = counter > 0 ? (uint32_t)counter : 0;
+    uint128 desired = {period | EVENT_TIMER_OWNER | (terminal ? EVENT_TIMER_TERMINAL : 0) | (counter > 0 ? EVENT_TIMER_FINITE : 0),
+                       nextGeneration | ((uint64_t)finiteCounter << EVENT_TIMER_COUNTER_SHIFT)};
+    uint128 expected = old;
+    if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired))
+      continue;
+
+    if (!(old.low & EVENT_TIMER_OWNER))
+      eventTimerProcessOwner(event, old, desired);
+    return nextGeneration;
+  }
+}
+
+static void eventTimerCancelGeneration(aioUserEvent *event, uint32_t generation)
 {
   if (generation)
-    eventTimerPublishConfig(event, 0, 0, generation);
+    eventTimerPublishConfig(event, 0, 0, generation, 0);
 }
 
-static void eventTimerScheduleImpl(aioUserEvent *event,
-                                   int enqueueOnly,
-                                   int transferReference)
+// Claims a delivery reference for a decoded full-generation handle. The
+// successful DWCAS pins the complete Head before any tail access.
+int eventTimerTryClaimReference(aioUserEvent *event, uint64_t generation)
 {
-  // RUNNING elects exactly one applier; DIRTY is its coalesced mailbox. Even
-  // when an applier already exists, this release RMW publishes the preceding
-  // config/tick/DELETE and prevents it from retiring as clean.
-  unsigned old = __uint_atomic_fetch_or(&event->timerControlState,
-                                              ecsRunning | ecsDirty,
-                                              amoRelease);
-  if (!(old & ecsRunning)) {
-    if (enqueueOnly) {
-      // Kernel signal producers transfer the reference claimed before their
-      // generation CAS. Other producers retain here. In both cases the tagged
-      // node is not made visible before its queued-control reference exists.
-      if (!transferReference)
-        eventIncrementReference(event, 1);
-      event->base->methodImpl.enqueue(event->base, eventTimerControlNode(event));
-    } else {
-      assert(!transferReference);
-      // Start/Stop/delete and coroutine delivery already own a reference for
-      // the whole synchronous call. Do not add a second refcount round-trip
-      // merely to run the applier on the same stack.
-      eventTimerProcessImpl(event, 0);
-    }
-  } else if (transferReference) {
-    // Another control reference (or the synchronous caller) already pins the
-    // sole applier. DIRTY carries our publication, so our temporary kernel
-    // publisher claim is no longer needed. RUNNING cannot retire underneath
-    // this fetch_or: if its final CAS follows us, DIRTY makes that CAS fail.
-    eventReferenceDropNonFinal(event, 1);
-  }
-}
-
-static void eventTimerSchedule(aioUserEvent *event, int enqueueOnly)
-{
-  eventTimerScheduleImpl(event, enqueueOnly, 0);
-}
-
-// The timer cell stays paired with this storage forever, so a stale kernel
-// envelope can safely read tag/incarnation even after the event was recycled.
-// It may claim only the incarnation carried by its arming and only while that
-// incarnation has a nonzero refcount. The acquire CAS observes the new
-// incarnation's final release-store tag=1; the post-CAS check closes the race
-// where recycle happened between the cheap incarnation prefilter and claim.
-// A fetch-add followed by rollback is not equivalent: it would transiently
-// resurrect a zero refcount and let two stale publishers finalize twice.
-static int eventTimerTryClaimPublisherReference(aioUserEvent *event,
-                                                uintptr_t incarnation)
-{
-  if (incarnation == 0 ||
-      __uintptr_atomic_load(&event->incarnation, amoRelaxed) != incarnation)
-    return 0;
-
-  uintptr_t old = __uintptr_atomic_load(&event->tag, amoRelaxed);
+  uint128 expected = {__uint64_atomic_load(&event->header.tag.low, amoRelaxed), generation};
   for (;;) {
-    uintptr_t refs = old & TAG_EVENT_REF_MASK;
-    if (refs == 0)
+    // The handle must still name a live, non-deleting event incarnation.
+    if (expected.high != generation || !(expected.low & TAG_EVENT_REF_MASK) || (expected.low & TAG_EVENT_DELETE))
       return 0;
-    assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
-    uintptr_t desired = old + 1;
-    if (__uintptr_atomic_compare_exchange(&event->tag,
-                                           &old,
-                                           desired,
-                                           amoAcquire)) {
-      if (__uintptr_atomic_load(&event->incarnation, amoRelaxed) == incarnation)
-        return 1;
-      // This is a real reference to the newer incarnation (the successful
-      // acquire saw its tag publication), so the general release path is the
-      // correct rollback and may legally be final.
-      eventDecrementReference(event, 1);
-      return 0;
-    }
-  }
-}
-
-static int eventTimerPublishGenerationSignal(aioUserEvent *event,
-                                             uintptr_t generation,
-                                             uintptr_t incarnation,
-                                             int probe)
-{
-  volatile uint128Pair *bucket = &event->timerSignals;
-  uint128Pair expected = __uint128_atomic_load_relaxed(bucket);
-  if (generation == 0 || expected.high != (uint64_t)generation)
-    return 0;
-  if (!eventTimerTryClaimPublisherReference(event, incarnation))
-    return 0;
-
-  for (;;) {
-    // The applier changes the bucket generation before disarm/restart. A late
-    // harvested tick may inspect the still-live storage, but can never publish
-    // into a different schedule.
-    if (expected.high != (uint64_t)generation) {
-      eventDecrementReference(event, 1);
-      return 0;
-    }
-    assert((expected.low == 0 || (int)(expected.low & 1) == probe) &&
-           "Mixed user-event timer signal kinds");
-    assert(expected.low <= UINT64_MAX - 2 && "User-event timer signal overflow");
-    uint128Pair desired = {
-      expected.low ? expected.low + 2 : (uint64_t)(2 | probe),
-      expected.high
-    };
-    if (__uint128_atomic_compare_and_swap_relaxed(bucket, &expected, desired)) {
-      // Transfer the publisher claim to a newly queued task, or release it if
-      // an existing applier owns RUNNING and only needs our DIRTY bit.
-      eventTimerScheduleImpl(event, 1, 1);
+    uint128 desired = {expected.low + 1, expected.high};
+    if (__uint128_atomic_compare_and_swap(&event->header.tag, &expected, desired))
       return 1;
-    }
   }
 }
 
-void eventTimerSignalTick(aioUserEvent *event,
-                          uintptr_t generation,
-                          uintptr_t incarnation)
+static void eventTimerProcessKernelTick(aioUserEvent *event, uint32_t generation, uint64_t incarnation, int probe)
 {
-  eventTimerPublishGenerationSignal(event, generation, incarnation, 0);
-}
+  // A stale harvested timer may outlive logical release and may inspect only
+  // Head while the rest of the pooled event is ASan-poisoned. The
+  // cheap generation prefilter and the DWCAS claim must therefore precede any
+  // access to the timer control word or event tail.
+  if (generation == 0 || eventHandleGeneration(event) != incarnation)
+    return;
+  if (!eventTimerTryClaimReference(event, incarnation))
+    return;
 
-void eventTimerSignalProbe(aioUserEvent *event,
-                           uintptr_t generation,
-                           uintptr_t incarnation)
-{
-  eventTimerPublishGenerationSignal(event, generation, incarnation, 1);
-}
-
-static void eventCoroutineDeliver(aioUserEvent *event)
-{
-  // Expected is not dereferenced before the successful DWCAS acquires the
-  // waiter publication.
-  uint128Pair expected = __uint128_atomic_load_relaxed(&event->waiter);
   for (;;) {
-    uint128Pair desired;
-    if (expected.low) {
-      desired.low = 0;
-      desired.high = 0;
-    } else {
-      // An accepted delivery may finish after delete, but it must not create a
-      // reusable credit in terminal state. An already installed waiter is
-      // still completed exactly once by either this delivery or delete.
-      if (eventReferenceIsDeleting(event))
-        return;
-      assert(expected.high != UINT64_MAX && "User-event coroutine credit overflow");
-      desired.low = 0;
-      desired.high = expected.high + 1;
-    }
-    if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired)) {
-      if (expected.low) {
-        coroutineTy *coroutine = (coroutineTy*)(uintptr_t)expected.low;
-        uintptr_t sleepGeneration = (uintptr_t)expected.high;
-        if (sleepGeneration)
-          eventTimerCancelGeneration(event, sleepGeneration);
-        assert(coroutineIsMain() && "User-event callback must run in the main coroutine");
-        coroutineCall(coroutine);
-      }
+    uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
+    if (eventTimerControlGeneration(old) != generation || !eventTimerControlPeriod(old) || (old.low & EVENT_TIMER_TERMINAL)) {
+      eventDecrementReference(event, 1);
       return;
     }
+
+    uint128 desired = old;
+    desired.low |= EVENT_TIMER_OWNER;
+    if (probe) {
+      desired.low |= EVENT_TIMER_PROBE;
+    } else {
+      uint32_t counter = eventTimerControlCounter(old);
+      if (eventTimerControlIsFinite(old)) {
+        if (!counter) {
+          eventDecrementReference(event, 1);
+          return;
+        }
+        counter--;
+      } else {
+        counter++;
+      }
+      desired = eventTimerControlSetCounter(desired, counter);
+    }
+
+    uint128 expected = old;
+    if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired)) {
+      if (eventTimerControlGeneration(expected) != generation) {
+        eventDecrementReference(event, 1);
+        return;
+      }
+      continue;
+    }
+
+    if (!probe)
+      eventQueueTimerDelivery(event, eventTimerDataLoad(event, amoRelaxed));
+    if (!(old.low & EVENT_TIMER_OWNER))
+      eventTimerProcessOwner(event, old, desired);
+    eventDecrementReference(event, 1);
+    return;
+  }
+}
+
+void eventTimerSignalTick(aioUserEvent *event, uint32_t generation, uint64_t incarnation)
+{
+  eventTimerProcessKernelTick(event, generation, incarnation, 0);
+}
+
+void eventTimerSignalProbe(aioUserEvent *event, uint32_t generation, uint64_t incarnation)
+{
+  eventTimerProcessKernelTick(event, generation, incarnation, 1);
+}
+
+static coroutineTy *eventCoroutineClaim(aioUserEvent *event, int *waiterKind)
+{
+  uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
+  for (;;) {
+    int kind = (int)(expected & ewtMask);
+    if (kind == ewtDeleted)
+      return 0;
+    uintptr_t desired = kind ? 0 : expected + ewtCreditUnit;
+    if (!__uintptr_atomic_compare_exchange(&event->waiter, &expected, desired, amoAcquire))
+      continue;
+    if (!kind)
+      return 0;
+    *waiterKind = kind;
+    return (coroutineTy*)(expected & ~(uintptr_t)ewtMask);
+  }
+}
+
+static void eventCoroutineResume(coroutineTy *coroutine)
+{
+  if (coroutine) {
+    assert(coroutineIsMain() && "User-event coroutine delivery must run in the main coroutine");
+    coroutineCall(coroutine);
   }
 }
 
 static void eventCoroutineCancel(aioUserEvent *event)
 {
-  uint128Pair empty = { 0, 0 };
-  uint128Pair old = __uint128_atomic_exchange(&event->waiter, empty);
-  if (old.low) {
-    coroutineTy *coroutine = (coroutineTy*)(uintptr_t)old.low;
-    assert(coroutineIsMain() && "User-event cancellation must run in the main coroutine");
-    coroutineCall(coroutine);
-  }
-}
-
-static int eventTryConsumeCredit(aioUserEvent *event)
-{
-  if (eventReferenceIsDeleting(event))
-    return 1;
-  uint128Pair expected = __uint128_atomic_load_relaxed(&event->waiter);
+  uintptr_t old = __uintptr_atomic_load(&event->waiter, amoRelaxed);
   for (;;) {
-    assert(expected.low == 0 && "Only one coroutine may wait on a user event");
-    if (expected.high == 0)
-      return 0;
-    uint128Pair desired = { 0, expected.high - 1 };
-    if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired))
-      return 1;
+    unsigned kind = (unsigned)(old & ewtMask);
+    if (kind == ewtDeleted)
+      return;
+    if (__uintptr_atomic_compare_exchange(&event->waiter, &old, ewtDeleted, amoAcquire)) {
+      if (kind == ewtUser || kind == ewtSleep)
+        eventCoroutineResume((coroutineTy*)(old & ~(uintptr_t)ewtMask));
+      return;
+    }
   }
 }
 
-static int eventInstallWaiter(aioUserEvent *event, uintptr_t sleepGeneration)
+static int eventInstallWaiter(aioUserEvent *event, unsigned waiterKind)
 {
-  if (eventReferenceIsDeleting(event))
+  uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
+  if ((expected & ewtMask) == ewtDeleted)
     return 0;
-
-  // The waiter reference is released by the resumed coroutine, not by the
-  // delivery/delete path that removes its pointer. This also covers the
-  // activate-before-yield handshake implemented by coroutineCall/Yield.
-  eventIncrementReference(event, 1);
-  uint128Pair expected = __uint128_atomic_load_relaxed(&event->waiter);
-  for (;;) {
-    if (eventReferenceIsDeleting(event)) {
-      eventReferenceDropNonFinal(event, 1);
-      return 0;
-    }
-    assert(expected.low == 0 && "Only one coroutine may wait on a user event");
-    if (expected.high) {
-      uint128Pair desiredCredit = { 0, expected.high - 1 };
-      if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desiredCredit)) {
-        eventReferenceDropNonFinal(event, 1);
-        return 0;
-      }
-      continue;
-    }
-
-    uint128Pair desired = {
-      (uint64_t)(uintptr_t)coroutineCurrent(),
-      (uint64_t)sleepGeneration
-    };
-    if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired)) {
-      // Close may have won immediately after the pre-CAS check and already
-      // drained an earlier control pass. Re-scheduling makes this publication
-      // visible to the terminal waiter cancellation.
-      if (eventReferenceIsDeleting(event))
-        eventTimerSchedule(event, 1);
-      return 1;
-    }
-  }
-}
-
-static int eventTimerStopApplied(aioUserEvent *event)
-{
-  if (!(event->timerState & etsArmed)) {
-    event->timerState &= ~etsNeedsRearm;
-    assert(!(event->timerState & etsHasReference));
-    return 1;
-  }
-
-  uint128Pair noTicks = { 0, 0 };
-  __uint128_atomic_exchange_relaxed(&event->timerSignals, noTicks);
-  event->timerState &= ~etsNeedsRearm;
-  if (!event->base->methodImpl.updateEventTimer(event,
-                                                etuStop,
-                                                event->timerAppliedGeneration,
-                                                0))
-    return 0;
-
-  event->timerState &= ~etsArmed;
-  if (event->timerState & etsHasReference) {
-    event->timerState &= ~etsHasReference;
-    // The RUNNING applier is independently pinned by its queued control
-    // reference or by the synchronous caller.
-    eventReferenceDropNonFinal(event, 1);
-  }
-  return 1;
-}
-
-static void eventTimerStartApplied(aioUserEvent *event)
-{
-  if (!event->root.timerId)
-    event->base->methodImpl.initializeTimer(event->base, &event->root);
-  if (!event->root.timerId)
-    return;
-
-  eventIncrementReference(event, 1); // kernel arming/callback reference
-  event->timerState |= etsHasReference;
-  uint128Pair ticks = { 0, (uint64_t)event->timerAppliedGeneration };
-  __uint128_atomic_exchange_relaxed(&event->timerSignals, ticks);
-  if (!event->base->methodImpl.updateEventTimer(event,
-                                                etuStart,
-                                                event->timerAppliedGeneration,
-                                                event->timerAppliedPeriod)) {
-    uint128Pair noTicks = { 0, 0 };
-    __uint128_atomic_exchange_relaxed(&event->timerSignals, noTicks);
-    event->timerState &= ~etsHasReference;
-    eventReferenceDropNonFinal(event, 1);
-    return;
-  }
-  event->timerState |= etsArmed;
-}
-
-static void eventTimerProcessImpl(aioUserEvent *event, int releaseControlReference)
-{
-  assert(__uint_atomic_load(&event->timerControlState, amoRelaxed) & ecsRunning);
-
-  for (;;) {
-    // Clear only DIRTY, retaining exclusive RUNNING ownership. Acquire pairs
-    // with every producer's release fetch_or; a producer racing this pass
-    // changes RUNNING back to RUNNING|DIRTY and makes the final CAS fail.
-    __uint_atomic_fetch_and(&event->timerControlState,
-                                  ~ecsDirty,
-                                  amoAcquire);
-
-    if (eventReferenceIsDeleting(event)) {
-      if (!eventTimerStopApplied(event))
-        continue;
-      if (event->root.callback == 0 && !releaseControlReference) {
-        // This synchronous applier may be an arbitrary Start/Stop thread.
-        // Transfer its ownership to the loop before touching a coroutine
-        // waiter; coroutineCall is only valid from an asyncLoop main context.
+  assert((expected & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");
+  if (expected == 0) {
+    uintptr_t coroutine = (uintptr_t)coroutineCurrent();
+    assert(coroutine && !(coroutine & ewtMask) && "Coroutine pointer is not sufficiently aligned");
+    uintptr_t desired = coroutine | waiterKind;
+    if (__uintptr_atomic_compare_exchange(&event->waiter, &expected, desired, amoRelease)) {
+      // The second same-word RMW against Delete schedules cancellation.
+      uint64_t oldTag = __uint64_atomic_fetch_and_add(&event->header.tag.low, TAG_EVENT_WAITER_COMMITTED, amoRelease);
+      if (oldTag & TAG_EVENT_DELETE) {
         eventIncrementReference(event, 1);
-        event->base->methodImpl.enqueue(event->base, eventTimerControlNode(event));
-        return;
+        event->header.base->methodImpl.enqueue(event->header.base, eventCancellationNode(event));
       }
-      eventCoroutineCancel(event);
-    } else {
-      uintptr_t desiredGeneration;
-      uint64_t desiredPeriod;
-      int desiredCounter;
-      int stable = eventTimerSnapshot(event,
-                                      &desiredGeneration,
-                                      &desiredPeriod,
-                                      &desiredCounter);
-      if (stable && desiredGeneration != event->timerAppliedGeneration) {
-        if (!eventTimerStopApplied(event))
-          continue;
-        event->timerAppliedGeneration = desiredGeneration;
-        event->timerAppliedPeriod = desiredPeriod;
-        event->timerRemaining = desiredCounter;
-        if (desiredPeriod)
-          eventTimerStartApplied(event);
-      }
-
-      if (stable && (event->timerState & etsArmed) &&
-          desiredGeneration == event->timerAppliedGeneration) {
-        uint128Pair empty = { 0, (uint64_t)event->timerAppliedGeneration };
-        uint64_t confirmedTicks = 0;
-        uint128Pair signals = __uint128_atomic_load_relaxed(&event->timerSignals);
-        if (signals.low)
-          signals = __uint128_atomic_exchange_relaxed(&event->timerSignals, empty);
-        uint64_t signalCount = signals.low >> 1;
-        int probes = (int)(signals.low & 1);
-        if (signals.high == (uint64_t)event->timerAppliedGeneration && signalCount && probes) {
-          // Each epoll envelope consumed an EPOLLONESHOT shot even when the
-          // timerfd read says EAGAIN, so the current schedule must be rearmed.
-          event->timerState |= etsNeedsRearm;
-          for (uint64_t i = 0; i < signalCount; i++) {
-            int consumed = event->base->methodImpl.updateEventTimer(
-              event,
-              etuConsume,
-              event->timerAppliedGeneration,
-              event->timerAppliedPeriod);
-            if (consumed > 1)
-              confirmedTicks++;
-          }
-        } else if (signals.high == (uint64_t)event->timerAppliedGeneration && !probes) {
-          confirmedTicks = signalCount;
-        }
-        if (confirmedTicks) {
-          event->timerState |= etsNeedsRearm;
-          for (uint64_t i = 0; i < confirmedTicks; i++) {
-            // The generation claim is the tick's linearization point against
-            // Start/Stop. A later control publication is reconciled on the
-            // next pass and cannot make this tick mutate its new counter.
-            if (eventReferenceIsDeleting(event) ||
-                __uintptr_atomic_load(&event->timerConfigSequence, amoAcquire) !=
-                  event->timerAppliedGeneration)
-              break;
-            // A non-semaphore rejection means one delivery is already
-            // pending, so every remaining tick in this detached batch would
-            // coalesce into it. A semaphore rejection is possible only after
-            // delete. Either way, walking the rest cannot accept anything.
-            if (!eventReferenceTryActivate(event))
-              break;
-#ifdef OS_WINDOWS
-            if (!event->base->methodImpl.activate(event)) {
-              eventReferenceDeactivate(event);
-              eventReferenceDropNonFinal(event, 1);
-              break;
-            }
-#else
-            // Reactor enqueue is an infallible void publication. Keeping
-            // IOCP's rollback branch out of this build removes a branch
-            // after every POSIX timer activation.
-            event->base->methodImpl.activate(event);
-#endif
-            if (event->timerRemaining > 0 && --event->timerRemaining == 0)
-              break;
-          }
-
-        }
-
-        if (eventReferenceIsDeleting(event) ||
-            __uintptr_atomic_load(&event->timerConfigSequence, amoAcquire) !=
-              event->timerAppliedGeneration)
-          continue;
-        if (event->timerRemaining == 0 && desiredCounter > 0) {
-          if (!eventTimerStopApplied(event))
-            continue;
-        } else if ((event->timerState & (etsArmed | etsNeedsRearm)) ==
-                   (etsArmed | etsNeedsRearm)) {
-          if (!event->base->methodImpl.updateEventTimer(event,
-                                                        etuRearm,
-                                                        event->timerAppliedGeneration,
-                                                        event->timerAppliedPeriod))
-            continue;
-          event->timerState &= ~etsNeedsRearm;
-        }
-      }
+      return 1;
     }
+    if ((expected & ewtMask) == ewtDeleted)
+      return 0;
+  }
 
-    // Retire only a clean owner. If a producer set DIRTY at any point after
-    // the pass began, this CAS fails and the same owner drains another pass;
-    // if it succeeds, a later producer observes no RUNNING bit and queues its
-    // own referenced task. Release keeps all consumer work before hand-off.
-    if (!__uint_atomic_compare_and_swap(&event->timerControlState,
-                                              ecsRunning,
-                                              0,
-                                              amoRelease))
-      continue;
+  (void)__uintptr_atomic_fetch_and_add(&event->waiter, (uintptr_t)0 - ewtCreditUnit, amoAcquire);
+  return 0;
+}
 
-    if (releaseControlReference)
-      eventDecrementReference(event, 1);
-    return; // the release may have recycled event
+static void eventFinishWaiter(aioUserEvent *event)
+{
+  // Clear the rendezvous after Yield; this bit is not a reference.
+  (void)__uint64_atomic_fetch_and_add(&event->header.tag.low, 0ULL - TAG_EVENT_WAITER_COMMITTED, amoRelaxed);
+}
+
+static void eventQueueTimerDelivery(aioUserEvent *event, aioEventTimerState *timer)
+{
+  assert(timer && "Queueing delivery for an uninitialized user-event timer");
+
+  uintptr_t old = __uintptr_atomic_fetch_and_add(&timer->deliveryState, 1, amoRelease);
+  if (!old) {
+    eventIncrementReference(event, 1);
+    event->header.base->methodImpl.enqueue(event->header.base, eventDeliveryNode(event));
   }
 }
 
-void eventTimerProcess(aioUserEvent *event)
+static int eventResumeCoroutine(aioUserEvent *event, int manual)
 {
-  eventTimerProcessImpl(event, 1);
+  int waiterKind = ewtNone;
+  coroutineTy *coroutine = eventCoroutineClaim(event, &waiterKind);
+  int cancelledSleep = manual && waiterKind == ewtSleep;
+  if (cancelledSleep) {
+    eventTimerPublishConfig(event, 0, 0, UINT64_MAX, 0);
+    aioEventTimerState *timer = eventTimerDataLoad(event, amoAcquire);
+    if (timer)
+      __uintptr_atomic_store(&timer->deliveryState, 0, amoRelaxed);
+  }
+  eventCoroutineResume(coroutine);
+  return cancelledSleep;
+}
+
+static void eventProcessCancellation(aioUserEvent *event)
+{
+  // The waiter sentinel stays terminal, so a late accepted producer may
+  // repopulate deliveryState but cannot turn that delivery into a credit.
+  __uintptr_atomic_store(&event->signalState, 0, amoRelaxed);
+  aioEventTimerState *timer = eventTimerDataLoad(event, amoAcquire);
+  if (timer)
+    __uintptr_atomic_store(&timer->deliveryState, 0, amoRelaxed);
+  eventCoroutineCancel(event);
+}
+
+static void eventDeliverCallbacks(aioUserEvent *event, uintptr_t count, int manual)
+{
+  if (manual && !event->header.isSemaphore && count)
+    count = 1;
+  // Admission has already taken a delivery reference. Delete closes the
+  // event to new work but cannot retract callbacks in this accepted batch.
+  aioEventCb *callback = (aioEventCb*)event->callback;
+  while (count--)
+    callback(event, event->arg);
+}
+
+static int eventDeliverCoroutines(aioUserEvent *event, uintptr_t count, int manual)
+{
+  int cancelledSleep = 0;
+  while (count--)
+    cancelledSleep |= eventResumeCoroutine(event, manual);
+  return cancelledSleep;
+}
+
+static void eventProcessCoroutineDeliveries(aioUserEvent *event, aioEventTimerState *timer)
+{
+  unsigned old = __uint_atomic_exchange(&timer->deliveryControl, edcRunning | edcDirty, amoRelease);
+  if (old & edcRunning)
+    return;
+
+  for (;;) {
+    __uint_atomic_exchange(&timer->deliveryControl, edcRunning, amoAcquire);
+
+    uintptr_t manual = __uintptr_atomic_exchange(&event->signalState, 0, amoAcquire);
+    uintptr_t timerCount = __uintptr_atomic_exchange(&timer->deliveryState, 0, amoAcquire);
+
+    if (event->header.isSemaphore) {
+      if (!eventDeliverCoroutines(event, manual, 1))
+        eventDeliverCoroutines(event, timerCount, 0);
+    } else if (manual) {
+      // Manual wake wins a simultaneous ioSleep expiration and cancels its
+      // accepted-but-not-yet-delivered tick before resuming the coroutine.
+      eventDeliverCoroutines(event, 1, 1);
+    } else if (timerCount) {
+      eventDeliverCoroutines(event, 1, 0);
+    }
+
+    if (__uint_atomic_compare_and_swap(&timer->deliveryControl, edcRunning, 0, amoRelease))
+      return;
+  }
+}
+
+static void eventProcessQueuedTask(aioUserEvent *event, int cancellation)
+{
+  if (cancellation) {
+    eventProcessCancellation(event);
+    return;
+  }
+
+  // Timer queue publication already carries the initialized lazy-state pointer.
+  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
+  assert(timer && "Timer delivery without initialized timer state");
+  if (!event->callback) {
+    eventProcessCoroutineDeliveries(event, timer);
+    return;
+  }
+  uintptr_t count = __uintptr_atomic_exchange(&timer->deliveryState, 0, amoAcquire);
+  if (!count)
+    return; // stale/duplicate tagged delivery node
+
+  eventDeliverCallbacks(event, count, 0);
+}
+
+void eventManualReady(aioUserEvent *event)
+{
+  if (!event->callback) {
+    aioEventTimerState *timer = eventTimerDataLoad(event, amoAcquire);
+    if (timer) {
+      eventProcessCoroutineDeliveries(event, timer);
+      return;
+    }
+  }
+
+  uintptr_t count = __uintptr_atomic_exchange(&event->signalState, 0, amoAcquire);
+  if (!count)
+    return; // stale/duplicate readiness envelope
+
+  eventDeliverCallbacks(event, count, 1);
 }
 
 aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback, void *arg)
 {
-  aioUserEvent *event = 0;
-  int fresh = asyncOpAlloc(base,
-                           sizeof(aioUserEvent),
-                           0,
-                           &base->eventPool,
-                           0,
-                           (asyncOpRoot**)&event);
+  aioUserEvent *event = (aioUserEvent*)objectAlloc(&base->eventPool, sizeof(aioUserEvent), TAGGED_POINTER_ALIGNMENT);
   if (!event)
     return 0;
 
-  // A stale POSIX timer envelope may inspect incarnation, tag and
-  // timerSignals while this slot is being reused. Keep the timer paired with
-  // the slot, preserve both monotonic identities, and initialize only those
-  // shared fields atomically. waiter has no kernel reader and is unreachable
-  // without a live reference, so ordinary stores are sufficient for it.
-  void *timerId = event->root.timerId;
-  memset(&event->root, 0, sizeof(event->root));
-  event->root.opCode = actUserEvent;
-  event->root.finishMethod = eventFinish;
-  event->root.callback = (void*)callback;
-  event->root.arg = arg;
-  event->root.objectPool = &base->eventPool;
-  event->root.running = arWaiting;
-  event->root.timerId = timerId;
-  event->base = base;
-  event->isSemaphore = isSemaphore;
-  __uintptr_atomic_store((volatile uintptr_t*)&event->timerSignals.low,
-                         0,
-                         amoRelaxed);
-  __uintptr_atomic_store((volatile uintptr_t*)&event->timerSignals.high,
-                         0,
-                         amoRelaxed);
-  event->waiter.low = 0;
-  event->waiter.high = 0;
-  __uint_atomic_store(&event->timerControlState, 0, amoRelaxed);
-  event->timerRemaining = 0;
-  event->timerState = 0;
+  // A stale kernel envelope may inspect only Head while this slot
+  // is pooled or being reused. Keep the optional backend timer paired with the
+  // slot, preserve its monotonic event generation, reset the tail, and publish
+  // the live refcount only after initialization is complete.
+  uintptr_t generation = eventHandleGeneration(event);
+  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
+  objectHeaderSetType(&event->header, ohtUserEvent);
+  event->header.base = base;
+  event->callback = (void*)callback;
+  event->arg = arg;
+  event->header.isSemaphore = isSemaphore;
+  if (timer)
+    eventTimerDeliveryReset(timer);
+  __uint64_atomic_store(&event->timerControl.low, 0, amoRelaxed);
+  __uint64_atomic_store(&event->timerControl.high, 0, amoRelaxed);
+  __uintptr_atomic_store(&event->waiter, 0, amoRelaxed);
+  __uintptr_atomic_store(&event->signalState, 0, amoRelaxed);
   event->destructorCb = 0;
   event->destructorCbArg = 0;
-  if (fresh)
-    __uintptr_atomic_store(&event->timerConfigSequence, 0, amoRelaxed);
-  __uintptr_atomic_store(&event->timerConfigPeriod, 0, amoRelaxed);
-  event->timerAppliedGeneration = 0;
-  event->timerAppliedPeriod = 0;
-  __uint_atomic_store(&event->timerConfigCounter, 0, amoRelaxed);
-  if (fresh)
-    __uintptr_atomic_store(&event->incarnation, 1, amoRelaxed);
+  event->activationId = UINT64_MAX;
 
   // Publish every field above and the incarnation bump performed by the
   // preceding final release. Kernel claims acquire this word before accepting
   // an incarnation, so it must be the last initialization store.
-  __uintptr_atomic_store(&event->tag, 1, amoRelease);
+  __uint64_atomic_store(&event->header.tag.low, 1, amoRelease);
+  if (!base->methodImpl.initializeUserEvent(event)) {
+    __uint64_atomic_store(&event->header.tag.high, generation + 1, amoRelaxed);
+    __uint64_atomic_store(&event->header.tag.low, TAG_EVENT_DELETE, amoRelaxed);
+    base->methodImpl.releaseUserEvent(event);
+    return 0;
+  }
   return event;
 }
-
 
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket)
 {
@@ -838,8 +789,7 @@ aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice)
   // Character devices (serial ports, ttys) cannot raise it and stay
   // guard-free.
   struct stat deviceStat;
-  if (fstat(hDevice, &deviceStat) == 0 &&
-      (S_ISFIFO(deviceStat.st_mode) || S_ISSOCK(deviceStat.st_mode)))
+  if (fstat(hDevice, &deviceStat) == 0 && (S_ISFIFO(deviceStat.st_mode) || S_ISSOCK(deviceStat.st_mode)))
     needGuard = 1;
 #ifdef F_SETNOSIGPIPE
   // Per-fd suppression (Darwin/NetBSD) makes per-write masking unnecessary.
@@ -861,50 +811,53 @@ void deleteAioObject(aioObject *object)
 
 asyncBase *aioGetBase(aioObject *object)
 {
-  return object->root.base;
+  return object->root.header.base;
 }
 
 void userEventStartTimer(aioUserEvent *event, uint64_t usTimeout, int counter)
 {
   assert(usTimeout > 0 && "A user-event timer period must be non-zero");
-  assert(usTimeout <= (uint64_t)INT64_MAX / 10 &&
-         "A user-event timer period exceeds the supported range");
-  eventTimerPublishConfig(event, usTimeout, counter, UINTPTR_MAX);
+  assert(usTimeout <= (uint64_t)INT64_MAX / 10 && "A user-event timer period exceeds the supported range");
+  if (eventReferenceIsDeleting(event))
+    return;
+  eventTimerPublishConfig(event, usTimeout, counter, UINT64_MAX, 0);
 }
-
 
 void userEventStopTimer(aioUserEvent *event)
 {
-  eventTimerPublishConfig(event, 0, 0, UINTPTR_MAX);
+  if (eventReferenceIsDeleting(event))
+    return;
+  eventTimerPublishConfig(event, 0, 0, UINT64_MAX, 0);
 }
 
 void userEventActivate(aioUserEvent *event)
 {
-  if (!eventReferenceTryActivate(event))
+  if (eventReferenceIsDeleting(event))
     return;
-#ifdef OS_WINDOWS
-  if (!event->base->methodImpl.activate(event)) {
-    // The delivery was accepted atomically before backend publication. A
-    // failed IOCP post must undo both pieces or the non-semaphore gate and its
-    // delivery reference leak forever.
-    eventReferenceDeactivate(event);
-    eventReferenceDropNonFinal(event, 1);
+
+  uintptr_t old;
+  if (event->header.isSemaphore) {
+    old = __uintptr_atomic_fetch_and_add(&event->signalState, 1, amoRelease);
+  } else {
+    old = __uintptr_atomic_exchange(&event->signalState, 1, amoRelease);
   }
-#else
-  // kqueue/epoll enqueue cannot fail, and this final indirect call becomes a
-  // tail call in the hot activation path.
-  event->base->methodImpl.activate(event);
-#endif
+
+  // The personal descriptor/completion is only a manual doorbell. Once one is
+  // pending, signalState carries the exact count or the coalescing gate.
+  if (old == 0)
+    event->header.base->methodImpl.activate(event);
 }
 
 void deleteUserEvent(aioUserEvent *event)
 {
-  int firstDelete = eventReferenceMarkDeleting(event);
-  assert(firstDelete && "deleteUserEvent may be called exactly once");
-  if (!firstDelete)
-    return;
+  // Arbitrate with waiter commit; acquire imports its published pointer.
+  uint64_t oldTag = __uint64_atomic_fetch_and_add(&event->header.tag.low, TAG_EVENT_DELETE, amoAcquire);
 
-  eventTimerSchedule(event, event->root.callback == 0);
+  eventTimerPublishConfig(event, 0, 0, UINT64_MAX, 1);
+  if (event->callback == 0 && (oldTag & TAG_EVENT_WAITER_COMMITTED)) {
+    eventIncrementReference(event, 1);
+    event->header.base->methodImpl.enqueue(event->header.base, eventCancellationNode(event));
+  }
   eventDecrementReference(event, 1);
 }
 
@@ -929,13 +882,12 @@ asyncOpRoot *implRead(aioObject *object,
     return 0;
 
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.read, rwFinish, buffer, size);
+  fillContext(&context, object->root.header.base->methodImpl.read, rwFinish, buffer, size);
   if (size < sb->totalSize) {
     size_t bytes;
     while (*bytesTransferred <= size) {
-      int result = object->root.type == ioObjectSocket ?
-        socketSyncRead(object->hSocket, sb->ptr, sb->totalSize, 0, &bytes) :
-        deviceSyncRead(object->hDevice, sb->ptr, sb->totalSize, 0, &bytes);
+      int result = object->root.header.objectType == ioObjectSocket ? socketSyncRead(object->hSocket, sb->ptr, sb->totalSize, 0, &bytes)
+                                                                    : deviceSyncRead(object->hDevice, sb->ptr, sb->totalSize, 0, &bytes);
       if (result) {
         sb->dataSize = bytes;
         if (copyFromBuffer(buffer, bytesTransferred, sb, size) || !(flags & afWaitAll))
@@ -950,9 +902,10 @@ asyncOpRoot *implRead(aioObject *object,
     return 0;
   } else {
     size_t bytes = 0;
-    int result = object->root.type == ioObjectSocket ?
-      socketSyncRead(object->hSocket, (uint8_t*)buffer+*bytesTransferred, size-*bytesTransferred, flags & afWaitAll, &bytes) :
-      deviceSyncRead(object->hDevice, (uint8_t*)buffer+*bytesTransferred, size-*bytesTransferred, flags & afWaitAll, &bytes);
+    int result =
+        object->root.header.objectType == ioObjectSocket
+            ? socketSyncRead(object->hSocket, (uint8_t*)buffer + *bytesTransferred, size - *bytesTransferred, flags & afWaitAll, &bytes)
+            : deviceSyncRead(object->hDevice, (uint8_t*)buffer + *bytesTransferred, size - *bytesTransferred, flags & afWaitAll, &bytes);
     *bytesTransferred += bytes;
     if (result) {
       return 0;
@@ -987,7 +940,7 @@ asyncOpRoot *implWrite(aioObject *object,
 #endif
   size_t bytes = 0;
   int result;
-  if (object->root.type == ioObjectSocket) {
+  if (object->root.header.objectType == ioObjectSocket) {
     result = socketSyncWrite(object->hSocket, buffer, size, flags & afWaitAll, &bytes);
   }
 #ifndef OS_WINDOWS
@@ -1006,7 +959,7 @@ asyncOpRoot *implWrite(aioObject *object,
     return 0;
   } else {
     struct Context context;
-    fillContext(&context, object->root.base->methodImpl.write, rwFinish, (void*)((uintptr_t)buffer), size);
+    fillContext(&context, object->root.header.base->methodImpl.write, rwFinish, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | extraFlags, usTimeout, (void*)callback, arg, actWrite, &context);
     op->bytesTransferred = bytes;
     return &op->root;
@@ -1016,29 +969,36 @@ asyncOpRoot *implWrite(aioObject *object,
 static asyncOpRoot *implReadProxy(aioObjectRoot *object, AsyncFlags flags, uint64_t usTimeout, void *callback, void *arg, void *contextPtr)
 {
   struct Context *context = (struct Context*)contextPtr;
-  return implRead((aioObject*)object, context->Buffer, context->TransactionSize, flags, usTimeout, (aioCb*)callback, arg, &context->BytesTransferred);
+  return implRead((aioObject*)object,
+                  context->Buffer,
+                  context->TransactionSize,
+                  flags,
+                  usTimeout,
+                  (aioCb*)callback,
+                  arg,
+                  &context->BytesTransferred);
 }
 
 static asyncOpRoot *implWriteProxy(aioObjectRoot *object, AsyncFlags flags, uint64_t usTimeout, void *callback, void *arg, void *contextPtr)
 {
   struct Context *context = (struct Context*)contextPtr;
-  return implWrite((aioObject*)object, context->Buffer, context->TransactionSize, flags, usTimeout, (aioCb*)callback, arg, &context->BytesTransferred);
+  return implWrite((aioObject*)object,
+                   context->Buffer,
+                   context->TransactionSize,
+                   flags,
+                   usTimeout,
+                   (aioCb*)callback,
+                   arg,
+                   &context->BytesTransferred);
 }
 
-void aioConnect(aioObject *object,
-                const HostAddress *address,
-                uint64_t usTimeout,
-                aioConnectCb callback,
-                void *arg)
+void aioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout, aioConnectCb callback, void *arg)
 {
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.connect, connectFinish, 0, 0);
+  fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afNone, usTimeout, (void*)callback, arg, actConnect, &context);
   op->host = *address;
-  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp,
-                                         0,
-                                         (uintptr_t)&op->root,
-                                         amoSeqCst)) {
+  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp, 0, (uintptr_t)&op->root, amoSeqCst)) {
     // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
@@ -1048,11 +1008,7 @@ void aioConnect(aioObject *object,
   combinerPushOperation(&op->root);
 }
 
-
-void aioAccept(aioObject *object,
-               uint64_t usTimeout,
-               aioAcceptCb callback,
-               void *arg)
+void aioAccept(aioObject *object, uint64_t usTimeout, aioAcceptCb callback, void *arg)
 {
 #ifdef OS_WINDOWS
   AsyncFlags flags = afNone;
@@ -1060,7 +1016,7 @@ void aioAccept(aioObject *object,
   AsyncFlags flags = afRunning;
 #endif
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.accept, acceptFinish, 0, 0);
+  fillContext(&context, object->root.header.base->methodImpl.accept, acceptFinish, 0, 0);
   asyncOpRoot *op = newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actAccept, &context);
   combinerPushOperation(op);
 }
@@ -1077,41 +1033,23 @@ static void initOp(asyncOpRoot *op, void *contextPtr)
   ((asyncOp*)op)->bytesTransferred = context->BytesTransferred;
 }
 
-ssize_t aioRead(aioObject *object,
-                void *buffer,
-                size_t size,
-                AsyncFlags flags,
-                uint64_t usTimeout,
-                aioCb callback,
-                void *arg)
+ssize_t aioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioCb callback, void *arg)
 {
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.read, rwFinish, buffer, size);
+  fillContext(&context, object->root.header.base->methodImpl.read, rwFinish, buffer, size);
   runAioOperation(&object->root, newAsyncOp, implReadProxy, makeResult, initOp, flags, usTimeout, (void*)callback, arg, actRead, &context);
   return context.Result;
 }
 
-ssize_t aioWrite(aioObject *object,
-                 const void *buffer,
-                 size_t size,
-                 AsyncFlags flags,
-                 uint64_t usTimeout,
-                 aioCb callback,
-                 void *arg)
+ssize_t aioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioCb callback, void *arg)
 {
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.write, rwFinish, (void*)((uintptr_t)buffer), size);
+  fillContext(&context, object->root.header.base->methodImpl.write, rwFinish, (void*)((uintptr_t)buffer), size);
   runAioOperation(&object->root, newAsyncOp, implWriteProxy, makeResult, initOp, flags, usTimeout, (void*)callback, arg, actWrite, &context);
   return context.Result;
 }
 
-ssize_t aioReadMsg(aioObject *object,
-                   void *buffer,
-                   size_t size,
-                   AsyncFlags flags,
-                   uint64_t usTimeout,
-                   aioReadMsgCb callback,
-                   void *arg)
+ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioReadMsgCb callback, void *arg)
 {
   // Datagram fast path runs the syscall without entering the combiner, so
   // the sticky delete sweep cannot stop it - gate here: a call after
@@ -1121,7 +1059,7 @@ ssize_t aioReadMsg(aioObject *object,
     if (callback == 0)
       return -(ssize_t)aosCanceled;
     struct Context context;
-    fillContext(&context, object->root.base->methodImpl.readMsg, readMsgFinish, buffer, size);
+    fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
     op->bytesTransferred = 0;
     memset(&op->host, 0, sizeof(op->host));
@@ -1152,7 +1090,7 @@ ssize_t aioReadMsg(aioObject *object,
 #endif
 
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.readMsg, readMsgFinish, buffer, size);
+  fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
   if (truncated) {
     // The datagram is already consumed and cut down to the buffer size:
     // parking the operation here would lose it with no completion at all
@@ -1192,8 +1130,6 @@ ssize_t aioReadMsg(aioObject *object,
   return -(ssize_t)aosPending;
 }
 
-
-
 ssize_t aioWriteMsg(aioObject *object,
                     const HostAddress *address,
                     const void *buffer,
@@ -1208,7 +1144,7 @@ ssize_t aioWriteMsg(aioObject *object,
     if (callback == 0)
       return -(ssize_t)aosCanceled;
     struct Context context;
-    fillContext(&context, object->root.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
+    fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
     op->bytesTransferred = 0;
     opForceStatus(&op->root, aosCanceled);
@@ -1220,13 +1156,13 @@ ssize_t aioWriteMsg(aioObject *object,
   struct sockaddr_storage remoteAddress;
   socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
 #ifdef OS_WINDOWS
-  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, addrlen);
+  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&remoteAddress, addrlen);
 #else
-  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr *)&remoteAddress, addrlen);
+  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr*)&remoteAddress, addrlen);
 #endif
 
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
+  fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
   if (result >= 0) {
     if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
       return result;
@@ -1247,17 +1183,13 @@ ssize_t aioWriteMsg(aioObject *object,
   return -(ssize_t)aosPending;
 }
 
-
 int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
 {
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.connect, connectFinish, 0, 0);
+  fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afCoroutine, usTimeout, 0, 0, actConnect, &context);
   op->host = *address;
-  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp,
-                                         0,
-                                         (uintptr_t)&op->root,
-                                         amoSeqCst)) {
+  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp, 0, (uintptr_t)&op->root, amoSeqCst)) {
     // Transport initialization is one-shot for an object.
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
@@ -1270,11 +1202,7 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
   return status == aosSuccess ? 0 : -status;
 }
 
-
-int ioAccept(aioObject *object,
-             socketTy *acceptedSocket,
-             HostAddress *remoteAddress,
-             uint64_t usTimeout)
+int ioAccept(aioObject *object, socketTy *acceptedSocket, HostAddress *remoteAddress, uint64_t usTimeout)
 {
   *acceptedSocket = INVALID_SOCKET;
   if (remoteAddress)
@@ -1286,7 +1214,7 @@ int ioAccept(aioObject *object,
   AsyncFlags flags = afRunning;
 #endif
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.accept, acceptFinish, 0, 0);
+  fillContext(&context, object->root.header.base->methodImpl.accept, acceptFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actAccept, &context);
   combinerPushOperation(&op->root);
 
@@ -1301,20 +1229,18 @@ int ioAccept(aioObject *object,
   return status == aosSuccess ? 0 : -(int)status;
 }
 
-
 ssize_t ioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.read, 0, buffer, size);
+  fillContext(&context, object->root.header.base->methodImpl.read, 0, buffer, size);
   asyncOpRoot *op = runIoOperation(&object->root, newAsyncOp, implReadProxy, initOp, flags, usTimeout, actRead, &context);
   return op ? coroutineRwFinish((asyncOp*)op, object) : (ssize_t)context.BytesTransferred;
 }
 
-
 ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.write, 0, (void*)((uintptr_t)buffer), size);
+  fillContext(&context, object->root.header.base->methodImpl.write, 0, (void*)((uintptr_t)buffer), size);
   asyncOpRoot *op = runIoOperation(&object->root, newAsyncOp, implWriteProxy, initOp, flags, usTimeout, actWrite, &context);
   return op ? coroutineRwFinish((asyncOp*)op, object) : (ssize_t)context.BytesTransferred;
 }
@@ -1348,7 +1274,7 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
 #endif
 
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.readMsg, 0, buffer, size);
+  fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
   if (truncated) {
     // The datagram is already consumed and cut down to the buffer size:
     // parking the operation here would lose it with no completion at all
@@ -1393,13 +1319,13 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
   struct sockaddr_storage remoteAddress;
   socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
 #ifdef OS_WINDOWS
-  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr *)&remoteAddress, addrlen);
+  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&remoteAddress, addrlen);
 #else
-  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr *)&remoteAddress, addrlen);
+  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr*)&remoteAddress, addrlen);
 #endif
 
   struct Context context;
-  fillContext(&context, object->root.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
+  fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
   if (result != -1) {
     // Data received synchronously
     if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {
@@ -1421,33 +1347,38 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
   return coroutineRwFinish(op, object);
 }
 
-
 void ioSleep(aioUserEvent *event, uint64_t usTimeout)
 {
-  if (eventTryConsumeCredit(event))
+  if (eventReferenceIsDeleting(event))
     return;
 
+  uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
+  assert((expected & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");
+  if (expected) {
+    (void)__uintptr_atomic_fetch_and_add(&event->waiter, (uintptr_t)0 - ewtCreditUnit, amoAcquire);
+    return;
+  }
+
   assert(usTimeout > 0 && "ioSleep timeout must be non-zero");
-  assert(usTimeout <= (uint64_t)INT64_MAX / 10 &&
-         "ioSleep timeout exceeds the supported range");
-  uintptr_t generation = eventTimerPublishConfig(event, usTimeout, 1, UINTPTR_MAX);
+  assert(usTimeout <= (uint64_t)INT64_MAX / 10 && "ioSleep timeout exceeds the supported range");
+  uint32_t generation = eventTimerPublishConfig(event, usTimeout, 1, UINT64_MAX, 0);
   if (!generation)
     return;
-  if (!eventInstallWaiter(event, generation)) {
+  if (!eventInstallWaiter(event, ewtSleep)) {
     eventTimerCancelGeneration(event, generation);
     return;
   }
   coroutineYield();
+  eventFinishWaiter(event);
   eventTimerCancelGeneration(event, generation);
-  eventDecrementReference(event, 1); // waiter reference
 }
 
 void ioWaitUserEvent(aioUserEvent *event)
 {
-  if (eventTryConsumeCredit(event))
+  if (eventReferenceIsDeleting(event))
     return;
-  if (!eventInstallWaiter(event, 0))
+  if (!eventInstallWaiter(event, ewtUser))
     return;
   coroutineYield();
-  eventDecrementReference(event, 1); // waiter reference
+  eventFinishWaiter(event);
 }

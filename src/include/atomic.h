@@ -20,9 +20,17 @@ typedef enum AtomicMemoryOrder {
 } AtomicMemoryOrder;
 
 __NO_UNUSED_FUNCTION_BEGIN
-static inline unsigned __uint_atomic_fetch_and_add(unsigned volatile *ptr,
-                                                    unsigned value,
-                                                    AtomicMemoryOrder order)
+static inline void __atomic_fence(AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  __atomic_thread_fence(order);
+#else
+  (void)order;
+  MemoryBarrier();
+#endif
+}
+
+static inline unsigned __uint_atomic_fetch_and_add(unsigned volatile *ptr, unsigned value, AtomicMemoryOrder order)
 {
 #ifndef _MSC_VER // Not Microsoft compiler
   return __atomic_fetch_add(ptr, value, order);
@@ -109,6 +117,90 @@ static inline void __uint_atomic_store(unsigned volatile *ptr, unsigned value, A
 #endif
 }
 
+static inline uint64_t __uint64_atomic_fetch_and_add(uint64_t volatile *ptr,
+                                                      uint64_t value,
+                                                      AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_fetch_add(ptr, value, order);
+#else
+  (void)order;
+  return (uint64_t)InterlockedExchangeAdd64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+}
+
+static inline uint64_t __uint64_atomic_fetch_or(uint64_t volatile *ptr,
+                                                 uint64_t value,
+                                                 AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_fetch_or(ptr, value, order);
+#else
+  (void)order;
+  return (uint64_t)InterlockedOr64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+}
+
+static inline void __uint64_atomic_or(uint64_t volatile *ptr,
+                                      uint64_t value,
+                                      AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  (void)__atomic_fetch_or(ptr, value, order);
+#else
+  (void)order;
+  (void)InterlockedOr64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+}
+
+static inline int __uint64_atomic_compare_and_swap(uint64_t volatile *ptr,
+                                                   uint64_t expected,
+                                                   uint64_t desired,
+                                                   AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_compare_exchange_n(ptr,
+                                     &expected,
+                                     desired,
+                                     0,
+                                     order,
+                                     order == amoRelease ? amoRelaxed : order);
+#else
+  (void)order;
+  return InterlockedCompareExchange64((volatile LONG64*)ptr,
+                                      (LONG64)desired,
+                                      (LONG64)expected) == (LONG64)expected;
+#endif
+}
+
+static inline uint64_t __uint64_atomic_load(uint64_t volatile *ptr,
+                                            AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_load_n(ptr, order);
+#else
+  return order == amoRelaxed
+    ? (uint64_t)ReadNoFence64((volatile LONG64*)ptr)
+    : (uint64_t)ReadAcquire64((volatile LONG64*)ptr);
+#endif
+}
+
+static inline void __uint64_atomic_store(uint64_t volatile *ptr,
+                                         uint64_t value,
+                                         AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  __atomic_store_n(ptr, value, order);
+#else
+  if (order == amoRelaxed)
+    WriteNoFence64((volatile LONG64*)ptr, (LONG64)value);
+  else if (order == amoRelease)
+    WriteRelease64((volatile LONG64*)ptr, (LONG64)value);
+  else
+    InterlockedExchange64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+}
+
 static inline uintptr_t __uintptr_atomic_fetch_and_add(uintptr_t volatile *ptr,
                                                         uintptr_t value,
                                                         AtomicMemoryOrder order)
@@ -153,6 +245,22 @@ static inline uintptr_t __uintptr_atomic_fetch_and(uintptr_t volatile *ptr,
   return (uintptr_t)InterlockedAnd((volatile LONG*)ptr, (LONG)value);
 #else
   return (uintptr_t)InterlockedAnd64((volatile LONG64*)ptr, (LONG64)value);
+#endif
+#endif
+}
+
+static inline uintptr_t __uintptr_atomic_exchange(uintptr_t volatile *ptr,
+                                                   uintptr_t value,
+                                                   AtomicMemoryOrder order)
+{
+#ifndef _MSC_VER // Not Microsoft compiler
+  return __atomic_exchange_n(ptr, value, order);
+#else
+  (void)order;
+#ifdef OS_32
+  return (uintptr_t)InterlockedExchange((volatile LONG*)ptr, (LONG)value);
+#else
+  return (uintptr_t)InterlockedExchange64((volatile LONG64*)ptr, (LONG64)value);
 #endif
 #endif
 }

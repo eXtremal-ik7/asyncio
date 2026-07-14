@@ -16,7 +16,7 @@ constexpr size_t kCombinerAlignment = size_t{1} << COMBINER_TAG_SIZE;
 
 inline void destroyConcurrentQueue(ConcurrentQueue *queue)
 {
-  for (ConcurrentQueuePartition &partition : queue->Partitions) {
+  for (ConcurrentQueuePartition &partition: queue->Partitions) {
     free(partition.queue);
     partition.queue = nullptr;
     partition.enqueuePos = 0;
@@ -58,14 +58,9 @@ struct alignas(kCombinerAlignment) TestOp {
   std::function<void(TestOp&)> cancelHook;
   std::function<void(TestOp&)> finishHook;
 
-  explicit TestOp(TestObject &object,
-                  int opCode = OPCODE_READ,
-                  AsyncFlags flags = afNone,
-                  uint64_t timeout = 0,
-                  bool hasCallback = true);
+  explicit TestOp(TestObject &object, int opCode = OPCODE_READ, AsyncFlags flags = afNone, uint64_t timeout = 0, bool hasCallback = true);
 
-  void setResults(std::initializer_list<AsyncOpStatus> values)
-  {
+  void setResults(std::initializer_list<AsyncOpStatus> values) {
     results.assign(values);
     resultIndex = 0;
   }
@@ -78,9 +73,8 @@ struct alignas(kCombinerAlignment) TestOp {
 
 static_assert(alignof(TestOp) >= kCombinerAlignment, "combiner nodes must be tag-aligned");
 static_assert(offsetof(TestObject, root) == 0, "aioObjectRoot must be the first member");
-static_assert(offsetof(TestOp, root) == 0, "asyncOpRoot must be the first member");
 
-struct TestBackend : asyncBase {
+struct TestBackend: asyncBase {
   asyncBase &base;
   ConcurrentQueue operationPool{};
   std::vector<asyncOpRoot*> completions;
@@ -93,16 +87,17 @@ struct TestBackend : asyncBase {
   unsigned initializeTimerCalls = 0;
   unsigned wakeupCalls = 0;
   uintptr_t nextTimerTag = 1;
-  uintptr_t lastEventTimerGeneration = 0;
+  uint32_t lastEventTimerGeneration = 0;
   uint64_t lastEventTimerPeriod = 0;
-  std::function<int(aioUserEvent*, EventTimerUpdate, uintptr_t, uint64_t)> eventTimerHook;
+  std::function<int(aioUserEvent*, EventTimerUpdate, uint32_t, uint64_t)> eventTimerHook;
   // Backs the loop-slot bitmap and timerSleep array that createAsyncBase
   // allocates for production bases.
   std::array<uintptr_t, 1> loopSlots{};
   alignas(CACHE_LINE_SIZE) std::array<TimerSleepSlot, 8> sleepSlots{};
 
-  TestBackend() : asyncBase{}, base(*this)
-  {
+  TestBackend() :
+    asyncBase{},
+    base(*this) {
     // Cursor 0 keeps the wheel's first rotation aligned with the small
     // absolute ticks the tests use as checkpoints
     timerWheelInit(&base, 0);
@@ -111,6 +106,7 @@ struct TestBackend : asyncBase {
     base.methodImpl.initializeTimer = initializeTimer;
     base.methodImpl.startTimer = startTimer;
     base.methodImpl.stopTimer = stopTimer;
+    base.methodImpl.initializeUserEvent = initializeUserEvent;
     base.methodImpl.activate = activateEvent;
     base.methodImpl.wakeupLoop = wakeupLoop;
     base.methodImpl.updateEventTimer = updateEventTimer;
@@ -119,14 +115,13 @@ struct TestBackend : asyncBase {
     base.loopThreadSlots = loopSlots.data();
     base.loopThreadSlotWords = static_cast<unsigned>(loopSlots.size());
     base.loopThreadLimit = static_cast<unsigned>(sleepSlots.size());
-    for (TimerSleepSlot &slot : sleepSlots)
+    for (TimerSleepSlot &slot: sleepSlots)
       slot.wakeTick = UINTPTR_MAX;
     currentFinishedSync = 0;
     messageLoopThreadId = 0;
   }
 
-  ~TestBackend()
-  {
+  ~TestBackend() {
     if (!completions.empty())
       ADD_FAILURE() << completions.size() << " completion(s) were not drained by the test";
     destroyConcurrentQueue(&operationPool);
@@ -135,21 +130,19 @@ struct TestBackend : asyncBase {
     timerWheelTeardown(&base);
   }
 
-  void drainCompletions()
-  {
+  void drainCompletions() {
     size_t index = 0;
     while (index < completions.size()) {
       asyncOpRoot *op = completions[index++];
-      if (eventTimerIsControlNode(op)) {
-        eventTimerProcess(eventTimerControlEvent(op));
+      if (((uintptr_t)op & eventQueueTagMask) == eventQueueTagMask) {
+        aioUserEvent *event = (aioUserEvent*)((uintptr_t)op & ~(uintptr_t)eventQueueTagMask);
+        currentFinishedSync = 0;
+        eventManualReady(event);
+        eventDecrementReference(event, 1);
         continue;
       }
-      if (op->opCode == actUserEvent) {
-        aioUserEvent *event = reinterpret_cast<aioUserEvent*>(op);
-        currentFinishedSync = 0;
-        eventReferenceDeactivate(event);
-        op->finishMethod(op);
-        eventDecrementReference(event, 1);
+      if (eventIsQueueTask(op)) {
+        eventExecuteQueuedTask(op);
         continue;
       }
       if (op->callback)
@@ -165,19 +158,12 @@ struct TestBackend : asyncBase {
     completions.clear();
   }
 
-  static TestBackend &from(asyncBase *base)
-  {
-    return *static_cast<TestBackend*>(base);
-  }
+  static TestBackend &from(asyncBase *base) { return *static_cast<TestBackend*>(base); }
 
-  static void enqueue(asyncBase *base, asyncOpRoot *op)
-  {
-    from(base).completions.push_back(op);
-  }
+  static void enqueue(asyncBase *base, asyncOpRoot *op) { from(base).completions.push_back(op); }
 
-  static void taskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t signals)
-  {
-    TestBackend &backend = from(object->base);
+  static void taskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t signals) {
+    TestBackend &backend = from(object->header.base);
     backend.handledSignals.push_back(signals);
     uint32_t progress = signals & COMBINER_TAG_PROGRESS_MASK;
     uint32_t needStart = progress;
@@ -197,44 +183,30 @@ struct TestBackend : asyncBase {
       executeOperationList(&object->writeQueue);
   }
 
-  static void initializeTimer(asyncBase *base, asyncOpRoot *op)
-  {
+  static void initializeTimer(asyncBase *base, asyncOpRoot *op) {
     TestBackend &backend = from(base);
     backend.initializeTimerCalls++;
     op->timerId = reinterpret_cast<void*>(backend.nextTimerTag++);
   }
 
-  // User events never initialize root.object, production backends route
-  // their timer calls through event->base - the stubs must mirror that or any
-  // deleteUserEvent/userEventStartTimer on a TestBackend event dereferences
-  // garbage
-  static asyncBase *timerBase(asyncOpRoot *op)
-  {
-    return op->opCode == actUserEvent ? reinterpret_cast<aioUserEvent*>(op)->base : op->object->base;
-  }
+  static asyncBase *timerBase(asyncOpRoot *op) { return op->object->header.base; }
 
-  static void startTimer(asyncOpRoot *op)
-  {
-    from(timerBase(op)).startTimerCalls++;
-  }
+  static void startTimer(asyncOpRoot *op) { from(timerBase(op)).startTimerCalls++; }
 
-  static void stopTimer(asyncOpRoot *op)
-  {
-    from(timerBase(op)).stopTimerCalls++;
-  }
+  static void stopTimer(asyncOpRoot *op) { from(timerBase(op)).stopTimerCalls++; }
 
-  static int activateEvent(aioUserEvent *event)
-  {
-    enqueue(event->base, &event->root);
+  static int initializeUserEvent(aioUserEvent*) { return 1; }
+
+  static int activateEvent(aioUserEvent *event) {
+    // Model a kernel readiness envelope that successfully claimed the live
+    // generation. Its reference spans the queued record and delivery.
+    eventIncrementReference(event, 1);
+    enqueue(event->header.base, (asyncOpRoot*)((uintptr_t)event | eventQueueTagMask));
     return 1;
   }
 
-  static int updateEventTimer(aioUserEvent *event,
-                              EventTimerUpdate update,
-                              uintptr_t generation,
-                              uint64_t period)
-  {
-    TestBackend &backend = from(event->base);
+  static int updateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period) {
+    TestBackend &backend = from(event->header.base);
     backend.lastEventTimerGeneration = generation;
     backend.lastEventTimerPeriod = period;
     if (update == etuStart)
@@ -248,18 +220,13 @@ struct TestBackend : asyncBase {
     return 1;
   }
 
-  static void releaseUserEvent(aioUserEvent *event)
-  {
-    concurrentQueuePush(event->root.objectPool, event);
-  }
+  static void releaseUserEvent(aioUserEvent *event) { objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent)); }
 
-  static void wakeupLoop(asyncBase *base)
-  {
-    from(base).wakeupCalls++;
-  }
+  static void wakeupLoop(asyncBase *base) { from(base).wakeupCalls++; }
 };
 
-inline TestObject::TestObject(TestBackend &owner) : backend(&owner)
+inline TestObject::TestObject(TestBackend &owner) :
+  backend(&owner)
 {
   initObjectRoot(&root, &owner.base, ioObjectUserDefined, resourceDestructor);
   objectSetDestructorCb(&root, destructorCallback, this);
@@ -273,8 +240,7 @@ inline void TestObject::resourceDestructor(aioObjectRoot *root)
 inline void TestObject::destructorCallback(aioObjectRoot*, void *arg)
 {
   TestObject *object = static_cast<TestObject*>(arg);
-  object->destructorGeneration =
-    __uintptr_atomic_load(&object->root.Head.gen, amoRelaxed);
+  object->destructorGeneration = __uint64_atomic_load(&object->root.header.tag.high, amoRelaxed);
   object->destructorCallbacks++;
 }
 
@@ -283,24 +249,10 @@ inline void TestObject::memoryRelease(aioObjectRoot *root)
   reinterpret_cast<TestObject*>(root)->memoryReleases++;
 }
 
-inline TestOp::TestOp(TestObject &object,
-                      int opCode,
-                      AsyncFlags flags,
-                      uint64_t timeout,
-                      bool hasCallback)
-  : owner(&object)
+inline TestOp::TestOp(TestObject &object, int opCode, AsyncFlags flags, uint64_t timeout, bool hasCallback) :
+  owner(&object)
 {
-  initAsyncOpRoot(&root,
-                  execute,
-                  cancel,
-                  finish,
-                  release,
-                  &object.root,
-                  hasCallback ? this : nullptr,
-                  this,
-                  flags,
-                  opCode,
-                  timeout);
+  initAsyncOpRoot(&root, execute, cancel, finish, release, &object.root, hasCallback ? this : nullptr, this, flags, opCode, timeout);
   root.objectPool = &object.backend->operationPool;
 }
 

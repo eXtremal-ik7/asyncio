@@ -72,7 +72,7 @@ RlpxOperation *initOp(aioExecuteProc *start,
                int opCode)
 {
   RlpxOperation *op = 0;
-  if (asyncOpAlloc(socket->root.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
+  if (asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
   initAsyncOpRoot(&op->root, start, cancel, finish, releaseOp, &socket->root, callback, arg, flags, opCode, timeout);
   return op;
 }
@@ -87,7 +87,7 @@ RlpxOperation *initReadOp(aioExecuteProc *start,
                    int opCode)
 {
   RlpxOperation *op = 0;
-  if (asyncOpAlloc(socket->root.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
+  if (asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
   initAsyncOpRoot(&op->root, start, cancel, finish, releaseOp, &socket->root, callback, arg, flags, opCode, timeout);
   return op;
 }
@@ -106,7 +106,7 @@ RlpxOperation *initWriteOp(aioExecuteProc *start,
   __UNUSED(data);
   __UNUSED(size);
   RlpxOperation *op = 0;
-  if (asyncOpAlloc(socket->root.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
+  if (asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
   initAsyncOpRoot(&op->root, start, cancel, finish, releaseOp, &socket->root, callback, arg, flags, opCode, timeout);
   return op;
 }

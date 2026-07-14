@@ -194,7 +194,7 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
 {
   zmtpOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
   }
 
   initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
@@ -213,7 +213,7 @@ static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
 {
   zmtpOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
   }
 
   initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
@@ -235,7 +235,7 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
 {
   zmtpOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+  if (asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
   }
 
   initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);

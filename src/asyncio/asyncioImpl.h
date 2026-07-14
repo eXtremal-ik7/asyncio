@@ -9,12 +9,13 @@ extern "C" {
 #include "asyncio/ringBuffer.h"
 #include "atomic128.h"
 #ifndef OS_WINDOWS
+#include <errno.h>
 #include <signal.h>
 #endif
 
 #define TAGGED_POINTER_DATA_SIZE 6
 #define TAGGED_POINTER_ALIGNMENT (((intptr_t)1) << TAGGED_POINTER_DATA_SIZE)
-#define TAGGED_POINTER_DATA_MASK (TAGGED_POINTER_ALIGNMENT-1)
+#define TAGGED_POINTER_DATA_MASK (TAGGED_POINTER_ALIGNMENT - 1)
 #define TAGGED_POINTER_PTR_MASK (~TAGGED_POINTER_DATA_MASK)
 
 // Timeout grid: an exact cascading hierarchical timer wheel. The tick is a
@@ -34,7 +35,7 @@ extern "C" {
 // the whole 64-bit range. Level L covers windows of 2^(10L) ticks; deadlines
 // beyond level 3 clamp into its farthest slot and re-cascade on visit.
 typedef struct timerWheel {
-  uint128Pair slots[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS];
+  uint128 slots[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS];
   // Occupancy bitmap, one bit per slot (64-bit words - the wheel already
   // requires a 64-bit target). The loops derive their sleep horizon from it
   // instead of polling at the grid tick while links are parked. Protocol:
@@ -76,8 +77,7 @@ typedef enum IoActionTy {
   actReadMsg,
   actConnect = OPCODE_WRITE,
   actWrite,
-  actWriteMsg,
-  actUserEvent = OPCODE_OTHER,
+  actWriteMsg
 } IoActionTy;
 
 // (object, startOp, sig): startOp != 0 is an op-node to start; sig is the
@@ -92,6 +92,7 @@ typedef aioObject *newAioObjectTy(asyncBase*, IoObjectTy, void*);
 typedef void deleteObjectTy(aioObject*);
 typedef void startTimerTy(asyncOpRoot*);
 typedef void stopTimerTy(asyncOpRoot*);
+typedef int initializeUserEventTy(aioUserEvent*);
 typedef int activateTy(aioUserEvent*);
 
 typedef enum EventTimerUpdate {
@@ -99,14 +100,21 @@ typedef enum EventTimerUpdate {
   etuStop,
   etuRearm,
   // Reactor-only readiness probe. The backend consumes its timer channel
-  // under the common applier and returns 2 for a real tick, 1 for stale/EAGAIN.
+  // under the common owner and returns an EventTimerUpdateResult.
   etuConsume
 } EventTimerUpdate;
 
-// User-event timers have a separate serialized control plane. The common
-// event applier is the sole caller; backend callbacks only publish ticks.
+typedef enum EventTimerUpdateResult {
+  eturFailed = 0,
+  eturApplied,
+  eturTick
+} EventTimerUpdateResult;
+
+// User-event timers have a separate serialized control plane. The thread
+// which acquires timerControl.OWNER is the sole backend caller; another
+// publisher updates the same DWCAS word and lets that owner reconcile it.
 // generation is meaningful for start/rearm and travels back with a tick.
-typedef int updateEventTimerTy(aioUserEvent*, EventTimerUpdate, uintptr_t, uint64_t);
+typedef int updateEventTimerTy(aioUserEvent*, EventTimerUpdate, uint32_t, uint64_t);
 typedef void releaseUserEventTy(aioUserEvent*);
 
 struct asyncImpl {
@@ -121,6 +129,7 @@ struct asyncImpl {
   initializeTimerTy *initializeTimer;
   startTimerTy *startTimer;
   stopTimerTy *stopTimer;
+  initializeUserEventTy *initializeUserEvent;
   activateTy *activate;
   aioExecuteProc *connect;
   aioExecuteProc *accept;
@@ -165,9 +174,6 @@ struct asyncBase {
   unsigned loopThreadSlotWords;
   unsigned loopThreadLimit;
   volatile unsigned messageLoopThreadCounter;
-  // Diagnostics for generation-rejected kernel/timer handles. Incremented
-  // only on the cold stale path; successful publications pay no RMW.
-  volatile uintptr_t staleHandleDrops;
 
 #ifndef NDEBUG
   int opsCount;
@@ -206,29 +212,18 @@ static inline uint32_t combinerSelectActiveIoEvents(int hasInitialization,
                                                     int hasWriteQueue)
 {
   if (hasInitialization)
-    return initializationState == arRunning
-      ? (initializationIsWrite ? IO_EVENT_WRITE : IO_EVENT_READ)
-      : 0;
+    return initializationState == arRunning ? (initializationIsWrite ? IO_EVENT_WRITE : IO_EVENT_READ) : 0;
 
-  return (hasReadQueue ? IO_EVENT_READ : 0) |
-         (hasWriteQueue ? IO_EVENT_WRITE : 0);
+  return (hasReadQueue ? IO_EVENT_READ : 0) | (hasWriteQueue ? IO_EVENT_WRITE : 0);
 }
 
 static inline uint32_t combinerActiveIoEvents(aioObjectRoot *object)
 {
   asyncOpRoot *initialization = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
   if (initialization)
-    return combinerSelectActiveIoEvents(1,
-                                        initialization->running,
-                                        initialization->opCode & OPCODE_WRITE,
-                                        0,
-                                        0);
+    return combinerSelectActiveIoEvents(1, initialization->running, initialization->opCode & OPCODE_WRITE, 0, 0);
 
-  return combinerSelectActiveIoEvents(0,
-                                      arWaiting,
-                                      0,
-                                      object->readQueue.head != 0,
-                                      object->writeQueue.head != 0);
+  return combinerSelectActiveIoEvents(0, arWaiting, 0, object->readQueue.head != 0, object->writeQueue.head != 0);
 }
 
 typedef enum CombinerInitializationAction {
@@ -239,17 +234,13 @@ typedef enum CombinerInitializationAction {
 
 // Status and position select one mutually exclusive initialization action;
 // execution itself remains outside this pure function.
-static inline CombinerInitializationAction combinerSelectInitializationAction(AsyncOpRunningTy running,
-                                                                               AsyncOpStatus status)
+static inline CombinerInitializationAction combinerSelectInitializationAction(AsyncOpRunningTy running, AsyncOpStatus status)
 {
   switch (running) {
-    case arRunning:
-      return status == aosPending ? ciaExecute : ciaRelease;
-    case arCancelling:
-      return ciaRelease;
+    case arRunning: return status == aosPending ? ciaExecute : ciaRelease;
+    case arCancelling: return ciaRelease;
     case arWaiting:
-    default:
-      return ciaNone;
+    default: return ciaNone;
   }
 }
 
@@ -259,20 +250,16 @@ typedef enum CombinerReapAction {
   craRelease
 } CombinerReapAction;
 
-static inline CombinerReapAction combinerSelectReapAction(AsyncOpRunningTy running,
-                                                           AsyncOpStatus status)
+static inline CombinerReapAction combinerSelectReapAction(AsyncOpRunningTy running, AsyncOpStatus status)
 {
   if (status == aosPending)
     return craKeep;
 
   switch (running) {
-    case arRunning:
-      return craCancel;
-    case arWaiting:
-      return craRelease;
+    case arRunning: return craCancel;
+    case arWaiting: return craRelease;
     case arCancelling:
-    default:
-      return craKeep;
+    default: return craKeep;
   }
 }
 
@@ -295,6 +282,23 @@ struct SigpipeGuard {
 
 void sigpipeGuardEnter(struct SigpipeGuard *guard);
 void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe);
+
+// Map the errno of a failed stream/datagram socket syscall (recv/send/read/
+// write/recvmsg/sendto) to an operation status. EAGAIN means the socket buffer
+// is momentarily empty or full: the operation stays pending and is retried on
+// the next readiness event. EPIPE (peer gone, broken pipe) and ENOTCONN (the
+// socket was never connected) both normalize to aosNotConnected, so callers can
+// tell an absent/lost connection from an opaque failure; every other errno
+// collapses to aosUnknownError (errno is not otherwise surfaced by the API).
+static inline AsyncOpStatus socketStatusFromErrno(int error)
+{
+  switch (error) {
+    case EAGAIN: return aosPending;
+    case EPIPE:
+    case ENOTCONN: return aosNotConnected;
+    default: return aosUnknownError;
+  }
+}
 #endif
 
 struct asyncOp {
@@ -310,74 +314,148 @@ struct asyncOp {
   size_t internalBufferSize;
 };
 
+typedef struct aioEventTimerState {
+  // Backend timer storage is allocated lazily with this control block and
+  // remains paired with the type-stable event cell across pool reuse.
+  void *timerId;
+
+  // Accepted timer callbacks waiting for the tagged delivery task. Ordinary
+  // callbacks count every accepted tick; callback-less non-semaphore events
+  // coalesce them when the coroutine consumer drains this word. Manual
+  // activation has an independent word in aioUserEvent.
+  volatile uintptr_t deliveryState;
+
+  // Consumer-only ownership for callback-less coroutine events. It merges a
+  // manual wake racing the sleep tick without putting any extra RMW on the
+  // userEventActivate producer path.
+  volatile unsigned deliveryControl;
+
+  // OWNER-only backend fact which is absent from the desired control word:
+  // whether the most recent start syscall succeeded. This occupies the
+  // structure's former tail padding, so the lazy block does not grow.
+  unsigned armed;
+} aioEventTimerState;
+
+typedef char aioEventTimerStateMustBe24Bytes[sizeof(aioEventTimerState) == 24 ? 1 : -1];
+
 struct aioUserEvent {
-  asyncOpRoot root;
+  // Common kernel-visible prefix. tag.low contains references, DELETE and the
+  // coroutine-waiter rendezvous bit; tag.high is the full monotonic
+  // incarnation. A harvested kernel envelope may inspect only the tag and
+  // immutable type until it has atomically claimed a matching reference.
+  objectHeader header;
 
-  // Producer/applier hot line. Operation storage is cache-line aligned, and
-  // the compile-time checks below keep every field touched by activation,
-  // timer-signal publication and mailbox election in one cache line. A timer
-  // tick therefore takes ownership of one line instead of bouncing tag and
-  // timerSignals on two different lines.
-  volatile uintptr_t tag;
-  asyncBase *base;
+  // The rest of the first cache line is the complete manual/callback path.
+  // Timer and coroutine state starts on the second line below.
+  void *callback;
+  void *arg;
 
-  // {encoded signal count, armed generation}. low = count<<1 | probeKind:
-  // kqueue/IOCP publish confirmed ticks (kind 0), epoll publishes readiness
-  // probes (kind 1) whose timerfd read is serialized by the applier. A signal
-  // may increment only the installed generation; stop/restart changes the
-  // pair first, making a late publisher fail its CAS instead of touching the
-  // next schedule. One backend uses exactly one kind, so both fit one pair.
-  volatile uint128Pair timerSignals;
+  // Manual activations only. Semaphore mode counts every activation;
+  // non-semaphore mode is a 0/1 pending gate. Timer delivery state lives in
+  // the lazy timerData block and never contends on this hot producer word.
+  volatile uintptr_t signalState;
 
-  // {waiter coroutine pointer, metadata}. With a waiter, metadata is the
-  // ioSleep timer generation (0 for ioWaitUserEvent); without one it is the
-  // accumulated activation-credit count. Changed only by DWCAS.
-  volatile uint128Pair waiter;
+  // Backend-owned manual activation identity: eventfd on epoll, the unique
+  // EVFILT_USER ident on kqueue, unused on IOCP where pointer and full
+  // generation occupy separate completion-packet fields.
+  uint64_t activationId;
 
-  // Coalesced control task state. Its queue node is event->root with the free
-  // low pointer bit set (all operation storage is 64-byte aligned), avoiding a
-  // second full asyncOpRoot in every event.
-  volatile unsigned timerControlState;
-  int isSemaphore;
-  int timerRemaining;
-  unsigned timerState;
+  // One DWCAS word is both the latest logical timer state and the owner
+  // mailbox. It is laid out as follows (bit 0 is the least-significant bit):
+  //
+  //   low  0..59  period in microseconds
+  //        60     pending epoll timerfd probe
+  //        61     terminal Delete publication
+  //        62     finite-count marker
+  //        63     backend-syscall OWNER
+  //   high 0..31  schedule generation
+  //        32..63 finite remaining count, or an infinite-timer tick sequence
+  //
+  // A user publication replaces period/count, advances generation and either
+  // acquires a free OWNER or leaves an existing owner in place. A confirmed
+  // kernel tick changes only the count lane and similarly acquires or notifies
+  // OWNER. The owner releases with an exact whole-word CAS: any concurrent
+  // publication makes it fail and supplies the next snapshot to reconcile.
+  // With OWNER clear, this is the exact last reconciled desired snapshot; a
+  // new owner therefore uses it as applied state, while timerData->armed
+  // records whether the backend accepted the arm. The public period limit is
+  // below 2^60, leaving the four control bits without reducing the API range.
+  volatile uint128 timerControl;
 
-  // Cold configuration/lifetime line. Timer Start/Stop has one external
-  // controller; sequence is even while stable and odd only during the
-  // forbidden overlapping-writer window. Every snapshot field is atomic so
-  // even an observing retry is valid C and TSan-clean.
+  // Null until this cell is first used with a timer. The block stays paired
+  // with pooled event storage across reuse; manual-only workloads allocate
+  // neither backend storage nor delivery arbitration.
+  aioEventTimerState *volatile timerData;
+
+  // One-word coroutine rendezvous. Tags identify ordinary/ioSleep waiters;
+  // aligned nonzero values encode credits and zero is empty. Coroutine
+  // pointers are at least four-byte aligned. Lifetime while installed belongs
+  // to the helper's caller-owned strong reference, not to this word.
+  volatile uintptr_t waiter;
+
   userEventDestructorCb *destructorCb;
   void *destructorCbArg;
-  volatile uintptr_t timerConfigSequence;
-  volatile uintptr_t timerConfigPeriod;
-
-  // Consumer-owned applied state (only eventTimerProcess touches it).
-  uintptr_t timerAppliedGeneration;
-  uint64_t timerAppliedPeriod;
-  volatile unsigned timerConfigCounter;
-
-  // Lifetime identity carried by every kernel timer arming. Only the final
-  // reference path advances it, after the user's destructor and before the
-  // event/timer pair returns to eventPool. It deliberately occupies the
-  // eight bytes of tail padding in the fourth cache line.
-  volatile uintptr_t incarnation;
 };
 
-typedef char aioUserEventMustStayFourCacheLines[
-  sizeof(struct aioUserEvent) == 4 * CACHE_LINE_SIZE ? 1 : -1];
-typedef char aioUserEventHotFieldsMustShareOneCacheLine[
-  offsetof(struct aioUserEvent, tag) / CACHE_LINE_SIZE ==
-  offsetof(struct aioUserEvent, timerState) / CACHE_LINE_SIZE ? 1 : -1];
+typedef char aioUserEventMustBe112Bytes[sizeof(struct aioUserEvent) == 112 ? 1 : -1];
+typedef char aioUserEventTimerStateStartsOnSecondCacheLine[offsetof(struct aioUserEvent, timerControl) == CACHE_LINE_SIZE ? 1 : -1];
 
-enum EventTimerStateFlags {
-  etsArmed = 1,
-  etsNeedsRearm = 2,
-  etsHasReference = 4
+static inline uint64_t eventHandleGeneration(aioUserEvent *event)
+{
+  return objectHeaderGeneration(&event->header);
+}
+
+static inline aioEventTimerState *eventTimerDataLoad(aioUserEvent *event, AtomicMemoryOrder order)
+{
+  return (aioEventTimerState*)__pointer_atomic_load((void* volatile*)&event->timerData, order);
+}
+
+#define EVENT_TIMER_PERIOD_MASK ((1ULL << 60) - 1)
+#define EVENT_TIMER_PROBE (1ULL << 60)
+#define EVENT_TIMER_TERMINAL (1ULL << 61)
+#define EVENT_TIMER_FINITE (1ULL << 62)
+#define EVENT_TIMER_OWNER (1ULL << 63)
+#define EVENT_TIMER_GENERATION_MASK 0xFFFFFFFFULL
+#define EVENT_TIMER_COUNTER_SHIFT 32
+
+static inline uint64_t eventTimerControlPeriod(uint128 control)
+{
+  return control.low & EVENT_TIMER_PERIOD_MASK;
+}
+
+static inline uint32_t eventTimerControlGeneration(uint128 control)
+{
+  return (uint32_t)control.high;
+}
+
+static inline uint32_t eventTimerControlCounter(uint128 control)
+{
+  return (uint32_t)(control.high >> EVENT_TIMER_COUNTER_SHIFT);
+}
+
+static inline int eventTimerControlIsFinite(uint128 control)
+{
+  return (control.low & EVENT_TIMER_FINITE) != 0;
+}
+
+static inline uint32_t eventTimerGeneration(aioUserEvent *event)
+{
+  return (uint32_t)__uint64_atomic_load(&event->timerControl.high, amoRelaxed);
+}
+
+enum EventDeliveryControlFlags {
+  edcRunning = 1,
+  edcDirty = 2
 };
 
-enum EventControlStateFlags {
-  ecsRunning = 1,
-  ecsDirty = 2
+enum EventWaiterTag {
+  ewtCredits = 0,
+  ewtNone = ewtCredits,
+  ewtUser = 1,
+  ewtSleep = 2,
+  ewtDeleted = 3,
+  ewtMask = 3,
+  ewtCreditUnit = 4
 };
 
 // Drop a protocol-local claim while another owner is known to pin the event.
@@ -387,101 +465,57 @@ enum EventControlStateFlags {
 // refs > count independently of the value observed here.
 static inline void eventReferenceDropNonFinal(aioUserEvent *event, uintptr_t count)
 {
-  assert(count > 0 && count <= TAG_EVENT_REF_MASK);
-  uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag,
-                                                  (uintptr_t)0 - count,
-                                                  amoRelaxed);
+  uintptr_t old = __uint64_atomic_fetch_and_add(&event->header.tag.low, UINT64_C(0) - count, amoRelaxed);
   (void)old;
-  assert((old & TAG_EVENT_REF_MASK) > count &&
-         "A supposedly non-final event reference was the last one");
-}
-
-static inline int eventReferenceMarkDeleting(aioUserEvent *event)
-{
-  uintptr_t old = __uintptr_atomic_fetch_or(&event->tag,
-                                             TAG_EVENT_DELETE,
-                                             amoRelaxed);
-  assert((old & TAG_EVENT_REF_MASK) != 0 && "Deleting an already released event");
-  return (old & TAG_EVENT_DELETE) == 0;
+  assert((old & TAG_EVENT_REF_MASK) > count && "A supposedly non-final event reference was the last one");
 }
 
 static inline int eventReferenceIsDeleting(aioUserEvent *event)
 {
   // DELETE is only a sticky control bit; no payload is published through it.
-  return (__uintptr_atomic_load(&event->tag, amoRelaxed) & TAG_EVENT_DELETE) != 0;
+  return (__uint64_atomic_load(&event->header.tag.low, amoRelaxed) & TAG_EVENT_DELETE) != 0;
 }
 
-static inline int eventReferenceTryActivate(aioUserEvent *event)
+enum {
+  // Queue pointers are 64-byte aligned. Tag 1 requests loop-context waiter
+  // cancellation; tag 2 drains accepted timer deliveries.
+  eventQueueCancellationTag = 1,
+  eventQueueDeliveryTag = 2,
+  eventQueueTagMask = 3
+};
+
+static inline asyncOpRoot *eventCancellationNode(aioUserEvent *event)
 {
-  if (event->isSemaphore) {
-    // The caller owns another reference, so rolling back a terminal optimistic
-    // retain cannot itself recycle the event.
-    uintptr_t old = __uintptr_atomic_fetch_and_add(&event->tag, 1, amoRelaxed);
-    if (old & TAG_EVENT_DELETE) {
-      __uintptr_atomic_fetch_and_add(&event->tag, (uintptr_t)0 - 1, amoRelaxed);
-      return 0;
-    }
-#ifndef NDEBUG
-    uintptr_t refs = old & TAG_EVENT_REF_MASK;
-    assert(refs != 0 && "Activation without an owned event reference");
-    assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
-#endif
-    return 1;
-  }
-
-  uintptr_t old = __uintptr_atomic_load(&event->tag, amoRelaxed);
-  for (;;) {
-    if (old & (TAG_EVENT_DELETE | TAG_EVENT_OP))
-      return 0;
-#ifndef NDEBUG
-    uintptr_t refs = old & TAG_EVENT_REF_MASK;
-    assert(refs != 0 && "Activation without an owned event reference");
-    assert(refs != TAG_EVENT_REF_MASK && "Event reference overflow");
-#endif
-    uintptr_t desired = (old + 1) | TAG_EVENT_OP;
-    if (__uintptr_atomic_compare_exchange(&event->tag,
-                                           &old,
-                                           desired,
-                                           amoRelaxed))
-      return 1;
-  }
+  return (asyncOpRoot*)((uintptr_t)event | eventQueueCancellationTag);
 }
 
-static inline void eventReferenceDeactivate(aioUserEvent *event)
+static inline asyncOpRoot *eventDeliveryNode(aioUserEvent *event)
 {
-  if (event->isSemaphore)
-    return;
-  uintptr_t old = __uintptr_atomic_fetch_and(&event->tag,
-                                              ~TAG_EVENT_OP,
-                                              amoRelaxed);
-  (void)old;
-  assert((old & TAG_EVENT_OP) && "Deactivating an event without a pending delivery");
+  return (asyncOpRoot*)((uintptr_t)event | eventQueueDeliveryTag);
 }
 
-enum { eventTimerControlTag = 1 };
-
-static inline asyncOpRoot *eventTimerControlNode(aioUserEvent *event)
+static inline int eventIsQueueTask(asyncOpRoot *node)
 {
-  return (asyncOpRoot*)((uintptr_t)&event->root | eventTimerControlTag);
+  uintptr_t tag = (uintptr_t)node & eventQueueTagMask;
+  return tag == eventQueueCancellationTag || tag == eventQueueDeliveryTag;
 }
 
-static inline int eventTimerIsControlNode(asyncOpRoot *node)
+static inline int eventIsCancellationNode(asyncOpRoot *node)
 {
-  return ((uintptr_t)node & eventTimerControlTag) != 0;
+  return ((uintptr_t)node & eventQueueTagMask) == eventQueueCancellationTag;
 }
 
-static inline aioUserEvent *eventTimerControlEvent(asyncOpRoot *node)
+static inline aioUserEvent *eventQueueTaskEvent(asyncOpRoot *node)
 {
-  return (aioUserEvent*)((uintptr_t)node & ~(uintptr_t)eventTimerControlTag);
+  return (aioUserEvent*)((uintptr_t)node & ~(uintptr_t)eventQueueTagMask);
 }
 
-void eventTimerSignalTick(aioUserEvent *event,
-                          uintptr_t generation,
-                          uintptr_t incarnation);
-void eventTimerSignalProbe(aioUserEvent *event,
-                           uintptr_t generation,
-                           uintptr_t incarnation);
-void eventTimerProcess(aioUserEvent *event);
+void eventTimerSignalTick(aioUserEvent *event, uint32_t generation, uint64_t incarnation);
+void eventTimerSignalProbe(aioUserEvent *event, uint32_t generation, uint64_t incarnation);
+// Executes either tagged event task and releases its queue-owned reference.
+void eventExecuteQueuedTask(asyncOpRoot *node);
+void eventManualReady(aioUserEvent *event);
+int eventTimerTryClaimReference(aioUserEvent *event, uint64_t generation);
 
 // Single-threaded wheel lifecycle. Init may run on zeroed or reused storage
 // and seeds every slot's baseTick for the given cursor; teardown recycles
@@ -551,11 +585,6 @@ __NO_UNUSED_FUNCTION_END
 // release returns the number of loop invocations still active after exit.
 int loopThreadEnter(asyncBase *base);
 unsigned loopThreadExit(asyncBase *base);
-
-static inline void recordStaleHandleDrop(asyncBase *base)
-{
-  __uintptr_atomic_fetch_and_add(&base->staleHandleDrops, 1, amoRelaxed);
-}
 
 int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size);
 #ifdef __cplusplus
