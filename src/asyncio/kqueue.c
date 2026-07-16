@@ -27,19 +27,22 @@ typedef struct kqueueBase {
 // like the op pools themselves: a pooled op slot - and its timer - can be
 // recycled into any base, so per-base counters could hand two timers equal
 // bases and let their idents collide inside one kqueue
-static volatile intptr_t timerIdCounter;
+static volatile uint64_t timerIdCounter;
 
 enum {
   timerIdentSeqBits = (int)(sizeof(uint64_t) * 4)
 };
 
+static uint64_t timerNewIdentBase(void)
+{
+  return __uint64_atomic_fetch_and_add(&timerIdCounter, 1, amoRelaxed) << timerIdentSeqBits;
+}
+
 static uint64_t timerNextIdent(aioTimer *timer)
 {
   uint64_t seqMask = (1ULL << timerIdentSeqBits) - 1;
-  uint64_t base = (uint64_t)timer->fd & ~seqMask;
-  uint64_t seq = ((uint64_t)timer->fd + 1) & seqMask;
-  assert(seq != 0 && "kqueue timer ident sequence exhausted without rotation");
-  return base | seq;
+  uint64_t ident = (uint64_t)timer->fd + 1;
+  return (ident & seqMask) ? ident : (timerNewIdentBase() | 1);
 }
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
@@ -366,8 +369,8 @@ static aioTimer *kqueueNewTimer(asyncBase *base, TimerKind kind)
     return 0;
   timerInitialize(timer);
   timer->header.base = base;
-  // Seed the permanent base into the high half; the low half advances on arm.
-  timer->fd = (intptr_t)((uintptr_t)__sync_fetch_and_add(&timerIdCounter, 1) << timerIdentSeqBits);
+  // Seed the high half; the low half advances on each arm.
+  timer->fd = (intptr_t)timerNewIdentBase();
   timer->header.timer.kind = (uint8_t)kind;
   return timer;
 }
@@ -390,23 +393,7 @@ static aioTimer *kqueuePrepareTimer(asyncOpRoot *op, asyncBase *base)
   if (!timer)
     return 0;
   assert(timer->header.timer.kind == tkOperation);
-
-  uintptr_t seqMask = (((uintptr_t)1) << timerIdentSeqBits) - 1;
-  if (!timer->header.timer.broken && ((uintptr_t)timer->fd & seqMask) != seqMask)
-    return timer;
-
-  // Allocate and initialize the replacement before tombstoning the old cell.
-  // On OOM the old disarmed cell remains attached and can be retried safely.
-  aioTimer *replacement = kqueueNewTimer(base, tkOperation);
-  if (!replacement)
-    return 0;
-  replacement->operation.op = op;
-
-  timerUnpublish(timer);
-  // Permanent tombstone: a stale kevent may retain this timer's pointer.
-  timer->header.timer.broken = 1;
-  op->timerId = replacement;
-  return replacement;
+  return timer;
 }
 
 static int kqueueArmTimer(asyncOpRoot *op)
@@ -459,14 +446,12 @@ static int kqueueDisarmTimer(aioTimer *timer)
   if (result == 0 || errno == ENOENT)
     return 1;
 
-  // Do not recycle a cell whose knote could still be live. A best-effort
-  // disable prevents a wake storm; either way the next arm rotates to a fresh
-  // physical cell and stale deliveries see this cell's zero tag.
+  // Keep a failed-delete knote quiet. Its old ident cannot match a later arm
+  // of the same physical timer cell.
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DISABLE, 0, 0, 0);
   do {
     result = kevent(((kqueueBase*)timer->header.base)->kqueueFd, &event, 1, 0, 0, 0);
   } while (result == -1 && errno == EINTR);
-  timer->header.timer.broken = 1;
   return 1;
 }
 
@@ -509,19 +494,7 @@ static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event)
     eventTimerStore(event, timer, amoRelaxed);
   }
 
-  uintptr_t seqMask = (((uintptr_t)1) << timerIdentSeqBits) - 1;
-  if (!timer->header.timer.broken && ((uintptr_t)timer->fd & seqMask) != seqMask)
-    return timer;
-
-  aioTimer *replacement = kqueueNewTimer(event->header.base, tkUserEvent);
-  if (!replacement)
-    return 0;
-  replacement->event.userEvent = event;
-
-  timerUnpublish(timer);
-  timer->header.timer.broken = 1;
-  eventTimerStore(event, replacement, amoRelaxed);
-  return replacement;
+  return timer;
 }
 
 static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_t period)

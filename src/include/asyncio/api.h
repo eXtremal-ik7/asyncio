@@ -120,9 +120,8 @@ typedef struct objectHeader {
     int isSemaphore;
     struct {
       uint8_t kind;
-      uint8_t broken;
       uint8_t registered;
-      uint8_t reserved;
+      uint16_t reserved;
     } timer;
   };
   asyncBase *base;

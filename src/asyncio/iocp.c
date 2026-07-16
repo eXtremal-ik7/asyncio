@@ -59,7 +59,6 @@ static void iocpInitializeTimerState(aioTimer *timer, asyncBase *base, void *tar
   __uint64_atomic_store(&timer->header.tag.high, 0, amoRelaxed);
   objectHeaderSetType(&timer->header, ohtTimer);
   timer->header.timer.kind = (uint8_t)kind;
-  timer->header.timer.broken = 0;
   timer->header.timer.registered = 0;
   timer->header.timer.reserved = 0;
   timer->header.base = base;

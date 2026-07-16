@@ -81,7 +81,6 @@ static inline void timerInitialize(aioTimer *timer)
   __uint64_atomic_store(&timer->header.tag.high, 0, amoRelaxed);
   objectHeaderSetType(&timer->header, ohtTimer);
   timer->header.timer.kind = tkUnknown;
-  timer->header.timer.broken = 0;
   timer->header.timer.registered = 0;
   timer->header.timer.reserved = 0;
   __uint64_atomic_store(&timer->operation.deadline, 0, amoRelaxed);

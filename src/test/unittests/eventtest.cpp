@@ -1598,6 +1598,31 @@ TEST(user_event_timer, manual_activation_may_overlap_serialized_timer_control)
   deleteUserEvent(event);
 }
 
+#if defined(OS_DARWIN) || defined(OS_FREEBSD)
+TEST(user_event_timer, kqueue_ident_wrap_reuses_the_same_timer_cell)
+{
+  aioUserEvent *event = newUserEvent(gBase, 0, nullptr, nullptr);
+  ASSERT_NE(event, nullptr);
+
+  userEventStartTimer(event, 60000000, 1);
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
+  ASSERT_NE(timer, nullptr);
+  userEventStopTimer(event);
+
+  constexpr uint64_t kSequenceMask = UINT32_MAX;
+  uint64_t oldBase = (uint64_t)timer->fd & ~kSequenceMask;
+  timer->fd = (intptr_t)(oldBase | kSequenceMask);
+
+  userEventStartTimer(event, 60000000, 1);
+  EXPECT_EQ(eventTimerLoad(event, amoRelaxed), timer);
+  EXPECT_EQ((uint64_t)timer->fd & kSequenceMask, 1u);
+  EXPECT_NE((uint64_t)timer->fd & ~kSequenceMask, oldBase);
+
+  userEventStopTimer(event);
+  deleteUserEvent(event);
+}
+#endif
+
 #ifdef OS_COMMONUNIX
 TEST(user_event_timer, recycled_event_timer_belongs_to_its_new_base)
 {
