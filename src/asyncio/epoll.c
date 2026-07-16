@@ -134,11 +134,12 @@ asyncBase *epollNewAsyncBase()
       return 0;
     }
 
-    // The event fd bypasses the combiner re-arm logic (the message loop
-    // re-arms it directly), so register it here explicitly
+    // The event fd bypasses the combiner logic, so register it here
+    // explicitly. Edge-triggered: every eventfd_write raises a fresh edge,
+    // so the message loop drains the counter without a re-arm syscall
     if (epollControl(base->epollFd,
                      EPOLL_CTL_ADD,
-                     EPOLLIN | EPOLLONESHOT,
+                     EPOLLIN | EPOLLET,
                      base->eventFd,
                      kernelHandleEncode(&base->eventObject->root.header)) == -1) {
       close(base->eventFd);
@@ -169,8 +170,9 @@ void epollPostEmptyOperation(asyncBase *base)
 void epollWakeupLoop(asyncBase *base)
 {
   // Pure kick: no queue node (an empty node is the quit marker). The eventfd
-  // is EPOLLIN|EPOLLONESHOT-registered, one sleeper wakes, reads it out and
-  // re-arms; with nobody sleeping the next epoll_wait returns once immediately
+  // is EPOLLIN|EPOLLET-registered: the write raises an edge that wakes one
+  // sleeper, which drains the counter; with nobody sleeping the next
+  // epoll_wait returns once immediately
   eventfd_write(((epollBase*)base)->eventFd, 1);
 }
 
@@ -308,9 +310,11 @@ void epollNextFinishedOperation(asyncBase *base)
         case ohtObject: {
           aioObject *object = (aioObject*)header;
           if (object == localBase->eventObject) {
+            // Drain only: a write landing after this read raises a fresh
+            // edge, EAGAIN means a sibling won the drain race - neither
+            // case needs a re-arm
             eventfd_t eventValue;
             eventfd_read(localBase->eventFd, &eventValue);
-            epollControl(localBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, localBase->eventFd, envelope);
             break;
           }
 

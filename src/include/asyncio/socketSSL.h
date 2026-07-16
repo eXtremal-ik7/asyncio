@@ -40,7 +40,10 @@ typedef struct SSLOp {
 } SSLOp;
 
 
-SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket);
+// userContext: optional shared SSL_CTX (reference counted, the caller keeps
+// ownership of its reference); NULL creates a private client context with
+// certificate verification disabled
+SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket, SSL_CTX *userContext);
 void sslSocketDelete(SSLSocket *socket);
 
 socketTy sslGetSocket(const SSLSocket *socket);

@@ -273,7 +273,7 @@ static void sslSocketDestructor(aioObjectRoot *root)
 }
 
 
-SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket)
+SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket, SSL_CTX *userContext)
 {
   // The caller always provides the transport socket and thereby chooses the
   // address family, as in the http/btc/zmtp/rlpx modules
@@ -297,16 +297,21 @@ SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket)
     }
   }
 
+  if (userContext) {
+    SSL_CTX_up_ref(userContext);
+    S->sslContext = userContext;
+  } else {
 #ifdef DEPRECATEDIN_1_1_0
-  S->sslContext = SSL_CTX_new (TLS_client_method());
+    S->sslContext = SSL_CTX_new (TLS_client_method());
 #else
-  S->sslContext = SSL_CTX_new (TLS_method());
+    S->sslContext = SSL_CTX_new (TLS_method());
 #endif
-  if (!S->sslContext) {
-    objectFree(&objectPool, S, sizeof(SSLSocket));
-    return 0;
+    if (!S->sslContext) {
+      objectFree(&objectPool, S, sizeof(SSLSocket));
+      return 0;
+    }
+    SSL_CTX_set_verify(S->sslContext, SSL_VERIFY_NONE, NULL);
   }
-  SSL_CTX_set_verify(S->sslContext, SSL_VERIFY_NONE, NULL);
   S->ssl = SSL_new(S->sslContext);
   S->bioIn = BIO_new(BIO_s_mem());
   S->bioOut = BIO_new(BIO_s_mem());

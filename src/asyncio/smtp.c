@@ -317,7 +317,7 @@ static AsyncOpStatus smtpStepConnect(SMTPClient *client, SMTPOp *op)
 static AsyncOpStatus smtpStepUpgradeTls(SMTPClient *client, SMTPOp *op, int nextState)
 {
   op->State = nextState;
-  client->TlsSocket = sslSocketNew(aioGetBase(client->PlainSocket), client->PlainSocket);
+  client->TlsSocket = sslSocketNew(aioGetBase(client->PlainSocket), client->PlainSocket, 0);
   if (!client->TlsSocket)
     return aosUnknownError;
   aioSslConnect(client->TlsSocket, 0, 0, 0, smtpsConnectProc, op);
@@ -483,7 +483,7 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
   } else if (type == smtpServerSmtps) {
     aioObject *plain = newSocketIo(base, socket);
     if (plain)
-      client->TlsSocket = sslSocketNew(base, plain);
+      client->TlsSocket = sslSocketNew(base, plain, 0);
     if (!client->TlsSocket) {
       if (plain)
         deleteAioObject(plain);

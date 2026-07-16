@@ -67,7 +67,7 @@ static void sslConnectGarbageScenario(int flood)
   if (!clientIo)
     exit(2);
 
-  ctx.client = sslSocketNew(ctx.base, clientIo);
+  ctx.client = sslSocketNew(ctx.base, clientIo, nullptr);
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
@@ -135,7 +135,7 @@ static void sslConnectPeerDropScenario()
   if (!clientIo)
     exit(2);
 
-  ctx.client = sslSocketNew(ctx.base, clientIo);
+  ctx.client = sslSocketNew(ctx.base, clientIo, nullptr);
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
@@ -236,7 +236,7 @@ static void sslReadGarbageScenario(int flood)
   if (!clientIo)
     exit(2);
 
-  ctx.client = sslSocketNew(ctx.base, clientIo);
+  ctx.client = sslSocketNew(ctx.base, clientIo, nullptr);
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   // no timeout: the dead stream must produce an error, not wait for a rescue timer
@@ -314,7 +314,7 @@ TEST(ssl, write_before_handshake)
   aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
   ASSERT_NE(clientIo, nullptr);
 
-  ctx.client = sslSocketNew(gBase, clientIo);
+  ctx.client = sslSocketNew(gBase, clientIo, nullptr);
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
@@ -368,7 +368,7 @@ TEST(ssl, write_without_connect)
 
   aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
   ASSERT_NE(clientIo, nullptr);
-  SSLSocket *client = sslSocketNew(gBase, clientIo);
+  SSLSocket *client = sslSocketNew(gBase, clientIo, nullptr);
 
   aioSslWrite(client, payload, sizeof(payload)-1, afNone, 1000000, sslWriteNoConnectCb, &ctx);
   asyncLoop(gBase);
@@ -389,7 +389,7 @@ TEST(ssl, double_connect_rejected)
 
   aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
   ASSERT_NE(clientIo, nullptr);
-  SSLSocket *client = sslSocketNew(gBase, clientIo);
+  SSLSocket *client = sslSocketNew(gBase, clientIo, nullptr);
 
   HostAddress address;
   address.family = AF_INET;
@@ -407,4 +407,29 @@ TEST(ssl, double_connect_rejected)
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
   EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
     << "the second SSL connect was not rejected while the first was in flight";
+}
+
+// A caller-supplied SSL_CTX is shared, not consumed: the socket must take its
+// own reference, so the caller may drop theirs right away and several sockets
+// may share one context. ASAN turns a missing up_ref into a double free here.
+TEST(ssl, shared_user_context)
+{
+  SSL_CTX *userContext = SSL_CTX_new(TLS_client_method());
+  ASSERT_NE(userContext, nullptr);
+
+  aioObject *firstIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  aioObject *secondIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(firstIo, nullptr);
+  ASSERT_NE(secondIo, nullptr);
+
+  SSLSocket *first = sslSocketNew(gBase, firstIo, userContext);
+  SSLSocket *second = sslSocketNew(gBase, secondIo, userContext);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(first->sslContext, userContext);
+  EXPECT_EQ(second->sslContext, userContext);
+
+  SSL_CTX_free(userContext);  // the sockets keep the context alive on their own
+  sslSocketDelete(first);
+  sslSocketDelete(second);
 }
