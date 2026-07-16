@@ -1,6 +1,6 @@
 #pragma once
 
-#include "asyncioImpl.h"
+#include "reactor.h"
 
 #include <gtest/gtest.h>
 
@@ -80,16 +80,18 @@ struct TestBackend: asyncBase {
   std::vector<asyncOpRoot*> completions;
   std::vector<asyncOpRoot*> recycled;
   std::vector<asyncOpRoot*> started;
+  std::vector<aioTimer*> eventTimers;
   std::vector<uint32_t> handledSignals;
   unsigned startTimerCalls = 0;
   unsigned stopTimerCalls = 0;
-  unsigned rearmTimerCalls = 0;
+  unsigned consumeTimerCalls = 0;
   unsigned initializeTimerCalls = 0;
   unsigned wakeupCalls = 0;
   uintptr_t nextTimerTag = 1;
   uint32_t lastEventTimerGeneration = 0;
   uint64_t lastEventTimerPeriod = 0;
   std::function<int(aioUserEvent*, EventTimerUpdate, uint32_t, uint64_t)> eventTimerHook;
+  std::function<uint64_t(aioUserEvent*, uint64_t, uint32_t, uint64_t)> eventTimerConsumeHook;
   // Backs the loop-slot bitmap and timerSleep array that createAsyncBase
   // allocates for production bases.
   std::array<uintptr_t, 1> loopSlots{};
@@ -110,6 +112,7 @@ struct TestBackend: asyncBase {
     base.methodImpl.activate = activateEvent;
     base.methodImpl.wakeupLoop = wakeupLoop;
     base.methodImpl.updateEventTimer = updateEventTimer;
+    base.methodImpl.consumeEventTimerTick = consumeEventTimerTick;
     base.methodImpl.releaseUserEvent = releaseUserEvent;
     base.timerSleep = sleepSlots.data();
     base.loopThreadSlots = loopSlots.data();
@@ -128,6 +131,8 @@ struct TestBackend: asyncBase {
     destroyConcurrentQueue(&base.globalQueue);
     destroyConcurrentQueue(&base.eventPool);
     timerWheelTeardown(&base);
+    for (aioTimer *timer: eventTimers)
+      alignedFree(timer);
   }
 
   void drainCompletions() {
@@ -207,17 +212,35 @@ struct TestBackend: asyncBase {
 
   static int updateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period) {
     TestBackend &backend = from(event->header.base);
+    if (update == etuStart && !eventTimerLoad(event, amoRelaxed)) {
+      aioTimer *timer = static_cast<aioTimer*>(alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT));
+      if (!timer)
+        return 0;
+      reactorTimerInitializeSharedState(timer);
+      timer->header.base = event->header.base;
+      timer->header.timer.kind = rtkUserEvent;
+      timer->fd = -1;
+      timer->target = event;
+      eventTimerStore(event, timer, amoRelaxed);
+      backend.eventTimers.push_back(timer);
+    }
     backend.lastEventTimerGeneration = generation;
     backend.lastEventTimerPeriod = period;
     if (update == etuStart)
       backend.startTimerCalls++;
     else if (update == etuStop)
       backend.stopTimerCalls++;
-    else if (update == etuRearm)
-      backend.rearmTimerCalls++;
     if (backend.eventTimerHook)
       return backend.eventTimerHook(event, update, generation, period);
     return 1;
+  }
+
+  static uint64_t consumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period) {
+    TestBackend &backend = from(event->header.base);
+    backend.consumeTimerCalls++;
+    if (backend.eventTimerConsumeHook)
+      return backend.eventTimerConsumeHook(event, published, generation, period);
+    return published;
   }
 
   static void releaseUserEvent(aioUserEvent *event) { objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent)); }

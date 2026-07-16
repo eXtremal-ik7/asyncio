@@ -55,6 +55,7 @@ void epollStopTimer(asyncOpRoot *op);
 int epollInitializeUserEvent(aioUserEvent *event);
 int epollActivate(aioUserEvent *op);
 int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period);
+uint64_t epollConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period);
 void epollReleaseUserEvent(aioUserEvent *event);
 AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr);
@@ -63,14 +64,14 @@ AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *op);
 AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *op);
 static int epollMonotonicNow(uint64_t *nowNs);
-static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata);
+static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata, uint32_t events);
 
 static struct asyncImpl epollImpl = {combinerTaskHandler,   epollEnqueue,         epollPostEmptyOperation, epollNextFinishedOperation,
                                      epollNewAioObject,     epollNewAsyncOp,      epollCancelAsyncOp,      epollDeleteObject,
                                      epollInitializeTimer,  epollStartTimer,      epollStopTimer,          epollInitializeUserEvent,
                                      epollActivate,         epollAsyncConnect,    epollAsyncAccept,        epollAsyncRead,
                                      epollAsyncWrite,       epollAsyncReadMsg,    epollAsyncWriteMsg,      epollWakeupLoop,
-                                     epollUpdateEventTimer, epollReleaseUserEvent};
+                                     epollUpdateEventTimer, epollConsumeEventTimerTick, epollReleaseUserEvent};
 
 static int epollControl(int epollFd, int action, uint32_t events, int fd, void *ptr)
 {
@@ -315,12 +316,13 @@ void epollNextFinishedOperation(asyncBase *base)
         case ohtTimer: {
           aioTimer *timer = (aioTimer*)header;
           if (timer->header.timer.kind == rtkUserEvent) {
-            // Do not read timerfd here. The event owner serializes its
-            // read/settime/disarm sequence and rearms the consumed shot.
+            // Publish one provisional tick. The owner replaces it with the
+            // accumulated timerfd count after it has serialized against
+            // start/stop.
             uint64_t armedGeneration;
-            uint64_t armedIncarnation;
-            if (reactorTimerDecodeCountProbe(timer, generation, &armedGeneration, &armedIncarnation))
-              eventTimerSignalProbe((aioUserEvent*)timer->target, armedGeneration, armedIncarnation);
+            uint64_t armedEventGeneration;
+            if (reactorTimerDecodeCount(timer, generation, &armedGeneration, &armedEventGeneration))
+              eventTimerSignal((aioUserEvent*)timer->target, armedGeneration, armedEventGeneration, 1);
             break;
           }
 
@@ -335,13 +337,9 @@ void epollNextFinishedOperation(asyncBase *base)
             break;
           }
 
-          switch (reactorTimerDecodeDeadlineHandle(timer, generation, now, &armedGeneration, &armedObject, &armedObjectGeneration)) {
-            case rteIgnore: break;
-            case rteUserEvent: eventTimerSignalTick((aioUserEvent*)timer->target, armedGeneration, 0); break;
-            case rteExpireOperation:
-              (void)opCancel((asyncOpRoot*)timer->target, armedGeneration, aosTimeout, armedObject, armedObjectGeneration);
-              break;
-          }
+          if (reactorTimerDecodeDeadlineHandle(timer, generation, now, &armedGeneration, &armedObject, &armedObjectGeneration) ==
+              rteExpireOperation)
+            (void)opCancel((asyncOpRoot*)timer->target, armedGeneration, aosTimeout, armedObject, armedObjectGeneration);
           break;
         }
 
@@ -502,16 +500,16 @@ static int epollTimerEnsureFd(aioTimer *timer)
   return timer->fd != -1;
 }
 
-static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata)
+static int epollTimerPublish(aioTimer *timer, asyncBase *target, void *udata, uint32_t events)
 {
   asyncBase *old = timer->header.timer.registered ? timer->header.base : 0;
   epollBase *targetBase = (epollBase*)target;
   int action = old == target && old ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-  int result = epollControl(targetBase->epollFd, action, EPOLLIN | EPOLLONESHOT, (int)timer->fd, udata);
+  int result = epollControl(targetBase->epollFd, action, events, (int)timer->fd, udata);
   if (result == -1 && action == EPOLL_CTL_MOD && errno == ENOENT)
-    result = epollControl(targetBase->epollFd, EPOLL_CTL_ADD, EPOLLIN | EPOLLONESHOT, (int)timer->fd, udata);
+    result = epollControl(targetBase->epollFd, EPOLL_CTL_ADD, events, (int)timer->fd, udata);
   else if (result == -1 && action == EPOLL_CTL_ADD && errno == EEXIST)
-    result = epollControl(targetBase->epollFd, EPOLL_CTL_MOD, EPOLLIN | EPOLLONESHOT, (int)timer->fd, udata);
+    result = epollControl(targetBase->epollFd, EPOLL_CTL_MOD, events, (int)timer->fd, udata);
   if (result == -1)
     return 0;
 
@@ -555,7 +553,7 @@ void epollStartTimer(asyncOpRoot *op)
   }
 
   void *udata = reactorTimerArmDeadlineGeneration(timer, op, opGetGeneration(op), deadline);
-  if (!epollTimerPublish(timer, op->object->header.base, udata)) {
+  if (!epollTimerPublish(timer, op->object->header.base, udata, EPOLLIN | EPOLLONESHOT)) {
     epollTimerRollbackArm(timer);
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
   }
@@ -575,7 +573,7 @@ static int epollStartTimerGeneration(aioUserEvent *event, aioTimer *timer, uint3
     return 0;
   }
   void *udata = reactorTimerArmEventCountGeneration(timer, event, generation);
-  if (!epollTimerPublish(timer, event->header.base, udata)) {
+  if (!epollTimerPublish(timer, event->header.base, udata, EPOLLIN | EPOLLET)) {
     epollTimerRollbackArm(timer);
     return 0;
   }
@@ -587,9 +585,7 @@ static int epollDisarmTimer(aioTimer *timer)
   struct itimerspec its;
   memset(&its, 0, sizeof(its));
   reactorTimerDisarm(timer);
-  // settime starts a new timerfd epoch and clears the expiration count. The
-  // delivered EPOLLONESHOT shot may stay registered but cannot wake again
-  // until the next arm's checked MOD/ADD; no drain or empty-mask MOD needed.
+  // settime starts a new timerfd epoch and clears the expiration count.
   return epollTimerSettime(timer, 0, &its);
 }
 
@@ -629,10 +625,7 @@ int epollActivate(aioUserEvent *event)
 
 int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period)
 {
-  // OWNER acquired the config publication which made this lazy block usable.
-  aioEventTimerState *timerData = eventTimerDataLoad(event, amoRelaxed);
-  assert(timerData);
-  aioTimer *timer = (aioTimer*)timerData->timerId;
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   switch (update) {
     case etuStart:
       if (!timer) {
@@ -644,27 +637,30 @@ int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t
         timer->fd = -1;
         timer->target = event;
         timer->header.timer.kind = rtkUserEvent;
-        timerData->timerId = timer;
+        eventTimerStore(event, timer, amoRelaxed);
       }
       return epollStartTimerGeneration(event, timer, generation, period);
     case etuStop: {
       assert(timer && "Stopping a user-event timer which was never armed");
       return epollDisarmTimer(timer);
     }
-    case etuRearm:
-      assert(timer && "Rearming a user-event timer which was never armed");
-      return epollTimerPublish(timer, event->header.base, reactorTimerUdata(timer));
-    case etuConsume: {
-      assert(timer && "Consuming a user-event timer which was never armed");
-      uint64_t expirations;
-      ssize_t bytes;
-      do {
-        bytes = read((int)timer->fd, &expirations, sizeof(expirations));
-      } while (bytes < 0 && errno == EINTR);
-      return bytes == (ssize_t)sizeof(expirations) && expirations != 0 ? eturTick : eturApplied;
-    }
   }
   return 1;
+}
+
+uint64_t epollConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period)
+{
+  __UNUSED(generation);
+  __UNUSED(period);
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
+  uint64_t expirations;
+  ssize_t bytes;
+  do {
+    bytes = read((int)timer->fd, &expirations, sizeof(expirations));
+  } while (bytes < 0 && errno == EINTR);
+  // A competing harvested readiness may find the descriptor drained. Its
+  // provisional control-word tick remains the conservative delivery count.
+  return bytes == (ssize_t)sizeof(expirations) ? expirations : published;
 }
 
 void epollReleaseUserEvent(aioUserEvent *event)
@@ -674,20 +670,17 @@ void epollReleaseUserEvent(aioUserEvent *event)
     close((int)event->activationId);
     event->activationId = UINT64_MAX;
   }
-  aioEventTimerState *timerData = eventTimerDataLoad(event, amoAcquire);
-  aioTimer *timer = timerData ? (aioTimer*)timerData->timerId : 0;
-  if (!timer) {
-    objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
-    return;
+  aioTimer *timer = eventTimerLoad(event, amoAcquire);
+  if (timer) {
+    assert(__uint64_atomic_load(&timer->header.tag.low, amoAcquire) == 0 && "Recycling an armed user-event timer");
+    if (timer->header.timer.registered && timer->fd != -1)
+      (void)epollControl(((epollBase*)timer->header.base)->epollFd, EPOLL_CTL_DEL, 0, (int)timer->fd, 0);
+    if (timer->fd != -1)
+      close((int)timer->fd);
+    timer->fd = -1;
+    timer->header.timer.registered = 0;
+    timer->header.base = event->header.base;
   }
-  assert(__uint64_atomic_load(&timer->header.tag.low, amoAcquire) == 0 && "Recycling an armed user-event timer");
-  if (timer->header.timer.registered && timer->fd != -1)
-    (void)epollControl(((epollBase*)timer->header.base)->epollFd, EPOLL_CTL_DEL, 0, (int)timer->fd, 0);
-  if (timer->fd != -1)
-    close((int)timer->fd);
-  timer->fd = -1;
-  timer->header.timer.registered = 0;
-  timer->header.base = event->header.base;
   // The timer cell is the physical lifetime anchor for stale epoll batches;
   // keep event<->timer immutable and return them to the pool as one unit.
   objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));

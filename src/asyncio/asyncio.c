@@ -19,11 +19,10 @@
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
 
-static void eventQueueTimerDelivery(aioUserEvent *event, aioEventTimerState *timer);
-static void eventProcessQueuedTask(aioUserEvent *event, int cancellation);
-static void eventProcessCoroutineDeliveries(aioUserEvent *event, aioEventTimerState *timer);
+static void eventDeliverCallbacks(aioUserEvent *event, uintptr_t count);
+static void eventCoroutineResume(aioUserEvent *event, uintptr_t count, int manual, uint32_t generation);
 static void eventProcessCancellation(aioUserEvent *event);
-static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint64_t expectedGeneration, int terminal);
+static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint32_t requiredGeneration, int terminal);
 
 #ifdef OS_WINDOWS
 asyncBase *iocpNewAsyncBase();
@@ -85,7 +84,7 @@ void eventExecuteQueuedTask(asyncOpRoot *node)
 {
   aioUserEvent *event = eventQueueTaskEvent(node);
   currentFinishedSync = 0;
-  eventProcessQueuedTask(event, eventIsCancellationNode(node));
+  eventProcessCancellation(event);
   eventDecrementReference(event, 1);
 }
 
@@ -264,147 +263,70 @@ void setSocketBuffer(aioObject *socket, size_t bufferSize)
   }
 }
 
-static void eventTimerDeliveryReset(aioEventTimerState *timer)
-{
-  __uintptr_atomic_store(&timer->deliveryState, 0, amoRelaxed);
-  __uint_atomic_store(&timer->deliveryControl, 0, amoRelaxed);
-  timer->armed = 0;
-}
-
-static aioEventTimerState *eventTimerEnsure(aioUserEvent *event)
-{
-  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
-  if (timer)
-    return timer;
-
-  // Timer control is single-controller, so only Delete can overlap this first
-  // allocation. Delete publishes a sticky terminal bit in the embedded DWCAS
-  // word; a delayed Start may leave this paired block allocated but cannot arm
-  // the event after that publication.
-  timer = (aioEventTimerState*)alignedMalloc(sizeof(*timer), TAGGED_POINTER_ALIGNMENT);
-  if (!timer)
-    return 0;
-  memset(timer, 0, sizeof(*timer));
-  __pointer_atomic_store((void* volatile*)&event->timerData, timer, amoRelease);
-  return timer;
-}
-
 static uint32_t eventTimerNextGeneration(uint32_t generation)
 {
   generation++;
   return generation ? generation : 1;
 }
 
-static uint128 eventTimerControlSetCounter(uint128 control, uint32_t counter)
+static uint32_t eventTimerControlTickDelta(uint128 applied, uint128 current)
 {
-  control.high = (control.high & EVENT_TIMER_GENERATION_MASK) | ((uint64_t)counter << EVENT_TIMER_COUNTER_SHIFT);
-  return control;
+  return (uint32_t)(eventTimerControlCounter(current) - eventTimerControlCounter(applied));
 }
 
-static int eventTimerStopApplied(aioUserEvent *event, aioEventTimerState *timer, uint32_t generation)
+static void eventTimerStop(aioUserEvent *event, aioTimer *timer)
 {
-  if (!timer || !timer->armed)
-    return 1;
-
-  if (!event->header.base->methodImpl.updateEventTimer(event, etuStop, generation, 0))
-    return 0;
-
-  timer->armed = 0;
-  eventReferenceDropNonFinal(event, 1);
-  return 1;
-}
-
-static void eventTimerStartApplied(aioUserEvent *event, aioEventTimerState *timer, uint32_t generation, uint64_t period)
-{
-  assert(timer);
-  eventIncrementReference(event, 1);
-  if (!event->header.base->methodImpl.updateEventTimer(event, etuStart, generation, period)) {
-    eventReferenceDropNonFinal(event, 1);
+  if (!timer)
     return;
-  }
-  timer->armed = 1;
+  aioTimerUserEventState *state = eventTimerState(timer);
+  if (!state->armed)
+    return;
+
+  (void)event->header.base->methodImpl.updateEventTimer(event, etuStop, 0, 0);
+  state->armed = 0;
 }
 
-static void eventTimerProcessOwner(aioUserEvent *event, uint128 applied, uint128 current)
+static aioTimer *eventTimerApplyConfig(aioUserEvent *event, aioTimer *timer, uint128 *applied, uint128 current)
 {
-  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
-  uint32_t appliedGeneration = eventTimerControlGeneration(applied);
-  uint64_t appliedPeriod = eventTimerControlPeriod(applied);
-  uint32_t appliedCounter = eventTimerControlCounter(applied);
-  int appliedFinite = eventTimerControlIsFinite(applied);
-  int probeNeedsRearm = 0;
+  eventTimerStop(event, timer);
+
+  *applied = current;
+  uint64_t period = eventTimerControlPeriod(current);
+  if (period && !(current.low & EVENT_TIMER_TERMINAL)) {
+    uint32_t remaining = eventTimerControlIsFinite(current) ? eventTimerControlCounter(current) : 0;
+    int armed = event->header.base->methodImpl.updateEventTimer(event, etuStart, eventTimerControlGeneration(current), period);
+    timer = eventTimerLoad(event, amoRelaxed);
+    if (timer) {
+      aioTimerUserEventState *state = eventTimerState(timer);
+      state->remaining = remaining;
+      state->armed = (uint32_t)armed;
+    }
+  }
+  return timer;
+}
+
+static void eventTimerProcessUserOwner(aioUserEvent *event, uint128 applied, uint128 current)
+{
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
+  aioTimerUserEventState *state = timer ? eventTimerState(timer) : 0;
 
   for (;;) {
-    uint32_t generation = eventTimerControlGeneration(current);
-    uint32_t counter = eventTimerControlCounter(current);
-
-    if (generation != appliedGeneration) {
-      probeNeedsRearm = 0;
-      if (!eventTimerStopApplied(event, timer, appliedGeneration))
-        continue;
-
-      appliedGeneration = generation;
-      appliedPeriod = eventTimerControlPeriod(current);
-      appliedCounter = counter;
-      appliedFinite = eventTimerControlIsFinite(current);
-      if (appliedPeriod && !(current.low & EVENT_TIMER_TERMINAL))
-        eventTimerStartApplied(event, timer, generation, appliedPeriod);
+    if (eventTimerControlGeneration(current) != eventTimerControlGeneration(applied)) {
+      timer = eventTimerApplyConfig(event, timer, &applied, current);
+      state = timer ? eventTimerState(timer) : 0;
     }
 
-    if ((current.low & EVENT_TIMER_PROBE) && generation == appliedGeneration) {
-      int consumed = eturApplied;
-      if (timer && timer->armed) {
-        consumed = event->header.base->methodImpl.updateEventTimer(event, etuConsume, generation, appliedPeriod);
-        if (consumed == eturFailed)
-          continue;
-        probeNeedsRearm = 1;
-      }
-
-      uint32_t accepted = consumed == eturTick;
-      for (;;) {
-        uint128 desired = current;
-        desired.low &= ~EVENT_TIMER_PROBE;
-        if (accepted) {
-          uint32_t desiredCounter = eventTimerControlCounter(desired);
-          if (eventTimerControlIsFinite(desired)) {
-            if (desiredCounter)
-              desiredCounter--;
-            else
-              accepted = 0;
-          } else {
-            desiredCounter++;
-          }
-          desired = eventTimerControlSetCounter(desired, desiredCounter);
-        }
-
-        uint128 expected = current;
-        if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired)) {
-          current = desired;
-          if (accepted)
-            eventQueueTimerDelivery(event, timer);
-          break;
-        }
-        current = expected;
-        if (eventTimerControlGeneration(current) != generation) {
-          accepted = 0;
-          probeNeedsRearm = 0;
-          break;
-        }
-      }
+    uint32_t published = eventTimerControlTickDelta(applied, current);
+    if (published) {
+      // A user owner discards the raced input without spending the private
+      // counter. Zero tells an IOCP backend to rearm even a one-shot last tick.
+      applied.high = current.high;
+      if (state && state->armed)
+        (void)event->header.base->methodImpl.consumeEventTimerTick(event,
+                                                                  0,
+                                                                  eventTimerControlGeneration(applied),
+                                                                  eventTimerControlPeriod(applied));
       continue;
-    }
-
-    counter = eventTimerControlCounter(current);
-    if (counter != appliedCounter || probeNeedsRearm) {
-      if (appliedFinite && counter == 0) {
-        if (!eventTimerStopApplied(event, timer, generation))
-          continue;
-      } else if (timer && timer->armed) {
-        if (!event->header.base->methodImpl.updateEventTimer(event, etuRearm, generation, appliedPeriod))
-          continue;
-      }
-      appliedCounter = counter;
-      probeNeedsRearm = 0;
     }
 
     uint128 unlocked = current;
@@ -416,18 +338,63 @@ static void eventTimerProcessOwner(aioUserEvent *event, uint128 applied, uint128
   }
 }
 
-static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint64_t expectedGeneration, int terminal)
+static uintptr_t eventTimerProcessKernelOwner(aioUserEvent *event, uint128 applied, uint128 current, uint32_t *deliveryGeneration)
 {
-  if (period && !eventTimerEnsure(event))
-    return 0;
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
+  aioTimerUserEventState *state = timer ? eventTimerState(timer) : 0;
+  uintptr_t deliveryCount = 0;
 
+  for (;;) {
+    if (eventTimerControlGeneration(current) != eventTimerControlGeneration(applied)) {
+      timer = eventTimerApplyConfig(event, timer, &applied, current);
+      state = timer ? eventTimerState(timer) : 0;
+    }
+
+    uint32_t published = eventTimerControlTickDelta(applied, current);
+    if (published) {
+      uint32_t generation = eventTimerControlGeneration(applied);
+      applied.high = current.high;
+      if (!state || !state->armed)
+        continue;
+
+      uint64_t count = event->header.base->methodImpl.consumeEventTimerTick(event,
+                                                                            published,
+                                                                            generation,
+                                                                            eventTimerControlPeriod(applied));
+      if (eventTimerControlIsFinite(applied)) {
+        if (count > state->remaining)
+          count = state->remaining;
+        state->remaining -= (uint32_t)count;
+        if (!state->remaining)
+          eventTimerStop(event, timer);
+      }
+      if (count) {
+        if (!event->callback && *deliveryGeneration != generation)
+          deliveryCount = 0;
+        *deliveryGeneration = generation;
+        deliveryCount += count;
+      }
+      continue;
+    }
+
+    uint128 unlocked = current;
+    unlocked.low &= ~EVENT_TIMER_OWNER;
+    uint128 expected = current;
+    if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, unlocked))
+      return deliveryCount;
+    current = expected;
+  }
+}
+
+static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint32_t requiredGeneration, int terminal)
+{
   for (;;) {
     uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
     if ((old.low & EVENT_TIMER_TERMINAL) && !terminal)
       return 0;
 
     uint32_t generation = eventTimerControlGeneration(old);
-    if (expectedGeneration != UINT64_MAX && generation != expectedGeneration)
+    if (requiredGeneration && generation != requiredGeneration)
       return 0;
 
     uint32_t nextGeneration = eventTimerNextGeneration(generation);
@@ -439,7 +406,7 @@ static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, in
       continue;
 
     if (!(old.low & EVENT_TIMER_OWNER))
-      eventTimerProcessOwner(event, old, desired);
+      eventTimerProcessUserOwner(event, old, desired);
     return nextGeneration;
   }
 }
@@ -450,14 +417,14 @@ static void eventTimerCancelGeneration(aioUserEvent *event, uint32_t generation)
     eventTimerPublishConfig(event, 0, 0, generation, 0);
 }
 
-// Claims a delivery reference for a decoded full-generation handle. The
+// Claims a kernel reference for a decoded full-generation handle. The
 // successful DWCAS pins the complete Head before any tail access.
-int eventTimerTryClaimReference(aioUserEvent *event, uint64_t generation)
+int eventTimerTryClaimReference(aioUserEvent *event, uint64_t eventGeneration)
 {
-  uint128 expected = {__uint64_atomic_load(&event->header.tag.low, amoRelaxed), generation};
+  uint128 expected = {__uint64_atomic_load(&event->header.tag.low, amoRelaxed), eventGeneration};
   for (;;) {
     // The handle must still name a live, non-deleting event incarnation.
-    if (expected.high != generation || !(expected.low & TAG_EVENT_REF_MASK) || (expected.low & TAG_EVENT_DELETE))
+    if (expected.high != eventGeneration || !(expected.low & TAG_EVENT_REF_MASK) || (expected.low & TAG_EVENT_DELETE))
       return 0;
     uint128 desired = {expected.low + 1, expected.high};
     if (__uint128_atomic_compare_and_swap(&event->header.tag, &expected, desired))
@@ -465,92 +432,75 @@ int eventTimerTryClaimReference(aioUserEvent *event, uint64_t generation)
   }
 }
 
-static void eventTimerProcessKernelTick(aioUserEvent *event, uint32_t generation, uint64_t incarnation, int probe)
+void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t eventGeneration, uint64_t tickCount)
 {
   // A stale harvested timer may outlive logical release and may inspect only
   // Head while the rest of the pooled event is ASan-poisoned. The
-  // cheap generation prefilter and the DWCAS claim must therefore precede any
-  // access to the timer control word or event tail.
-  if (generation == 0 || eventHandleGeneration(event) != incarnation)
+  // cheap event-generation prefilter and the DWCAS claim must therefore
+  // precede any access to the timer control word or event tail.
+  if (timerGeneration == 0 || eventHandleGeneration(event) != eventGeneration)
     return;
-  if (!eventTimerTryClaimReference(event, incarnation))
+  if (!eventTimerTryClaimReference(event, eventGeneration))
     return;
 
   for (;;) {
     uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
-    if (eventTimerControlGeneration(old) != generation || !eventTimerControlPeriod(old) || (old.low & EVENT_TIMER_TERMINAL)) {
+    if (eventTimerControlGeneration(old) != timerGeneration || !eventTimerControlPeriod(old) || (old.low & EVENT_TIMER_TERMINAL)) {
       eventDecrementReference(event, 1);
       return;
     }
 
     uint128 desired = old;
     desired.low |= EVENT_TIMER_OWNER;
-    if (probe) {
-      desired.low |= EVENT_TIMER_PROBE;
-    } else {
-      uint32_t counter = eventTimerControlCounter(old);
-      if (eventTimerControlIsFinite(old)) {
-        if (!counter) {
-          eventDecrementReference(event, 1);
-          return;
-        }
-        counter--;
-      } else {
-        counter++;
-      }
-      desired = eventTimerControlSetCounter(desired, counter);
-    }
+    desired.high += (uint64_t)(uint32_t)tickCount << EVENT_TIMER_COUNTER_SHIFT;
 
     uint128 expected = old;
     if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired)) {
-      if (eventTimerControlGeneration(expected) != generation) {
+      if (eventTimerControlGeneration(expected) != timerGeneration) {
         eventDecrementReference(event, 1);
         return;
       }
       continue;
     }
 
-    if (!probe)
-      eventQueueTimerDelivery(event, eventTimerDataLoad(event, amoRelaxed));
-    if (!(old.low & EVENT_TIMER_OWNER))
-      eventTimerProcessOwner(event, old, desired);
+    if (!(old.low & EVENT_TIMER_OWNER)) {
+      uint32_t deliveryGeneration = 0;
+      uintptr_t deliveryCount = eventTimerProcessKernelOwner(event, old, desired, &deliveryGeneration);
+      if (deliveryCount) {
+        if (event->callback)
+          eventDeliverCallbacks(event, deliveryCount);
+        else
+          eventCoroutineResume(event, deliveryCount, 0, deliveryGeneration);
+      }
+    }
     eventDecrementReference(event, 1);
     return;
   }
 }
 
-void eventTimerSignalTick(aioUserEvent *event, uint32_t generation, uint64_t incarnation)
-{
-  eventTimerProcessKernelTick(event, generation, incarnation, 0);
-}
-
-void eventTimerSignalProbe(aioUserEvent *event, uint32_t generation, uint64_t incarnation)
-{
-  eventTimerProcessKernelTick(event, generation, incarnation, 1);
-}
-
-static coroutineTy *eventCoroutineClaim(aioUserEvent *event, int *waiterKind)
+static void eventCoroutineResume(aioUserEvent *event, uintptr_t count, int manual, uint32_t generation)
 {
   uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
   for (;;) {
     int kind = (int)(expected & ewtMask);
     if (kind == ewtDeleted)
-      return 0;
-    uintptr_t desired = kind ? 0 : expected + ewtCreditUnit;
+      return;
+    // A manual wake publishes cancellation before competing for an ioSleep
+    // waiter. A timer validates after loading waiter, so a failed CAS observes
+    // the winner before it can turn an old tick into a later credit.
+    if (manual && kind == ewtSleep)
+      eventTimerPublishConfig(event, 0, 0, 0, 0);
+    else if (generation && eventTimerGeneration(event) != generation)
+      return;
+    uintptr_t desired = kind ? (count - 1) * ewtCreditUnit : expected + count * ewtCreditUnit;
     if (!__uintptr_atomic_compare_exchange(&event->waiter, &expected, desired, amoAcquire))
       continue;
     if (!kind)
-      return 0;
-    *waiterKind = kind;
-    return (coroutineTy*)(expected & ~(uintptr_t)ewtMask);
-  }
-}
-
-static void eventCoroutineResume(coroutineTy *coroutine)
-{
-  if (coroutine) {
+      return;
+    coroutineTy *coroutine = (coroutineTy*)(expected & ~(uintptr_t)ewtMask);
     assert(coroutineIsMain() && "User-event coroutine delivery must run in the main coroutine");
     coroutineCall(coroutine);
+    return;
   }
 }
 
@@ -562,8 +512,10 @@ static void eventCoroutineCancel(aioUserEvent *event)
     if (kind == ewtDeleted)
       return;
     if (__uintptr_atomic_compare_exchange(&event->waiter, &old, ewtDeleted, amoAcquire)) {
-      if (kind == ewtUser || kind == ewtSleep)
-        eventCoroutineResume((coroutineTy*)(old & ~(uintptr_t)ewtMask));
+      if (kind == ewtUser || kind == ewtSleep) {
+        assert(coroutineIsMain() && "User-event coroutine cancellation must run in the main coroutine");
+        coroutineCall((coroutineTy*)(old & ~(uintptr_t)ewtMask));
+      }
       return;
     }
   }
@@ -602,126 +554,32 @@ static void eventFinishWaiter(aioUserEvent *event)
   (void)__uint64_atomic_fetch_and_add(&event->header.tag.low, 0ULL - TAG_EVENT_WAITER_COMMITTED, amoRelaxed);
 }
 
-static void eventQueueTimerDelivery(aioUserEvent *event, aioEventTimerState *timer)
-{
-  assert(timer && "Queueing delivery for an uninitialized user-event timer");
-
-  uintptr_t old = __uintptr_atomic_fetch_and_add(&timer->deliveryState, 1, amoRelease);
-  if (!old) {
-    eventIncrementReference(event, 1);
-    event->header.base->methodImpl.enqueue(event->header.base, eventDeliveryNode(event));
-  }
-}
-
-static int eventResumeCoroutine(aioUserEvent *event, int manual)
-{
-  int waiterKind = ewtNone;
-  coroutineTy *coroutine = eventCoroutineClaim(event, &waiterKind);
-  int cancelledSleep = manual && waiterKind == ewtSleep;
-  if (cancelledSleep) {
-    eventTimerPublishConfig(event, 0, 0, UINT64_MAX, 0);
-    aioEventTimerState *timer = eventTimerDataLoad(event, amoAcquire);
-    if (timer)
-      __uintptr_atomic_store(&timer->deliveryState, 0, amoRelaxed);
-  }
-  eventCoroutineResume(coroutine);
-  return cancelledSleep;
-}
-
 static void eventProcessCancellation(aioUserEvent *event)
 {
-  // The waiter sentinel stays terminal, so a late accepted producer may
-  // repopulate deliveryState but cannot turn that delivery into a credit.
+  // The waiter sentinel stays terminal, so a late kernel owner cannot turn a
+  // timer signal into a credit.
   __uintptr_atomic_store(&event->signalState, 0, amoRelaxed);
-  aioEventTimerState *timer = eventTimerDataLoad(event, amoAcquire);
-  if (timer)
-    __uintptr_atomic_store(&timer->deliveryState, 0, amoRelaxed);
   eventCoroutineCancel(event);
 }
 
-static void eventDeliverCallbacks(aioUserEvent *event, uintptr_t count, int manual)
+static void eventDeliverCallbacks(aioUserEvent *event, uintptr_t count)
 {
-  if (manual && !event->header.isSemaphore && count)
-    count = 1;
-  // Admission has already taken a delivery reference. Delete closes the
-  // event to new work but cannot retract callbacks in this accepted batch.
+  // Admission owns a reference. Delete cannot retract this accepted batch.
   aioEventCb *callback = (aioEventCb*)event->callback;
   while (count--)
     callback(event, event->arg);
 }
 
-static int eventDeliverCoroutines(aioUserEvent *event, uintptr_t count, int manual)
-{
-  int cancelledSleep = 0;
-  while (count--)
-    cancelledSleep |= eventResumeCoroutine(event, manual);
-  return cancelledSleep;
-}
-
-static void eventProcessCoroutineDeliveries(aioUserEvent *event, aioEventTimerState *timer)
-{
-  unsigned old = __uint_atomic_exchange(&timer->deliveryControl, edcRunning | edcDirty, amoRelease);
-  if (old & edcRunning)
-    return;
-
-  for (;;) {
-    __uint_atomic_exchange(&timer->deliveryControl, edcRunning, amoAcquire);
-
-    uintptr_t manual = __uintptr_atomic_exchange(&event->signalState, 0, amoAcquire);
-    uintptr_t timerCount = __uintptr_atomic_exchange(&timer->deliveryState, 0, amoAcquire);
-
-    if (event->header.isSemaphore) {
-      if (!eventDeliverCoroutines(event, manual, 1))
-        eventDeliverCoroutines(event, timerCount, 0);
-    } else if (manual) {
-      // Manual wake wins a simultaneous ioSleep expiration and cancels its
-      // accepted-but-not-yet-delivered tick before resuming the coroutine.
-      eventDeliverCoroutines(event, 1, 1);
-    } else if (timerCount) {
-      eventDeliverCoroutines(event, 1, 0);
-    }
-
-    if (__uint_atomic_compare_and_swap(&timer->deliveryControl, edcRunning, 0, amoRelease))
-      return;
-  }
-}
-
-static void eventProcessQueuedTask(aioUserEvent *event, int cancellation)
-{
-  if (cancellation) {
-    eventProcessCancellation(event);
-    return;
-  }
-
-  // Timer queue publication already carries the initialized lazy-state pointer.
-  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
-  assert(timer && "Timer delivery without initialized timer state");
-  if (!event->callback) {
-    eventProcessCoroutineDeliveries(event, timer);
-    return;
-  }
-  uintptr_t count = __uintptr_atomic_exchange(&timer->deliveryState, 0, amoAcquire);
-  if (!count)
-    return; // stale/duplicate tagged delivery node
-
-  eventDeliverCallbacks(event, count, 0);
-}
-
 void eventManualReady(aioUserEvent *event)
 {
-  if (!event->callback) {
-    aioEventTimerState *timer = eventTimerDataLoad(event, amoAcquire);
-    if (timer) {
-      eventProcessCoroutineDeliveries(event, timer);
-      return;
-    }
-  }
-
   uintptr_t count = __uintptr_atomic_exchange(&event->signalState, 0, amoAcquire);
   if (!count)
-    return; // stale/duplicate readiness envelope
+    return;
 
-  eventDeliverCallbacks(event, count, 1);
+  if (event->callback)
+    eventDeliverCallbacks(event, count);
+  else
+    eventCoroutineResume(event, count, 1, 0);
 }
 
 aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback, void *arg)
@@ -735,14 +593,17 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
   // slot, preserve its monotonic event generation, reset the tail, and publish
   // the live refcount only after initialization is complete.
   uintptr_t generation = eventHandleGeneration(event);
-  aioEventTimerState *timer = eventTimerDataLoad(event, amoRelaxed);
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   objectHeaderSetType(&event->header, ohtUserEvent);
   event->header.base = base;
   event->callback = (void*)callback;
   event->arg = arg;
   event->header.isSemaphore = isSemaphore;
-  if (timer)
-    eventTimerDeliveryReset(timer);
+  if (timer) {
+    aioTimerUserEventState *state = eventTimerState(timer);
+    state->remaining = 0;
+    state->armed = 0;
+  }
   __uint64_atomic_store(&event->timerControl.low, 0, amoRelaxed);
   __uint64_atomic_store(&event->timerControl.high, 0, amoRelaxed);
   __uintptr_atomic_store(&event->waiter, 0, amoRelaxed);
@@ -820,14 +681,14 @@ void userEventStartTimer(aioUserEvent *event, uint64_t usTimeout, int counter)
   assert(usTimeout <= (uint64_t)INT64_MAX / 10 && "A user-event timer period exceeds the supported range");
   if (eventReferenceIsDeleting(event))
     return;
-  eventTimerPublishConfig(event, usTimeout, counter, UINT64_MAX, 0);
+  eventTimerPublishConfig(event, usTimeout, counter, 0, 0);
 }
 
 void userEventStopTimer(aioUserEvent *event)
 {
   if (eventReferenceIsDeleting(event))
     return;
-  eventTimerPublishConfig(event, 0, 0, UINT64_MAX, 0);
+  eventTimerPublishConfig(event, 0, 0, 0, 0);
 }
 
 void userEventActivate(aioUserEvent *event)
@@ -853,7 +714,7 @@ void deleteUserEvent(aioUserEvent *event)
   // Arbitrate with waiter commit; acquire imports its published pointer.
   uint64_t oldTag = __uint64_atomic_fetch_and_add(&event->header.tag.low, TAG_EVENT_DELETE, amoAcquire);
 
-  eventTimerPublishConfig(event, 0, 0, UINT64_MAX, 1);
+  eventTimerPublishConfig(event, 0, 0, 0, 1);
   if (event->callback == 0 && (oldTag & TAG_EVENT_WAITER_COMMITTED)) {
     eventIncrementReference(event, 1);
     event->header.base->methodImpl.enqueue(event->header.base, eventCancellationNode(event));
@@ -1361,7 +1222,7 @@ void ioSleep(aioUserEvent *event, uint64_t usTimeout)
 
   assert(usTimeout > 0 && "ioSleep timeout must be non-zero");
   assert(usTimeout <= (uint64_t)INT64_MAX / 10 && "ioSleep timeout exceeds the supported range");
-  uint32_t generation = eventTimerPublishConfig(event, usTimeout, 1, UINT64_MAX, 0);
+  uint32_t generation = eventTimerPublishConfig(event, usTimeout, 1, 0, 0);
   if (!generation)
     return;
   if (!eventInstallWaiter(event, ewtSleep)) {

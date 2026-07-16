@@ -981,13 +981,11 @@ TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
   aioUserEvent event{};
   __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
   __uint64_atomic_store(&event.header.tag.high, (UINT64_C(1) << 40) | 5, amoRelaxed);
-  aioEventTimerState timerData{};
-  event.timerData = &timerData;
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  event.timer = &timer;
   initializeReactorTimer(timer);
   timer.target = &event;
   timer.fd = static_cast<intptr_t>(uintptr_t{2} << rtIdentSeqBits);
-  timerData.timerId = &timer;
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkUserEvent));
 
   void *udata = reactorTimerArmEventIdentGeneration(&timer, &event, 1);
@@ -1023,17 +1021,15 @@ TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
 // Same restart through the epoll/probe protocol: a loop delivery snapshots
 // only the current schedule. The owner later reads timerfd under its serial
 // ownership; eventtest covers the EAGAIN/confirmed-expiration decisions.
-TEST(timer_reactor, count_probe_snapshots_the_restarted_user_event)
+TEST(timer_reactor, count_handle_snapshots_the_restarted_user_event)
 {
   aioUserEvent event{};
   __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
   __uint64_atomic_store(&event.header.tag.high, (UINT64_C(1) << 40) | 9, amoRelaxed);
-  aioEventTimerState timerData{};
-  event.timerData = &timerData;
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
+  event.timer = &timer;
   initializeReactorTimer(timer);
   timer.target = &event;
-  timerData.timerId = &timer;
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkUserEvent));
 
   void *udata = reactorTimerArmEventCountGeneration(&timer, &event, 1);
@@ -1047,8 +1043,8 @@ TEST(timer_reactor, count_probe_snapshots_the_restarted_user_event)
 
   uint64_t armedGeneration = 0;
   uint64_t armedIncarnation = 0;
-  EXPECT_FALSE(reactorTimerDecodeCountProbe(&timer, staleGeneration, &armedGeneration, &armedIncarnation));
-  ASSERT_TRUE(reactorTimerDecodeCountProbe(&timer, currentGeneration, &armedGeneration, &armedIncarnation));
+  EXPECT_FALSE(reactorTimerDecodeCount(&timer, staleGeneration, &armedGeneration, &armedIncarnation));
+  ASSERT_TRUE(reactorTimerDecodeCount(&timer, currentGeneration, &armedGeneration, &armedIncarnation));
   EXPECT_EQ(armedIncarnation, (UINT64_C(1) << 40) | 9u);
   EXPECT_EQ(armedGeneration, 2u);
 }
@@ -1168,10 +1164,11 @@ TEST(timer_reactor, every_timer_udata_is_a_common_header_handle)
   ASSERT_TRUE(reactorTimerBindKind(&timer, rtkOperation));
   EXPECT_EQ(generationOf(reactorTimerUdata(&timer), &timer), 0u);
 
-  // Both arm flavors preserve the operation generation.
+  // Both operation arm flavors preserve the operation generation.
   EXPECT_EQ(generationOf(reactorTimerArmIdent(&timer, &op.root), &timer), opGetGeneration(&op.root));
   reactorTimerDisarm(&timer);
-  EXPECT_EQ(generationOf(reactorTimerArmCount(&timer, &op.root), &timer), opGetGeneration(&op.root));
+  EXPECT_EQ(generationOf(reactorTimerArmDeadlineGeneration(&timer, &op.root, opGetGeneration(&op.root), 1), &timer),
+            opGetGeneration(&op.root));
   reactorTimerDisarm(&timer);
 
   // User-event timer kind lives in the common-header union and the schedule
@@ -1179,13 +1176,11 @@ TEST(timer_reactor, every_timer_udata_is_a_common_header_handle)
   aioUserEvent event{};
   __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
   __uint64_atomic_store(&event.header.tag.high, 1, amoRelaxed);
-  aioEventTimerState timerData{};
-  event.timerData = &timerData;
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer eventTimer{}; // production timers come from alignedMalloc
+  event.timer = &eventTimer;
   initializeReactorTimer(eventTimer);
   eventTimer.target = &event;
   ASSERT_TRUE(reactorTimerBindKind(&eventTimer, rtkUserEvent));
-  timerData.timerId = &eventTimer;
   EXPECT_EQ(generationOf(reactorTimerArmEventIdentGeneration(&eventTimer, &event, 1), &eventTimer), 1u);
   reactorTimerDisarm(&eventTimer);
   EXPECT_EQ(generationOf(reactorTimerArmEventCountGeneration(&eventTimer, &event, 2), &eventTimer), 2u);

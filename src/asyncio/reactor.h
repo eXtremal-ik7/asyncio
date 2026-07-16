@@ -15,10 +15,9 @@
 // sequence), so an old envelope is rejected exactly. epoll has only the
 // pointer: operation timers therefore snapshot the current absolute
 // CLOCK_MONOTONIC deadline and may adopt it only after that deadline has
-// genuinely passed; no delivery reads timerfd, so a stale reader cannot drain
-// a newer arm. Periodic user events use a weaker readiness probe: their sole
-// owner serializes timerfd reads with stop/rearm, while generation and event
-// incarnation prevent publication into a different logical schedule.
+// genuinely passed. Periodic user events let their sole owner serialize
+// timerfd reads with start/stop, while generation and event incarnation
+// prevent publication into a different logical schedule.
 // Timer transitions are pure value logic over aioTimer fields and are always
 // compiled on every platform; each backend calls its own flavor, and unit
 // tests exercise both anywhere.
@@ -87,7 +86,7 @@ enum {
   rtIdentSeqBits = (int)(sizeof(uint64_t) * 4)
 };
 
-typedef struct aioTimer {
+struct aioTimer {
   // Common kernel-visible prefix. tag.low is the release/acquire publication
   // word of the current arming; 0 = the
   // disarmed sentinel, and an armed store can never equal it:
@@ -97,11 +96,16 @@ typedef struct aioTimer {
   // by the common reactor envelope. The final release store to tag.low is the
   // publication edge for target and the side fields below.
   objectHeader header;
-  // epoll operation timers: absolute CLOCK_MONOTONIC deadline in nanoseconds.
-  // This is a side field of tag and therefore follows the release/acquire
-  // snapshot protocol below. User-event timers use the serialized timerfd
-  // probe path and do not read it.
-  uint64_t armedDeadline;
+  union {
+    // epoll operation timers: absolute CLOCK_MONOTONIC deadline in
+    // nanoseconds. This side field follows the release/acquire snapshot
+    // protocol below.
+    uint64_t armedDeadline;
+
+    // User-event OWNER-only applied state. A zero remaining count denotes an
+    // unlimited timer while armed; positive public counters fit in uint32_t.
+    aioTimerUserEventState userEvent;
+  };
   // Operation timers only: owner handle captured before kernel publication.
   // Once opSetStatus wins, operation storage may recycle and these fields are
   // the only legal route to the object combiner. User-event timers leave them
@@ -111,7 +115,7 @@ typedef struct aioTimer {
   // User-event timers only: logical lifetime identity of the event. The
   // timer cell itself survives event reuse, so every delivered envelope must
   // carry this side value into the event's two-phase reference claim.
-  uint64_t armedEventIncarnation;
+  uint64_t armedEventGeneration;
   // epoll: the timerfd. kqueue: the full composite ident of the current
   // arming (kevent ident for EV_ADD/EV_DELETE); plain field, only the arming
   // side reads and writes it - arm/stop of one timer are serialized by op
@@ -123,9 +127,10 @@ typedef struct aioTimer {
   // aioUserEvent; keeping it typeless avoids forcing user events to embed a
   // fake asyncOpRoot.
   void *target;
-} aioTimer;
+};
 
 typedef char aioTimerMustStayCompact[sizeof(aioTimer) <= 2 * CACHE_LINE_SIZE ? 1 : -1];
+typedef char aioTimerUserEventStateMustFollowHeader[offsetof(aioTimer, userEvent) == sizeof(objectHeader) ? 1 : -1];
 
 static inline void reactorTimerInitializeSharedState(aioTimer *timer)
 {
@@ -139,7 +144,7 @@ static inline void reactorTimerInitializeSharedState(aioTimer *timer)
   __uint64_atomic_store(&timer->armedDeadline, 0, amoRelaxed);
   __uint64_atomic_store(&timer->armedObject, 0, amoRelaxed);
   __uint64_atomic_store(&timer->armedObjectGeneration, 0, amoRelaxed);
-  __uint64_atomic_store(&timer->armedEventIncarnation, 0, amoRelaxed);
+  __uint64_atomic_store(&timer->armedEventGeneration, 0, amoRelaxed);
 }
 
 // What a delivered kernel timer event means for the backend loop.
@@ -198,7 +203,7 @@ static inline void *reactorTimerArmIdentTargetGeneration(aioTimer *timer, void *
     __uint64_atomic_store(&timer->armedObjectGeneration, objectHeaderGeneration(&object->header), amoRelease);
   } else {
     aioUserEvent *event = (aioUserEvent*)target;
-    __uint64_atomic_store(&timer->armedEventIncarnation, eventHandleGeneration(event), amoRelease);
+    __uint64_atomic_store(&timer->armedEventGeneration, eventHandleGeneration(event), amoRelease);
   }
   // Release, not relaxed: the decode's seqlock triple acquires this store,
   // and the resulting synchronizes-with edge is what forces a reader that
@@ -245,7 +250,7 @@ static inline ReactorTimerEventAction reactorTimerDecodeIdentHandle(aioTimer *ti
                                                                     uint64_t *armedGeneration,
                                                                     aioObjectRoot**armedObject,
                                                                     uint64_t *armedObjectGeneration,
-                                                                    uint64_t *armedEventIncarnation)
+                                                                    uint64_t *armedEventGeneration)
 {
   uint64_t armed = __uint64_atomic_load(&timer->header.tag.low, amoAcquire);
   if (armed == 0 || armed != eventIdent)
@@ -255,9 +260,9 @@ static inline ReactorTimerEventAction reactorTimerDecodeIdentHandle(aioTimer *ti
     return rteIgnore;
   aioObjectRoot *object = 0;
   uint64_t objectGeneration = 0;
-  uint64_t eventIncarnation = 0;
+  uint64_t eventGeneration = 0;
   if (timer->header.timer.kind == rtkUserEvent) {
-    eventIncarnation = __uint64_atomic_load(&timer->armedEventIncarnation, amoAcquire);
+    eventGeneration = __uint64_atomic_load(&timer->armedEventGeneration, amoAcquire);
   } else {
     object = (aioObjectRoot*)__uint64_atomic_load(&timer->armedObject, amoAcquire);
     objectGeneration = __uint64_atomic_load(&timer->armedObjectGeneration, amoAcquire);
@@ -271,7 +276,7 @@ static inline ReactorTimerEventAction reactorTimerDecodeIdentHandle(aioTimer *ti
   *armedGeneration = generation;
   *armedObject = object;
   *armedObjectGeneration = objectGeneration;
-  *armedEventIncarnation = eventIncarnation;
+  *armedEventGeneration = eventGeneration;
   return timer->header.timer.kind == rtkUserEvent ? rteUserEvent : rteExpireOperation;
 }
 
@@ -282,52 +287,35 @@ static inline ReactorTimerEventAction reactorTimerDecodeIdent(aioTimer *timer,
 {
   aioObjectRoot *object;
   uint64_t objectGeneration;
-  uint64_t eventIncarnation;
-  return reactorTimerDecodeIdentHandle(timer, envelopeGeneration, eventIdent, armedGeneration, &object, &objectGeneration, &eventIncarnation);
+  uint64_t eventGeneration;
+  return reactorTimerDecodeIdentHandle(timer, envelopeGeneration, eventIdent, armedGeneration, &object, &objectGeneration, &eventGeneration);
 }
 
-// ---- epoll user-event flavor: serialized timerfd readiness probes --------
+// ---- epoll user-event flavor: serialized timerfd counts ------------------
 
 // Publish a periodic user-event arming. timerfd_settime runs before this call
-// and checked ADD/MOD runs after it. A loop delivery only snapshots the tag
-// and posts a probe; the event owner is the sole reader of timerfd and the
-// sole stop/rearm writer, so no harvested loop thread can drain a newer arm.
-static inline void *reactorTimerArmCountTargetGeneration(aioTimer *timer, void *target, ReactorTimerKind kind, uint64_t generation)
+// and checked ADD/MOD runs after it. A loop delivery snapshots this arm; the
+// event owner remains the sole reader of timerfd and the sole start/stop
+// writer, so no harvested loop thread can drain a newer arm.
+static inline void *reactorTimerArmEventCountGeneration(aioTimer *timer, aioUserEvent *event, uint64_t generation)
 {
-  assert(timer->header.timer.kind == (uint8_t)kind);
-  timer->target = target;
+  assert(timer->header.timer.kind == rtkUserEvent);
+  timer->target = event;
   reactorTimerDisarm(timer);
-  if (kind == rtkUserEvent) {
-    __uint64_atomic_store(&timer->armedEventIncarnation, eventHandleGeneration((aioUserEvent*)target), amoRelease);
-  }
+  __uint64_atomic_store(&timer->armedEventGeneration, eventHandleGeneration(event), amoRelease);
   __uint64_atomic_store(&timer->header.tag.high, generation, amoRelease);
   __uint64_atomic_store(&timer->header.tag.low, 1, amoRelease);
   return reactorTimerUdata(timer);
 }
 
-static inline void *reactorTimerArmCountGeneration(aioTimer *timer, asyncOpRoot *op, uint64_t generation)
-{
-  return reactorTimerArmCountTargetGeneration(timer, op, rtkOperation, generation);
-}
-
-static inline void *reactorTimerArmEventCountGeneration(aioTimer *timer, aioUserEvent *event, uint64_t generation)
-{
-  return reactorTimerArmCountTargetGeneration(timer, event, rtkUserEvent, generation);
-}
-
-static inline void *reactorTimerArmCount(aioTimer *timer, asyncOpRoot *op)
-{
-  return reactorTimerArmCountGeneration(timer, op, opGetGeneration(op));
-}
-
-// Snapshot the two fields needed by an epoll user-event probe. A newer arm
+// Snapshot the two fields needed by an epoll user-event readiness event. A newer arm
 // may publish its incarnation before its final tag; acquiring that side value
 // also observes the intervening tag=0, so the relaxed recheck rejects the
 // mixed snapshot by per-location coherence.
-static inline int reactorTimerDecodeCountProbe(aioTimer *timer,
-                                               uint64_t envelopeGeneration,
-                                               uint64_t *armedGeneration,
-                                               uint64_t *armedIncarnation)
+static inline int reactorTimerDecodeCount(aioTimer *timer,
+                                         uint64_t envelopeGeneration,
+                                         uint64_t *armedGeneration,
+                                         uint64_t *armedEventGeneration)
 {
   uint64_t armed = __uint64_atomic_load(&timer->header.tag.low, amoAcquire);
   if (armed == 0)
@@ -335,12 +323,12 @@ static inline int reactorTimerDecodeCountProbe(aioTimer *timer,
   uint64_t generation = __uint64_atomic_load(&timer->header.tag.high, amoAcquire);
   if (generation != envelopeGeneration)
     return 0;
-  uint64_t incarnation = __uint64_atomic_load(&timer->armedEventIncarnation, amoAcquire);
+  uint64_t eventGeneration = __uint64_atomic_load(&timer->armedEventGeneration, amoAcquire);
   if (__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != armed || objectHeaderGeneration(&timer->header) != generation)
     return 0;
   *armedGeneration = generation;
-  *armedIncarnation = incarnation;
-  return incarnation != 0;
+  *armedEventGeneration = eventGeneration;
+  return 1;
 }
 
 // epoll operation timer publication. Every arm explicitly crosses tag==0;
@@ -382,7 +370,7 @@ static inline ReactorTimerEventAction reactorTimerDecodeDeadlineHandle(aioTimer 
   *armedGeneration = generation;
   *armedObject = object;
   *armedObjectGeneration = objectGeneration;
-  return timer->header.timer.kind == rtkUserEvent ? rteUserEvent : rteExpireOperation;
+  return rteExpireOperation;
 }
 
 static inline ReactorTimerEventAction reactorTimerDecodeDeadline(aioTimer *timer,

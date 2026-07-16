@@ -44,6 +44,7 @@ void kqueueStopTimer(asyncOpRoot *op);
 int kqueueInitializeUserEvent(aioUserEvent *event);
 int kqueueActivate(aioUserEvent *op);
 int kqueueUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period);
+uint64_t kqueueConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period);
 void kqueueReleaseUserEvent(aioUserEvent *event);
 AsyncOpStatus kqueueAsyncConnect(asyncOpRoot *opptr);
 AsyncOpStatus kqueueAsyncAccept(asyncOpRoot *opptr);
@@ -57,7 +58,7 @@ static struct asyncImpl kqueueImpl = {combinerTaskHandler,    kqueueEnqueue,    
                                       kqueueInitializeTimer,  kqueueStartTimer,      kqueueStopTimer,          kqueueInitializeUserEvent,
                                       kqueueActivate,         kqueueAsyncConnect,    kqueueAsyncAccept,        kqueueAsyncRead,
                                       kqueueAsyncWrite,       kqueueAsyncReadMsg,    kqueueAsyncWriteMsg,      kqueueWakeupLoop,
-                                      kqueueUpdateEventTimer, kqueueReleaseUserEvent};
+                                      kqueueUpdateEventTimer, kqueueConsumeEventTimerTick, kqueueReleaseUserEvent};
 
 static int kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, uintptr_t ident, void *ptr)
 {
@@ -254,17 +255,19 @@ void kqueueNextFinishedOperation(asyncBase *base)
           uint64_t armedGeneration = 0;
           aioObjectRoot *armedObject = 0;
           uint64_t armedObjectGeneration = 0;
-          uint64_t armedEventIncarnation = 0;
+          uint64_t armedEventGeneration = 0;
           switch (reactorTimerDecodeIdentHandle(timer,
                                                 generation,
                                                 (uint64_t)events[n].ident,
                                                 &armedGeneration,
                                                 &armedObject,
                                                 &armedObjectGeneration,
-                                                &armedEventIncarnation)) {
+                                                &armedEventGeneration)) {
             case rteIgnore: break;
 
-            case rteUserEvent: eventTimerSignalTick((aioUserEvent*)timer->target, armedGeneration, armedEventIncarnation); break;
+            case rteUserEvent:
+              eventTimerSignal((aioUserEvent*)timer->target, armedGeneration, armedEventGeneration, (uint64_t)events[n].data);
+              break;
 
             case rteExpireOperation:
               (void)opCancel((asyncOpRoot*)timer->target, armedGeneration, aosTimeout, armedObject, armedObjectGeneration);
@@ -470,14 +473,14 @@ int kqueueActivate(aioUserEvent *event)
   return result == 0;
 }
 
-static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event, aioEventTimerState *timerData)
+static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event)
 {
-  aioTimer *timer = (aioTimer*)timerData->timerId;
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   if (!timer) {
     timer = kqueueNewTimer(event->header.base, event, rtkUserEvent);
     if (!timer)
       return 0;
-    timerData->timerId = timer;
+    eventTimerStore(event, timer, amoRelaxed);
   }
 
   uintptr_t seqMask = (((uintptr_t)1) << rtIdentSeqBits) - 1;
@@ -490,14 +493,14 @@ static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event, aioEventTimerState
 
   reactorTimerDisarm(timer);
   timer->header.timer.broken = 1;
-  timerData->timerId = replacement;
+  eventTimerStore(event, replacement, amoRelaxed);
   return replacement;
 }
 
-static int kqueueArmEventTimer(aioUserEvent *event, aioEventTimerState *timerData, uint32_t generation, uint64_t period)
+static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_t period)
 {
   struct kevent kernelEvent;
-  aioTimer *timer = kqueuePrepareEventTimer(event, timerData);
+  aioTimer *timer = kqueuePrepareEventTimer(event);
   if (!timer)
     return 0;
   void *udata = reactorTimerArmEventIdentGeneration(timer, event, generation);
@@ -516,19 +519,24 @@ static int kqueueArmEventTimer(aioUserEvent *event, aioEventTimerState *timerDat
 
 int kqueueUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period)
 {
-  // OWNER acquired the config publication which made this lazy block usable.
-  aioEventTimerState *timerData = eventTimerDataLoad(event, amoRelaxed);
-  assert(timerData);
-  aioTimer *timer = (aioTimer*)timerData->timerId;
   switch (update) {
-    case etuStart: return kqueueArmEventTimer(event, timerData, generation, period);
-    case etuStop: assert(timer && "Stopping a user-event timer which was never armed"); return kqueueDisarmTimer(timer);
-    case etuRearm:
-      // EVFILT_TIMER remains active after a periodic delivery.
-      break;
-    case etuConsume: break;
+    case etuStart: return kqueueArmEventTimer(event, generation, period);
+    case etuStop: {
+      aioTimer *timer = eventTimerLoad(event, amoRelaxed);
+      assert(timer && "Stopping a user-event timer which was never armed");
+      return kqueueDisarmTimer(timer);
+    }
   }
   return 1;
+}
+
+uint64_t kqueueConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period)
+{
+  __UNUSED(event);
+  __UNUSED(generation);
+  __UNUSED(period);
+  // EVFILT_TIMER is periodic and kevent.data already carried the exact batch.
+  return published;
 }
 
 void kqueueReleaseUserEvent(aioUserEvent *event)
@@ -539,13 +547,11 @@ void kqueueReleaseUserEvent(aioUserEvent *event)
     (void)result;
     event->activationId = UINT64_MAX;
   }
-  aioEventTimerState *timerData = eventTimerDataLoad(event, amoAcquire);
-  aioTimer *timer = timerData ? (aioTimer*)timerData->timerId : 0;
-  if (!timer) {
-    objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
-    return;
-  }
-  assert(__uint64_atomic_load(&timer->header.tag.low, amoAcquire) == 0 && "Recycling an armed user-event timer");
+#ifndef NDEBUG
+  aioTimer *timer = eventTimerLoad(event, amoAcquire);
+  if (timer)
+    assert(__uint64_atomic_load(&timer->header.tag.low, amoAcquire) == 0 && "Recycling an armed user-event timer");
+#endif
   // EV_DELETE/expiry has made the knote inert, but harvested kevents may
   // retain timer's address indefinitely. Park the immutable event/timer pair
   // together; the next incarnation continues the timer's ident sequence.
