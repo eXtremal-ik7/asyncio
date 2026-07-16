@@ -27,6 +27,7 @@
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
 #include "asyncioextras/zmtp.h"
+#include "verdict.h"
 
 #ifdef OS_WINDOWS
 #include <winsock2.h>
@@ -268,49 +269,7 @@ int main(int argc, char **argv)
   // progress for 10 seconds is a verdict, not a timeout
   uint64_t expectedOps = opsSubmitted.load();
   unsigned expectedObjects = objectsCreated.load();
-  auto lastProgressAt = std::chrono::steady_clock::now();
-  uint64_t lastProgress = ~static_cast<uint64_t>(0);
-  for (;;) {
-    uint64_t delivered = callbacksDelivered.load();
-    unsigned destroyed = destructorsFired.load();
-    if (destroyed == expectedObjects && delivered >= expectedOps)
-      break;
-
-    uint64_t progress = delivered + destroyed;
-    auto now = std::chrono::steady_clock::now();
-    if (progress != lastProgress) {
-      lastProgress = progress;
-      lastProgressAt = now;
-    } else if (now - lastProgressAt > std::chrono::seconds(10)) {
-      fprintf(stderr, "STALL: %u/%u sockets destroyed, %" PRIu64 "/%" PRIu64 " callbacks delivered\n",
-              destroyed, expectedObjects, delivered, expectedOps);
-      unsigned dumped = 0;
-      for (auto &arena : arenas) {
-        for (auto &ctx : arena) {
-          if (ctx.destructors.load() || ctx.callbacks.load() == ctx.expected.load() || !ctx.handle)
-            continue;
-          aioObjectRoot *o = ctx.handle;
-          fprintf(stderr,
-                  "  sock %p: refs=%" PRIuPTR " head=%" PRIx64 " readQ=%p writeQ=%p"
-                  " cancelIoFlag=%u deletePending=%u initialization=%" PRIxPTR " missing=%u\n",
-                  (void*)o,
-                  o->refs,
-                  __uint64_atomic_load(&o->header.tag.low, amoRelaxed),
-                  (void*)o->readQueue.head,
-                  (void*)o->writeQueue.head,
-                  o->CancelIoFlag, o->DeletePending, o->initializationOp,
-                  ctx.expected.load() - ctx.callbacks.load());
-          if (++dumped == 16)
-            break;
-        }
-        if (dumped == 16)
-          break;
-      }
-      fflush(nullptr);
-      std::_Exit(2); // loop threads may be jammed, a clean join is not coming
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  drainOrDie(arenas, expectedOps, expectedObjects, callbacksDelivered, destructorsFired, "sockets", "sock");
 
   postQuitOperation(gBase);
   for (auto &thread : loops)
@@ -331,13 +290,7 @@ int main(int argc, char **argv)
   for (auto &thread : responders)
     thread.join();
 
-  uint64_t exactlyOnceViolations = 0;
-  for (auto &arena : arenas) {
-    for (auto &ctx : arena) {
-      if (ctx.callbacks.load() != ctx.expected.load() || ctx.destructors.load() != 1)
-        exactlyOnceViolations++;
-    }
-  }
+  uint64_t exactlyOnceViolations = countExactlyOnceViolations(arenas);
 
   double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count();
   printf("status: success %" PRIu64 " timeout %" PRIu64 " canceled %" PRIu64

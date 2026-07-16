@@ -174,103 +174,32 @@ ParserResultTy httpRequestParse(HttpRequestParserState *state, httpRequestParseC
         break;
       }
 
-      int token;
-      const char *p = state->ptr;
-      if ((localResult = httpHeaderNameLookup(&p, state->end, &token)) != ParserResultOk)
-        return localResult;
-
       component.type = httpRequestDtHeaderEntry;
-      component.header.entryType = token;
-      component.header.entryName.data = state->ptr;
-      component.header.entryName.size = static_cast<size_t>(p - state->ptr);
-      ++p;
-      skipOWS(&p, state->end);
-
-      if (token == hhContentLength) {
-        size_t contentSize;
-        if ( (localResult = readDec(&p, state->end, &contentSize)) != ParserResultOk )
-          return localResult;
-        component.header.sizeValue = contentSize;
-        state->dataRemaining = contentSize;
-        if (!callback(&component, arg))
-          return ParserResultCancelled;
-      } else {
-        component.header.stringValue.data = p;
-        if ( (localResult = readUntilCRLF(&p, state->end)) != ParserResultOk )
-          return localResult;
-        component.header.stringValue.size = static_cast<size_t>(p-component.header.stringValue.data-2);
-        trimTrailingOWS(&component.header.stringValue);
-        if (token == hhTransferEncoding)
-          state->chunked = isChunkedTransferEncoding(&component.header.stringValue);
-        if (!callback(&component, arg))
-          return ParserResultCancelled;
-      }
-
-      state->ptr = p;
+      localResult = parseHeaderLine(state, &component, [&]() {
+        return callback(&component, arg) != 0;
+      });
+      if (localResult != ParserResultOk)
+        return localResult;
     }
   }
 
   if (state->state == httpRequestBody) {
     if (state->chunked) {
-      const char *p = state->ptr;
-
-      for (;;) {
-        if (state->dataRemaining) {
-          bool needMoreData = false;
-          const char *readyChunk = p;
-          size_t readyChunkSize;
-          if (canRead(p, state->end, state->dataRemaining)) {
-            readyChunkSize = state->dataRemaining;
-            p += state->dataRemaining;
-            state->dataRemaining = 0;
-            state->firstFragment = false;
-          } else {
-            readyChunkSize = std::min(state->dataRemaining, static_cast<size_t>(state->end - p));
-            p += readyChunkSize;
-            state->dataRemaining -= readyChunkSize;
-            needMoreData = true;
-          }
-
-          if (readyChunkSize) {
-            component.type = httpRequestDtData;
-            component.data.data = readyChunk;
-            component.data.size = readyChunkSize;
-            if (!callback(&component, arg))
-              return ParserResultCancelled;
-            state->ptr = p;
-          }
-
-          if (needMoreData)
-            return ParserResultNeedMoreData;
-        } else {
-          // we at begin of next chunk
-          if (!state->firstFragment) {
-            // skip CRLF for non-first chunk
-            if (!canRead(p, state->end, 2))
-              return ParserResultNeedMoreData;
-            p += 2;
-          }
-
-          size_t chunkSize;
-          if ( (localResult = readHex(&p, state->end, &chunkSize)) != ParserResultOk )
-            return localResult;
-
-          if (chunkSize == 0) {
-            if ( (localResult = skipTrailers(&p, state->end)) != ParserResultOk )
-              return localResult;
-            component.type = httpRequestDtDataLast;
-            component.data.data = p;
-            component.data.size = 0;
-            if (!callback(&component, arg))
-              return ParserResultCancelled;
-            state->state = httpRequestStLast;
-            state->ptr = p;
-            break;
-          } else {
-            state->dataRemaining = chunkSize;
-          }
-        }
-      }
+      localResult = parseChunkedBody(state, httpRequestStLast,
+        [&](const char *data, size_t size) {
+          component.type = httpRequestDtData;
+          component.data.data = data;
+          component.data.size = size;
+          return callback(&component, arg) != 0;
+        },
+        [&](const char *trailersEnd) {
+          component.type = httpRequestDtDataLast;
+          component.data.data = trailersEnd;
+          component.data.size = 0;
+          return callback(&component, arg) != 0;
+        });
+      if (localResult != ParserResultOk)
+        return localResult;
     } else {
       const char *p = state->ptr;
       if (canRead(p, state->end, state->dataRemaining)) {

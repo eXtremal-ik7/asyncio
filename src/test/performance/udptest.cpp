@@ -304,7 +304,9 @@ void test_readcb(AsyncOpStatus status,
   }
 }
 
-// Asynchronous receiver with timer callback
+// Asynchronous receiver with timer callback; serves both the plain and the
+// realtime flavor - the RT context adds afRealtime to every re-arm. One
+// predictable branch per packet next to a syscall does not affect the rates.
 void test_readcb_timer(AsyncOpStatus status,
                        aioObject *socket,
                        HostAddress address,
@@ -317,45 +319,17 @@ void test_readcb_timer(AsyncOpStatus status,
   ReceiverCtx *ctx = static_cast<ReceiverCtx*>(arg);
   if (receiverStopping(ctx))
     return;
-  
-  if (status == aosSuccess) {
-    receiverAccountPacket(ctx);
-    while (!receiverStopping(ctx) &&
-           aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afActiveOnce, 1000000, test_readcb_timer, ctx) > 0) {
-      threadPacketsNum++;
-      receiverAccountPacket(ctx);
-    }
-  } else {
-    if (!ctx->started || ctx->oldPacketsNum != ctx->packetsNum) {
-      ctx->oldPacketsNum = ctx->packetsNum;
-      aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afNone, 1000000, test_readcb_timer, ctx);
-    }
-  }
-}
 
-// Asynchronous receiver with RT timer callback
-void test_readcb_timer_rt(AsyncOpStatus status,
-                          aioObject *socket,
-                          HostAddress address,
-                          size_t transferred,
-                          void *arg)
-{
-  __UNUSED(address);
-  __UNUSED(transferred);
-  threadPacketsNum++;
-  ReceiverCtx *ctx = static_cast<ReceiverCtx*>(arg);
-  if (receiverStopping(ctx))
-    return;
-  
+  AsyncFlags rt = ctx->type == aioReceiverAsyncRT ? afRealtime : afNone;
   if (status == aosSuccess) {
     receiverAccountPacket(ctx);
     while (!receiverStopping(ctx) &&
            aioReadMsg(socket,
                       &ctx->buffer,
                       sizeof(ctx->buffer),
-                      static_cast<AsyncFlags>(afRealtime | afActiveOnce),
+                      static_cast<AsyncFlags>(rt | afActiveOnce),
                       1000000,
-                      test_readcb_timer_rt,
+                      test_readcb_timer,
                       ctx) > 0) {
       threadPacketsNum++;
       receiverAccountPacket(ctx);
@@ -363,7 +337,7 @@ void test_readcb_timer_rt(AsyncOpStatus status,
   } else {
     if (!ctx->started || ctx->oldPacketsNum != ctx->packetsNum) {
       ctx->oldPacketsNum = ctx->packetsNum;
-      aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), afRealtime, 1000000, test_readcb_timer_rt, ctx);
+      aioReadMsg(socket, &ctx->buffer, sizeof(ctx->buffer), rt, 1000000, test_readcb_timer, ctx);
     }
   }
 }
@@ -382,7 +356,7 @@ void *test_aio_receiver(void *arg)
       aioReadMsg(ctx->server, &ctx->buffer, sizeof(ctx->buffer), afNone, 1000000, test_readcb_timer, ctx);
       break;      
     case aioReceiverAsyncRT :
-      aioReadMsg(ctx->server, &ctx->buffer, sizeof(ctx->buffer), afRealtime, 1000000, test_readcb_timer_rt, ctx);
+      aioReadMsg(ctx->server, &ctx->buffer, sizeof(ctx->buffer), afRealtime, 1000000, test_readcb_timer, ctx);
       break;
     default :
       fprintf(stderr, "Invalid receiver type, exiting...\n");

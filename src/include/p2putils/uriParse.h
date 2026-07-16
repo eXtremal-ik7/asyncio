@@ -6,7 +6,6 @@
 #include <stdint.h>
 
 #include <string>
-#include <vector>
 
 // Low-level interface
 
@@ -83,8 +82,6 @@ public:
   
 public:
   void build(std::string &out);
-protected:
-    std::string data;
 };
 
 int uriParse(const char *uri, URI *data);

@@ -1,16 +1,11 @@
+#include "smtpargs.h"
+
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
 #include "asyncio/smtp.h"
 
-#include "p2putils/uriParse.h"
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-
-#if !defined(OS_WINDOWS)
-#include <netdb.h>
-#endif
 
 struct Context {
   asyncBase *Base;
@@ -44,65 +39,12 @@ void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *a
 
 int main(int argc, char **argv)
 {
-  if (argc != 10) {
-    fprintf(stderr, "usage: %s <server:port> <type> <client host> <login> <password> <from> <to> <subject> <text>\n", argv[0]);
-    return 1;
-  }
+  SmtpArgs args;
+  int parseResult = parseSmtpArgs(argc, argv, args);
+  if (parseResult != 0)
+    return parseResult;
 
   Context context;
-  const char *server = argv[1];
-  const char *type = argv[2];
-  const char *clientHost = argv[3];
-  const char *login = argv[4];
-  const char *password = argv[5];
-  const char *from = argv[6];
-  const char *to = argv[7];
-  const char *subject = argv[8];
-  const char *text = argv[9];
-
-  HostAddress smtpAddress;
-  SmtpServerType serverType = smtpServerPlain;
-
-  // Build HostAddress for server
-  {
-    URI uri;
-    if (!uriParseHostPort(server, &uri, 0) || uri.port == 0) {
-      fprintf(stderr, "Invalid server %s\nIt must have address:port format\n", server);
-      return 1;
-    }
-
-    smtpAddress.family = AF_INET;
-    smtpAddress.port = static_cast<uint16_t>(uri.port);
-    if (uri.hostType == URI::HostTypeIPv4) {
-      smtpAddress.ipv4 = uri.ipv4;
-    } else if (uri.hostType == URI::HostTypeDNS) {
-      hostent *host = gethostbyname(uri.domain.c_str());
-      if (!host || !host->h_addr) {
-        fprintf(stderr, " * cannot retrieve address of %s (gethostbyname failed)\n", uri.domain.c_str());
-        return 1;
-      }
-      memcpy(&smtpAddress.ipv4, host->h_addr, sizeof(smtpAddress.ipv4));
-    } else {
-      fprintf(stderr, "IPv6 address is not supported by this example\n");
-      return 1;
-    }
-  }
-
-  // Analyze type
-  bool startTls = false;
-  if (strcmp(type, "plain") == 0) {
-    serverType = smtpServerPlain;
-  } else if (strcmp(type, "smtps") == 0) {
-    serverType = smtpServerSmtps;
-  } else if (strcmp(type, "starttls") == 0) {
-    serverType = smtpServerPlain;
-    startTls = true;
-  } else {
-    fprintf(stderr, "Invalid server type\nAvailable types: plain, smtps, starttls\n");
-    return 1;
-  }
-
-
   initializeAsyncIo(aiNone);
   asyncBase *base = createAsyncBase(amOSDefault, 1);
 
@@ -110,10 +52,11 @@ int main(int argc, char **argv)
   localHost.ipv4 = INADDR_ANY;
   localHost.family = AF_INET;
   localHost.port = 0;
-  SMTPClient *client = smtpClientNew(base, localHost, serverType);
+  SMTPClient *client = smtpClientNew(base, localHost, args.serverType);
 
   context.Base = base;
-  aioSmtpSendMail(client, smtpAddress, startTls, clientHost, login, password, from, to, subject, text, afNone, 5000000, responseCb, &context);
+  aioSmtpSendMail(client, args.serverAddress, args.startTls, args.clientHost, args.login, args.password,
+                  args.from, args.to, args.subject, args.text, afNone, 5000000, responseCb, &context);
   asyncLoop(base);
   return 0;
 }

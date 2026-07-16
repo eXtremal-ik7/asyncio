@@ -70,30 +70,6 @@ static inline unsigned __uint_atomic_exchange(unsigned volatile *ptr,
 #endif
 }
 
-static inline unsigned __uint_atomic_fetch_or(unsigned volatile *ptr,
-                                               unsigned value,
-                                               AtomicMemoryOrder order)
-{
-#ifndef _MSC_VER // Not Microsoft compiler
-  return __atomic_fetch_or(ptr, value, order);
-#else
-  (void)order;
-  return (unsigned)InterlockedOr((volatile LONG*)ptr, (LONG)value);
-#endif
-}
-
-static inline unsigned __uint_atomic_fetch_and(unsigned volatile *ptr,
-                                                unsigned value,
-                                                AtomicMemoryOrder order)
-{
-#ifndef _MSC_VER // Not Microsoft compiler
-  return __atomic_fetch_and(ptr, value, order);
-#else
-  (void)order;
-  return (unsigned)InterlockedAnd((volatile LONG*)ptr, (LONG)value);
-#endif
-}
-
 static inline unsigned __uint_atomic_load(unsigned volatile *ptr, AtomicMemoryOrder order)
 {
 #ifndef _MSC_VER // Not Microsoft compiler
@@ -138,18 +114,6 @@ static inline uint64_t __uint64_atomic_fetch_or(uint64_t volatile *ptr,
 #else
   (void)order;
   return (uint64_t)InterlockedOr64((volatile LONG64*)ptr, (LONG64)value);
-#endif
-}
-
-static inline void __uint64_atomic_or(uint64_t volatile *ptr,
-                                      uint64_t value,
-                                      AtomicMemoryOrder order)
-{
-#ifndef _MSC_VER // Not Microsoft compiler
-  (void)__atomic_fetch_or(ptr, value, order);
-#else
-  (void)order;
-  (void)InterlockedOr64((volatile LONG64*)ptr, (LONG64)value);
 #endif
 }
 
@@ -392,18 +356,6 @@ static inline int __pointer_atomic_compare_and_swap(void *volatile *ptr,
 #else
   (void)order;
   return InterlockedCompareExchangePointer(ptr, desired, expected) == expected;
-#endif
-}
-
-static inline void *__pointer_atomic_exchange(void *volatile *ptr,
-                                              void *value,
-                                              AtomicMemoryOrder order)
-{
-#ifndef _MSC_VER // Not Microsoft compiler
-  return __atomic_exchange_n(ptr, value, order);
-#else
-  (void)order;
-  return InterlockedExchangePointer(ptr, value);
 #endif
 }
 

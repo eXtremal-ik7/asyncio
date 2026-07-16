@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <time.h>
 
-ConcurrentQueue asyncOpLinkListPool;
+static ConcurrentQueue asyncOpLinkListPool;
 
 static inline unsigned highestBitIndex64(uint64_t value)
 {
@@ -132,6 +132,28 @@ void timerWheelTeardown(asyncBase *base)
   }
 }
 
+// One publication attempt into the slot incarnation held in *observed: push
+// the link onto the observed head with the pair CAS (head and baseTick are
+// validated together) and set the occupancy bit on the empty -> non-empty
+// transition. The set runs after the publication: the window where the chain
+// exists bitless is closed by the wakeup check that follows every arm. On a
+// CAS loss *observed holds the fresh slot value and the caller decides
+// whether that incarnation is still the right target.
+static int timerWheelTryPublish(asyncBase *base, unsigned level, unsigned index,
+                                uint128 *observed, asyncOpListLink *link)
+{
+  volatile uint128 *slot = &base->timerWheel.slots[level][index];
+  link->next = (asyncOpListLink*)(uintptr_t)observed->low;
+  uint128 desired;
+  desired.low = (uint64_t)(uintptr_t)link;
+  desired.high = observed->high;
+  if (!__uint128_atomic_compare_and_swap(slot, observed, desired))
+    return 0;
+  if (!observed->low)
+    timerWheelMarkOccupied(base, level, index);
+  return 1;
+}
+
 int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
 {
   uint64_t deadline = link->deadlineTick;
@@ -156,20 +178,12 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
       unsigned index = ((unsigned)(cursor >> (TIMER_WHEEL_LEVEL_BITS * level)) + TIMER_WHEEL_SLOTS - 1) %
                        TIMER_WHEEL_SLOTS;
       volatile uint128 *slot = &base->timerWheel.slots[level][index];
-      // Routing snapshot only; the successful DWCAS below is the publication
-      // acquire and validates both possibly torn words.
+      // Routing snapshot only; the successful DWCAS inside the publish helper
+      // is the publication acquire and validates both possibly torn words.
       uint128 observed = __uint128_atomic_load_relaxed(slot);
-      for (;;) {
-        link->next = (asyncOpListLink*)(uintptr_t)observed.low;
-        uint128 desired;
-        desired.low = (uint64_t)(uintptr_t)link;
-        desired.high = observed.high;
-        if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
-          if (!observed.low)
-            timerWheelMarkOccupied(base, level, index);
-          return 1;
-        }
-      }
+      while (!timerWheelTryPublish(base, level, index, &observed, link))
+        continue;
+      return 1;
     }
 
     unsigned level = diff ? highestBitIndex64(diff) / TIMER_WHEEL_LEVEL_BITS : 0;
@@ -184,19 +198,8 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
     volatile uint128 *slot = &base->timerWheel.slots[level][index];
     uint128 observed = __uint128_atomic_load_relaxed(slot);
     while (observed.high == expectedBase) {
-      link->next = (asyncOpListLink*)(uintptr_t)observed.low;
-      uint128 desired;
-      desired.low = (uint64_t)(uintptr_t)link;
-      desired.high = expectedBase;
-      if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
-        // Activation (empty -> non-empty) sets the occupancy bit; links
-        // stacked onto a live chain ride on the bit already set. The set runs
-        // after the publication: the window where the chain exists bitless is
-        // closed by the wakeup check that follows every arm.
-        if (!observed.low)
-          timerWheelMarkOccupied(base, level, index);
+      if (timerWheelTryPublish(base, level, index, &observed, link))
         return 1;
-      }
     }
 
     // The window's incarnation is gone - its visit already ran (baseTick

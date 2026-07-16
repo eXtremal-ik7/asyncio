@@ -46,8 +46,6 @@ void epollPostEmptyOperation(asyncBase *base);
 void epollWakeupLoop(asyncBase *base);
 void epollNextFinishedOperation(asyncBase *base);
 aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data);
-asyncOpRoot *epollNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool);
-int epollCancelAsyncOp(asyncOpRoot *opptr);
 void epollDeleteObject(aioObject *object);
 void epollInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void epollStartTimer(asyncOpRoot *op);
@@ -57,21 +55,34 @@ int epollActivate(aioUserEvent *op);
 int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period);
 uint64_t epollConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period);
 void epollReleaseUserEvent(aioUserEvent *event);
-AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr);
-AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr);
-AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr);
 AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr);
-AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *op);
-AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *op);
 static int epollMonotonicNow(uint64_t *nowNs);
 static int epollTimerPublish(aioTimer *timer, asyncBase *target, uint64_t envelope, uint32_t events);
 
-static struct asyncImpl epollImpl = {combinerTaskHandler,   epollEnqueue,         epollPostEmptyOperation, epollNextFinishedOperation,
-                                     epollNewAioObject,     epollNewAsyncOp,      epollCancelAsyncOp,      epollDeleteObject,
-                                     epollInitializeTimer,  epollStartTimer,      epollStopTimer,          epollInitializeUserEvent,
-                                     epollActivate,         epollAsyncConnect,    epollAsyncAccept,        epollAsyncRead,
-                                     epollAsyncWrite,       epollAsyncReadMsg,    epollAsyncWriteMsg,      epollWakeupLoop,
-                                     epollUpdateEventTimer, epollConsumeEventTimerTick, epollReleaseUserEvent};
+static struct asyncImpl epollImpl = {
+  combinerTaskHandler,
+  epollEnqueue,
+  epollPostEmptyOperation,
+  epollNextFinishedOperation,
+  epollNewAioObject,
+  newAsyncOp,
+  cancelAsyncOp,
+  epollInitializeTimer,
+  epollStartTimer,
+  epollStopTimer,
+  epollInitializeUserEvent,
+  epollActivate,
+  connectSyscall,
+  acceptSyscall,
+  readSyscall,
+  epollAsyncWrite,
+  readMsgSyscall,
+  writeMsgSyscall,
+  epollWakeupLoop,
+  epollUpdateEventTimer,
+  epollConsumeEventTimerTick,
+  epollReleaseUserEvent
+};
 
 static int epollControl(int epollFd, int action, uint32_t events, int fd, uint64_t envelope)
 {
@@ -84,15 +95,6 @@ static int epollControl(int epollFd, int action, uint32_t events, int fd, uint64
     result = epoll_ctl(epollFd, action, fd, &ev);
   } while (result == -1 && errno == EINTR);
   return result;
-}
-
-static int getFd(EPollObject *object)
-{
-  switch (object->Object.root.header.objectType) {
-    case ioObjectDevice: return object->Object.hDevice;
-    case ioObjectSocket: return object->Object.hSocket;
-    default: return -1;
-  }
 }
 
 static uint32_t epollEvents(uint32_t ioEvents)
@@ -176,63 +178,17 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   EPollObject *fdObject =
       (object->header.objectType == ioObjectDevice || object->header.objectType == ioObjectSocket) ? (EPollObject*)object : 0;
-  uint32_t oldIoEvents = fdObject ? combinerActiveIoEvents(object) : 0;
-  uint32_t progress = sig & COMBINER_TAG_PROGRESS_MASK;
-  uint32_t ioEvents = fdObject ? progress | ((sig & COMBINER_TAG_ERROR) ? IO_EVENT_ERROR : 0) : 0;
-
-  // A dying object gets no fd readiness processing: its operations are being
-  // cancelled wholesale anyway, and its descriptor may already be closed;
-  // the error path ioctl and a rearm epoll_ctl must not run on a reused fd.
-  if (fdObject && __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
-    ioEvents = 0;
-    progress = 0;
-  }
-
-  // READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE.
-  uint32_t needStart = progress;
-
-  // Start a submitted operation before completing initialization from the
-  // accumulated event: a start delivered together with the event must
-  // enter its queue first, otherwise a failed connect cancels the queues
-  // without it and the operation would start on the dead socket afterwards
-  if (op)
-    startOperation(op, &needStart);
-
-  // By contract initialization precedes ordinary I/O, so any progress while
-  // its slot is occupied belongs to it. Drive it before the disconnect sweep
-  // so queued operations inherit a connect failure, not aosDisconnected.
-  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
-    processInitializationOp(object, &needStart);
-
-  // CANCEL/CANCELIO: a timeout/opCancel/cancelIo set the status and asked for
-  // a scan; the CANCELIO position additionally drives the CancelIoFlag sweep
-  if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
-    reapObject(object, sig, &needStart);
-
-  if (ioEvents & IO_EVENT_ERROR) {
-    // EPOLLRDHUP mapped to TAG_ERROR, cancel all operations with aosDisconnected status
-    int available;
-    int fd = getFd(fdObject);
-    ioctl(fd, FIONREAD, &available);
-    if (available == 0)
-      cancelOperationList(&object->readQueue, aosDisconnected);
-    cancelOperationList(&object->writeQueue, aosDisconnected);
-  }
-
-  if (needStart & IO_EVENT_READ)
-    executeOperationList(&object->readQueue);
-  if (needStart & IO_EVENT_WRITE)
-    executeOperationList(&object->writeQueue);
+  CombinerPassEvents pass = reactorCombinerCore(object, fdObject ? &fdObject->Object : 0, op, sig);
 
   if (fdObject && !__uint_atomic_load(&object->DeletePending, amoRelaxed)) {
-    int fd = getFd(fdObject);
+    int fd = getFd(&fdObject->Object);
     epollBase *base = (epollBase*)object->header.base;
-    uint32_t currentEvents = epollEvents(oldIoEvents);
+    uint32_t currentEvents = epollEvents(pass.oldIoEvents);
     uint32_t newEvents;
 
     // Calculate the current mask because no fd->mask map is kept. Any delivered
     // event consumes the EPOLLONESHOT shot, whatever direction it carries.
-    if (ioEvents)
+    if (pass.ioEvents)
       currentEvents = 0;
 
     newEvents = epollEvents(combinerActiveIoEvents(object));
@@ -358,25 +314,18 @@ void epollNextFinishedOperation(asyncBase *base)
             break;
           }
 
-          uint32_t eventMask = 0;
-          if (events[n].events & EPOLLIN)
-            eventMask |= IO_EVENT_READ;
-          if (events[n].events & EPOLLOUT)
-            eventMask |= IO_EVENT_WRITE;
+          // Encode kernel readiness straight into combiner tag bits (their
+          // values deliberately match IO_EVENT_*): EPOLLERR/EPOLLHUP wake
+          // both directions, EPOLLRDHUP additionally raises the error sweep.
+          uint32_t bits = 0;
+          if (events[n].events & (EPOLLIN | EPOLLERR | EPOLLHUP))
+            bits |= COMBINER_TAG_PROGRESS_READ;
+          if (events[n].events & (EPOLLOUT | EPOLLERR | EPOLLHUP))
+            bits |= COMBINER_TAG_PROGRESS_WRITE;
           if (events[n].events & EPOLLRDHUP)
-            eventMask |= IO_EVENT_ERROR;
-          if (events[n].events & (EPOLLERR | EPOLLHUP))
-            eventMask |= IO_EVENT_READ | IO_EVENT_WRITE;
-          if (eventMask) {
-            uint32_t bits = 0;
-            if (eventMask & IO_EVENT_READ)
-              bits |= COMBINER_TAG_PROGRESS_READ;
-            if (eventMask & IO_EVENT_WRITE)
-              bits |= COMBINER_TAG_PROGRESS_WRITE;
-            if (eventMask & IO_EVENT_ERROR)
-              bits |= COMBINER_TAG_ERROR | COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
+            bits |= COMBINER_TAG_ERROR | COMBINER_TAG_PROGRESS_READ | COMBINER_TAG_PROGRESS_WRITE;
+          if (bits)
             (void)combinerPushValidated(&object->root, generation, bits);
-          }
           break;
         }
       }
@@ -401,23 +350,6 @@ aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
   object->Object.buffer.offset = 0;
   object->Object.buffer.dataSize = 0;
   return &object->Object;
-}
-
-asyncOpRoot *epollNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool)
-{
-  asyncOp *op = 0;
-  if (asyncOpAlloc(base, sizeof(asyncOp), isRealTime, objectPool, objectTimerPool, (asyncOpRoot**)&op)) {
-    op->internalBuffer = 0;
-    op->internalBufferSize = 0;
-  }
-
-  return &op->root;
-}
-
-int epollCancelAsyncOp(asyncOpRoot *opptr)
-{
-  __UNUSED(opptr);
-  return 1;
 }
 
 void epollDeleteObject(aioObject *object)
@@ -464,12 +396,9 @@ void epollInitializeTimer(asyncBase *base, asyncOpRoot *op)
 
 static int epollMonotonicDeadline(uint64_t timeout, struct itimerspec *its, uint64_t *deadline)
 {
-  struct timespec now;
-  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1 || now.tv_sec < 0)
+  uint64_t nowNs;
+  if (!epollMonotonicNow(&nowNs) || timeout > UINT64_MAX / 1000ULL)
     return 0;
-  if ((uint64_t)now.tv_sec > UINT64_MAX / 1000000000ULL || timeout > UINT64_MAX / 1000ULL)
-    return 0;
-  uint64_t nowNs = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
   uint64_t delta = timeout * 1000ULL;
   if (nowNs > UINT64_MAX - delta)
     return 0;
@@ -537,13 +466,9 @@ static void epollTimerRollbackArm(aioTimer *timer)
 
 void epollStartTimer(asyncOpRoot *op)
 {
-  aioTimer *timer = (aioTimer*)op->timerId;
-  if (!timer) {
-    // The paired cell is created once per pooled slot; a constructor-time
-    // allocation failure must not disable this slot's timeouts forever.
-    epollInitializeTimer(op->object->header.base, op);
-    timer = (aioTimer*)op->timerId;
-  }
+  // The paired cell is created once per pooled slot; a constructor-time
+  // allocation failure must not disable this slot's timeouts forever.
+  aioTimer *timer = (aioTimer*)opEnsureTimerCell(op);
   if (!timer) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
@@ -703,159 +628,18 @@ void epollReleaseUserEvent(aioUserEvent *event)
   objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
 }
 
-AsyncOpStatus epollAsyncConnect(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((EPollObject*)op->root.object);
-  if (op->state == 0) {
-    op->state = 1;
-    struct sockaddr_storage sa;
-    socklen_t saLen = hostAddressToSockaddr(&op->host, &sa);
-    int result = connect(fd, (struct sockaddr*)&sa, saLen);
-    if (result == -1 && errno != EINPROGRESS)
-      return aosUnknownError;
-    else
-      return aosPending;
-  } else {
-    int error;
-    socklen_t size = sizeof(error);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size);
-    return (error == 0) ? aosSuccess : aosUnknownError;
-  }
-}
-
-AsyncOpStatus epollAsyncAccept(asyncOpRoot *opptr)
-{
-  struct sockaddr_storage clientAddr;
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((EPollObject*)op->root.object);
-  socklen_t clientAddrSize = sizeof(clientAddr);
-  op->acceptSocket = accept(fd, (struct sockaddr*)&clientAddr, &clientAddrSize);
-
-  if (op->acceptSocket != -1) {
-    int current = fcntl(op->acceptSocket, F_GETFL);
-    fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current);
-    sockaddrToHostAddress(&clientAddr, &op->host);
-    return aosSuccess;
-  } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EPROTO || errno == EINTR) {
-    // The connection can be gone from the backlog by the time accept runs
-    // (stolen by another thread, aborted by the peer): wait for the next one.
-    // Resource exhaustion (EMFILE/ENFILE/ENOBUFS) must NOT retry: the
-    // backlog stays readable and the retry loop would spin hot
-    return aosPending;
-  } else {
-    return aosUnknownError;
-  }
-}
-
-AsyncOpStatus epollAsyncRead(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  EPollObject *object = (EPollObject*)op->root.object;
-  struct ioBuffer *sb = &object->Object.buffer;
-  int fd = getFd(object);
-
-  if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize))
-    return aosSuccess;
-
-  if (op->transactionSize <= object->Object.buffer.totalSize) {
-    while (op->bytesTransferred < op->transactionSize) {
-      ssize_t bytesRead = read(fd, sb->ptr, sb->totalSize);
-      if (bytesRead == 0)
-        return aosDisconnected;
-      else if (bytesRead < 0)
-        return socketStatusFromErrno(errno);
-      sb->dataSize = (size_t)bytesRead;
-
-      if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize) || !(opptr->flags & afWaitAll))
-        break;
-    }
-
-    return aosSuccess;
-  } else {
-    ssize_t bytesRead = read(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
-
-    if (bytesRead > 0) {
-      op->bytesTransferred += (size_t)bytesRead;
-      if (op->root.flags & afWaitAll && op->bytesTransferred < op->transactionSize)
-        return aosPending;
-      else
-        return aosSuccess;
-    } else if (bytesRead == 0) {
-      return op->transactionSize - op->bytesTransferred > 0 ? aosDisconnected : aosSuccess;
-    } else {
-      return socketStatusFromErrno(errno);
-    }
-  }
-}
-
 AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
-  EPollObject *object = (EPollObject*)op->root.object;
+  aioObject *object = (aioObject*)op->root.object;
   int fd = getFd(object);
 
+  // Linux has no per-descriptor SIGPIPE suppression, so sockets take an
+  // explicit MSG_NOSIGNAL send; pipes go through the masking write helper.
   ssize_t bytesWritten;
-  if (object->Object.root.header.objectType == ioObjectSocket) {
+  if (object->root.header.objectType == ioObjectSocket)
     bytesWritten = send(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred, MSG_NOSIGNAL);
-  } else if (object->Object.needSigpipeGuard && !sigpipeIgnored) {
-    struct SigpipeGuard guard;
-    sigpipeGuardEnter(&guard);
-    bytesWritten = write(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
-    sigpipeGuardLeave(&guard, bytesWritten == -1 && errno == EPIPE);
-  } else {
-    bytesWritten = write(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
-  }
-  if (bytesWritten > 0) {
-    op->bytesTransferred += (size_t)bytesWritten;
-    if (op->root.flags & afWaitAll && op->bytesTransferred < op->transactionSize)
-      return aosPending;
-    else
-      return aosSuccess;
-  } else if (bytesWritten == 0) {
-    return op->transactionSize - op->bytesTransferred > 0 ? aosDisconnected : aosSuccess;
-  } else {
-    return socketStatusFromErrno(errno);
-  }
-}
-
-AsyncOpStatus epollAsyncReadMsg(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((EPollObject*)op->root.object);
-
-  struct sockaddr_storage source;
-  struct iovec iov;
-  struct msghdr msg;
-  memset(&msg, 0, sizeof(msg));
-  iov.iov_base = op->buffer;
-  iov.iov_len = op->transactionSize;
-  msg.msg_name = &source;
-  msg.msg_namelen = sizeof(source);
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  ssize_t result = recvmsg(fd, &msg, 0);
-  if (result != -1) {
-    sockaddrToHostAddress(&source, &op->host);
-    op->bytesTransferred = (size_t)result;
-    // MSG_TRUNC: the datagram did not fit, the kernel dropped its tail
-    return (msg.msg_flags & MSG_TRUNC) ? aosBufferTooSmall : aosSuccess;
-  } else {
-    return socketStatusFromErrno(errno);
-  }
-}
-
-AsyncOpStatus epollAsyncWriteMsg(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((EPollObject*)op->root.object);
-
-  struct sockaddr_storage remoteAddress;
-  socklen_t addrLen = hostAddressToSockaddr(&op->host, &remoteAddress);
-  ssize_t result = sendto(fd, op->buffer, op->transactionSize, 0, (struct sockaddr*)&remoteAddress, addrLen);
-  if (result != -1) {
-    return aosSuccess;
-  }
-
-  return socketStatusFromErrno(errno);
+  else
+    bytesWritten = guardedWrite(object, fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
+  return transferStatus(op, bytesWritten);
 }

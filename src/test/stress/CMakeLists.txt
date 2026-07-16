@@ -1,13 +1,3 @@
-set(CMAKE_CXX_STANDARD 17)
-
-if (WIN32)
-  set(PLATFORM_LIBRARIES ws2_32 mswsock)
-endif()
-
-if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
-endif()
-
 add_executable(queuetest queuetest.cpp)
 target_link_libraries(queuetest asyncio-0.5 ${PLATFORM_LIBRARIES})
 

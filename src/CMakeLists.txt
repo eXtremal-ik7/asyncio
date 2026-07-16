@@ -63,7 +63,6 @@ endif()
 
 if (ASYNCIO_ENABLE_ZMTP)
   cxxpm_add_package(zeromq default)
-  set(Sources ${Sources} zmtp.cpp)
 endif()
 
 set(CMAKE_DEBUG_POSTFIX d)
@@ -83,10 +82,7 @@ if (WIN32)
     -D__STDC_LIMIT_MACROS
     -D__STDC_FORMAT_MACROS
   )
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(OS_LINUX 1)
-  set(OS_COMMONUNIX 1)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
   # Android is a Linux kernel (epoll + POSIX sockets); reuse the Linux paths.
   set(OS_LINUX 1)
   set(OS_COMMONUNIX 1)
@@ -154,7 +150,6 @@ configure_file(
 
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/config4cpp/include
   ${CMAKE_CURRENT_BINARY_DIR}/include
 )
 

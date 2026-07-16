@@ -8,6 +8,7 @@ extern "C" {
 #include "asyncio/api.h"
 #include "asyncio/ringBuffer.h"
 #include "atomic128.h"
+#include <stdlib.h>
 #ifndef OS_WINDOWS
 #include <errno.h>
 #include <signal.h>
@@ -89,7 +90,6 @@ typedef void postEmptyOperationTy(asyncBase*);
 typedef void loopWakeupTy(asyncBase*);
 typedef void nextFinishedOperationTy(asyncBase*);
 typedef aioObject *newAioObjectTy(asyncBase*, IoObjectTy, void*);
-typedef void deleteObjectTy(aioObject*);
 typedef void startTimerTy(asyncOpRoot*);
 typedef void stopTimerTy(asyncOpRoot*);
 typedef int initializeUserEventTy(aioUserEvent*);
@@ -120,7 +120,6 @@ struct asyncImpl {
   newAioObjectTy *newAioObject;
   newAsyncOpTy *newAsyncOp;
   aioCancelProc *cancelAsyncOp;
-  deleteObjectTy *deleteObject;
   initializeTimerTy *initializeTimer;
   startTimerTy *startTimer;
   stopTimerTy *stopTimer;
@@ -142,7 +141,6 @@ struct asyncImpl {
 };
 
 struct asyncBase {
-  enum AsyncMethod method;
   struct asyncImpl methodImpl;
   struct ConcurrentQueue globalQueue;
   // User-event storage is base-local. A pooled slot can therefore never keep
@@ -309,6 +307,32 @@ struct asyncOp {
   void *internalBuffer;
   size_t internalBufferSize;
 };
+
+__NO_UNUSED_FUNCTION_BEGIN
+// Lazily (re)creates the backend timer cell backing op->timerId; the cell is
+// pooled together with the operation, so a successful creation is permanent.
+// Returns the cell, or null when the backend could not allocate one - the
+// caller must fail the operation instead of arming it.
+static inline void *opEnsureTimerCell(asyncOpRoot *op)
+{
+  if (!op->timerId) {
+    asyncBase *base = op->object->header.base;
+    base->methodImpl.initializeTimer(base, op);
+  }
+  return op->timerId;
+}
+
+// Grows an operation-owned scratch buffer to at least `required` bytes. A
+// null buffer always has zero size, so plain realloc covers the first
+// allocation; the buffer never shrinks and is reused by pooled operations.
+static inline void asyncOpEnsureInternalBuffer(void **buffer, size_t *bufferSize, size_t required)
+{
+  if (*bufferSize < required) {
+    *buffer = realloc(*buffer, required);
+    *bufferSize = required;
+  }
+}
+__NO_UNUSED_FUNCTION_END
 
 typedef struct aioTimer aioTimer;
 

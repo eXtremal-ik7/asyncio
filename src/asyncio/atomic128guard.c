@@ -14,11 +14,6 @@ uint128 atomic128GuardLoad(const volatile uint128 *ptr)
   return __uint128_atomic_load(ptr);
 }
 
-uint128 atomic128GuardExchange(volatile uint128 *ptr, uint128 value)
-{
-  return __uint128_atomic_exchange(ptr, value);
-}
-
 int atomic128GuardCasRelaxed(volatile uint128 *ptr,
                              uint128 *expected,
                              uint128 desired)
@@ -29,10 +24,4 @@ int atomic128GuardCasRelaxed(volatile uint128 *ptr,
 uint128 atomic128GuardLoadRelaxed(const volatile uint128 *ptr)
 {
   return __uint128_atomic_load_relaxed(ptr);
-}
-
-uint128 atomic128GuardExchangeRelaxed(volatile uint128 *ptr,
-                                      uint128 value)
-{
-  return __uint128_atomic_exchange_relaxed(ptr, value);
 }

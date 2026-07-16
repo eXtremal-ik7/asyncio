@@ -6,6 +6,9 @@
 // its beginning once more data arrives.
 
 #include "p2putils/CommonParse.h"
+#include "p2putils/HttpParseCommon.h"
+#include "HttpTokens.h"
+#include <algorithm>
 #include <stdint.h>
 #include <string.h>
 
@@ -168,5 +171,117 @@ static inline ParserResultTy skipTrailers(const char **ptr, const char *end)
     ParserResultTy result = readUntilCRLF(&p, end);
     if (result != ParserResultOk)
       return result;
+  }
+}
+
+// One header line shared by the response and request parsers: the name-token
+// lookup plus the Content-Length / string-value branch. The caller sets
+// component->type once and keeps the end-of-headers (empty line) handling to
+// itself; emit() returning false becomes ParserResultCancelled (the response
+// parser cannot cancel, its emitter always returns true and the branch folds
+// away at instantiation).
+template<typename State, typename Component, typename Emit>
+static ParserResultTy parseHeaderLine(State *state, Component *component, Emit emit)
+{
+  ParserResultTy result;
+  int token;
+  const char *p = state->ptr;
+  if ((result = httpHeaderNameLookup(&p, state->end, &token)) != ParserResultOk)
+    return result;
+
+  component->header.entryType = token;
+  component->header.entryName.data = state->ptr;
+  component->header.entryName.size = static_cast<size_t>(p - state->ptr);
+  ++p;
+  skipOWS(&p, state->end);
+
+  if (token == hhContentLength) {
+    size_t contentSize;
+    if ((result = readDec(&p, state->end, &contentSize)) != ParserResultOk)
+      return result;
+    component->header.sizeValue = contentSize;
+    state->dataRemaining = contentSize;
+    if (!emit())
+      return ParserResultCancelled;
+  } else {
+    component->header.stringValue.data = p;
+    if ((result = readUntilCRLF(&p, state->end)) != ParserResultOk)
+      return result;
+    component->header.stringValue.size = static_cast<size_t>(p - component->header.stringValue.data - 2);
+    trimTrailingOWS(&component->header.stringValue);
+    if (token == hhTransferEncoding)
+      state->chunked = isChunkedTransferEncoding(&component->header.stringValue);
+    if (!emit())
+      return ParserResultCancelled;
+  }
+
+  state->ptr = p;
+  return ParserResultOk;
+}
+
+// The chunked-body machine shared by the response and request parsers: data
+// of the current chunk (emitted as it arrives), the CRLF closing a non-first
+// chunk, the size line of the next one, and the zero chunk with its trailers.
+// The parsers differ only in the emitted component constants and in the
+// cancellation contract, so both variations live in the emit callables (a
+// false return becomes ParserResultCancelled); lastState is the parser's
+// terminal state, stored once the zero chunk is consumed. The non-chunked
+// body branches genuinely differ between the parsers and stay with them.
+template<typename State, typename StateValue, typename EmitFragment, typename EmitLast>
+static ParserResultTy parseChunkedBody(State *state, StateValue lastState, EmitFragment emitFragment, EmitLast emitLast)
+{
+  ParserResultTy result;
+  const char *p = state->ptr;
+
+  for (;;) {
+    if (state->dataRemaining) {
+      bool needMoreData = false;
+      const char *readyChunk = p;
+      size_t readyChunkSize;
+      if (canRead(p, state->end, state->dataRemaining)) {
+        readyChunkSize = state->dataRemaining;
+        p += state->dataRemaining;
+        state->dataRemaining = 0;
+        state->firstFragment = false;
+      } else {
+        readyChunkSize = std::min(state->dataRemaining, static_cast<size_t>(state->end - p));
+        p += readyChunkSize;
+        state->dataRemaining -= readyChunkSize;
+        needMoreData = true;
+      }
+
+      if (readyChunkSize) {
+        if (!emitFragment(readyChunk, readyChunkSize))
+          return ParserResultCancelled;
+        state->ptr = p;
+      }
+
+      if (needMoreData)
+        return ParserResultNeedMoreData;
+    } else {
+      // we at begin of next chunk
+      if (!state->firstFragment) {
+        // skip CRLF for non-first chunk
+        if (!canRead(p, state->end, 2))
+          return ParserResultNeedMoreData;
+        p += 2;
+      }
+
+      size_t chunkSize;
+      if ((result = readHex(&p, state->end, &chunkSize)) != ParserResultOk)
+        return result;
+
+      if (chunkSize == 0) {
+        if ((result = skipTrailers(&p, state->end)) != ParserResultOk)
+          return result;
+        if (!emitLast(p))
+          return ParserResultCancelled;
+        state->state = lastState;
+        state->ptr = p;
+        return ParserResultOk;
+      }
+
+      state->dataRemaining = chunkSize;
+    }
   }
 }

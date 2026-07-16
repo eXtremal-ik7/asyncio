@@ -65,15 +65,13 @@ static void httpOversizedHeaderScenario()
   if (!startTCPServer(ctx.base, httpOversizedHeaderAcceptCb, &ctx, gPort))
     exit(2);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  if (socketBind(clientSocket, &address) != 0)
+  aioObject *clientIo = initializeTCPClient(ctx.base, nullptr, nullptr, 0);
+  if (!clientIo)
     exit(2);
 
-  ctx.client = httpClientNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  ctx.client = httpClientNew(ctx.base, clientIo);
+  HostAddress address;
+  address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   aioHttpConnect(ctx.client, &address, nullptr, 3000000, httpOversizedHeaderConnectCb, &ctx);

@@ -479,6 +479,32 @@ void startOperation(asyncOpRoot *op, uint32_t *needStart)
   *needStart |= (list->head && list->head->running == arWaiting) ? tag : 0;
 }
 
+// Survivor accumulator shared by the positional sweeps (reapQueue and
+// cancelOperationList): survivors keep their relative order in a freshly
+// linked queue, everything else was released in place. The caller clears the
+// op's links before appending, so a released op never leaves a stale prev
+// behind.
+typedef struct {
+  asyncOpRoot *head;
+  asyncOpRoot *tail;
+} SurvivorList;
+
+static inline void survivorAppend(SurvivorList *survivors, asyncOpRoot *op)
+{
+  op->executeQueue.prev = survivors->tail;
+  if (survivors->tail)
+    survivors->tail->executeQueue.next = op;
+  else
+    survivors->head = op;
+  survivors->tail = op;
+}
+
+static inline void survivorCommit(List *list, const SurvivorList *survivors)
+{
+  list->head = survivors->head;
+  list->tail = survivors->tail;
+}
+
 // Reap terminal operations from one queue positionally: release the ones with no
 // I/O in flight, hold an in-flight op (cancelMethod == 0) on its head until its
 // late completion. Pending operations are left untouched. The queue is rebuilt
@@ -486,7 +512,7 @@ void startOperation(asyncOpRoot *op, uint32_t *needStart)
 static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
 {
   asyncOpRoot *op = list->head;
-  asyncOpRoot *keptHead = 0, *keptTail = 0;
+  SurvivorList survivors = {0, 0};
   while (op) {
     asyncOpRoot *next = op->executeQueue.next;
     int keep = 0, release = 0;
@@ -506,22 +532,15 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
     }
 
     op->executeQueue.prev = op->executeQueue.next = 0;
-    if (keep) {
-      op->executeQueue.prev = keptTail;
-      if (keptTail)
-        keptTail->executeQueue.next = op;
-      else
-        keptHead = op;
-      keptTail = op;
-    } else if (release) {
+    if (keep)
+      survivorAppend(&survivors, op);
+    else if (release)
       opRelease(op, status, 0);
-    }
     op = next;
   }
 
-  list->head = keptHead;
-  list->tail = keptTail;
-  if (keptHead && keptHead->running == arWaiting)
+  survivorCommit(list, &survivors);
+  if (survivors.head && survivors.head->running == arWaiting)
     *needStart |= tag;
 }
 
@@ -571,10 +590,8 @@ void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
 
 void opRelease(asyncOpRoot *op, AsyncOpStatus status, List *executeList)
 {
-  if (op->timerId && status != aosTimeout) {
-    if (op->flags & afRealtime)
-      op->object->header.base->methodImpl.stopTimer(op);
-  }
+  if (op->timerId && status != aosTimeout && (op->flags & afRealtime))
+    op->object->header.base->methodImpl.stopTimer(op);
 
   if (executeList)
     eqRemove(executeList, op);
@@ -639,7 +656,7 @@ void cancelOperationList(List *list, AsyncOpStatus status)
   // most the head survives; the queue is rebuilt from the survivors rather than
   // wiped.
   asyncOpRoot *op = list->head;
-  asyncOpRoot *keptHead = 0, *keptTail = 0;
+  SurvivorList survivors = {0, 0};
   while (op) {
     asyncOpRoot *next = op->executeQueue.next;
     int keep = 0, release = 0;
@@ -662,21 +679,14 @@ void cancelOperationList(List *list, AsyncOpStatus status)
     }
 
     op->executeQueue.prev = op->executeQueue.next = 0;
-    if (keep) {
-      op->executeQueue.prev = keptTail;
-      if (keptTail)
-        keptTail->executeQueue.next = op;
-      else
-        keptHead = op;
-      keptTail = op;
-    } else if (release) {
+    if (keep)
+      survivorAppend(&survivors, op);
+    else if (release)
       opRelease(op, status, 0);
-    }
     op = next;
   }
 
-  list->head = keptHead;
-  list->tail = keptTail;
+  survivorCommit(list, &survivors);
 }
 
 int opCancel(asyncOpRoot *op, uintptr_t generation, AsyncOpStatus status, aioObjectRoot *object, uintptr_t objectGeneration)
@@ -721,19 +731,15 @@ int executeGlobalQueue(asyncBase *base)
       continue;
     }
 
-    switch (op->opCode) {
-      default: {
-        assert(opGetStatus(op) != aosPending && "finishing pending operation!");
-        currentFinishedSync = 0;
-        if (op->flags & afCoroutine) {
-          assert(coroutineIsMain() && "Execute global queue from non-main coroutine");
-          coroutineCall((coroutineTy*)op->finishMethod);
-        } else {
-          if (op->callback)
-            op->finishMethod(op);
-          releaseAsyncOp(op);
-        }
-      }
+    assert(opGetStatus(op) != aosPending && "finishing pending operation!");
+    currentFinishedSync = 0;
+    if (op->flags & afCoroutine) {
+      assert(coroutineIsMain() && "Execute global queue from non-main coroutine");
+      coroutineCall((coroutineTy*)op->finishMethod);
+    } else {
+      if (op->callback)
+        op->finishMethod(op);
+      releaseAsyncOp(op);
     }
   }
 
@@ -826,6 +832,20 @@ static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
   return 0;
 }
 
+// One captured Head entry: the shared DELETE handling runs first - it destroys
+// the object and the drain must stop (non-zero return, nothing may touch the
+// object afterwards) - otherwise the backend task handler runs the node/tag.
+static inline int combinerDispatch(aioObjectRoot *object,
+                                   combinerTaskHandlerTy *taskHandler,
+                                   asyncOpRoot *op,
+                                   uint32_t tag)
+{
+  if (combinerTaskHandlerCommon(object, tag))
+    return 1;
+  taskHandler(object, op, tag);
+  return 0;
+}
+
 void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr forRun)
 {
   AsyncOpTaggedPtr stubOp = taggedAsyncOpStub();
@@ -835,9 +855,8 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
     asyncOpRoot *op;
     uint32_t tag;
     taggedAsyncOpDecode(forRun, &op, &tag);
-    if (combinerTaskHandlerCommon(object, tag))
+    if (combinerDispatch(object, combinerTaskHandler, op, tag))
       return;
-    combinerTaskHandler(object, op, tag);
   }
 
   for (;;) {
@@ -897,9 +916,8 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       taggedAsyncOpDecode(tail, &current, &tag);
       if (current == (asyncOpRoot*)stubOp.data)
         current = 0;
-      if (combinerTaskHandlerCommon(object, tag))
+      if (combinerDispatch(object, combinerTaskHandler, current, tag))
         return;
-      combinerTaskHandler(object, current, tag);
     }
 
     while (reversed.data) {
@@ -907,9 +925,8 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       uint32_t tag;
       taggedAsyncOpDecode(reversed, &current, &tag);
       reversed = current->next;
-      if (combinerTaskHandlerCommon(object, tag))
+      if (combinerDispatch(object, combinerTaskHandler, current, tag))
         return;
-      combinerTaskHandler(object, current, tag);
     }
   }
 }

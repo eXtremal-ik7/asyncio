@@ -9,6 +9,24 @@
 
 namespace {
 
+// Asserts that a parsed fragment equals the expected string; the size check
+// stays first as the guard of the memcmp against out-of-bounds reads.
+void expectData(const Raw &data, const char *expected)
+{
+  ASSERT_EQ(data.size, strlen(expected));
+  ASSERT_EQ(memcmp(data.data, expected, strlen(expected)), 0);
+}
+
+// Single-buffer request parse driver: init, hand over the whole buffer,
+// return the parser verdict.
+ParserResultTy parseRequest(const void *request, size_t size, httpRequestParseCb *callback, void *arg)
+{
+  HttpRequestParserState state;
+  httpRequestParserInit(&state);
+  httpRequestSetBuffer(&state, request, size);
+  return httpRequestParse(&state, callback, arg);
+}
+
 void httpRequestCb1Impl(HttpRequestComponent *component, void *arg)
 {
   int *callNum = static_cast<int*>(arg);
@@ -17,26 +35,20 @@ void httpRequestCb1Impl(HttpRequestComponent *component, void *arg)
     ASSERT_EQ(component->method, hmGet);
   } else if (*callNum == 1) {
     ASSERT_EQ(component->type, httpRequestDtUriPathElement);
-    ASSERT_EQ(component->data.size, strlen("path"));
-    ASSERT_EQ(memcmp(component->data.data, "path", strlen("path")), 0);
+    expectData(component->data, "path");
   } else if (*callNum == 2) {
     ASSERT_EQ(component->type, httpRequestDtUriPathElement);
-    ASSERT_EQ(component->data.size, strlen("to"));
-    ASSERT_EQ(memcmp(component->data.data, "to", strlen("to")), 0);
+    expectData(component->data, "to");
   } else if (*callNum == 3) {
     ASSERT_EQ(component->type, httpRequestDtUriPathElement);
-    ASSERT_EQ(component->data.size, strlen("page"));
-    ASSERT_EQ(memcmp(component->data.data, "page", strlen("page")), 0);
+    expectData(component->data, "page");
   } else if (*callNum == 4) {
     ASSERT_EQ(component->type, httpRequestDtUriQueryElement);
-    ASSERT_EQ(component->data.size, strlen("qname"));
-    ASSERT_EQ(memcmp(component->data.data, "qname", strlen("qname")), 0);
-    ASSERT_EQ(component->data2.size, strlen("value"));
-    ASSERT_EQ(memcmp(component->data2.data, "value", strlen("value")), 0);
+    expectData(component->data, "qname");
+    expectData(component->data2, "value");
   } else if (*callNum == 5) {
     ASSERT_EQ(component->type, httpRequestDtUriFragment);
-    ASSERT_EQ(component->data.size, strlen("fragment"));
-    ASSERT_EQ(memcmp(component->data.data, "fragment", strlen("fragment")), 0);
+    expectData(component->data, "fragment");
   } else if (*callNum == 6) {
     ASSERT_EQ(component->type, httpRequestDtVersion);
     ASSERT_EQ(component->version.majorVersion, 1u);
@@ -44,18 +56,15 @@ void httpRequestCb1Impl(HttpRequestComponent *component, void *arg)
   } else if (*callNum == 7) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhHost);
-    ASSERT_EQ(component->header.stringValue.size, strlen("localhost:8080"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "localhost:8080", strlen("localhost:8080")), 0);
+    expectData(component->header.stringValue, "localhost:8080");
   } else if (*callNum == 8) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhUserAgent);
-    ASSERT_EQ(component->header.stringValue.size, strlen("curl/7.58.0"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "curl/7.58.0", strlen("curl/7.58.0")), 0);
+    expectData(component->header.stringValue, "curl/7.58.0");
   } else if (*callNum == 9) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhAccept);
-    ASSERT_EQ(component->header.stringValue.size, strlen("*/*"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "*/*", strlen("*/*")), 0);
+    expectData(component->header.stringValue, "*/*");
   } else if (*callNum == 10) {
     ASSERT_EQ(component->type, httpRequestDtDataLast);
     ASSERT_EQ(component->data.size, 0u);
@@ -72,12 +81,10 @@ void httpRequestCb2Impl(HttpRequestComponent *component, void *arg)
     ASSERT_EQ(component->method, hmPost);
   } else if (*callNum == 1) {
     ASSERT_EQ(component->type, httpRequestDtUriPathElement);
-    ASSERT_EQ(component->data.size, strlen("api"));
-    ASSERT_EQ(memcmp(component->data.data, "api", strlen("api")), 0);
+    expectData(component->data, "api");
   } else if (*callNum == 2) {
     ASSERT_EQ(component->type, httpRequestDtUriPathElement);
-    ASSERT_EQ(component->data.size, strlen("usercreate"));
-    ASSERT_EQ(memcmp(component->data.data, "usercreate", strlen("usercreate")), 0);
+    expectData(component->data, "usercreate");
   } else if (*callNum == 3) {
     ASSERT_EQ(component->type, httpRequestDtVersion);
     ASSERT_EQ(component->version.majorVersion, 1u);
@@ -85,18 +92,15 @@ void httpRequestCb2Impl(HttpRequestComponent *component, void *arg)
   } else if (*callNum == 4) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhHost);
-    ASSERT_EQ(component->header.stringValue.size, strlen("localhost:18880"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "localhost:18880", strlen("localhost:18880")), 0);
+    expectData(component->header.stringValue, "localhost:18880");
   } else if (*callNum == 5) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhUserAgent);
-    ASSERT_EQ(component->header.stringValue.size, strlen("curl/7.58.0"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "curl/7.58.0", strlen("curl/7.58.0")), 0);
+    expectData(component->header.stringValue, "curl/7.58.0");
   } else if (*callNum == 6) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhAccept);
-    ASSERT_EQ(component->header.stringValue.size, strlen("*/*"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "*/*", strlen("*/*")), 0);
+    expectData(component->header.stringValue, "*/*");
   } else if (*callNum == 7) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhContentLength);
@@ -104,14 +108,11 @@ void httpRequestCb2Impl(HttpRequestComponent *component, void *arg)
   } else if (*callNum == 8) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhContentType);
-    ASSERT_EQ(component->header.entryName.size, strlen("Content-Type"));
-    ASSERT_EQ(memcmp(component->header.entryName.data, "Content-Type", strlen("Content-Type")), 0);
-    ASSERT_EQ(component->header.stringValue.size, strlen("application/x-www-form-urlencoded"));
-    ASSERT_EQ(memcmp(component->header.stringValue.data, "application/x-www-form-urlencoded", strlen("application/x-www-form-urlencoded")), 0);
+    expectData(component->header.entryName, "Content-Type");
+    expectData(component->header.stringValue, "application/x-www-form-urlencoded");
   } else if (*callNum == 9) {
     ASSERT_EQ(component->type, httpRequestDtDataLast);
-    ASSERT_EQ(component->data.size, 2u);
-    ASSERT_EQ(memcmp(component->data.data, "{}", 2), 0);
+    expectData(component->data, "{}");
   }
 
   (*callNum)++;
@@ -128,10 +129,7 @@ TEST(http, http_request_parser)
   {
     int callNum = 0;
     const char request1[] = "GET /path/to/page?qname=value#fragment HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/7.58.0\r\nAccept: */*\r\n\r\n\r\n";
-    HttpRequestParserState state;
-    httpRequestParserInit(&state);
-    httpRequestSetBuffer(&state, request1, sizeof(request1)-1);
-    ParserResultTy result = httpRequestParse(&state, httpRequestCb1, &callNum);
+    ParserResultTy result = parseRequest(request1, sizeof(request1)-1, httpRequestCb1, &callNum);
     ASSERT_EQ(result, ParserResultOk);
     ASSERT_EQ(callNum, 11);
   }
@@ -139,10 +137,7 @@ TEST(http, http_request_parser)
   {
     int callNum = 0;
     const char request[] = "POST /api/usercreate HTTP/1.1\r\nHost: localhost:18880\r\nUser-Agent: curl/7.58.0\r\nAccept: */*\r\nContent-Length: 2\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n{}";
-    HttpRequestParserState state;
-    httpRequestParserInit(&state);
-    httpRequestSetBuffer(&state, request, sizeof(request)-1);
-    ParserResultTy result = httpRequestParse(&state, [](HttpRequestComponent *component, void *arg) -> int {
+    ParserResultTy result = parseRequest(request, sizeof(request)-1, [](HttpRequestComponent *component, void *arg) -> int {
       httpRequestCb2Impl(component, arg);
       return 1;
     }, &callNum);
@@ -192,6 +187,11 @@ int httpRequestTestCb(HttpRequestComponent *component, void *arg)
   return 1;
 }
 
+ParserResultTy parseRequest(const void *request, size_t size, HttpRequestTestContext &context)
+{
+  return parseRequest(request, size, httpRequestTestCb, &context);
+}
+
 struct HttpResponseTestContext {
   unsigned code = 0;
   std::string description;
@@ -221,6 +221,15 @@ void httpResponseTestCb(HttpComponent *component, void *arg)
         ctx->finalDataEvents++;
       break;
   }
+}
+
+// Response-side driver, symmetric to parseRequest.
+ParserResultTy parseResponse(const void *response, size_t size, HttpResponseTestContext &context)
+{
+  HttpParserState state;
+  httpInit(&state);
+  httpSetBuffer(&state, response, size);
+  return httpParse(&state, httpResponseTestCb, &context);
 }
 
 struct HeaderTokenPair {
@@ -268,10 +277,7 @@ TEST(http, common_tokens)
   request += "\r\n";
 
   HttpRequestTestContext context;
-  HttpRequestParserState state;
-  httpRequestParserInit(&state);
-  httpRequestSetBuffer(&state, request.data(), request.size());
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request.data(), request.size(), context), ParserResultOk);
   ASSERT_TRUE(context.done);
   ASSERT_EQ(context.headerTypes.size(), count);
   for (size_t i = 0; i < count; i++) {
@@ -293,10 +299,7 @@ TEST(http, common_tokens)
   for (const HeaderTokenPair &method : methods) {
     std::string methodRequest = std::string(method.name) + " /x HTTP/1.1\r\n\r\n";
     HttpRequestTestContext methodContext;
-    HttpRequestParserState methodState;
-    httpRequestParserInit(&methodState);
-    httpRequestSetBuffer(&methodState, methodRequest.data(), methodRequest.size());
-    ASSERT_EQ(httpRequestParse(&methodState, httpRequestTestCb, &methodContext), ParserResultOk);
+    ASSERT_EQ(parseRequest(methodRequest.data(), methodRequest.size(), methodContext), ParserResultOk);
     EXPECT_EQ(methodContext.method, method.token) << method.name;
   }
 }
@@ -317,10 +320,7 @@ TEST(http, header_name_near_miss)
   for (const char *name : names) {
     std::string request = std::string("GET /x HTTP/1.1\r\n") + name + ": 999\r\n\r\n";
     HttpRequestTestContext context;
-    HttpRequestParserState state;
-    httpRequestParserInit(&state);
-    httpRequestSetBuffer(&state, request.data(), request.size());
-    ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk) << name;
+    ASSERT_EQ(parseRequest(request.data(), request.size(), context), ParserResultOk) << name;
     ASSERT_TRUE(context.done) << name;
     ASSERT_EQ(context.headerTypes.size(), 1u) << name;
     EXPECT_EQ(context.headerTypes[0], static_cast<int>(hhUnknown)) << name;
@@ -334,10 +334,7 @@ TEST(http, header_name_case_insensitive)
 {
   const char request[] = "POST /x HTTP/1.1\r\ncontent-length: 2\r\nX-CUSTOM: y\r\n\r\nab";
   HttpRequestTestContext context;
-  HttpRequestParserState state;
-  httpRequestParserInit(&state);
-  httpRequestSetBuffer(&state, request, sizeof(request)-1);
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
   ASSERT_TRUE(context.done);
   ASSERT_EQ(context.headerTypes.size(), 2u);
   EXPECT_EQ(context.headerTypes[0], static_cast<int>(hhContentLength));
@@ -358,10 +355,7 @@ TEST(http, request_chunked_body)
                          "Trailer-Header: v\r\n"
                          "\r\n";
   HttpRequestTestContext context;
-  HttpRequestParserState state;
-  httpRequestParserInit(&state);
-  httpRequestSetBuffer(&state, request, sizeof(request)-1);
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
   ASSERT_TRUE(context.done);
   ASSERT_EQ(context.headerTypes.size(), 1u);
   EXPECT_EQ(context.headerTypes[0], static_cast<int>(hhTransferEncoding));
@@ -377,10 +371,7 @@ TEST(http, malformed_header_names)
   };
   for (const char *request : requests) {
     HttpRequestTestContext context;
-    HttpRequestParserState state;
-    httpRequestParserInit(&state);
-    httpRequestSetBuffer(&state, request, strlen(request));
-    EXPECT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultError) << request;
+    EXPECT_EQ(parseRequest(request, strlen(request), context), ParserResultError) << request;
   }
 }
 
@@ -393,10 +384,7 @@ TEST(http, content_length_invalid)
   };
   for (const char *request : requests) {
     HttpRequestTestContext context;
-    HttpRequestParserState state;
-    httpRequestParserInit(&state);
-    httpRequestSetBuffer(&state, request, strlen(request));
-    EXPECT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultError) << request;
+    EXPECT_EQ(parseRequest(request, strlen(request), context), ParserResultError) << request;
   }
 }
 
@@ -405,10 +393,7 @@ TEST(http, method_case_sensitive)
   // RFC 9110: methods are case-sensitive, "get" is an unknown extension method
   const char request[] = "get /x HTTP/1.1\r\n\r\n";
   HttpRequestTestContext context;
-  HttpRequestParserState state;
-  httpRequestParserInit(&state);
-  httpRequestSetBuffer(&state, request, sizeof(request)-1);
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
   EXPECT_EQ(context.method, static_cast<int>(hmUnknown));
 }
 
@@ -437,10 +422,7 @@ TEST(http, header_value_ows)
 {
   const char request[] = "GET /x HTTP/1.1\r\nHost:\tlocalhost \r\nUser-Agent:no-space\r\n\r\n";
   HttpRequestTestContext context;
-  HttpRequestParserState state;
-  httpRequestParserInit(&state);
-  httpRequestSetBuffer(&state, request, sizeof(request)-1);
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
   ASSERT_EQ(context.headerValues.size(), 2u);
   EXPECT_EQ(context.headerValues[0], "localhost");
   EXPECT_EQ(context.headerValues[1], "no-space");
@@ -456,10 +438,7 @@ TEST(http, response_parser)
                             "\r\n"
                             "Hello";
     HttpResponseTestContext context;
-    HttpParserState state;
-    httpInit(&state);
-    httpSetBuffer(&state, response, sizeof(response)-1);
-    ASSERT_EQ(httpParse(&state, httpResponseTestCb, &context), ParserResultOk);
+    ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
     EXPECT_EQ(context.code, 404u);
     EXPECT_EQ(context.description, "Not Found");
     EXPECT_EQ(context.headerTypes, (std::vector<int>{hhContentType, hhETag, hhContentLength}));
@@ -472,10 +451,7 @@ TEST(http, response_parser)
     // reason phrase is optional
     const char response[] = "HTTP/1.1 200\r\n\r\n";
     HttpResponseTestContext context;
-    HttpParserState state;
-    httpInit(&state);
-    httpSetBuffer(&state, response, sizeof(response)-1);
-    ASSERT_EQ(httpParse(&state, httpResponseTestCb, &context), ParserResultOk);
+    ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
     EXPECT_EQ(context.code, 200u);
     EXPECT_EQ(context.description.size(), 0u);
     EXPECT_EQ(context.body.size(), 0u);
@@ -493,10 +469,7 @@ TEST(http, response_chunked)
                           "Expires: never\r\n"
                           "\r\n";
   HttpResponseTestContext context;
-  HttpParserState state;
-  httpInit(&state);
-  httpSetBuffer(&state, response, sizeof(response)-1);
-  ASSERT_EQ(httpParse(&state, httpResponseTestCb, &context), ParserResultOk);
+  ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
   EXPECT_EQ(context.code, 200u);
   EXPECT_EQ(context.headerTypes, (std::vector<int>{hhTransferEncoding}));
   EXPECT_EQ(context.body, "Wikipedia");

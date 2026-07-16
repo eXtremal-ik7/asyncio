@@ -9,22 +9,18 @@
 
 socketTy socketCreate(int af, int type, int protocol, int isAsync)
 {
-#ifdef OS_WINDOWS
-  return WSASocket(af, type, protocol, NULL, 0, isAsync ? WSA_FLAG_OVERLAPPED : 0);
-#else
   int hSocket = socket(af, type, protocol);
   if (isAsync) {
     int current = fcntl(hSocket, F_GETFL);
     fcntl(hSocket, F_SETFL, O_NONBLOCK | current);
   }
-  
+
   int optval = 1;
   setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&optval, sizeof(optval) );
 #ifdef SO_NOSIGPIPE
   setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
 #endif
   return hSocket;
-#endif
 }
 
 void socketClose(socketTy hSocket)

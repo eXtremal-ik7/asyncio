@@ -14,7 +14,6 @@ extern "C" {
 #include "asyncio/dynamicBuffer.h"
   
 typedef struct HTTPClient HTTPClient;
-typedef struct HTTPInfo HTTPInfo;
 typedef struct HTTPOp HTTPOp;
 
 typedef void httpConnectCb(AsyncOpStatus, HTTPClient*, void*);

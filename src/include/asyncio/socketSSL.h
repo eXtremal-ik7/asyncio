@@ -16,9 +16,8 @@ typedef void sslCb(AsyncOpStatus status, SSLSocket *object, size_t transferred, 
 
 typedef struct SSLSocket {
   aioObjectRoot root;
-  
+
   aioObject *object;
-  int isConnected;
   SSL_CTX *sslContext;
   SSL *ssl;
   BIO *bioIn;

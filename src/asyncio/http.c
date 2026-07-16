@@ -9,8 +9,7 @@ static ConcurrentQueue opTimerPool;
 static ConcurrentQueue objectPool;
 
 typedef enum {
-  httpOpConnect = 0,
-  httpOpRequest
+  httpOpConnect = 0
 } HttpOpTy;
 
 static AsyncOpStatus httpParseStart(asyncOpRoot *opptr);
@@ -22,15 +21,11 @@ static int cancel(asyncOpRoot *opptr)
   return 0;
 }
 
-static void connectFinish(asyncOpRoot *opptr)
+// httpConnectCb and httpRequestCb are the same function type, so connect and
+// request operations share one finish thunk
+static void operationFinish(asyncOpRoot *opptr)
 {
-  ((httpConnectCb*)opptr->callback)(opGetStatus(opptr), (HTTPClient*)opptr->object, opptr->arg);
-}
-
-static void requestFinish(asyncOpRoot *opptr)
-{
-  HTTPClient *client = (HTTPClient*)opptr->object;
-  ((httpRequestCb*)opptr->callback)(opGetStatus(opptr), client, opptr->arg);
+  ((httpRequestCb*)opptr->callback)(opGetStatus(opptr), (HTTPClient*)opptr->object, opptr->arg);
 }
 
 static void httpResumeProc(AsyncOpStatus status, aioObject *object, size_t transferred, void *arg)
@@ -288,7 +283,9 @@ static void httpClientDestructor(aioObjectRoot *root)
   objectFree(&objectPool, client, sizeof(HTTPClient));
 }
 
-HTTPClient *httpClientNew(asyncBase *base, aioObject *socket)
+// Shared constructor body; `socket` is stored into the union member selected
+// by isHttps
+static HTTPClient *httpClientNewCommon(asyncBase *base, void *socket, int isHttps)
 {
   if (!socket)
     return 0;
@@ -307,44 +304,44 @@ HTTPClient *httpClientNew(asyncBase *base, aioObject *socket)
   }
 
   initObjectRoot(&client->root, base, ioObjectUserDefined, httpClientDestructor);
-  client->isHttps = 0;
+  client->isHttps = isHttps;
   client->inBufferOffset = 0;
   client->requestBytesSent = 0;
   httpSetBuffer(&client->state, client->inBuffer, 0);
-  client->plainSocket = socket;
+  if (isHttps)
+    client->sslSocket = (SSLSocket*)socket;
+  else
+    client->plainSocket = (aioObject*)socket;
   return client;
+}
+
+HTTPClient *httpClientNew(asyncBase *base, aioObject *socket)
+{
+  return httpClientNewCommon(base, socket, 0);
 }
 
 HTTPClient *httpsClientNew(asyncBase *base, SSLSocket *socket)
 {
-  if (!socket)
-    return 0;
-  HTTPClient *client = (HTTPClient*)objectAlloc(&objectPool,
-                                                sizeof(HTTPClient),
-                                                16);
-  if (!client)
-    return 0;
-  if (!client->inBuffer) {
-    client->inBuffer = (uint8_t*)malloc(65536);
-    if (!client->inBuffer) {
-      objectFree(&objectPool, client, sizeof(HTTPClient));
-      return 0;
-    }
-    client->inBufferSize = 65536;
-  }
-
-  initObjectRoot(&client->root, base, ioObjectUserDefined, httpClientDestructor);
-  client->isHttps = 1;
-  client->inBufferOffset = 0;
-  client->requestBytesSent = 0;
-  httpSetBuffer(&client->state, client->inBuffer, 0);
-  client->sslSocket = socket;
-  return client;
+  return httpClientNewCommon(base, socket, 1);
 }
 
 void httpClientDelete(HTTPClient *client)
 {
   objectDelete(&client->root);
+}
+
+// Copies caller data into the operation-owned scratch buffer, growing it when
+// needed (a fresh operation starts with an empty buffer and pooled operations
+// reuse it; realloc of a null buffer is the first allocation)
+static void httpOpSetData(HTTPOp *op, const void *data, size_t size)
+{
+  if (op->internalBufferSize < size) {
+    op->internalBuffer = realloc(op->internalBuffer, size);
+    op->internalBufferSize = size;
+  }
+
+  op->dataSize = size;
+  memcpy(op->internalBuffer, data, size);
 }
 
 void aioHttpConnect(HTTPClient *client,
@@ -354,21 +351,13 @@ void aioHttpConnect(HTTPClient *client,
                     httpConnectCb callback,
                     void *arg)
 {
-  HTTPOp *op = allocHttpOp(httpConnectStart, connectFinish, client, httpOpConnect, 0, 0, (void*)callback, arg, afNone, usTimeout);
+  HTTPOp *op = allocHttpOp(httpConnectStart, operationFinish, client, httpOpConnect, 0, 0, (void*)callback, arg, afNone, usTimeout);
   op->address = *address;
 
-  if (tlsextHostName) {
-    size_t tlsextHostNameSize = strlen(tlsextHostName) + 1;
-    if (op->internalBufferSize < tlsextHostNameSize) {
-      op->internalBuffer = realloc(op->internalBuffer, tlsextHostNameSize);
-      op->internalBufferSize = tlsextHostNameSize;
-    }
-
-    op->dataSize = tlsextHostNameSize;
-    memcpy(op->internalBuffer, tlsextHostName, tlsextHostNameSize);
-  } else {
+  if (tlsextHostName)
+    httpOpSetData(op, tlsextHostName, strlen(tlsextHostName) + 1);
+  else
     op->dataSize = 0;
-  }
 
   combinerPushOperation(&op->root);
 }
@@ -382,17 +371,8 @@ void aioHttpRequest(HTTPClient *client,
                     httpRequestCb callback,
                     void *arg)
 {
-  HTTPOp *op = allocHttpOp(httpParseStart, requestFinish, client, httpOpConnect, parseCallback, parseArg, (void*)callback, arg, afNone, usTimeout);
-  if (op->internalBufferSize >= requestSize) {
-    op->dataSize = requestSize;
-    memcpy(op->internalBuffer, request, requestSize);
-  } else {
-    op->internalBuffer = realloc(op->internalBuffer, requestSize);
-    op->internalBufferSize = requestSize;
-    op->dataSize = requestSize;
-    memcpy(op->internalBuffer, request, requestSize);
-  }
-
+  HTTPOp *op = allocHttpOp(httpParseStart, operationFinish, client, httpOpConnect, parseCallback, parseArg, (void*)callback, arg, afNone, usTimeout);
+  httpOpSetData(op, request, requestSize);
   combinerPushOperation(&op->root);
 }
 
@@ -402,18 +382,10 @@ int ioHttpConnect(HTTPClient *client, const HostAddress *address, const char *tl
   HTTPOp *op = allocHttpOp(httpConnectStart, 0, client, httpOpConnect, 0, 0, 0, 0, afCoroutine, usTimeout);
   op->address = *address;
 
-  if (tlsextHostName) {
-    size_t tlsextHostNameSize = strlen(tlsextHostName) + 1;
-    if (op->internalBufferSize < tlsextHostNameSize) {
-      op->internalBuffer = realloc(op->internalBuffer, tlsextHostNameSize);
-      op->internalBufferSize = tlsextHostNameSize;
-    }
-
-    op->dataSize = tlsextHostNameSize;
-    memcpy(op->internalBuffer, tlsextHostName, tlsextHostNameSize);
-  } else {
+  if (tlsextHostName)
+    httpOpSetData(op, tlsextHostName, strlen(tlsextHostName) + 1);
+  else
     op->dataSize = 0;
-  }
 
   combinerPushOperation(&op->root);
   coroutineYield();
@@ -430,16 +402,7 @@ AsyncOpStatus ioHttpRequest(HTTPClient *client,
                             void *parseArg)
 {
   HTTPOp *op = allocHttpOp(httpParseStart, 0, client, httpOpConnect, parseCallback, parseArg, 0, 0, afCoroutine, usTimeout);
-  if (op->internalBufferSize >= requestSize) {
-    op->dataSize = requestSize;
-    memcpy(op->internalBuffer, request, requestSize);
-  } else {
-    op->internalBuffer = realloc(op->internalBuffer, requestSize);
-    op->internalBufferSize = requestSize;
-    op->dataSize = requestSize;
-    memcpy(op->internalBuffer, request, requestSize);
-  }
-
+  httpOpSetData(op, request, requestSize);
   combinerPushOperation(&op->root);
   coroutineYield();
 

@@ -51,8 +51,6 @@ void kqueuePostEmptyOperation(asyncBase *base);
 void kqueueWakeupLoop(asyncBase *base);
 void kqueueNextFinishedOperation(asyncBase *base);
 aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data);
-asyncOpRoot *kqueueNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool);
-int kqueueCancelAsyncOp(asyncOpRoot *opptr);
 void kqueueDeleteObject(aioObject *object);
 void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void kqueueStartTimer(asyncOpRoot *op);
@@ -62,38 +60,58 @@ int kqueueActivate(aioUserEvent *op);
 int kqueueUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period);
 uint64_t kqueueConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period);
 void kqueueReleaseUserEvent(aioUserEvent *event);
-AsyncOpStatus kqueueAsyncConnect(asyncOpRoot *opptr);
-AsyncOpStatus kqueueAsyncAccept(asyncOpRoot *opptr);
-AsyncOpStatus kqueueAsyncRead(asyncOpRoot *opptr);
 AsyncOpStatus kqueueAsyncWrite(asyncOpRoot *opptr);
-AsyncOpStatus kqueueAsyncReadMsg(asyncOpRoot *op);
-AsyncOpStatus kqueueAsyncWriteMsg(asyncOpRoot *op);
 
-static struct asyncImpl kqueueImpl = {combinerTaskHandler,    kqueueEnqueue,         kqueuePostEmptyOperation, kqueueNextFinishedOperation,
-                                      kqueueNewAioObject,     kqueueNewAsyncOp,      kqueueCancelAsyncOp,      kqueueDeleteObject,
-                                      kqueueInitializeTimer,  kqueueStartTimer,      kqueueStopTimer,          kqueueInitializeUserEvent,
-                                      kqueueActivate,         kqueueAsyncConnect,    kqueueAsyncAccept,        kqueueAsyncRead,
-                                      kqueueAsyncWrite,       kqueueAsyncReadMsg,    kqueueAsyncWriteMsg,      kqueueWakeupLoop,
-                                      kqueueUpdateEventTimer, kqueueConsumeEventTimerTick, kqueueReleaseUserEvent};
+static struct asyncImpl kqueueImpl = {
+  combinerTaskHandler,
+  kqueueEnqueue,
+  kqueuePostEmptyOperation,
+  kqueueNextFinishedOperation,
+  kqueueNewAioObject,
+  newAsyncOp,
+  cancelAsyncOp,
+  kqueueInitializeTimer,
+  kqueueStartTimer,
+  kqueueStopTimer,
+  kqueueInitializeUserEvent,
+  kqueueActivate,
+  connectSyscall,
+  acceptSyscall,
+  readSyscall,
+  kqueueAsyncWrite,
+  readMsgSyscall,
+  writeMsgSyscall,
+  kqueueWakeupLoop,
+  kqueueUpdateEventTimer,
+  kqueueConsumeEventTimerTick,
+  kqueueReleaseUserEvent
+};
+
+// Single-change submission on the configuration plane; every such kevent
+// call shares this EINTR retry. errno of the final attempt is preserved.
+static int kqueueSubmit(int kqueueFd, const struct kevent *event)
+{
+  int result;
+  do {
+    result = kevent(kqueueFd, event, 1, 0, 0, 0);
+  } while (result == -1 && errno == EINTR);
+  return result;
+}
 
 static int kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, uintptr_t ident, uint64_t envelope)
 {
   struct kevent event;
   EV_SET(&event, ident, filter, flags, 0, 0, (void*)(uintptr_t)envelope);
-  int result;
-  do {
-    result = kevent(kqueueFd, &event, 1, 0, 0, 0);
-  } while (result == -1 && errno == EINTR);
-  return result;
+  return kqueueSubmit(kqueueFd, &event);
 }
 
-static int getFd(aioObject *object)
+// Triggers the base's own EVFILT_USER doorbell knote. Intentionally a single
+// kevent call with no EINTR retry: doorbell posts are fire-and-forget.
+static void kqueueDoorbell(kqueueBase *base)
 {
-  switch (object->root.header.objectType) {
-    case ioObjectDevice: return object->hDevice;
-    case ioObjectSocket: return object->hSocket;
-    default: return -1;
-  }
+  struct kevent ev;
+  EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, 0);
+  kevent(base->kqueueFd, &ev, 1, 0, 0, 0);
 }
 
 asyncBase *kqueueNewAsyncBase()
@@ -121,11 +139,8 @@ asyncBase *kqueueNewAsyncBase()
 
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op)
 {
-  kqueueBase *localBase = (kqueueBase*)base;
-  struct kevent ev;
   concurrentQueuePush(&base->globalQueue, op);
-  EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, 0);
-  kevent(localBase->kqueueFd, &ev, 1, 0, 0, 0);
+  kqueueDoorbell((kqueueBase*)base);
 }
 
 void kqueuePostEmptyOperation(asyncBase *base)
@@ -138,68 +153,20 @@ void kqueueWakeupLoop(asyncBase *base)
   // Pure kick: trigger the user event without a queue node (an empty node is
   // the quit marker). One sleeper wakes; the loop's udata==0 branch is a
   // no-op and EV_CLEAR resets the event on delivery
-  struct kevent ev;
-  EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, 0);
-  kevent(((kqueueBase*)base)->kqueueFd, &ev, 1, 0, 0, 0);
+  kqueueDoorbell((kqueueBase*)base);
 }
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 {
   kqueueBase *base = (kqueueBase*)object->header.base;
   aioObject *fdObject = (object->header.objectType == ioObjectDevice || object->header.objectType == ioObjectSocket) ? (aioObject*)object : 0;
-  uint32_t oldIoEvents = fdObject ? combinerActiveIoEvents(object) : 0;
-  uint32_t progress = sig & COMBINER_TAG_PROGRESS_MASK;
-  uint32_t ioEvents = fdObject ? progress | ((sig & COMBINER_TAG_ERROR) ? IO_EVENT_ERROR : 0) : 0;
-
-  // A dying object gets no fd readiness processing: its operations are being
-  // cancelled wholesale anyway, and its descriptor may already be closed;
-  // the error path ioctl and a rearm kevent must not run on a reused fd.
-  if (fdObject && __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
-    ioEvents = 0;
-    progress = 0;
-  }
-
-  // READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE.
-  uint32_t needStart = progress;
-
-  // Start a submitted operation before completing initialization from the
-  // accumulated event: a start delivered together with the event must
-  // enter its queue first, otherwise a failed connect cancels the queues
-  // without it and the operation would start on the dead socket afterwards
-  if (op)
-    startOperation(op, &needStart);
-
-  // By contract initialization precedes ordinary I/O, so any progress while
-  // its slot is occupied belongs to it. Drive it before the disconnect sweep
-  // so queued operations inherit a connect failure, not aosDisconnected.
-  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
-    processInitializationOp(object, &needStart);
-
-  // CANCEL/CANCELIO: a timeout/opCancel/cancelIo set the status and asked for
-  // a scan; the CANCELIO position additionally drives the CancelIoFlag sweep
-  if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
-    reapObject(object, sig, &needStart);
-
-  if (ioEvents & IO_EVENT_ERROR) {
-    // EV_EOF mapped to TAG_ERROR, cancel all operations with aosDisconnected status
-    int available;
-    int fd = getFd((aioObject*)object);
-    ioctl(fd, FIONREAD, &available);
-    if (available == 0)
-      cancelOperationList(&object->readQueue, aosDisconnected);
-    cancelOperationList(&object->writeQueue, aosDisconnected);
-  }
-
-  if (needStart & IO_EVENT_READ)
-    executeOperationList(&object->readQueue);
-  if (needStart & IO_EVENT_WRITE)
-    executeOperationList(&object->writeQueue);
+  CombinerPassEvents pass = reactorCombinerCore(object, fdObject, op, sig);
 
   if (fdObject && !__uint_atomic_load(&object->DeletePending, amoRelaxed)) {
     int fd = getFd(fdObject);
     uint32_t newIoEvents = combinerActiveIoEvents(object);
-    unsigned readEventActivated = (oldIoEvents & IO_EVENT_READ) && !(ioEvents & IO_EVENT_READ);
-    unsigned writeEventActivated = (oldIoEvents & IO_EVENT_WRITE) && !(ioEvents & IO_EVENT_WRITE);
+    unsigned readEventActivated = (pass.oldIoEvents & IO_EVENT_READ) && !(pass.ioEvents & IO_EVENT_READ);
+    unsigned writeEventActivated = (pass.oldIoEvents & IO_EVENT_WRITE) && !(pass.ioEvents & IO_EVENT_WRITE);
     uint64_t encoded = 0;
     if (((newIoEvents & IO_EVENT_READ) && !readEventActivated) || ((newIoEvents & IO_EVENT_WRITE) && !writeEventActivated))
       encoded = kernelHandleEncode(&fdObject->root.header);
@@ -328,23 +295,6 @@ aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data)
   return object;
 }
 
-asyncOpRoot *kqueueNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *objectPool, ConcurrentQueue *objectTimerPool)
-{
-  asyncOp *op = 0;
-  if (asyncOpAlloc(base, sizeof(asyncOp), isRealTime, objectPool, objectTimerPool, (asyncOpRoot**)&op)) {
-    op->internalBuffer = 0;
-    op->internalBufferSize = 0;
-  }
-
-  return &op->root;
-}
-
-int kqueueCancelAsyncOp(asyncOpRoot *opptr)
-{
-  __UNUSED(opptr);
-  return 1;
-}
-
 void kqueueDeleteObject(aioObject *object)
 {
   switch (object->root.header.objectType) {
@@ -383,13 +333,9 @@ void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op)
   op->timerId = timer;
 }
 
-static aioTimer *kqueuePrepareTimer(asyncOpRoot *op, asyncBase *base)
+static aioTimer *kqueuePrepareTimer(asyncOpRoot *op)
 {
-  aioTimer *timer = (aioTimer*)op->timerId;
-  if (!timer) {
-    kqueueInitializeTimer(base, op);
-    timer = (aioTimer*)op->timerId;
-  }
+  aioTimer *timer = (aioTimer*)opEnsureTimerCell(op);
   if (!timer)
     return 0;
   assert(timer->header.timer.kind == tkOperation);
@@ -400,7 +346,7 @@ static int kqueueArmTimer(asyncOpRoot *op)
 {
   asyncBase *target = op->object->header.base;
   struct kevent event;
-  aioTimer *timer = kqueuePrepareTimer(op, target);
+  aioTimer *timer = kqueuePrepareTimer(op);
   if (!timer)
     return 0;
   uint64_t ident = timerNextIdent(timer);
@@ -414,11 +360,7 @@ static int kqueueArmTimer(asyncOpRoot *op)
 
   uint64_t envelope = kernelHandleEncode(&timer->header);
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_USECONDS, op->timeout, (void*)(uintptr_t)envelope);
-  int result;
-  do {
-    result = kevent(((kqueueBase*)target)->kqueueFd, &event, 1, 0, 0, 0);
-  } while (result == -1 && errno == EINTR);
-  if (result == -1) {
+  if (kqueueSubmit(((kqueueBase*)target)->kqueueFd, &event) == -1) {
     timerUnpublish(timer);
     return 0;
   }
@@ -439,19 +381,13 @@ static int kqueueDisarmTimer(aioTimer *timer)
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
   // ENOENT is the normal outcome whenever the oneshot already fired and was
   // harvested (every expiry-driven stop) or the timer was never armed
-  int result;
-  do {
-    result = kevent(((kqueueBase*)timer->header.base)->kqueueFd, &event, 1, 0, 0, 0);
-  } while (result == -1 && errno == EINTR);
-  if (result == 0 || errno == ENOENT)
+  if (kqueueSubmit(((kqueueBase*)timer->header.base)->kqueueFd, &event) == 0 || errno == ENOENT)
     return 1;
 
   // Keep a failed-delete knote quiet. Its old ident cannot match a later arm
   // of the same physical timer cell.
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DISABLE, 0, 0, 0);
-  do {
-    result = kevent(((kqueueBase*)timer->header.base)->kqueueFd, &event, 1, 0, 0, 0);
-  } while (result == -1 && errno == EINTR);
+  (void)kqueueSubmit(((kqueueBase*)timer->header.base)->kqueueFd, &event);
   return 1;
 }
 
@@ -476,11 +412,7 @@ int kqueueActivate(aioUserEvent *event)
 {
   struct kevent kernelEvent;
   EV_SET(&kernelEvent, event->activationId, EVFILT_USER, 0, NOTE_TRIGGER, 0, (void*)(uintptr_t)kernelHandleEncode(&event->header));
-  int result;
-  do {
-    result = kevent(((kqueueBase*)event->header.base)->kqueueFd, &kernelEvent, 1, 0, 0, 0);
-  } while (result == -1 && errno == EINTR);
-  return result == 0;
+  return kqueueSubmit(((kqueueBase*)event->header.base)->kqueueFd, &kernelEvent) == 0;
 }
 
 static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event)
@@ -512,11 +444,7 @@ static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_
 
   void *envelope = (void*)kernelHandleEncode(&timer->header);
   EV_SET(&kernelEvent, timer->fd, EVFILT_TIMER, EV_ADD | EV_ENABLE, NOTE_USECONDS, period, envelope);
-  int result;
-  do {
-    result = kevent(((kqueueBase*)event->header.base)->kqueueFd, &kernelEvent, 1, 0, 0, 0);
-  } while (result == -1 && errno == EINTR);
-  if (result == -1) {
+  if (kqueueSubmit(((kqueueBase*)event->header.base)->kqueueFd, &kernelEvent) == -1) {
     timerUnpublish(timer);
     return 0;
   }
@@ -566,160 +494,17 @@ void kqueueReleaseUserEvent(aioUserEvent *event)
   objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
 }
 
-AsyncOpStatus kqueueAsyncConnect(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((aioObject*)op->root.object);
-  if (op->state == 0) {
-    op->state = 1;
-    struct sockaddr_storage sa;
-    socklen_t saLen = hostAddressToSockaddr(&op->host, &sa);
-    int result = connect(fd, (struct sockaddr*)&sa, saLen);
-    if (result == -1 && errno != EINPROGRESS)
-      return aosUnknownError;
-    else
-      return aosPending;
-  } else {
-    int error;
-    socklen_t size = sizeof(error);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size);
-    return (error == 0) ? aosSuccess : aosUnknownError;
-  }
-}
-
-AsyncOpStatus kqueueAsyncAccept(asyncOpRoot *opptr)
-{
-  struct sockaddr_storage clientAddr;
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((aioObject*)op->root.object);
-  socklen_t clientAddrSize = sizeof(clientAddr);
-  op->acceptSocket = accept(fd, (struct sockaddr*)&clientAddr, &clientAddrSize);
-
-  if (op->acceptSocket != -1) {
-    int current = fcntl(op->acceptSocket, F_GETFL);
-    fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current);
-    sockaddrToHostAddress(&clientAddr, &op->host);
-    return aosSuccess;
-  } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EPROTO || errno == EINTR) {
-    // The connection can be gone from the backlog by the time accept runs
-    // (stolen by another thread, aborted by the peer): wait for the next one.
-    // Resource exhaustion (EMFILE/ENFILE/ENOBUFS) must NOT retry: the
-    // backlog stays readable and the retry loop would spin hot
-    return aosPending;
-  } else {
-    return aosUnknownError;
-  }
-}
-
-AsyncOpStatus kqueueAsyncRead(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  aioObject *object = (aioObject*)op->root.object;
-  struct ioBuffer *sb = &object->buffer;
-  int fd = getFd(object);
-
-  if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize))
-    return aosSuccess;
-
-  if (op->transactionSize <= object->buffer.totalSize) {
-    while (op->bytesTransferred < op->transactionSize) {
-      ssize_t bytesRead = read(fd, sb->ptr, sb->totalSize);
-      if (bytesRead == 0)
-        return aosDisconnected;
-      else if (bytesRead < 0)
-        return socketStatusFromErrno(errno);
-      sb->dataSize = (size_t)bytesRead;
-
-      if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize) || !(opptr->flags & afWaitAll))
-        break;
-    }
-
-    return aosSuccess;
-  } else {
-    ssize_t bytesRead = read(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
-
-    if (bytesRead > 0) {
-      op->bytesTransferred += (size_t)bytesRead;
-      if (op->root.flags & afWaitAll && op->bytesTransferred < op->transactionSize)
-        return aosPending;
-      else
-        return aosSuccess;
-    } else if (bytesRead == 0) {
-      return op->transactionSize - op->bytesTransferred > 0 ? aosDisconnected : aosSuccess;
-    } else {
-      return socketStatusFromErrno(errno);
-    }
-  }
-}
-
 AsyncOpStatus kqueueAsyncWrite(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
   aioObject *object = (aioObject*)op->root.object;
-  int fd = getFd(object);
 
   // Sockets are covered by SO_NOSIGPIPE from newSocketIo, and on Darwin/NetBSD
   // pipes are covered by F_SETNOSIGPIPE (needSigpipeGuard stays zero); the
   // masked branch is only reachable for pipes on FreeBSD.
-  ssize_t bytesWritten;
-  if (object->needSigpipeGuard && !sigpipeIgnored) {
-    struct SigpipeGuard guard;
-    sigpipeGuardEnter(&guard);
-    bytesWritten = write(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
-    sigpipeGuardLeave(&guard, bytesWritten == -1 && errno == EPIPE);
-  } else {
-    bytesWritten = write(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
-  }
-  if (bytesWritten > 0) {
-    op->bytesTransferred += bytesWritten;
-    if (op->root.flags & afWaitAll && op->bytesTransferred < op->transactionSize)
-      return aosPending;
-    else
-      return aosSuccess;
-  } else if (bytesWritten == 0) {
-    return op->transactionSize - op->bytesTransferred > 0 ? aosDisconnected : aosSuccess;
-  } else {
-    return socketStatusFromErrno(errno);
-  }
-}
-
-AsyncOpStatus kqueueAsyncReadMsg(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((aioObject*)op->root.object);
-
-  struct sockaddr_storage source;
-  struct iovec iov;
-  struct msghdr msg;
-  memset(&msg, 0, sizeof(msg));
-  iov.iov_base = op->buffer;
-  iov.iov_len = op->transactionSize;
-  msg.msg_name = &source;
-  msg.msg_namelen = sizeof(source);
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  ssize_t result = recvmsg(fd, &msg, 0);
-  if (result != -1) {
-    sockaddrToHostAddress(&source, &op->host);
-    op->bytesTransferred = (size_t)result;
-    // MSG_TRUNC: the datagram did not fit, the kernel dropped its tail
-    return (msg.msg_flags & MSG_TRUNC) ? aosBufferTooSmall : aosSuccess;
-  } else {
-    return socketStatusFromErrno(errno);
-  }
-}
-
-AsyncOpStatus kqueueAsyncWriteMsg(asyncOpRoot *opptr)
-{
-  asyncOp *op = (asyncOp*)opptr;
-  int fd = getFd((aioObject*)op->root.object);
-
-  struct sockaddr_storage remoteAddress;
-  socklen_t addrLen = hostAddressToSockaddr(&op->host, &remoteAddress);
-  ssize_t result = sendto(fd, op->buffer, op->transactionSize, 0, (struct sockaddr*)&remoteAddress, addrLen);
-  if (result != -1) {
-    return aosSuccess;
-  }
-
-  return socketStatusFromErrno(errno);
+  ssize_t bytesWritten = guardedWrite(object,
+                                      getFd(object),
+                                      (uint8_t*)op->buffer + op->bytesTransferred,
+                                      op->transactionSize - op->bytesTransferred);
+  return transferStatus(op, bytesWritten);
 }

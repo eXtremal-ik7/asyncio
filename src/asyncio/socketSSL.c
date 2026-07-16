@@ -9,7 +9,6 @@
 #include <string.h>
 
 #define DEFAULT_SSL_READ_BUFFER_SIZE 16384
-#define DEFAULT_SSL_WRITE_BUFFER_SIZE 16384
 
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
@@ -57,10 +56,6 @@ typedef struct coroReturnStruct {
 } coroReturnStruct;
 __NO_PADDING_END
 
-static AsyncOpStatus connectProc(asyncOpRoot *opptr);
-static AsyncOpStatus readProc(asyncOpRoot *opptr);
-static void sslWriteWriteCb(AsyncOpStatus status, aioObject *object, size_t transferred, void *arg);
-
 static int cancel(asyncOpRoot *opptr)
 {
   SSLSocket *S = (SSLSocket*)opptr->object;
@@ -89,6 +84,29 @@ static void releaseOp(asyncOpRoot *opptr)
   }
 }
 
+// Common part of the read/write operation constructors: pooled allocation
+// (a fresh operation starts with an empty scratch buffer) and field setup
+static SSLOp *allocSslOp(aioObjectRoot *object,
+                         AsyncFlags flags,
+                         uint64_t usTimeout,
+                         void *callback,
+                         void *arg,
+                         int opCode,
+                         struct Context *context)
+{
+  SSLOp *op = 0;
+  if (asyncOpAlloc(object->header.base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
+    op->internalBuffer = 0;
+    op->internalBufferSize = 0;
+  }
+
+  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
+  op->transactionSize = context->TransactionSize;
+  op->bytesTransferred = 0;
+  op->state = sslStInitalize;
+  return op;
+}
+
 static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
                                    AsyncFlags flags,
                                    uint64_t usTimeout,
@@ -97,18 +115,9 @@ static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
                                    int opCode,
                                    void *contextPtr)
 {
-  SSLOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->header.base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
-    op->internalBuffer = 0;
-    op->internalBufferSize = 0;
-  }
-
-  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
+  SSLOp *op = allocSslOp(object, flags, usTimeout, callback, arg, opCode, context);
   op->buffer = context->Buffer;
-  op->transactionSize = context->TransactionSize;
-  op->bytesTransferred = 0;
-  op->state = sslStInitalize;
   return &op->root;
 }
 
@@ -120,32 +129,16 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
                                     int opCode,
                                     void *contextPtr)
 {
-  SSLOp *op = 0;
   struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->header.base, sizeof(SSLOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
-    op->internalBuffer = 0;
-    op->internalBufferSize = 0;
-  }
-
-  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
+  SSLOp *op = allocSslOp(object, flags, usTimeout, callback, arg, opCode, context);
   if (!(flags & afNoCopy) && context->TransactionSize) {
-    if (op->internalBuffer == 0) {
-      op->internalBuffer = malloc(context->TransactionSize);
-      op->internalBufferSize = context->TransactionSize;
-    } else if (op->internalBufferSize < context->TransactionSize) {
-      op->internalBufferSize = context->TransactionSize;
-      op->internalBuffer = realloc(op->internalBuffer, context->TransactionSize);
-    }
-
+    asyncOpEnsureInternalBuffer(&op->internalBuffer, &op->internalBufferSize, context->TransactionSize);
     memcpy(op->internalBuffer, context->Buffer, context->TransactionSize);
     op->buffer = op->internalBuffer;
   } else {
     op->buffer = context->Buffer;
   }
 
-  op->transactionSize = context->TransactionSize;
-  op->bytesTransferred = 0;
-  op->state = sslStInitalize;
   return &op->root;
 }
 
@@ -158,7 +151,7 @@ static ssize_t coroutineRwFinish(SSLOp *op, SSLSocket *object)
   return status == aosSuccess ? (ssize_t)bytesTransferred : -(int)status;
 }
 
-size_t copyFromOut(SSLSocket *S)
+static size_t copyFromOut(SSLSocket *S)
 {
   size_t nBytes = BIO_ctrl_pending(S->bioOut);
   if (nBytes > S->sslWriteBufferSize) {
@@ -270,7 +263,7 @@ static AsyncOpStatus readProc(asyncOpRoot *opptr)
   }
 }
 
-void sslSocketDestructor(aioObjectRoot *root)
+static void sslSocketDestructor(aioObjectRoot *root)
 {
   SSLSocket *socket = (SSLSocket*)root;
   SSL_free(socket->ssl);
@@ -343,6 +336,29 @@ socketTy sslGetSocket(const SSLSocket *socket)
   return aioObjectSocket(socket->object);
 }
 
+// One-shot claim of the transport-initialization slot shared by both connect
+// entry points. The SSL state machine belongs to the initialization owner:
+// after a lost CAS a handshake may be running on it right now, so it is
+// configured only between a won CAS and the push.
+static void sslConnectSubmit(SSLSocket *socket, SSLOp *op, const char *tlsextHostName)
+{
+  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
+                                         0,
+                                         (uintptr_t)&op->root,
+                                         amoSeqCst)) {
+    // Transport initialization is one-shot for an object.
+    opForceStatus(&op->root, aosUnknownError);
+    addToGlobalQueue(&op->root);
+    return;
+  }
+
+  SSL_set_connect_state(socket->ssl);
+  if (tlsextHostName)
+    SSL_set_tlsext_host_name(socket->ssl, op->buffer);
+
+  combinerPushOperation(&op->root);
+}
+
 void aioSslConnect(SSLSocket *socket,
                    const HostAddress *address,
                    const char *tlsextHostName,
@@ -359,23 +375,7 @@ void aioSslConnect(SSLSocket *socket,
   else
     op->state = sslStProcessing;
 
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         (uintptr_t)&op->root,
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-    return;
-  }
-
-  // The SSL state machine belongs to the initialization owner: after a lost CAS a
-  // handshake may be running on it right now, so it must not be touched
-  SSL_set_connect_state(socket->ssl);
-  if (tlsextHostName)
-    SSL_set_tlsext_host_name(socket->ssl, op->buffer);
-
-  combinerPushOperation(&op->root);
+  sslConnectSubmit(socket, op, tlsextHostName);
 }
 
 asyncOpRoot *implSslRead(SSLSocket *socket,
@@ -468,7 +468,7 @@ ssize_t aioSslRead(SSLSocket *socket,
   return context.Result;
 }
 
-void sslWriteWriteCb(AsyncOpStatus status, aioObject *object, size_t transferred, void *arg)
+static void sslWriteWriteCb(AsyncOpStatus status, aioObject *object, size_t transferred, void *arg)
 {
   __UNUSED(object);
   SSLOp *op = (SSLOp*)arg;
@@ -570,19 +570,7 @@ int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlse
   fillContext(&context, connectProc, 0, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afCoroutine, usTimeout, 0, 0, sslOpConnect, &context);
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         (uintptr_t)&op->root,
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-  } else {
-    SSL_set_connect_state(socket->ssl);
-    if (tlsextHostName)
-      SSL_set_tlsext_host_name(socket->ssl, op->buffer);
-    combinerPushOperation(&op->root);
-  }
+  sslConnectSubmit(socket, op, tlsextHostName);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);

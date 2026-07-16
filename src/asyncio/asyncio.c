@@ -34,6 +34,15 @@ asyncBase *epollNewAsyncBase(void);
 asyncBase *kqueueNewAsyncBase(void);
 #endif
 
+// Reactor operations park as already running: kernel readiness drives them
+// from submission on. The IOCP proactor must reach executeMethod to post the
+// overlapped I/O first, so its operations park as waiting until then.
+#ifdef OS_WINDOWS
+static const AsyncFlags afSyncStarted = afNone;
+#else
+static const AsyncFlags afSyncStarted = afRunning;
+#endif
+
 struct Context {
   aioExecuteProc *StartProc;
   aioFinishProc *FinishProc;
@@ -129,14 +138,7 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
     memset(&op->host, 0, sizeof(op->host));
   }
   if (context->TransactionSize && (opCode & OPCODE_WRITE) && !(flags & afNoCopy)) {
-    if (op->internalBuffer == 0) {
-      op->internalBuffer = malloc(context->TransactionSize);
-      op->internalBufferSize = context->TransactionSize;
-    } else if (op->internalBufferSize < context->TransactionSize) {
-      op->internalBufferSize = context->TransactionSize;
-      op->internalBuffer = realloc(op->internalBuffer, context->TransactionSize);
-    }
-
+    asyncOpEnsureInternalBuffer(&op->internalBuffer, &op->internalBufferSize, context->TransactionSize);
     memcpy(op->internalBuffer, context->Buffer, context->TransactionSize);
     op->buffer = op->internalBuffer;
   } else {
@@ -146,9 +148,8 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
   return &op->root;
 }
 
-static ssize_t coroutineRwFinish(asyncOp *op, aioObject *object)
+static ssize_t coroutineRwFinish(asyncOp *op)
 {
-  __UNUSED(object);
   AsyncOpStatus status = opGetStatus(&op->root);
   size_t bytesTransferred = op->bytesTransferred;
   releaseAsyncOp(&op->root);
@@ -200,28 +201,19 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
     return 0;
   }
 
-  asyncBase *base = 0;
-  switch (method) {
+  // Each supported OS has exactly one backend, so the method parameter cannot
+  // select anything different from the OS default; it stays in the signature
+  // for a platform with alternative backends.
+  __UNUSED(method);
 #if defined(OS_WINDOWS)
-    case amIOCP: base = iocpNewAsyncBase(); break;
+  asyncBase *base = iocpNewAsyncBase();
 #elif defined(OS_LINUX)
-    case amEPoll: base = epollNewAsyncBase(); break;
+  asyncBase *base = epollNewAsyncBase();
 #elif defined(OS_DARWIN) || defined(OS_FREEBSD)
-    case amKQueue: base = kqueueNewAsyncBase(); break;
-#endif
-    case amOSDefault:
-    default:
-#if defined(OS_WINDOWS)
-      base = iocpNewAsyncBase();
-#elif defined(OS_LINUX)
-      base = epollNewAsyncBase();
-#elif defined(OS_DARWIN) || defined(OS_FREEBSD)
-      base = kqueueNewAsyncBase();
+  asyncBase *base = kqueueNewAsyncBase();
 #else
 #error "Unsupported OS: no I/O multiplexor backend available"
 #endif
-      break;
-  }
 
   if (!base) {
     alignedFree(timerSleep);
@@ -305,6 +297,20 @@ static aioTimer *eventTimerApplyConfig(aioUserEvent *event, aioTimer *timer, uin
   return timer;
 }
 
+// One attempt of the owner's release CAS: drop the OWNER bit from the control
+// word exactly as observed. Failure means a concurrent publication landed;
+// *current is refreshed and the owner must reconcile it before retrying.
+static inline int eventTimerTryRelease(aioUserEvent *event, uint128 *current)
+{
+  uint128 unlocked = *current;
+  unlocked.low &= ~EVENT_TIMER_OWNER;
+  uint128 expected = *current;
+  if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, unlocked))
+    return 1;
+  *current = expected;
+  return 0;
+}
+
 static void eventTimerProcessUserOwner(aioUserEvent *event, uint128 applied, uint128 current)
 {
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
@@ -329,12 +335,8 @@ static void eventTimerProcessUserOwner(aioUserEvent *event, uint128 applied, uin
       continue;
     }
 
-    uint128 unlocked = current;
-    unlocked.low &= ~EVENT_TIMER_OWNER;
-    uint128 expected = current;
-    if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, unlocked))
+    if (eventTimerTryRelease(event, &current))
       return;
-    current = expected;
   }
 }
 
@@ -377,12 +379,8 @@ static uintptr_t eventTimerProcessKernelOwner(aioUserEvent *event, uint128 appli
       continue;
     }
 
-    uint128 unlocked = current;
-    unlocked.low &= ~EVENT_TIMER_OWNER;
-    uint128 expected = current;
-    if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, unlocked))
+    if (eventTimerTryRelease(event, &current))
       return deliveryCount;
-    current = expected;
   }
 }
 
@@ -733,11 +731,6 @@ asyncOpRoot *implRead(aioObject *object,
 {
   *bytesTransferred = 0;
   struct ioBuffer *sb = &object->buffer;
-#ifdef OS_WINDOWS
-  AsyncFlags extraFlags = afNone;
-#else
-  AsyncFlags extraFlags = afRunning;
-#endif
 
   if (copyFromBuffer(buffer, bytesTransferred, sb, size))
     return 0;
@@ -754,7 +747,7 @@ asyncOpRoot *implRead(aioObject *object,
         if (copyFromBuffer(buffer, bytesTransferred, sb, size) || !(flags & afWaitAll))
           break;
       } else {
-        asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | extraFlags, usTimeout, (void*)callback, arg, actRead, &context);
+        asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afSyncStarted, usTimeout, (void*)callback, arg, actRead, &context);
         op->bytesTransferred = *bytesTransferred;
         return &op->root;
       }
@@ -771,7 +764,7 @@ asyncOpRoot *implRead(aioObject *object,
     if (result) {
       return 0;
     } else {
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | extraFlags, usTimeout, (void*)callback, arg, actRead, &context);
+      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afSyncStarted, usTimeout, (void*)callback, arg, actRead, &context);
       op->bytesTransferred = *bytesTransferred;
       return &op->root;
     }
@@ -794,11 +787,6 @@ asyncOpRoot *implWrite(aioObject *object,
                        void *arg,
                        size_t *bytesTransferred)
 {
-#ifdef OS_WINDOWS
-  AsyncFlags extraFlags = afNone;
-#else
-  AsyncFlags extraFlags = afRunning;
-#endif
   size_t bytes = 0;
   int result;
   if (object->root.header.objectType == ioObjectSocket) {
@@ -821,7 +809,7 @@ asyncOpRoot *implWrite(aioObject *object,
   } else {
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.write, rwFinish, (void*)((uintptr_t)buffer), size);
-    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | extraFlags, usTimeout, (void*)callback, arg, actWrite, &context);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afSyncStarted, usTimeout, (void*)callback, arg, actWrite, &context);
     op->bytesTransferred = bytes;
     return &op->root;
   }
@@ -853,14 +841,14 @@ static asyncOpRoot *implWriteProxy(aioObjectRoot *object, AsyncFlags flags, uint
                    &context->BytesTransferred);
 }
 
-void aioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout, aioConnectCb callback, void *arg)
+// Transport initialization is one-shot for an object: the connect operation
+// claims the initialization slot at submission. A losing claim is a second
+// connect on the same object and completes with aosUnknownError through the
+// global queue instead of entering the combiner.
+static void connectSubmit(asyncOp *op)
 {
-  struct Context context;
-  fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
-  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afNone, usTimeout, (void*)callback, arg, actConnect, &context);
-  op->host = *address;
-  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp, 0, (uintptr_t)&op->root, amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
+  aioObjectRoot *object = op->root.object;
+  if (!__uintptr_atomic_compare_and_swap(&object->initializationOp, 0, (uintptr_t)&op->root, amoSeqCst)) {
     opForceStatus(&op->root, aosUnknownError);
     addToGlobalQueue(&op->root);
     return;
@@ -869,16 +857,20 @@ void aioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeou
   combinerPushOperation(&op->root);
 }
 
+void aioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout, aioConnectCb callback, void *arg)
+{
+  struct Context context;
+  fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
+  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afNone, usTimeout, (void*)callback, arg, actConnect, &context);
+  op->host = *address;
+  connectSubmit(op);
+}
+
 void aioAccept(aioObject *object, uint64_t usTimeout, aioAcceptCb callback, void *arg)
 {
-#ifdef OS_WINDOWS
-  AsyncFlags flags = afNone;
-#else
-  AsyncFlags flags = afRunning;
-#endif
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.accept, acceptFinish, 0, 0);
-  asyncOpRoot *op = newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actAccept, &context);
+  asyncOpRoot *op = newAsyncOp(&object->root, afSyncStarted, usTimeout, (void*)callback, arg, actAccept, &context);
   combinerPushOperation(op);
 }
 
@@ -910,77 +902,97 @@ ssize_t aioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags 
   return context.Result;
 }
 
-ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioReadMsgCb callback, void *arg)
+// One receive syscall and truncation oracle for both datagram read paths:
+// Winsock consumes an oversized datagram and reports WSAEMSGSIZE, POSIX
+// returns the clipped payload flagged MSG_TRUNC - either way the datagram is
+// gone and must complete as aosBufferTooSmall, never be retried.
+static ssize_t readMsgSyscall(aioObject *object, void *buffer, size_t size, struct sockaddr_storage *source, int *truncated)
 {
-  // Datagram fast path runs the syscall without entering the combiner, so
-  // the sticky delete sweep cannot stop it - gate here: a call after
-  // objectDelete must be rejected without touching the socket, otherwise an
-  // incoming flood keeps this path succeeding and teardown never finishes
-  if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed)) {
-    if (callback == 0)
-      return -(ssize_t)aosCanceled;
-    struct Context context;
-    fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
-    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-    op->bytesTransferred = 0;
-    memset(&op->host, 0, sizeof(op->host));
-    opForceStatus(&op->root, aosCanceled);
-    addToGlobalQueue(&op->root);
-    return -(ssize_t)aosPending;
-  }
-
-  struct sockaddr_storage source;
-  int truncated;
 #ifdef OS_WINDOWS
-  socketLenTy addrlen = sizeof(source);
-  ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&source, &addrlen);
-  // Winsock consumes the datagram even when it does not fit into the buffer
-  truncated = result == -1 && WSAGetLastError() == WSAEMSGSIZE;
+  socketLenTy addrlen = sizeof(*source);
+  ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)source, &addrlen);
+  *truncated = result == -1 && WSAGetLastError() == WSAEMSGSIZE;
 #else
   struct iovec iov;
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
   iov.iov_base = buffer;
   iov.iov_len = size;
-  msg.msg_name = &source;
-  msg.msg_namelen = sizeof(source);
+  msg.msg_name = source;
+  msg.msg_namelen = sizeof(*source);
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
   ssize_t result = recvmsg(object->hSocket, &msg, 0);
-  truncated = result >= 0 && (msg.msg_flags & MSG_TRUNC);
+  *truncated = result >= 0 && (msg.msg_flags & MSG_TRUNC);
 #endif
+  return result;
+}
+
+static ssize_t writeMsgSyscall(aioObject *object, const HostAddress *address, const void *buffer, size_t size)
+{
+  struct sockaddr_storage remoteAddress;
+  socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
+#ifdef OS_WINDOWS
+  return sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&remoteAddress, addrlen);
+#else
+  return sendto(object->hSocket, buffer, size, 0, (struct sockaddr*)&remoteAddress, addrlen);
+#endif
+}
+
+// Datagram fast paths run their syscall without entering the combiner, so the
+// sticky delete sweep cannot stop them; the callers gate on DeletePending
+// before touching the socket - after objectDelete an incoming flood would
+// otherwise keep the path succeeding and teardown would never finish.
+// Fire-and-forget learns the rejection inline; a callback completes with
+// aosCanceled through the global queue.
+static ssize_t datagramRejectClosing(aioObject *object,
+                                     AsyncFlags flags,
+                                     uint64_t usTimeout,
+                                     void *callback,
+                                     void *arg,
+                                     int opCode,
+                                     struct Context *context)
+{
+  if (callback == 0)
+    return -(ssize_t)aosCanceled;
+  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, callback, arg, opCode, context);
+  if (opCode == actReadMsg)
+    memset(&op->host, 0, sizeof(op->host));
+  opForceStatus(&op->root, aosCanceled);
+  addToGlobalQueue(&op->root);
+  return -(ssize_t)aosPending;
+}
+
+ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioReadMsgCb callback, void *arg)
+{
+  if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed)) {
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
+    return datagramRejectClosing(object, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
+  }
+
+  struct sockaddr_storage source;
+  int truncated;
+  ssize_t result = readMsgSyscall(object, buffer, size, &source, &truncated);
 
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
-  if (truncated) {
-    // The datagram is already consumed and cut down to the buffer size:
-    // parking the operation here would lose it with no completion at all
+  if (truncated || result >= 0) {
+    // Either data arrived synchronously, or the datagram was consumed but cut
+    // down to the buffer size - a truncated datagram cannot be retried and
+    // must complete as aosBufferTooSmall, or it would be lost with no
+    // completion at all
     HostAddress host;
     sockaddrToHostAddress(&source, &host);
     if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
-      return -(ssize_t)aosBufferTooSmall;
+      return truncated ? -(ssize_t)aosBufferTooSmall : result;
     } else {
       if (flags & afActiveOnce)
         currentFinishedSync = 0;
       asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-      op->bytesTransferred = size;
+      op->bytesTransferred = truncated ? size : (size_t)result;
       op->host = host;
-      opForceStatus(&op->root, aosBufferTooSmall);
-      addToGlobalQueue(&op->root);
-    }
-  } else if (result >= 0) {
-    // Data received synchronously
-    HostAddress host;
-    sockaddrToHostAddress(&source, &host);
-    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
-      return result;
-    } else {
-      if (flags & afActiveOnce)
-        currentFinishedSync = 0;
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-      op->bytesTransferred = (size_t)result;
-      op->host = host;
-      opForceStatus(&op->root, aosSuccess);
+      opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
       addToGlobalQueue(&op->root);
     }
   } else {
@@ -1000,27 +1012,14 @@ ssize_t aioWriteMsg(aioObject *object,
                     aioCb callback,
                     void *arg)
 {
-  // See aioReadMsg: reject a closing object before the syscall
   if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed)) {
-    if (callback == 0)
-      return -(ssize_t)aosCanceled;
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
-    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
-    op->bytesTransferred = 0;
-    opForceStatus(&op->root, aosCanceled);
-    addToGlobalQueue(&op->root);
-    return -(ssize_t)aosPending;
+    return datagramRejectClosing(object, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
   }
 
   // Datagram socket can be accessed by multiple threads without lock
-  struct sockaddr_storage remoteAddress;
-  socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
-#ifdef OS_WINDOWS
-  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&remoteAddress, addrlen);
-#else
-  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr*)&remoteAddress, addrlen);
-#endif
+  ssize_t result = writeMsgSyscall(object, address, buffer, size);
 
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
@@ -1050,13 +1049,7 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
   fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afCoroutine, usTimeout, 0, 0, actConnect, &context);
   op->host = *address;
-  if (!__uintptr_atomic_compare_and_swap(&object->root.initializationOp, 0, (uintptr_t)&op->root, amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-  } else {
-    combinerPushOperation(&op->root);
-  }
+  connectSubmit(op);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);
@@ -1069,14 +1062,9 @@ int ioAccept(aioObject *object, socketTy *acceptedSocket, HostAddress *remoteAdd
   if (remoteAddress)
     memset(remoteAddress, 0, sizeof(*remoteAddress));
 
-#ifdef OS_WINDOWS
-  AsyncFlags flags = afNone;
-#else
-  AsyncFlags flags = afRunning;
-#endif
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.accept, acceptFinish, 0, 0);
-  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actAccept, &context);
+  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afSyncStarted | afCoroutine, usTimeout, 0, 0, actAccept, &context);
   combinerPushOperation(&op->root);
 
   coroutineYield();
@@ -1095,7 +1083,7 @@ ssize_t ioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, u
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.read, 0, buffer, size);
   asyncOpRoot *op = runIoOperation(&object->root, newAsyncOp, implReadProxy, initOp, flags, usTimeout, actRead, &context);
-  return op ? coroutineRwFinish((asyncOp*)op, object) : (ssize_t)context.BytesTransferred;
+  return op ? coroutineRwFinish((asyncOp*)op) : (ssize_t)context.BytesTransferred;
 }
 
 ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
@@ -1103,87 +1091,53 @@ ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags f
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.write, 0, (void*)((uintptr_t)buffer), size);
   asyncOpRoot *op = runIoOperation(&object->root, newAsyncOp, implWriteProxy, initOp, flags, usTimeout, actWrite, &context);
-  return op ? coroutineRwFinish((asyncOp*)op, object) : (ssize_t)context.BytesTransferred;
+  return op ? coroutineRwFinish((asyncOp*)op) : (ssize_t)context.BytesTransferred;
 }
 
 ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
-  // See aioReadMsg: reject a closing object before the syscall
+  // See datagramRejectClosing: reject a closing object before the syscall
   if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed))
     return -(ssize_t)aosCanceled;
 
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage source;
   int truncated;
-#ifdef OS_WINDOWS
-  socketLenTy addrlen = sizeof(source);
-  ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&source, &addrlen);
-  // Winsock consumes the datagram even when it does not fit into the buffer
-  truncated = result == -1 && WSAGetLastError() == WSAEMSGSIZE;
-#else
-  struct iovec iov;
-  struct msghdr msg;
-  memset(&msg, 0, sizeof(msg));
-  iov.iov_base = buffer;
-  iov.iov_len = size;
-  msg.msg_name = &source;
-  msg.msg_namelen = sizeof(source);
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  ssize_t result = recvmsg(object->hSocket, &msg, 0);
-  truncated = result >= 0 && (msg.msg_flags & MSG_TRUNC);
-#endif
+  ssize_t result = readMsgSyscall(object, buffer, size, &source, &truncated);
 
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
-  if (truncated) {
-    // The datagram is already consumed and cut down to the buffer size:
-    // parking the operation here would lose it with no completion at all
+  if (truncated || result >= 0) {
+    // Either data arrived synchronously, or the datagram was consumed but cut
+    // down to the buffer size - a truncated datagram cannot be retried and
+    // must complete as aosBufferTooSmall, or it would be lost with no
+    // completion at all
     if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {
       asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
-      op->bytesTransferred = size;
-      opForceStatus(&op->root, aosBufferTooSmall);
+      op->bytesTransferred = truncated ? size : (size_t)result;
+      opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
       addToGlobalQueue(&op->root);
       coroutineYield();
-      return coroutineRwFinish(op, object);
+      return coroutineRwFinish(op);
     } else {
-      return -(ssize_t)aosBufferTooSmall;
-    }
-  }
-  if (result >= 0) {
-    // Data received synchronously
-    if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
-      op->bytesTransferred = (size_t)result;
-      opForceStatus(&op->root, aosSuccess);
-      addToGlobalQueue(&op->root);
-      coroutineYield();
-      return coroutineRwFinish(op, object);
-    } else {
-      return result;
+      return truncated ? -(ssize_t)aosBufferTooSmall : result;
     }
   }
 
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
   combinerPushOperation(&op->root);
   coroutineYield();
-  return coroutineRwFinish(op, object);
+  return coroutineRwFinish(op);
 }
 
 ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout)
 {
-  // See aioReadMsg: reject a closing object before the syscall
+  // See datagramRejectClosing: reject a closing object before the syscall
   if (__uint_atomic_load(&object->root.DeletePending, amoRelaxed))
     return -(ssize_t)aosCanceled;
 
   // Datagram socket can be accessed by multiple threads without lock
-  struct sockaddr_storage remoteAddress;
-  socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
-#ifdef OS_WINDOWS
-  ssize_t result = sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&remoteAddress, addrlen);
-#else
-  ssize_t result = sendto(object->hSocket, buffer, size, 0, (struct sockaddr*)&remoteAddress, addrlen);
-#endif
+  ssize_t result = writeMsgSyscall(object, address, buffer, size);
 
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
@@ -1195,7 +1149,7 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
       opForceStatus(&op->root, aosSuccess);
       addToGlobalQueue(&op->root);
       coroutineYield();
-      return coroutineRwFinish(op, object);
+      return coroutineRwFinish(op);
     } else {
       return result;
     }
@@ -1205,7 +1159,7 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
   op->host = *address;
   combinerPushOperation(&op->root);
   coroutineYield();
-  return coroutineRwFinish(op, object);
+  return coroutineRwFinish(op);
 }
 
 void ioSleep(aioUserEvent *event, uint64_t usTimeout)

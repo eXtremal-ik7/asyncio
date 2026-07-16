@@ -388,14 +388,11 @@ TEST(socket, test_tcp_read_pipelined_with_connect)
 {
   TcpPipelineContext ctx(gBase);
 
+  aioObject *client = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(client, nullptr);
+
   HostAddress address;
   address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-  aioObject *client = newSocketIo(gBase, clientSocket);
-
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
   aioConnect(client, &address, 150000, tcpPipelineConnectCb, &ctx);
@@ -416,52 +413,19 @@ TEST(socket, test_tcp_read_pipelined_with_connect)
 // aioObjectRoot::initializationOp slot. A second connect submitted while the
 // first is still in flight must be rejected immediately instead of queueing
 // or corrupting the slot.
-struct DoubleConnectContext {
-  asyncBase *base;
-  AsyncOpStatus firstStatus;
-  AsyncOpStatus secondStatus;
-  int events;
-  int firstOrder;
-  int secondOrder;
-  DoubleConnectContext(asyncBase *baseArg) :
-    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
-    events(0), firstOrder(-1), secondOrder(-1) {}
-};
-
-static void doubleConnectFirstCb(AsyncOpStatus status, aioObject*, void *arg)
-{
-  DoubleConnectContext *ctx = static_cast<DoubleConnectContext*>(arg);
-  ctx->firstStatus = status;
-  ctx->firstOrder = ctx->events++;
-  if (ctx->events == 2)
-    postQuitOperation(ctx->base);
-}
-
-static void doubleConnectSecondCb(AsyncOpStatus status, aioObject*, void *arg)
-{
-  DoubleConnectContext *ctx = static_cast<DoubleConnectContext*>(arg);
-  ctx->secondStatus = status;
-  ctx->secondOrder = ctx->events++;
-  if (ctx->events == 2)
-    postQuitOperation(ctx->base);
-}
-
 TEST(socket, double_connect_rejected)
 {
-  DoubleConnectContext ctx(gBase);
+  DoubleConnectRecorder ctx(gBase);
+
+  aioObject *client = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(client, nullptr);
 
   HostAddress address;
   address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-  aioObject *client = newSocketIo(gBase, clientSocket);
-
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioConnect(client, &address, 150000, doubleConnectFirstCb, &ctx);
-  aioConnect(client, &address, 150000, doubleConnectSecondCb, &ctx);
+  aioConnect(client, &address, 150000, doubleConnectFirstCb<aioObject>, &ctx);
+  aioConnect(client, &address, 150000, doubleConnectSecondCb<aioObject>, &ctx);
 
   asyncLoop(gBase);
   deleteAioObject(client);
@@ -495,14 +459,11 @@ TEST(socket, delete_object_while_connecting)
 {
   DeleteWhileConnectingContext ctx(gBase);
 
+  aioObject *client = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(client, nullptr);
+
   HostAddress address;
   address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-  aioObject *client = newSocketIo(gBase, clientSocket);
-
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
   aioConnect(client, &address, 3000000, deleteWhileConnectingCb, &ctx);

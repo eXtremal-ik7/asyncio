@@ -5,10 +5,6 @@
 #include "asyncioconfig.h"
 #include "atomic.h"
 
-#ifdef BUILD_SANITIZE_ADDRESS
-#include <sanitizer/asan_interface.h>
-#include <sanitizer/common_interface_defs.h>
-#endif
 #ifdef BUILD_SANITIZE_THREAD
 #include <sanitizer/tsan_interface.h>
 #endif
@@ -84,28 +80,14 @@ typedef struct coroutineTy {
 #endif
 } coroutineTy;
 
+// Shared ASan fiber-switch helpers; must follow the coroutineTy definition.
+#include "coroutineSanitizer.h"
+
 static __thread coroutineTy *mainCoroutine;
 static __thread coroutineTy *currentCoroutine;
 
 void switchContext(contextTy *from, contextTy *to);
 void initFPU(contextTy *context);
-
-#ifdef BUILD_SANITIZE_ADDRESS
-static inline __attribute__((always_inline))
-void sanitizerFinishSwitch(coroutineTy *destination, coroutineTy *source)
-{
-  const void *sourceStackBottom;
-  size_t sourceStackSize;
-  __sanitizer_finish_switch_fiber(destination->asanFakeStack,
-                                  &sourceStackBottom,
-                                  &sourceStackSize);
-  destination->asanFakeStack = 0;
-  if (!source->asanStackBottom) {
-    source->asanStackBottom = sourceStackBottom;
-    source->asanStackSize = sourceStackSize;
-  }
-}
-#endif
 
 static inline __attribute__((always_inline))
 void coroutineSwitchContext(coroutineTy *from, coroutineTy *to, int finalSwitch)
@@ -134,29 +116,6 @@ void coroutineSwitchContext(coroutineTy *from, coroutineTy *to, int finalSwitch)
   sanitizerFinishSwitch(from, from->asanPrevious);
 #endif
 }
-
-#ifdef BUILD_SANITIZE_ADDRESS
-static __attribute__((no_sanitize_address))
-void asanDestroyFakeStack(void *fakeStack)
-{
-  // A suspended coroutine cannot execute the normal final switch which asks
-  // ASan to destroy its fake stack. Temporarily install it as the current fake
-  // stack, destroy it, then restore the actual current stack state. From the
-  // first finish_switch below until the next start_switch the thread runs with
-  // [0,0) stack bounds and a foreign fake stack (both are committed by
-  // finish_switch), so no instrumented code may execute in between - keep this
-  // helper uninstrumented and free of calls.
-  void *currentFakeStack;
-  const void *currentStackBottom;
-  size_t currentStackSize;
-  __sanitizer_start_switch_fiber(&currentFakeStack, 0, 0);
-  __sanitizer_finish_switch_fiber(fakeStack,
-                                  &currentStackBottom,
-                                  &currentStackSize);
-  __sanitizer_start_switch_fiber(0, currentStackBottom, currentStackSize);
-  __sanitizer_finish_switch_fiber(currentFakeStack, 0, 0);
-}
-#endif
 
 static inline __attribute__((always_inline))
 void sanitizerDestroyCoroutine(coroutineTy *coroutine)

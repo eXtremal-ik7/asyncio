@@ -101,7 +101,6 @@ enum zmtpOpState {
   stRecvReadSize,
   stRecvReadData,
 
-  stWriteSize,
   stWriteData,
 
   stFinished
@@ -148,14 +147,9 @@ static int cancel(asyncOpRoot *opptr)
   return 0;
 }
 
-static void acceptFinish(asyncOpRoot *opptr)
-{
-  reinterpret_cast<zmtpAcceptCb*>(opptr->callback)(opGetStatus(opptr),
-                                                   reinterpret_cast<zmtpSocket*>(opptr->object),
-                                                   opptr->arg);
-}
-
-static void connectFinish(asyncOpRoot *opptr)
+// zmtpAcceptCb, zmtpConnectCb and zmtpSendCb are the same function type, so
+// accept, connect and send operations share one finish thunk
+static void socketOpFinish(asyncOpRoot *opptr)
 {
   reinterpret_cast<zmtpConnectCb*>(opptr->callback)(opGetStatus(opptr),
                                                     reinterpret_cast<zmtpSocket*>(opptr->object),
@@ -173,15 +167,37 @@ static void recvFinish(asyncOpRoot *opptr)
                                                  opptr->arg);
 }
 
-static void sendFinish(asyncOpRoot *opptr)
+// Wire message type for a user-visible message kind (a long frame is any
+// payload that does not fit the one-byte length)
+static zmtpMsgTy zmtpMsgTypeFor(zmtpUserMsgTy userType, size_t size)
 {
-  reinterpret_cast<zmtpSendCb*>(opptr->callback)(opGetStatus(opptr),
-                                                 reinterpret_cast<zmtpSocket*>(opptr->object),
-                                                 opptr->arg);
+  switch (userType) {
+    case zmtpCommand :
+      return (size < 256) ? zmtpMsgFlagCommand : zmtpMsgFlagCommand | zmtpMsgFlagLong;
+    case zmtpMessagePart :
+      return (size < 256) ? zmtpMsgFlagMore : zmtpMsgFlagMore | zmtpMsgFlagLong;
+    case zmtpMessage :
+    default :
+      return (size < 256) ? zmtpMsgFlagNone : zmtpMsgFlagLong;
+  }
 }
 
-static void releaseOp(asyncOpRoot*)
+// Common part of the operation constructors: pooled allocation and state setup;
+// operations have no resources of their own, so no release procedure is needed
+static zmtpOp *allocZmtpOp(aioObjectRoot *object,
+                           AsyncFlags flags,
+                           uint64_t usTimeout,
+                           void *callback,
+                           void *arg,
+                           int opCode,
+                           const Context *context)
 {
+  zmtpOp *op = 0;
+  asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op);
+  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, 0, object, callback, arg, flags, opCode, usTimeout);
+  op->state = stInitialize;
+  op->stateRw = stInitialize;
+  return op;
 }
 
 static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
@@ -192,14 +208,7 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
                                int opCode,
                                void *contextPtr)
 {
-  zmtpOp *op = 0;
-  struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
-  }
-
-  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
-  op->state = stInitialize;
-  op->stateRw = stInitialize;
+  zmtpOp *op = allocZmtpOp(object, flags, usTimeout, callback, arg, opCode, (const Context*)contextPtr);
   return &op->root;
 }
 
@@ -211,14 +220,8 @@ static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
                                    int opCode,
                                    void *contextPtr)
 {
-  zmtpOp *op = 0;
-  struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
-  }
-
-  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
-  op->state = stInitialize;
-  op->stateRw = stInitialize;
+  const Context *context = (const Context*)contextPtr;
+  zmtpOp *op = allocZmtpOp(object, flags, usTimeout, callback, arg, opCode, context);
   op->data = nullptr;
   op->stream = context->Stream;
   op->size = context->TransactionSize;
@@ -233,29 +236,12 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
                                     int opCode,
                                     void *contextPtr)
 {
-  zmtpOp *op = 0;
-  struct Context *context = (struct Context*)contextPtr;
-  if (asyncOpAlloc(object->header.base, sizeof(zmtpOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {
-  }
-
-  initAsyncOpRoot(&op->root, context->StartProc, cancel, context->FinishProc, releaseOp, object, callback, arg, flags, opCode, usTimeout);
-  op->state = stInitialize;
-  op->stateRw = stInitialize;
+  const Context *context = (const Context*)contextPtr;
+  zmtpOp *op = allocZmtpOp(object, flags, usTimeout, callback, arg, opCode, context);
   op->data = context->Buffer;
   op->stream = nullptr;
   op->size = context->TransactionSize;
-  switch (context->UserMsgType) {
-    case zmtpCommand :
-      op->type = (context->TransactionSize < 256) ? zmtpMsgFlagCommand : zmtpMsgFlagCommand | zmtpMsgFlagLong;
-      break;
-    case zmtpMessagePart :
-      op->type = (context->TransactionSize < 256) ? zmtpMsgFlagMore : zmtpMsgFlagMore | zmtpMsgFlagLong;
-      break;
-    case zmtpMessage :
-    default :
-      op->type = (context->TransactionSize < 256) ? zmtpMsgFlagNone : zmtpMsgFlagLong;
-      break;
-  }
+  op->type = zmtpMsgTypeFor(context->UserMsgType, context->TransactionSize);
   return &op->root;
 }
 
@@ -437,6 +423,16 @@ static AsyncOpStatus startZmtpConnect(asyncOpRoot *opptr)
   return aosPending;
 }
 
+// Frame length decoded from the header bytes in socket->buffer (a short frame
+// carries one length byte, a long frame an 8-byte network-order length)
+static size_t zmtpFrameLength(zmtpSocket *socket, zmtpMsgTy type)
+{
+  if (!(type & zmtpMsgFlagLong))
+    return static_cast<size_t>(socket->buffer[1]);
+  else
+    return static_cast<size_t>(xntoh<uint64_t>(reinterpret_cast<uint64_t*>(socket->buffer+1)[0]));
+}
+
 static AsyncOpStatus startZmtpRecv(asyncOpRoot *opptr)
 {
   zmtpOp *op = reinterpret_cast<zmtpOp*>(opptr);
@@ -467,10 +463,7 @@ static AsyncOpStatus startZmtpRecv(asyncOpRoot *opptr)
 
       case stRecvReadData : {
         op->stateRw = (op->type & zmtpMsgFlagMore) ? stRecvReadType : stFinished;
-        if (!(op->type & zmtpMsgFlagLong))
-          op->transferred = static_cast<size_t>(socket->buffer[1]);
-        else
-          op->transferred = static_cast<size_t>(xntoh<uint64_t>(reinterpret_cast<uint64_t*>(socket->buffer+1)[0]));
+        op->transferred = zmtpFrameLength(socket, op->type);
 
         if (op->transferred <= op->size)
           childOp = implRead(socket->plainSocket, op->stream ? op->stream->reserve(op->transferred) : op->data, op->transferred, afWaitAll, 0, resumeRwCb, opptr, &bytes);
@@ -519,10 +512,7 @@ static asyncOpRoot *implZmtpRecvStream(zmtpSocket *socket, zmtpStream &msg, size
       }
     }
 
-    if (!(type & zmtpMsgFlagLong))
-      transferred = static_cast<size_t>(socket->buffer[1]);
-    else
-      transferred = static_cast<size_t>(xntoh<uint64_t>(reinterpret_cast<uint64_t*>(socket->buffer+1)[0]));
+    transferred = zmtpFrameLength(socket, type);
 
     if (transferred <= limit) {
       if ( (childOp = implRead(socket->plainSocket, msg.reserve(transferred), transferred, afWaitAll, 0, resumeRwCb, nullptr, &bytes)) ) {
@@ -562,39 +552,46 @@ static asyncOpRoot *implZmtpRecvStreamProxy(aioObjectRoot *object, AsyncFlags fl
   return implZmtpRecvStream(reinterpret_cast<zmtpSocket*>(object), *context->Stream, context->TransactionSize, flags, usTimeout, reinterpret_cast<zmtpRecvCb*>(callback), arg, &context->BytesTransferred, &context->MsgType);
 }
 
+// Builds the wire header in socket->buffer: the REQ/REP empty delimiter frame
+// when one is due, the flags byte and the short/long length; returns the
+// number of header bytes. Updates the REQ/REP delimiter state.
+static unsigned zmtpBuildSendHeader(zmtpSocket *socket, zmtpMsgTy msgType, size_t size)
+{
+  unsigned offset = 0;
+  if (!(msgType & zmtpMsgFlagCommand) &&
+      (socket->type == zmtpSocketREQ || socket->type == zmtpSocketREP) && !socket->needSendMore) {
+    socket->buffer[0] = zmtpMsgFlagMore;
+    socket->buffer[1] = 0;
+    offset = 2;
+  }
+
+  socket->needSendMore = (msgType & zmtpMsgFlagMore);
+
+  if (!(msgType & zmtpMsgFlagLong)) {
+    socket->buffer[offset] = static_cast<uint8_t>(msgType);
+    socket->buffer[offset+1] = static_cast<uint8_t>(size);
+    offset += 2;
+  } else {
+    socket->buffer[offset] = static_cast<uint8_t>(msgType);
+    reinterpret_cast<uint64_t*>(socket->buffer+offset+1)[0] = xhton<uint64_t>(size);
+    offset += 9;
+  }
+
+  return offset;
+}
+
 static AsyncOpStatus startZmtpSend(asyncOpRoot *opptr)
 {
   zmtpOp *op = reinterpret_cast<zmtpOp*>(opptr);
   zmtpSocket *socket = reinterpret_cast<zmtpSocket*>(opptr->object);
   asyncOpRoot *childOp = nullptr;
   size_t bytes;
-  unsigned offset = 0;
   while (!childOp) {
     switch (op->stateRw) {
       case stInitialize : {
-        op->stateRw = stWriteSize;
-        if (!(op->type & zmtpMsgFlagCommand) &&
-            (socket->type == zmtpSocketREQ || socket->type == zmtpSocketREP) && !socket->needSendMore) {
-          socket->buffer[0] = zmtpMsgFlagMore;
-          socket->buffer[1] = 0;
-          offset = 2;
-        }
-
-        socket->needSendMore = (op->type & zmtpMsgFlagMore);
-        break;
-      }
-      case stWriteSize : {
-        op->stateRw = stWriteData;
-        if (!(op->type & zmtpMsgFlagLong)) {
-          socket->buffer[offset] = static_cast<uint8_t>(op->type);
-          socket->buffer[offset+1] = static_cast<uint8_t>(op->size);
-          offset += 2;
-        } else {
-          socket->buffer[offset] = static_cast<uint8_t>(op->type);
-          reinterpret_cast<uint64_t*>(socket->buffer+offset+1)[0] = xhton<uint64_t>(op->size);
-          offset += 9;
-        }
-
+        // header build and first write form one step: no child operation can
+        // separate them, so no intermediate state is ever observed here
+        unsigned offset = zmtpBuildSendHeader(socket, op->type, op->size);
         if (op->size <= (sizeof(socket->buffer) - offset)) {
           op->stateRw = stFinished;
           memcpy(socket->buffer+offset, op->data, op->size);
@@ -625,45 +622,13 @@ static AsyncOpStatus startZmtpSend(asyncOpRoot *opptr)
   return aosPending;
 }
 
-asyncOpRoot *implZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserMsgTy type, AsyncFlags flags, uint64_t timeout, zmtpSendCb callback, void *arg, size_t *bytesTransferred)
+static asyncOpRoot *implZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserMsgTy type, AsyncFlags flags, uint64_t timeout, zmtpSendCb callback, void *arg, size_t *bytesTransferred)
 {
   asyncOpRoot *childOp = nullptr;
   size_t bytes;
   zmtpOpState state = stInitialize;
-  unsigned offset = 0;
-  zmtpMsgTy msgType;
-
-  switch (type) {
-    case zmtpCommand :
-      msgType = (size < 256) ? zmtpMsgFlagCommand : zmtpMsgFlagCommand | zmtpMsgFlagLong;
-      break;
-    case zmtpMessagePart :
-      msgType = (size < 256) ? zmtpMsgFlagMore : zmtpMsgFlagMore | zmtpMsgFlagLong;
-      break;
-    case zmtpMessage :
-    default :
-      msgType = (size < 256) ? zmtpMsgFlagNone : zmtpMsgFlagLong;
-      break;
-  }
-
-  if (!(msgType & zmtpMsgFlagCommand) &&
-      (socket->type == zmtpSocketREQ || socket->type == zmtpSocketREP) && !socket->needSendMore) {
-    socket->buffer[0] = zmtpMsgFlagMore;
-    socket->buffer[1] = 0;
-    offset = 2;
-  }
-
-  socket->needSendMore = (msgType & zmtpMsgFlagMore);
-
-  if (!(msgType & zmtpMsgFlagLong)) {
-    socket->buffer[offset] = static_cast<uint8_t>(msgType);
-    socket->buffer[offset+1] = static_cast<uint8_t>(size);
-    offset += 2;
-  } else {
-    socket->buffer[offset] = static_cast<uint8_t>(msgType);
-    reinterpret_cast<uint64_t*>(socket->buffer+offset+1)[0] = xhton<uint64_t>(size);
-    offset += 9;
-  }
+  zmtpMsgTy msgType = zmtpMsgTypeFor(type, size);
+  unsigned offset = zmtpBuildSendHeader(socket, msgType, size);
 
   if (size <= (sizeof(socket->buffer) - offset)) {
     memcpy(socket->buffer+offset, data, size);
@@ -680,7 +645,7 @@ asyncOpRoot *implZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserM
   }
 
   if (childOp) {
-    Context context(startZmtpSend, sendFinish, nullptr, data, size, type);
+    Context context(startZmtpSend, socketOpFinish, nullptr, data, size, type);
     zmtpOp *op = reinterpret_cast<zmtpOp*>(newWriteAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpSend, &context));
     op->stateRw = state;
     op->type = msgType;
@@ -699,7 +664,7 @@ static asyncOpRoot *implZmtpSendProxy(aioObjectRoot *object, AsyncFlags flags, u
   return implZmtpSend(reinterpret_cast<zmtpSocket*>(object), context->Buffer, context->TransactionSize, context->UserMsgType, flags, usTimeout, reinterpret_cast<zmtpSendCb*>(callback), arg, &context->BytesTransferred);
 }
 
-void zmtpSocketDestructor(aioObjectRoot *object)
+static void zmtpSocketDestructor(aioObjectRoot *object)
 {
   deleteAioObject(reinterpret_cast<zmtpSocket*>(object)->plainSocket);
   objectFree(&objectPool, object, sizeof(zmtpSocket));
@@ -727,10 +692,10 @@ void zmtpSocketDelete(zmtpSocket *socket)
   objectDelete(&socket->root);
 }
 
-void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpAcceptCb callback, void *arg)
+// One-shot claim of the transport-initialization slot shared by all four
+// accept/connect entry points
+static void submitInitOp(zmtpSocket *socket, asyncOpRoot *op)
 {
-  Context context(startZmtpAccept, acceptFinish, nullptr, nullptr, 0, zmtpUnknown);
-  asyncOpRoot *op = newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpAccept, &context);
   if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
                                          0,
                                          reinterpret_cast<uintptr_t>(op),
@@ -744,55 +709,54 @@ void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpA
   combinerPushOperation(op);
 }
 
+void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpAcceptCb callback, void *arg)
+{
+  Context context(startZmtpAccept, socketOpFinish, nullptr, nullptr, 0, zmtpUnknown);
+  asyncOpRoot *op = newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpAccept, &context);
+  submitInitOp(socket, op);
+}
+
 void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags flags, uint64_t timeout, zmtpConnectCb callback, void *arg)
 {
-  Context context(startZmtpConnect, connectFinish, nullptr, nullptr, 0, zmtpUnknown);
+  Context context(startZmtpConnect, socketOpFinish, nullptr, nullptr, 0, zmtpUnknown);
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpConnect, &context));
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         reinterpret_cast<uintptr_t>(&op->root),
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-    return;
-  }
+  submitInitOp(socket, &op->root);
+}
 
-  combinerPushOperation(&op->root);
+// Inline-completion glue shared by the aio/io entry points: publish the byte
+// count as the call result, or seed a queued operation with the inline state
+static void makeResult(void *contextPtr)
+{
+  Context *context = static_cast<Context*>(contextPtr);
+  context->Result = static_cast<ssize_t>(context->BytesTransferred);
+}
+
+static void initRecvOp(asyncOpRoot *op, void *contextPtr)
+{
+  Context *context = static_cast<Context*>(contextPtr);
+  reinterpret_cast<zmtpOp*>(op)->type = context->MsgType;
+  reinterpret_cast<zmtpOp*>(op)->transferred = context->BytesTransferred;
+}
+
+static void initSendOp(asyncOpRoot *op, void *contextPtr)
+{
+  Context *context = static_cast<Context*>(contextPtr);
+  reinterpret_cast<zmtpOp*>(op)->transferred = context->BytesTransferred;
 }
 
 ssize_t aioZmtpRecv(zmtpSocket *socket, zmtpStream &msg, size_t limit, AsyncFlags flags, uint64_t timeout, zmtpRecvCb callback, void *arg)
 {
   Context context(startZmtpRecv, recvFinish, &msg, nullptr, limit, zmtpUnknown);
-  auto makeResult = [](void *contextPtr) {
-    Context *context = static_cast<Context*>(contextPtr);
-    context->Result = static_cast<ssize_t>(context->BytesTransferred);
-  };
-  auto initOp = [](asyncOpRoot *op, void *contextPtr) {
-    Context *context = static_cast<Context*>(contextPtr);
-    reinterpret_cast<zmtpOp*>(op)->type = context->MsgType;
-    reinterpret_cast<zmtpOp*>(op)->transferred = context->BytesTransferred;
-  };
-
-  runAioOperation(&socket->root, newReadAsyncOp, implZmtpRecvStreamProxy, makeResult, initOp, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpRecv, &context);
+  runAioOperation(&socket->root, newReadAsyncOp, implZmtpRecvStreamProxy, makeResult, initRecvOp, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpRecv, &context);
   return context.Result;
 }
 
 ssize_t aioZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserMsgTy type, AsyncFlags flags, uint64_t timeout, zmtpSendCb callback, void *arg)
 {
-  Context context(startZmtpSend, sendFinish, nullptr, data, size, type);
-  auto makeResult = [](void *contextPtr) {
-    Context *context = static_cast<Context*>(contextPtr);
-    context->Result = static_cast<ssize_t>(context->BytesTransferred);
-  };
-  auto initOp = [](asyncOpRoot *op, void *contextPtr) {
-    Context *context = static_cast<Context*>(contextPtr);
-    reinterpret_cast<zmtpOp*>(op)->transferred = context->BytesTransferred;
-  };
-
-  runAioOperation(&socket->root, newWriteAsyncOp, implZmtpSendProxy, makeResult, initOp, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpSend, &context);
+  Context context(startZmtpSend, socketOpFinish, nullptr, data, size, type);
+  runAioOperation(&socket->root, newWriteAsyncOp, implZmtpSendProxy, makeResult, initSendOp, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpSend, &context);
   return context.Result;
 }
 
@@ -800,16 +764,7 @@ int ioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout)
 {
   Context context(startZmtpAccept, 0, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpAccept, &context);
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         reinterpret_cast<uintptr_t>(op),
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(op, aosUnknownError);
-    addToGlobalQueue(op);
-  } else {
-    combinerPushOperation(op);
-  }
+  submitInitOp(socket, op);
   coroutineYield();
 
   AsyncOpStatus status = opGetStatus(op);
@@ -823,16 +778,7 @@ int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags fla
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpConnect, &context));
   op->address = *address;
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         reinterpret_cast<uintptr_t>(&op->root),
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-  } else {
-    combinerPushOperation(&op->root);
-  }
+  submitInitOp(socket, &op->root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);
@@ -842,13 +788,7 @@ int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags fla
 ssize_t ioZmtpRecv(zmtpSocket *socket, zmtpStream &msg, size_t limit, AsyncFlags flags, uint64_t timeout, zmtpUserMsgTy *type)
 {
   Context context(startZmtpRecv, 0, &msg, nullptr, limit, zmtpUnknown);
-  auto initOp = [](asyncOpRoot *op, void *contextPtr) {
-    Context *context = static_cast<Context*>(contextPtr);
-    reinterpret_cast<zmtpOp*>(op)->type = context->MsgType;
-    reinterpret_cast<zmtpOp*>(op)->transferred = context->BytesTransferred;
-  };
-
-  zmtpOp *op = reinterpret_cast<zmtpOp*>(runIoOperation(&socket->root, newReadAsyncOp, implZmtpRecvStreamProxy, initOp, flags, timeout, zmtpOpRecv, &context));
+  zmtpOp *op = reinterpret_cast<zmtpOp*>(runIoOperation(&socket->root, newReadAsyncOp, implZmtpRecvStreamProxy, initRecvOp, flags, timeout, zmtpOpRecv, &context));
 
   if (op) {
     AsyncOpStatus status = opGetStatus(&op->root);
@@ -864,12 +804,7 @@ ssize_t ioZmtpRecv(zmtpSocket *socket, zmtpStream &msg, size_t limit, AsyncFlags
 ssize_t ioZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserMsgTy type, AsyncFlags flags, uint64_t timeout)
 {
   Context context(startZmtpSend, 0, nullptr, data, size, type);
-  auto initOp = [](asyncOpRoot *op, void *contextPtr) {
-    Context *context = static_cast<Context*>(contextPtr);
-    reinterpret_cast<zmtpOp*>(op)->transferred = context->BytesTransferred;
-  };
-
-  asyncOpRoot *op = runIoOperation(&socket->root, newWriteAsyncOp, implZmtpSendProxy, initOp, flags, timeout, zmtpOpSend, &context);
+  asyncOpRoot *op = runIoOperation(&socket->root, newWriteAsyncOp, implZmtpSendProxy, initSendOp, flags, timeout, zmtpOpSend, &context);
 
   if (op) {
     AsyncOpStatus status = opGetStatus(op);

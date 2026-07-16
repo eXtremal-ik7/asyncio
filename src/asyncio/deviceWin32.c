@@ -25,42 +25,30 @@ int serialPortSetConfig(iodevTy port,
 {
   DCB dcb;
   if (GetCommState(port, &dcb)) {
-    switch (speed) {
-      case 110:
-       dcb.BaudRate = CBR_110;
+    // Supported baud rates; an unknown request falls back to 9600.
+    static const struct {
+      int rate;
+      DWORD value;
+    } baudTable[] = {
+      {110, CBR_110},
+      {300, CBR_300},
+      {600, CBR_600},
+      {1200, CBR_1200},
+      {2400, CBR_2400},
+      {4800, CBR_4800},
+      {9600, CBR_9600},
+      {19200, CBR_19200},
+      {38400, CBR_38400},
+      {57600, CBR_57600},
+      {115200, CBR_115200},
+    };
+
+    dcb.BaudRate = CBR_9600;
+    for (size_t i = 0; i < sizeof(baudTable) / sizeof(baudTable[0]); i++) {
+      if (baudTable[i].rate == speed) {
+        dcb.BaudRate = baudTable[i].value;
         break;
-      case 300:
-        dcb.BaudRate = CBR_300;
-        break;
-      case 600:
-        dcb.BaudRate = CBR_600;
-        break;
-      case 1200:
-        dcb.BaudRate = CBR_1200;
-        break;
-      case 2400:
-        dcb.BaudRate = CBR_2400;
-        break;
-      case 4800:
-        dcb.BaudRate = CBR_4800;
-        break;
-      case 9600:
-        dcb.BaudRate = CBR_9600;
-        break;
-      case 19200:
-        dcb.BaudRate = CBR_19200;
-        break;
-      case 38400:
-        dcb.BaudRate = CBR_38400;
-        break;
-      case 57600:
-        dcb.BaudRate = CBR_57600;
-        break;
-      case 115200:
-        dcb.BaudRate = CBR_115200;
-        break;
-      default:
-        dcb.BaudRate = CBR_9600;
+      }
     }
 
     dcb.ByteSize = dataBits;

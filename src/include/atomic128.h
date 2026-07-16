@@ -149,25 +149,5 @@ static inline uint128 __uint128_atomic_load_relaxed(const volatile uint128 *ptr)
   return result;
 }
 
-// CAS loop — there is no native 128-bit exchange. Lock-free, not wait-free:
-// every retry means some other CAS on the pair succeeded.
-static inline uint128 __uint128_atomic_exchange(volatile uint128 *ptr, uint128 value)
-{
-  // The seed is only a CAS expected. A successful full-barrier CAS acquires
-  // the returned value; a failure replaces it with the CAS's atomic snapshot.
-  uint128 expected = __uint128_atomic_load_relaxed(ptr);
-  while (!__uint128_atomic_compare_and_swap(ptr, &expected, value))
-    continue;
-  return expected;
-}
-
-static inline uint128 __uint128_atomic_exchange_relaxed(volatile uint128 *ptr, uint128 value)
-{
-  uint128 expected = __uint128_atomic_load_relaxed(ptr);
-  while (!__uint128_atomic_compare_and_swap_relaxed(ptr, &expected, value))
-    continue;
-  return expected;
-}
-
 __NO_UNUSED_FUNCTION_END
 #endif //__ATOMIC128_H_

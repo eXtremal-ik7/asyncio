@@ -80,7 +80,6 @@ void iocpDeleteObject(aioObject *op);
 void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op);
 void iocpStartTimer(asyncOpRoot *op);
 void iocpStopTimer(asyncOpRoot *op);
-void iocpDestroyTimer(asyncOpRoot *op);
 int iocpInitializeUserEvent(aioUserEvent *event);
 int iocpActivate(aioUserEvent *event);
 int iocpUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period);
@@ -93,12 +92,30 @@ AsyncOpStatus iocpAsyncWrite(asyncOpRoot *op);
 AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *op);
 AsyncOpStatus iocpAsyncWriteMsg(asyncOpRoot *op);
 
-static struct asyncImpl iocpImpl = {combinerTaskHandler,  iocpEnqueue,         postEmptyOperation, iocpNextFinishedOperation,
-                                    iocpNewAioObject,     iocpNewAsyncOp,      iocpCancelAsyncOp,  iocpDeleteObject,
-                                    iocpInitializeTimer,  iocpStartTimer,      iocpStopTimer,      iocpInitializeUserEvent,
-                                    iocpActivate,         iocpAsyncConnect,    iocpAsyncAccept,    iocpAsyncRead,
-                                    iocpAsyncWrite,       iocpAsyncReadMsg,    iocpAsyncWriteMsg,  iocpWakeupLoop,
-                                    iocpUpdateEventTimer, iocpConsumeEventTimerTick, iocpReleaseUserEvent};
+static struct asyncImpl iocpImpl = {
+  combinerTaskHandler,
+  iocpEnqueue,
+  postEmptyOperation,
+  iocpNextFinishedOperation,
+  iocpNewAioObject,
+  iocpNewAsyncOp,
+  iocpCancelAsyncOp,
+  iocpInitializeTimer,
+  iocpStartTimer,
+  iocpStopTimer,
+  iocpInitializeUserEvent,
+  iocpActivate,
+  iocpAsyncConnect,
+  iocpAsyncAccept,
+  iocpAsyncRead,
+  iocpAsyncWrite,
+  iocpAsyncReadMsg,
+  iocpAsyncWriteMsg,
+  iocpWakeupLoop,
+  iocpUpdateEventTimer,
+  iocpConsumeEventTimerTick,
+  iocpReleaseUserEvent
+};
 
 static aioObject *getObject(iocpOp *op)
 {
@@ -355,11 +372,9 @@ void iocpNextFinishedOperation(asyncBase *base)
           if (op->flags & afCoroutine) {
             coroutineCall((coroutineTy*)op->finishMethod);
           } else {
-            aioObjectRoot *object = op->object;
             if (op->callback)
               op->finishMethod(op);
-            concurrentQueuePush(op->objectPool, op);
-            objectDecrementReference(object, 1);
+            releaseAsyncOp(op);
           }
         }
       } else if (entry->lpOverlapped) {
@@ -431,7 +446,7 @@ void iocpNextFinishedOperation(asyncBase *base)
       } else {
         unsigned threadsRunning = loopThreadExit(base);
         if (threadsRunning)
-          PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 0, 0, 0);
+          postEmptyOperation(base);
         return;
       }
     }
@@ -477,7 +492,8 @@ asyncOpRoot *iocpNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *ob
     op->info.internalBufferSize = 0;
   }
 
-  memset(&op->overlapped, 0, sizeof(op->overlapped));
+  // overlapped stays uninitialized here: every submit path clears it right
+  // before handing it to the kernel, and nothing reads it earlier.
   return &op->info.root;
 }
 
@@ -505,13 +521,16 @@ void iocpDeleteObject(aioObject *object)
   objectFree(&objectPool, object, sizeof(aioObject));
 }
 
-void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
+// Allocates and fully constructs a backend timer cell: a high-resolution
+// waitable timer with a plain fallback, plus its threadpool wait. Returns
+// NULL with nothing left behind when any stage fails, so the caller can
+// simply retry the whole construction on a later arm.
+static aioTimer *iocpNewTimerCell(asyncBase *base, void *target, unsigned kind)
 {
-  op->timerId = 0;
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   if (!timer)
-    return;
-  iocpInitializeTimerState(timer, base, op, IOCP_TIMER_KIND_OPERATION);
+    return 0;
+  iocpInitializeTimerState(timer, base, target, kind);
   timer->hTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
   if (!timer->hTimer)
     timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
@@ -522,20 +541,21 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
     if (timer->hTimer)
       CloseHandle(timer->hTimer);
     alignedFree(timer);
-    return;
+    return 0;
   }
-  op->timerId = timer;
+  return timer;
+}
+
+void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
+{
+  op->timerId = iocpNewTimerCell(base, op, IOCP_TIMER_KIND_OPERATION);
 }
 
 void iocpStartTimer(asyncOpRoot *op)
 {
-  aioTimer *timer = (aioTimer*)op->timerId;
-  if (!timer) {
-    // The paired cell is created once per pooled slot; a constructor-time
-    // allocation failure must not disable this slot's timeouts forever.
-    iocpInitializeTimer(op->object->header.base, op);
-    timer = (aioTimer*)op->timerId;
-  }
+  // The paired cell is created once per pooled slot; a constructor-time
+  // allocation failure must not disable this slot's timeouts forever.
+  aioTimer *timer = (aioTimer*)opEnsureTimerCell(op);
   if (!timer) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
@@ -561,17 +581,6 @@ void iocpStopTimer(asyncOpRoot *op)
     iocpDisarmWaitableTimer(timer);
 }
 
-void iocpDestroyTimer(asyncOpRoot *op)
-{
-  aioTimer *timer = (aioTimer*)op->timerId;
-  if (!timer)
-    return;
-  iocpDisarmWaitableTimer(timer);
-  CloseThreadpoolWait(timer->wait);
-  CloseHandle(timer->hTimer);
-  alignedFree(timer);
-}
-
 int iocpActivate(aioUserEvent *event)
 {
   // Manual packets provide two machine-word payloads, so IOCP does not need
@@ -593,20 +602,9 @@ static aioTimer *iocpEnsureEventTimer(aioUserEvent *event)
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   if (timer)
     return timer;
-  timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
+  timer = iocpNewTimerCell(event->header.base, event, IOCP_TIMER_KIND_USER_EVENT);
   if (!timer)
     return 0;
-  iocpInitializeTimerState(timer, event->header.base, event, IOCP_TIMER_KIND_USER_EVENT);
-  timer->hTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-  if (!timer->hTimer)
-    timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
-  timer->wait = timer->hTimer ? CreateThreadpoolWait(iocpTimerCb, timer, NULL) : NULL;
-  if (!timer->wait) {
-    if (timer->hTimer)
-      CloseHandle(timer->hTimer);
-    alignedFree(timer);
-    return 0;
-  }
   eventTimerStore(event, timer, amoRelaxed);
   return timer;
 }
@@ -703,13 +701,7 @@ AsyncOpStatus iocpAsyncAccept(asyncOpRoot *opptr)
 
   const DWORD addrSize = sizeof(struct sockaddr_storage) + 16;
   const size_t acceptResultSize = 2 * (size_t)addrSize;
-  if (op->info.internalBuffer == 0) {
-    op->info.internalBuffer = malloc(acceptResultSize);
-    op->info.internalBufferSize = acceptResultSize;
-  } else if (op->info.internalBufferSize < acceptResultSize) {
-    op->info.internalBuffer = realloc(op->info.internalBuffer, acceptResultSize);
-    op->info.internalBufferSize = acceptResultSize;
-  }
+  asyncOpEnsureInternalBuffer(&op->info.internalBuffer, &op->info.internalBufferSize, acceptResultSize);
 
   struct sockaddr_storage listenAddr;
   int listenAddrLen = sizeof(listenAddr);
@@ -820,13 +812,7 @@ AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *opptr)
   aioObject *object = getObject(op);
 
   const size_t acceptResultSize = sizeof(recvFromData);
-  if (op->info.internalBuffer == 0) {
-    op->info.internalBuffer = malloc(acceptResultSize);
-    op->info.internalBufferSize = acceptResultSize;
-  } else if (op->info.internalBufferSize < acceptResultSize) {
-    op->info.internalBuffer = realloc(op->info.internalBuffer, acceptResultSize);
-    op->info.internalBufferSize = acceptResultSize;
-  }
+  asyncOpEnsureInternalBuffer(&op->info.internalBuffer, &op->info.internalBufferSize, acceptResultSize);
 
   recvFromData *rf = op->info.internalBuffer;
   rf->size = sizeof(rf->addr);

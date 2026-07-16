@@ -58,6 +58,81 @@ inline bool wheelSlotOccupied(TestBackend &backend, unsigned level, unsigned ind
   return (backend.base.timerWheel.occupancy[level][index >> 6] >> (index & 63)) & 1;
 }
 
+// Heap link for direct wheel insertion: the sweep recycles links into the
+// global link pool, so a stack instance would leave a dangling pointer for a
+// later addToTimeoutQueue
+asyncOpListLink *makeHeapLink(TestOp &op, TestObject &object, uintptr_t generation, uint64_t deadlineTick)
+{
+  auto *link = static_cast<asyncOpListLink*>(malloc(sizeof(asyncOpListLink)));
+  link->op = &op.root;
+  link->generation = generation;
+  link->object = &object.root;
+  link->objectGeneration = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
+  link->next = nullptr;
+  link->deadlineTick = deadlineTick;
+  return link;
+}
+
+// Mounts a stack cell as the operation's realtime timer the way the backends
+// create one. Stack instances must mirror the alignment of production cells
+// (alignedMalloc) at their declaration: alignas(TAGGED_POINTER_ALIGNMENT).
+void makeOperationTimer(aioTimer &timer, TestBackend &backend, TestOp &op)
+{
+  initializeTimer(timer, &backend.base);
+  timer.operation.op = &op.root;
+  op.root.timerId = &timer;
+  timer.header.timer.kind = tkOperation;
+}
+
+// Wires a stack event/timer pair the way newUserEvent and the first arm do:
+// the pairing is permanent, tag.low holds one reference and tag.high the
+// event incarnation.
+void makeEventTimerFixture(aioUserEvent &event, aioTimer &timer, uint64_t incarnation)
+{
+  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
+  __uint64_atomic_store(&event.header.tag.high, incarnation, amoRelaxed);
+  event.timer = &timer;
+  initializeTimer(timer);
+  timer.event.userEvent = &event;
+  timer.header.timer.kind = tkUserEvent;
+}
+
+// Publication helpers, one per arm flavor. Each reproduces the exact store
+// sequence and memory order of the corresponding backend arm; the ident
+// flavors also write the composite kernel id into fd.
+void publishOperationIdent(aioTimer &timer, aioObjectRoot &object, uint64_t generation, uint64_t ident)
+{
+  timerPublishBegin(&timer);
+    timer.fd = static_cast<intptr_t>(ident);
+    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object, amoRelaxed);
+    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.header), amoRelaxed);
+  timerPublishEnd(&timer, generation, ident);
+}
+
+void publishOperationDeadline(aioTimer &timer, aioObjectRoot &object, uint64_t deadline, uint64_t generation)
+{
+  timerPublishBegin(&timer);
+    __uint64_atomic_store(&timer.operation.deadline, deadline, amoRelaxed);
+    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object, amoRelaxed);
+    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.header), amoRelaxed);
+  timerPublishEnd(&timer, generation, 1);
+}
+
+void publishEventIdent(aioTimer &timer, aioUserEvent &event, uint64_t generation, uint64_t ident)
+{
+  timerPublishBegin(&timer);
+    timer.fd = static_cast<intptr_t>(ident);
+    __uint64_atomic_store(&timer.event.generation, eventHandleGeneration(&event), amoRelease);
+  timerPublishEnd(&timer, generation, ident);
+}
+
+void publishEventSchedule(aioTimer &timer, aioUserEvent &event, uint64_t generation)
+{
+  timerPublishBegin(&timer);
+    __uint64_atomic_store(&timer.event.generation, eventHandleGeneration(&event), amoRelease);
+  timerPublishEnd(&timer, generation, 1);
+}
+
 TEST(timer_grid, rounds_deadlines_up_and_delivers_each_window_once)
 {
   TestBackend backend;
@@ -182,15 +257,7 @@ TEST(timer_grid, stale_generation_link_does_not_cancel_reused_operation)
   TestOp op(object);
   uintptr_t staleGeneration = opGetGeneration(&op.root);
   op.root.tag = ((staleGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
-  // Heap link: the sweep recycles it into the global link pool, so a stack
-  // instance would leave a dangling pointer for a later addToTimeoutQueue
-  auto *link = static_cast<asyncOpListLink*>(malloc(sizeof(asyncOpListLink)));
-  link->op = &op.root;
-  link->generation = staleGeneration;
-  link->object = &object.root;
-  link->objectGeneration = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
-  link->next = nullptr;
-  link->deadlineTick = 7;
+  asyncOpListLink *link = makeHeapLink(op, object, staleGeneration, 7);
   timerWheelInsert(&backend.base, link, 7);
 
   processTimeoutQueue(&backend.base, 8);
@@ -297,13 +364,7 @@ TEST(timer_wheel, publication_descends_into_open_lower_window_of_drained_upper)
   // A producer with a stale cursor hint routes to the drained level-1 window
   // first; the publication must descend into the still-open level-0 slot -
   // not be refused and not park a rotation late in level 1
-  auto *link = static_cast<asyncOpListLink*>(malloc(sizeof(asyncOpListLink)));
-  link->op = &op.root;
-  link->generation = opGetGeneration(&op.root);
-  link->object = &object.root;
-  link->objectGeneration = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
-  link->next = nullptr;
-  link->deadlineTick = 1030;
+  asyncOpListLink *link = makeHeapLink(op, object, opGetGeneration(&op.root), 1030);
   ASSERT_EQ(timerWheelInsert(&backend.base, link, 0), 1);
   EXPECT_EQ(peekWheelSlot(backend, 0, 1030 % TIMER_WHEEL_SLOTS).low, reinterpret_cast<uint64_t>(link));
   EXPECT_EQ(peekWheelSlot(backend, 1, 1).low, 0u);
@@ -874,20 +935,13 @@ TEST(timer_reactor, stale_doorbell_must_not_expire_a_rearmed_operation)
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
-  initializeTimer(timer, &backend.base);
-  timer.operation.op = &op.root;
+  makeOperationTimer(timer, backend, op);
   timer.fd = static_cast<intptr_t>(uint64_t{7} << 32); // creation seeds the base id
-  op.root.timerId = &timer;
-  timer.header.timer.kind = tkOperation;
 
   // The first incarnation arms its realtime timer; the kernel keeps both the
   // envelope and the ident of this arming inside the harvested event
   uint64_t ident = static_cast<uint64_t>(timer.fd) + 1;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), ident);
+  publishOperationIdent(timer, object.root, opGetGeneration(&op.root), ident);
   uint64_t envelope = kernelHandleEncode(&timer.header);
   uint64_t staleIdent = static_cast<uint64_t>(timer.fd);
   uint64_t staleGeneration = 0;
@@ -899,11 +953,7 @@ TEST(timer_reactor, stale_doorbell_must_not_expire_a_rearmed_operation)
   uintptr_t firstGeneration = opGetGeneration(&op.root);
   op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
   ident++;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), ident);
+  publishOperationIdent(timer, object.root, opGetGeneration(&op.root), ident);
   uint64_t currentEnvelope = kernelHandleEncode(&timer.header);
   uint64_t currentGeneration = 0;
   EXPECT_EQ(kernelHandleDecode(currentEnvelope, &currentGeneration), &timer.header);
@@ -934,27 +984,16 @@ TEST(timer_reactor, stale_epoll_doorbell_uses_the_current_absolute_deadline)
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
-  initializeTimer(timer, &backend.base);
-  timer.operation.op = &op.root;
-  op.root.timerId = &timer;
-  timer.header.timer.kind = tkOperation;
+  makeOperationTimer(timer, backend, op);
 
-  timerPublishBegin(&timer);
-    __uint64_atomic_store(&timer.operation.deadline, 100, amoRelaxed);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), 1);
+  publishOperationDeadline(timer, object.root, 100, opGetGeneration(&op.root));
   uint64_t envelope = kernelHandleEncode(&timer.header);
   uint64_t staleGeneration = 0;
   ASSERT_EQ(kernelHandleDecode(envelope, &staleGeneration), &timer.header);
 
   uintptr_t firstGeneration = opGetGeneration(&op.root);
   op.root.tag = ((firstGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
-  timerPublishBegin(&timer);
-    __uint64_atomic_store(&timer.operation.deadline, 200, amoRelaxed);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), 1);
+  publishOperationDeadline(timer, object.root, 200, opGetGeneration(&op.root));
   uint64_t currentEnvelope = kernelHandleEncode(&timer.header);
   uint64_t currentGeneration = 0;
   ASSERT_EQ(kernelHandleDecode(currentEnvelope, &currentGeneration), &timer.header);
@@ -989,22 +1028,14 @@ TEST(timer_reactor, side_snapshot_rejects_fields_from_a_newer_arm)
   initializeTimer(timer, &backend.base);
   timer.header.timer.kind = tkOperation;
   uint64_t ident = (uint64_t{9} << 32) + 1;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, 7, ident);
+  publishOperationIdent(timer, object.root, 7, ident);
 
   // Pause after the first ident check, then publish a complete new arm.
   uint64_t eventIdent = static_cast<uint64_t>(timer.fd);
   int isStale = __uint64_atomic_load(&timer.header.tag.low, amoAcquire) != eventIdent;
   ASSERT_FALSE(isStale);
   ident++;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, 8, ident);
+  publishOperationIdent(timer, object.root, 8, ident);
 
   uint64_t generation = __uint64_atomic_load(&timer.header.tag.high, amoAcquire);
   isStale |= __uint64_atomic_load(&timer.header.tag.low, amoRelaxed) != eventIdent;
@@ -1021,19 +1052,11 @@ TEST(timer_reactor, side_snapshot_rejects_fields_from_a_newer_arm)
 TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
 {
   aioUserEvent event{};
-  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
-  __uint64_atomic_store(&event.header.tag.high, (UINT64_C(1) << 40) | 5, amoRelaxed);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
-  event.timer = &timer;
-  initializeTimer(timer);
-  timer.event.userEvent = &event;
-  timer.header.timer.kind = tkUserEvent;
+  makeEventTimerFixture(event, timer, (UINT64_C(1) << 40) | 5);
 
   uint64_t ident = (uint64_t{2} << 32) + 1;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __uint64_atomic_store(&timer.event.generation, eventHandleGeneration(&event), amoRelease);
-  timerPublishEnd(&timer, 1, ident);
+  publishEventIdent(timer, event, 1, ident);
   uint64_t envelope = kernelHandleEncode(&timer.header);
   uint64_t staleIdent = static_cast<uint64_t>(timer.fd);
   uint64_t staleGeneration = 0;
@@ -1041,10 +1064,7 @@ TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
 
   timerUnpublish(&timer); // userEventStopTimer
   ident++;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __uint64_atomic_store(&timer.event.generation, eventHandleGeneration(&event), amoRelease);
-  timerPublishEnd(&timer, 2, ident);
+  publishEventIdent(timer, event, 2, ident);
   uint64_t currentEnvelope = kernelHandleEncode(&timer.header);
   uint64_t currentGeneration = 0;
   ASSERT_EQ(kernelHandleDecode(currentEnvelope, &currentGeneration), &timer.header);
@@ -1063,25 +1083,16 @@ TEST(timer_reactor, stale_doorbell_must_not_activate_a_restarted_user_event)
 TEST(timer_reactor, count_handle_snapshots_the_restarted_user_event)
 {
   aioUserEvent event{};
-  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
-  __uint64_atomic_store(&event.header.tag.high, (UINT64_C(1) << 40) | 9, amoRelaxed);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
-  event.timer = &timer;
-  initializeTimer(timer);
-  timer.event.userEvent = &event;
-  timer.header.timer.kind = tkUserEvent;
+  makeEventTimerFixture(event, timer, (UINT64_C(1) << 40) | 9);
 
-  timerPublishBegin(&timer);
-    __uint64_atomic_store(&timer.event.generation, eventHandleGeneration(&event), amoRelease);
-  timerPublishEnd(&timer, 1, 1);
+  publishEventSchedule(timer, event, 1);
   uint64_t envelope = kernelHandleEncode(&timer.header);
   uint64_t staleGeneration = 0;
   EXPECT_EQ(kernelHandleDecode(envelope, &staleGeneration), &timer.header);
 
   timerUnpublish(&timer); // userEventStopTimer
-  timerPublishBegin(&timer);
-    __uint64_atomic_store(&timer.event.generation, eventHandleGeneration(&event), amoRelease);
-  timerPublishEnd(&timer, 2, 1);
+  publishEventSchedule(timer, event, 2);
   uint64_t currentEnvelope = kernelHandleEncode(&timer.header);
   uint64_t currentGeneration = 0;
   EXPECT_EQ(kernelHandleDecode(currentEnvelope, &currentGeneration), &timer.header);
@@ -1116,21 +1127,14 @@ TEST(timer_reactor, arming_a_wrapped_generation_must_not_publish_the_unpublished
   TestObject object(backend);
   TestOp op(object, OPCODE_READ, afRealtime, 10);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer timer{}; // production timers come from alignedMalloc
-  initializeTimer(timer, &backend.base);
-  timer.operation.op = &op.root;
+  makeOperationTimer(timer, backend, op);
   timer.fd = 0; // even a zero base id must not let the composite ident hit 0
-  op.root.timerId = &timer;
-  timer.header.timer.kind = tkOperation;
 
   // The slot's generation legally wraps around to zero (2^24 recycles on a
   // 32-bit target)
   op.root.tag = (uintptr_t{0} << TAG_STATUS_SIZE) | aosPending;
   uint64_t ident = 1;
-  timerPublishBegin(&timer);
-    timer.fd = static_cast<intptr_t>(ident);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), ident);
+  publishOperationIdent(timer, object.root, opGetGeneration(&op.root), ident);
   uint64_t envelope = kernelHandleEncode(&timer.header);
   uint64_t envelopeGeneration = ~uint64_t{0};
   EXPECT_EQ(kernelHandleDecode(envelope, &envelopeGeneration), &timer.header);
@@ -1143,15 +1147,8 @@ TEST(timer_reactor, arming_a_wrapped_generation_must_not_publish_the_unpublished
 
   // epoll flavor: the armed bit keeps generation 0 away from the sentinel.
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer deadlineTimer{};
-  initializeTimer(deadlineTimer, &backend.base);
-  deadlineTimer.operation.op = &op.root;
-  op.root.timerId = &deadlineTimer;
-  deadlineTimer.header.timer.kind = tkOperation;
-  timerPublishBegin(&deadlineTimer);
-    __uint64_atomic_store(&deadlineTimer.operation.deadline, 10, amoRelaxed);
-    __pointer_atomic_store((void *volatile*)&deadlineTimer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&deadlineTimer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&deadlineTimer, 0, 1);
+  makeOperationTimer(deadlineTimer, backend, op);
+  publishOperationDeadline(deadlineTimer, object.root, 10, 0);
   uint64_t deadlineEnvelope = kernelHandleEncode(&deadlineTimer.header);
   envelopeGeneration = ~uint64_t{0};
   EXPECT_EQ(kernelHandleDecode(deadlineEnvelope, &envelopeGeneration), &deadlineTimer.header);
@@ -1234,40 +1231,22 @@ TEST(timer_reactor, every_timer_envelope_is_a_common_header_handle)
   EXPECT_EQ(generationOf(kernelHandleEncode(&timer.header), &timer), 0u);
 
   // Both operation arm flavors preserve the operation generation.
-  timerPublishBegin(&timer);
-    timer.fd = 1;
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), 1);
+  publishOperationIdent(timer, object.root, opGetGeneration(&op.root), 1);
   EXPECT_EQ(generationOf(kernelHandleEncode(&timer.header), &timer), opGetGeneration(&op.root));
   timerUnpublish(&timer);
-  timerPublishBegin(&timer);
-    __uint64_atomic_store(&timer.operation.deadline, 1, amoRelaxed);
-    __pointer_atomic_store((void *volatile*)&timer.operation.object, &object.root, amoRelaxed);
-    __uint64_atomic_store(&timer.operation.objectGeneration, objectHeaderGeneration(&object.root.header), amoRelaxed);
-  timerPublishEnd(&timer, opGetGeneration(&op.root), 1);
+  publishOperationDeadline(timer, object.root, 1, opGetGeneration(&op.root));
   EXPECT_EQ(generationOf(kernelHandleEncode(&timer.header), &timer), opGetGeneration(&op.root));
   timerUnpublish(&timer);
 
   // User-event timer kind lives in the common-header union and the schedule
   // generation follows the same encoding.
   aioUserEvent event{};
-  __uint64_atomic_store(&event.header.tag.low, 1, amoRelaxed);
-  __uint64_atomic_store(&event.header.tag.high, 1, amoRelaxed);
   alignas(TAGGED_POINTER_ALIGNMENT) aioTimer eventTimer{}; // production timers come from alignedMalloc
-  event.timer = &eventTimer;
-  initializeTimer(eventTimer);
-  eventTimer.event.userEvent = &event;
-  eventTimer.header.timer.kind = tkUserEvent;
-  timerPublishBegin(&eventTimer);
-    eventTimer.fd = 1;
-    __uint64_atomic_store(&eventTimer.event.generation, eventHandleGeneration(&event), amoRelease);
-  timerPublishEnd(&eventTimer, 1, 1);
+  makeEventTimerFixture(event, eventTimer, 1);
+  publishEventIdent(eventTimer, event, 1, 1);
   EXPECT_EQ(generationOf(kernelHandleEncode(&eventTimer.header), &eventTimer), 1u);
   timerUnpublish(&eventTimer);
-  timerPublishBegin(&eventTimer);
-    __uint64_atomic_store(&eventTimer.event.generation, eventHandleGeneration(&event), amoRelease);
-  timerPublishEnd(&eventTimer, 2, 1);
+  publishEventSchedule(eventTimer, event, 2);
   EXPECT_EQ(generationOf(kernelHandleEncode(&eventTimer.header), &eventTimer), 2u);
   timerUnpublish(&eventTimer);
 

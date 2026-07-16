@@ -6,25 +6,6 @@
 #include <assert.h>
 #include <stdlib.h>
 
-#ifdef BUILD_SANITIZE_ADDRESS
-#ifdef _MSC_VER
-void __sanitizer_start_switch_fiber(void **fakeStackSave,
-                                    const void *stackBottom,
-                                    size_t stackSize);
-void __sanitizer_finish_switch_fiber(void *fakeStackSave,
-                                     const void **oldStackBottom,
-                                     size_t *oldStackSize);
-void __asan_unpoison_memory_region(void const volatile *address, size_t size);
-#define NO_SANITIZE_ADDRESS __declspec(no_sanitize_address)
-#else
-#include <sanitizer/asan_interface.h>
-#include <sanitizer/common_interface_defs.h>
-#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
-#endif
-#else
-#define NO_SANITIZE_ADDRESS
-#endif
-
 __tls coroutineTy *currentCoroutine;
 __tls coroutineTy *mainCoroutine;
 
@@ -45,38 +26,10 @@ typedef struct coroutineTy {
 #endif
 } coroutineTy;
 
+// Shared ASan fiber-switch helpers; must follow the coroutineTy definition.
+#include "coroutineSanitizer.h"
+
 #ifdef BUILD_SANITIZE_ADDRESS
-static NO_SANITIZE_ADDRESS void sanitizerFinishSwitch(coroutineTy *destination,
-                                                       coroutineTy *source)
-{
-  const void *sourceStackBottom;
-  size_t sourceStackSize;
-  __sanitizer_finish_switch_fiber(destination->asanFakeStack,
-                                  &sourceStackBottom,
-                                  &sourceStackSize);
-  destination->asanFakeStack = 0;
-  if (!source->asanStackBottom) {
-    source->asanStackBottom = sourceStackBottom;
-    source->asanStackSize = sourceStackSize;
-  }
-}
-
-static NO_SANITIZE_ADDRESS void asanDestroyFakeStack(void *fakeStack)
-{
-  // A suspended coroutine cannot make the final switch which asks ASan to
-  // destroy its fake stack. Install it temporarily, destroy it, then restore
-  // the actual current stack state.
-  void *currentFakeStack;
-  const void *currentStackBottom;
-  size_t currentStackSize;
-  __sanitizer_start_switch_fiber(&currentFakeStack, 0, 0);
-  __sanitizer_finish_switch_fiber(fakeStack,
-                                  &currentStackBottom,
-                                  &currentStackSize);
-  __sanitizer_start_switch_fiber(0, currentStackBottom, currentStackSize);
-  __sanitizer_finish_switch_fiber(currentFakeStack, 0, 0);
-}
-
 static void sanitizerDestroyCoroutine(coroutineTy *coroutine)
 {
   if (coroutine->asanFakeStack) {

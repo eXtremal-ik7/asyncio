@@ -8,13 +8,6 @@ typedef struct Raw {
   size_t size;
 } Raw;
 
-typedef enum StateTy {
-  stFinish = 0,
-  stMemcmp,
-  stError,
-  stSwitchTable
-} StateTy;
-
 typedef enum ParserResultTy {
   ParserResultOk = 0,
   ParserResultNeedMoreData,

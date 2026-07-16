@@ -63,15 +63,13 @@ static void sslConnectGarbageScenario(int flood)
   if (!startTCPServer(ctx.base, sslGarbageAcceptCb, &ctx, gPort))
     exit(2);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  if (socketBind(clientSocket, &address) != 0)
+  aioObject *clientIo = initializeTCPClient(ctx.base, nullptr, nullptr, 0);
+  if (!clientIo)
     exit(2);
 
-  ctx.client = sslSocketNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  ctx.client = sslSocketNew(ctx.base, clientIo);
+  HostAddress address;
+  address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   // no timeout: the garbage must produce an error, not wait for a rescue timer
@@ -133,15 +131,13 @@ static void sslConnectPeerDropScenario()
   if (!startTCPServer(ctx.base, sslConnectPeerDropAcceptCb, &ctx, gPort))
     exit(2);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  if (socketBind(clientSocket, &address) != 0)
+  aioObject *clientIo = initializeTCPClient(ctx.base, nullptr, nullptr, 0);
+  if (!clientIo)
     exit(2);
 
-  ctx.client = sslSocketNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  ctx.client = sslSocketNew(ctx.base, clientIo);
+  HostAddress address;
+  address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   // no timeout: releasing on the child's terminal status is the contract (and a
@@ -236,12 +232,11 @@ static void sslReadGarbageScenario(int flood)
     exit(2);
   std::thread(sslTlsThenGarbageServer, listenSocket, flood).detach();
 
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  if (socketBind(clientSocket, &address) != 0)
+  aioObject *clientIo = initializeTCPClient(ctx.base, nullptr, nullptr, 0);
+  if (!clientIo)
     exit(2);
 
-  ctx.client = sslSocketNew(ctx.base, newSocketIo(ctx.base, clientSocket));
+  ctx.client = sslSocketNew(ctx.base, clientIo);
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   // no timeout: the dead stream must produce an error, not wait for a rescue timer
@@ -316,14 +311,12 @@ TEST(ssl, write_before_handshake)
   aioObject *listener = startTCPServer(gBase, sslSilentServerAcceptCb, &ctx, gPort);
   ASSERT_NE(listener, nullptr);
 
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+
+  ctx.client = sslSocketNew(gBase, clientIo);
   HostAddress address;
   address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-
-  ctx.client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   aioSslConnect(ctx.client, &address, nullptr, 150000, sslWriteBeforeHandshakeConnectCb, &ctx);
@@ -373,13 +366,9 @@ TEST(ssl, write_without_connect)
 
   SslWriteNoConnectContext ctx(gBase);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-  SSLSocket *client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+  SSLSocket *client = sslSocketNew(gBase, clientIo);
 
   aioSslWrite(client, payload, sizeof(payload)-1, afNone, 1000000, sslWriteNoConnectCb, &ctx);
   asyncLoop(gBase);
@@ -394,52 +383,20 @@ TEST(ssl, write_without_connect)
 // TCP connect does: a second handshake submitted while the first is still in
 // flight must be rejected immediately, without touching the shared SSL state
 // machine.
-struct SslDoubleConnectContext {
-  asyncBase *base;
-  AsyncOpStatus firstStatus;
-  AsyncOpStatus secondStatus;
-  int events;
-  int firstOrder;
-  int secondOrder;
-  SslDoubleConnectContext(asyncBase *baseArg) :
-    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
-    events(0), firstOrder(-1), secondOrder(-1) {}
-};
-
-static void sslDoubleConnectFirstCb(AsyncOpStatus status, SSLSocket*, void *arg)
-{
-  SslDoubleConnectContext *ctx = static_cast<SslDoubleConnectContext*>(arg);
-  ctx->firstStatus = status;
-  ctx->firstOrder = ctx->events++;
-  if (ctx->events == 2)
-    postQuitOperation(ctx->base);
-}
-
-static void sslDoubleConnectSecondCb(AsyncOpStatus status, SSLSocket*, void *arg)
-{
-  SslDoubleConnectContext *ctx = static_cast<SslDoubleConnectContext*>(arg);
-  ctx->secondStatus = status;
-  ctx->secondOrder = ctx->events++;
-  if (ctx->events == 2)
-    postQuitOperation(ctx->base);
-}
-
 TEST(ssl, double_connect_rejected)
 {
-  SslDoubleConnectContext ctx(gBase);
+  DoubleConnectRecorder ctx(gBase);
+
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+  SSLSocket *client = sslSocketNew(gBase, clientIo);
 
   HostAddress address;
   address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-  SSLSocket *client = sslSocketNew(gBase, newSocketIo(gBase, clientSocket));
-
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioSslConnect(client, &address, nullptr, 150000, sslDoubleConnectFirstCb, &ctx);
-  aioSslConnect(client, &address, nullptr, 150000, sslDoubleConnectSecondCb, &ctx);
+  aioSslConnect(client, &address, nullptr, 150000, doubleConnectFirstCb<SSLSocket>, &ctx);
+  aioSslConnect(client, &address, nullptr, 150000, doubleConnectSecondCb<SSLSocket>, &ctx);
 
   asyncLoop(gBase);
   sslSocketDelete(client);

@@ -1,5 +1,4 @@
 cxxpm_add_package(gtest default)
-set (CMAKE_CXX_STANDARD 17)
 
 if(MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_SILENCE_TR1_NAMESPACE_DEPRECATION_WARNING")
@@ -44,13 +43,8 @@ if (ASYNCIO_ENABLE_ZMTP)
   endif()
 endif()
 
-if (WIN32)
-  set(LIBRARIES ${LIBRARIES} ws2_32 mswsock)
-endif()
-
-if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
-endif()
+# PLATFORM_LIBRARIES comes from test/CMakeLists.txt (empty outside Windows)
+set(LIBRARIES ${LIBRARIES} ${PLATFORM_LIBRARIES})
 
 add_executable(unittest ${SOURCES})
 target_include_directories(

@@ -48,66 +48,26 @@ static int cancel(asyncOpRoot *opptr)
   return 0;
 }
 
-static void acceptFinish(asyncOpRoot *opptr)
-{
-  reinterpret_cast<rlpxAcceptCb*>(opptr->callback)(opGetStatus(opptr), reinterpret_cast<rlpxSocket*>(opptr->object), opptr->arg);
-}
-
-static void connectFinish(asyncOpRoot *opptr)
+// rlpxAcceptCb and rlpxConnectCb are the same function type, so accept and
+// connect operations share one finish thunk
+static void socketOpFinish(asyncOpRoot *opptr)
 {
   reinterpret_cast<rlpxConnectCb*>(opptr->callback)(opGetStatus(opptr), reinterpret_cast<rlpxSocket*>(opptr->object), opptr->arg);
 }
 
-static void releaseOp(asyncOpRoot*)
-{
-}
-
-RlpxOperation *initOp(aioExecuteProc *start,
-               aioFinishProc *finish,
-               rlpxSocket *socket,
-               AsyncFlags flags,
-               uint64_t timeout,
-               void *callback,
-               void *arg,
-               int opCode)
+// Operations have no resources of their own, so no release procedure is needed
+static RlpxOperation *initOp(aioExecuteProc *start,
+                             aioFinishProc *finish,
+                             rlpxSocket *socket,
+                             AsyncFlags flags,
+                             uint64_t timeout,
+                             void *callback,
+                             void *arg,
+                             int opCode)
 {
   RlpxOperation *op = 0;
-  if (asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
-  initAsyncOpRoot(&op->root, start, cancel, finish, releaseOp, &socket->root, callback, arg, flags, opCode, timeout);
-  return op;
-}
-
-RlpxOperation *initReadOp(aioExecuteProc *start,
-                   aioFinishProc *finish,
-                   rlpxSocket *socket,
-                   AsyncFlags flags,
-                   uint64_t timeout,
-                   void *callback,
-                   void *arg,
-                   int opCode)
-{
-  RlpxOperation *op = 0;
-  if (asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
-  initAsyncOpRoot(&op->root, start, cancel, finish, releaseOp, &socket->root, callback, arg, flags, opCode, timeout);
-  return op;
-}
-
-RlpxOperation *initWriteOp(aioExecuteProc *start,
-                    aioFinishProc *finish,
-                    rlpxSocket *socket,
-                    AsyncFlags flags,
-                    uint64_t timeout,
-                    void *callback,
-                    void *arg,
-                    int opCode,
-                    void *data,
-                    size_t size)
-{
-  __UNUSED(data);
-  __UNUSED(size);
-  RlpxOperation *op = 0;
-  if (asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op)) {}
-  initAsyncOpRoot(&op->root, start, cancel, finish, releaseOp, &socket->root, callback, arg, flags, opCode, timeout);
+  asyncOpAlloc(socket->root.header.base, sizeof(RlpxOperation), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op);
+  initAsyncOpRoot(&op->root, start, cancel, finish, 0, &socket->root, callback, arg, flags, opCode, timeout);
   return op;
 }
 
@@ -179,13 +139,13 @@ static AsyncOpStatus startRlpxAccept(asyncOpRoot *opptr)
 void aioRlpxAccept(rlpxSocket *socket, AsyncFlags flags, uint64_t timeout, rlpxAcceptCb callback, void *arg)
 {
   RlpxOperation *op =
-    initOp(startRlpxAccept, acceptFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpAccept);
+    initOp(startRlpxAccept, socketOpFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpAccept);
   combinerPushOperation(&op->root);
 }
 
 void aioRlpxConnect(rlpxSocket *socket, HostAddress address, AsyncFlags flags, uint64_t timeout, rlpxConnectCb callback, void *arg)
 {
-  RlpxOperation *op = initOp(startRlpxConnect, connectFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpConnect);
+  RlpxOperation *op = initOp(startRlpxConnect, socketOpFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpConnect);
   op->address = address;
 
 }

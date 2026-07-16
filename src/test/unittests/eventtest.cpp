@@ -45,6 +45,42 @@ void deletingTimerCallback(aioUserEvent *event, void *arg)
 
 using namespace std::chrono_literals;
 
+// Rendezvous between a test thread and a TestBackend hook: the hook parks in
+// enter() until the test calls open(); the test waits for the parked hook
+// with waitEntered(). Deciding WHICH hook invocation blocks stays in each
+// test's lambda, and cleanup after a failed waitEntered() stays at the call
+// site. Once open() ran, later enter() calls pass straight through.
+struct HookGate {
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool inside = false;
+  bool allow = false;
+
+  void enter() {
+    std::unique_lock<std::mutex> lock(mutex);
+    inside = true;
+    changed.notify_all();
+    changed.wait(lock, [this]() {
+      return allow;
+    });
+  }
+
+  bool waitEntered(std::chrono::milliseconds timeout = 1500ms) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return changed.wait_for(lock, timeout, [this]() {
+      return inside;
+    });
+  }
+
+  void open() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      allow = true;
+    }
+    changed.notify_all();
+  }
+};
+
 struct PublicEventProbe {
   std::mutex mutex;
   std::condition_variable changed;
@@ -400,21 +436,11 @@ TEST(core_user_event, timerfd_edge_arriving_during_read_is_not_lost)
   aioUserEvent *event = newUserEvent(&backend.base, 1, coreEventCallback, &context);
   ASSERT_NE(event, nullptr);
 
-  std::mutex mutex;
-  std::condition_variable changed;
-  unsigned readCalls = 0;
-  bool insideFirstRead = false;
-  bool allowFirstRead = false;
+  HookGate gate;
+  std::atomic<unsigned> readCalls{0};
   backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t, uint64_t) {
-    std::unique_lock<std::mutex> lock(mutex);
-    ++readCalls;
-    if (readCalls == 1) {
-      insideFirstRead = true;
-      changed.notify_all();
-      changed.wait(lock, [&]() {
-        return allowFirstRead;
-      });
-    }
+    if (++readCalls == 1)
+      gate.enter();
     return published;
   };
 
@@ -425,30 +451,15 @@ TEST(core_user_event, timerfd_edge_arriving_during_read_is_not_lost)
     eventTimerSignal(event, generation, incarnation, 1);
   });
 
-  bool ownerReachedRead;
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ownerReachedRead = changed.wait_for(lock, 1500ms, [&]() {
-      return insideFirstRead;
-    });
-  }
-  if (!ownerReachedRead) {
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      allowFirstRead = true;
-    }
-    changed.notify_all();
+  if (!gate.waitEntered()) {
+    gate.open();
     firstEdge.join();
     deleteUserEvent(event);
     FAIL() << "timer owner did not enter the timerfd read";
     return;
   }
   eventTimerSignal(event, generation, incarnation, 1);
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowFirstRead = true;
-  }
-  changed.notify_all();
+  gate.open();
   firstEdge.join();
 
   EXPECT_EQ(readCalls, 2u);
@@ -540,19 +551,10 @@ TEST(core_user_event, delete_reconciles_a_start_already_inside_backend_arm)
   ASSERT_NE(event, nullptr);
   eventSetDestructorCb(event, eventDestructor, &context);
 
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideStart = false;
-  bool allowStartReturn = false;
+  HookGate gate;
   backend.eventTimerHook = [&](aioUserEvent*, EventTimerUpdate update, uint32_t, uint64_t) {
-    if (update == etuStart) {
-      std::unique_lock<std::mutex> lock(mutex);
-      insideStart = true;
-      changed.notify_all();
-      changed.wait(lock, [&]() {
-        return allowStartReturn;
-      });
-    }
+    if (update == etuStart)
+      gate.enter();
     return 1;
   };
 
@@ -562,22 +564,13 @@ TEST(core_user_event, delete_reconciles_a_start_already_inside_backend_arm)
     eventDecrementReference(event, 1);
   });
 
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(changed.wait_for(lock, 1500ms, [&]() {
-      return insideStart;
-    }));
-  }
+  ASSERT_TRUE(gate.waitEntered());
   deleteUserEvent(event);
   EXPECT_EQ(__uint64_atomic_load(&event->header.tag.low, amoRelaxed) & TAG_EVENT_REF_MASK, 1u)
       << "the controller reference, not the armed timer, must pin a busy owner";
   EXPECT_EQ(context.destructors, 0u);
 
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowStartReturn = true;
-  }
-  changed.notify_all();
+  gate.open();
   controller.join();
 
   EXPECT_EQ(backend.startTimerCalls, 1u);
@@ -593,20 +586,11 @@ TEST(core_user_event, user_owner_discards_a_tick_without_entering_user_code)
   aioUserEvent *event = newUserEvent(&backend.base, 0, coreEventCallback, &context);
   ASSERT_NE(event, nullptr);
 
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideStart = false;
-  bool allowStart = false;
+  HookGate gate;
   unsigned consumed = 0;
   backend.eventTimerHook = [&](aioUserEvent*, EventTimerUpdate update, uint32_t, uint64_t) {
-    if (update == etuStart) {
-      std::unique_lock<std::mutex> lock(mutex);
-      insideStart = true;
-      changed.notify_all();
-      changed.wait(lock, [&]() {
-        return allowStart;
-      });
-    }
+    if (update == etuStart)
+      gate.enter();
     return 1;
   };
   backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t, uint64_t) {
@@ -622,21 +606,12 @@ TEST(core_user_event, user_owner_discards_a_tick_without_entering_user_code)
     userEventStartTimer(event, 100, 1);
     eventDecrementReference(event, 1);
   });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(changed.wait_for(lock, 1500ms, [&]() {
-      return insideStart;
-    }));
-  }
+  ASSERT_TRUE(gate.waitEntered());
 
   uint32_t generation = eventTimerGeneration(event);
   eventTimerSignal(event, generation, eventHandleGeneration(event), 1);
   EXPECT_EQ(context.finishes, 0u);
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowStart = true;
-  }
-  changed.notify_all();
+  gate.open();
   controller.join();
 
   EXPECT_EQ(consumed, 1u);
@@ -657,33 +632,17 @@ TEST(core_user_event, timer_publisher_does_not_wait_for_a_busy_kernel_owner)
   uint32_t firstGeneration = backend.lastEventTimerGeneration;
   uint64_t incarnation = eventHandleGeneration(event);
 
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideConsume = false;
-  bool allowConsume = false;
+  HookGate gate;
   backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t generation, uint64_t) {
-    if (generation == firstGeneration) {
-      std::unique_lock<std::mutex> lock(mutex);
-      insideConsume = true;
-      changed.notify_all();
-      changed.wait(lock, [&]() {
-        return allowConsume;
-      });
-    }
+    if (generation == firstGeneration)
+      gate.enter();
     return published;
   };
 
   std::thread tick([&]() {
     eventTimerSignal(event, firstGeneration, incarnation, 1);
   });
-  bool ownerReachedConsume;
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ownerReachedConsume = changed.wait_for(lock, 1500ms, [&]() {
-      return insideConsume;
-    });
-  }
-  if (!ownerReachedConsume) {
+  if (!gate.waitEntered()) {
     tick.join();
     backend.drainCompletions();
     deleteUserEvent(event);
@@ -691,26 +650,29 @@ TEST(core_user_event, timer_publisher_does_not_wait_for_a_busy_kernel_owner)
     return;
   }
 
+  // publisherReturned deliberately shares the gate's mutex, and the owner must
+  // stay parked while the publisher is measured: release it by hand inside the
+  // same critical section instead of through open().
   bool publisherReturned = false;
   eventIncrementReference(event, 1);
   std::thread publisher([&]() {
     userEventStartTimer(event, 200, 1);
     {
-      std::lock_guard<std::mutex> lock(mutex);
+      std::lock_guard<std::mutex> lock(gate.mutex);
       publisherReturned = true;
     }
-    changed.notify_all();
+    gate.changed.notify_all();
     eventDecrementReference(event, 1);
   });
   {
-    std::unique_lock<std::mutex> lock(mutex);
-    bool returnedWithoutOwner = changed.wait_for(lock, 1500ms, [&]() {
+    std::unique_lock<std::mutex> lock(gate.mutex);
+    bool returnedWithoutOwner = gate.changed.wait_for(lock, 1500ms, [&]() {
       return publisherReturned;
     });
-    allowConsume = true;
+    gate.allow = true;
     EXPECT_TRUE(returnedWithoutOwner);
   }
-  changed.notify_all();
+  gate.changed.notify_all();
   publisher.join();
   tick.join();
 
@@ -736,35 +698,18 @@ TEST(core_user_event, competing_timer_tick_notifies_the_existing_owner)
   uint32_t generation = backend.lastEventTimerGeneration;
   uint64_t incarnation = eventHandleGeneration(event);
 
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideConsume = false;
-  bool allowConsume = false;
+  HookGate gate;
+  std::atomic<unsigned> consumeCalls{0};
   backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t, uint64_t) {
-    {
-      std::unique_lock<std::mutex> lock(mutex);
-      if (!insideConsume) {
-        insideConsume = true;
-        changed.notify_all();
-        changed.wait(lock, [&]() {
-          return allowConsume;
-        });
-      }
-    }
+    if (++consumeCalls == 1)
+      gate.enter();
     return published;
   };
 
   std::thread firstTick([&]() {
     eventTimerSignal(event, generation, incarnation, 1);
   });
-  bool ownerReachedConsume;
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ownerReachedConsume = changed.wait_for(lock, 1500ms, [&]() {
-      return insideConsume;
-    });
-  }
-  if (!ownerReachedConsume) {
+  if (!gate.waitEntered()) {
     firstTick.join();
     backend.drainCompletions();
     deleteUserEvent(event);
@@ -775,11 +720,7 @@ TEST(core_user_event, competing_timer_tick_notifies_the_existing_owner)
     eventTimerSignal(event, generation, incarnation, 1);
   });
   secondTick.join();
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowConsume = true;
-  }
-  changed.notify_all();
+  gate.open();
   firstTick.join();
 
   EXPECT_EQ(context.finishes, 2u);
@@ -822,21 +763,23 @@ TEST(user_event, semaphore_delivers_every_activation)
   deleteUserEvent(event);
 }
 
-TEST(user_event, concurrent_nonsemaphore_activations_coalesce_before_drain)
+// Shared by the concurrent-activation pair below. Namespace scope so the
+// producer lambda reads the count without capturing it (MSVC refuses to
+// capture a constexpr local implicitly, C3493).
+constexpr unsigned kActivationThreads = 4;
+constexpr unsigned kActivationsPerProducer = 128;
+
+void verifyConcurrentActivations(int isSemaphore, unsigned expectedCallbacks)
 {
   PublicEventProbe probe;
-  aioUserEvent *event = newUserEvent(gBase, 0, publicEventCb, &probe);
+  aioUserEvent *event = newUserEvent(gBase, isSemaphore, publicEventCb, &probe);
   ASSERT_NE(event, nullptr);
 
-  constexpr unsigned kThreads = 4;
-  // static: lambdas below read it without a capture (MSVC refuses to capture
-  // a constexpr local implicitly, C3493)
-  static constexpr unsigned kActivationsPerThread = 128;
-  std::thread producers[kThreads];
+  std::thread producers[kActivationThreads];
   for (std::thread &producer: producers) {
     eventIncrementReference(event, 1);
     producer = std::thread([event]() {
-      for (unsigned i = 0; i < kActivationsPerThread; ++i)
+      for (unsigned i = 0; i < kActivationsPerProducer; ++i)
         userEventActivate(event);
       eventDecrementReference(event, 1);
     });
@@ -845,35 +788,18 @@ TEST(user_event, concurrent_nonsemaphore_activations_coalesce_before_drain)
     producer.join();
 
   drainQueuedUserEvents(gBase);
-  EXPECT_EQ(publicEventCallbackCount(probe), 1u);
+  EXPECT_EQ(publicEventCallbackCount(probe), expectedCallbacks);
   deleteUserEvent(event);
+}
+
+TEST(user_event, concurrent_nonsemaphore_activations_coalesce_before_drain)
+{
+  verifyConcurrentActivations(0, 1);
 }
 
 TEST(user_event, concurrent_semaphore_activations_are_not_lost)
 {
-  PublicEventProbe probe;
-  aioUserEvent *event = newUserEvent(gBase, 1, publicEventCb, &probe);
-  ASSERT_NE(event, nullptr);
-
-  constexpr unsigned kThreads = 4;
-  // static: lambdas below read it without a capture (MSVC refuses to capture
-  // a constexpr local implicitly, C3493)
-  static constexpr unsigned kActivationsPerThread = 128;
-  std::thread producers[kThreads];
-  for (std::thread &producer: producers) {
-    eventIncrementReference(event, 1);
-    producer = std::thread([event]() {
-      for (unsigned i = 0; i < kActivationsPerThread; ++i)
-        userEventActivate(event);
-      eventDecrementReference(event, 1);
-    });
-  }
-  for (std::thread &producer: producers)
-    producer.join();
-
-  drainQueuedUserEvents(gBase);
-  EXPECT_EQ(publicEventCallbackCount(probe), kThreads * kActivationsPerThread);
-  deleteUserEvent(event);
+  verifyConcurrentActivations(1, kActivationThreads * kActivationsPerProducer);
 }
 
 struct SelfReactivationProbe: PublicEventProbe {
@@ -1792,17 +1718,9 @@ TEST(core_user_event, delete_cancellation_is_sticky_against_late_timer_delivery)
   eventSetDestructorCb(probe.event, eventDestructor, &lifetime);
   userEventStartTimer(probe.event, 100, 1);
 
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideConsume = false;
-  bool allowConsume = false;
+  HookGate gate;
   backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t, uint64_t) {
-    std::unique_lock<std::mutex> lock(mutex);
-    insideConsume = true;
-    changed.notify_all();
-    changed.wait(lock, [&]() {
-      return allowConsume;
-    });
+    gate.enter();
     return published;
   };
 
@@ -1815,21 +1733,12 @@ TEST(core_user_event, delete_cancellation_is_sticky_against_late_timer_delivery)
   std::thread tick([&]() {
     eventTimerSignal(probe.event, generation, eventHandleGeneration(probe.event), 1);
   });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(changed.wait_for(lock, 1500ms, [&]() {
-      return insideConsume;
-    }));
-  }
+  ASSERT_TRUE(gate.waitEntered());
 
   eventIncrementReference(probe.event, 1); // keep the terminal state inspectable
   deleteUserEvent(probe.event);
   backend.drainCompletions();
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowConsume = true;
-  }
-  changed.notify_all();
+  gate.open();
   tick.join();
 
   EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u);
@@ -1839,11 +1748,16 @@ TEST(core_user_event, delete_cancellation_is_sticky_against_late_timer_delivery)
   EXPECT_EQ(lifetime.destructors, 1u);
 }
 
-TEST(core_user_event, manual_wake_discards_an_accepted_sleep_tick)
+// Shared by the manual-wake pair below: an externally woken sleeper must not
+// get the concurrently accepted sleep tick back as a credit for its next
+// wait. The expectation message names each flavor's failure mode; the
+// non-semaphore flavor additionally pins that ioSleep armed the paired
+// timer cell.
+void verifyManualWakeDiscardsSleepTick(int isSemaphore, const char *creditMessage)
 {
   TestBackend backend;
   CoroutineEventProbe probe;
-  probe.event = newUserEvent(&backend.base, 0, nullptr, nullptr);
+  probe.event = newUserEvent(&backend.base, isSemaphore, nullptr, nullptr);
   ASSERT_NE(probe.event, nullptr);
 
   coroutineTy *coroutine = coroutineNew(externallyWokenSleepCoroutine, &probe, 0x10000);
@@ -1851,101 +1765,43 @@ TEST(core_user_event, manual_wake_discards_an_accepted_sleep_tick)
   retainCoroutineEvent(&probe);
   ASSERT_EQ(coroutineCall(coroutine), 0);
 
-  aioTimer *timer = eventTimerLoad(probe.event, amoAcquire);
-  ASSERT_NE(timer, nullptr);
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideConsume = false;
-  bool allowConsume = false;
+  if (!isSemaphore) {
+    aioTimer *timer = eventTimerLoad(probe.event, amoAcquire);
+    ASSERT_NE(timer, nullptr);
+  }
+  HookGate gate;
   backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t, uint64_t) {
-    std::unique_lock<std::mutex> lock(mutex);
-    insideConsume = true;
-    changed.notify_all();
-    changed.wait(lock, [&]() {
-      return allowConsume;
-    });
+    gate.enter();
     return published;
   };
   uint32_t generation = eventTimerGeneration(probe.event);
   std::thread tick([&]() {
     eventTimerSignal(probe.event, generation, eventHandleGeneration(probe.event), 1);
   });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(changed.wait_for(lock, 1500ms, [&]() {
-      return insideConsume;
-    }));
-  }
+  ASSERT_TRUE(gate.waitEntered());
   userEventActivate(probe.event);
   backend.drainCompletions();
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowConsume = true;
-  }
-  changed.notify_all();
+  gate.open();
   tick.join();
 
-  EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u) << "the old sleep tick became a credit for the next wait";
+  EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u) << creditMessage;
   userEventActivate(probe.event);
   backend.drainCompletions();
   EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 2u);
+
   userEventStopTimer(probe.event);
   deleteUserEvent(probe.event);
   backend.drainCompletions();
 }
 
+TEST(core_user_event, manual_wake_discards_an_accepted_sleep_tick)
+{
+  verifyManualWakeDiscardsSleepTick(0, "the old sleep tick became a credit for the next wait");
+}
+
 TEST(core_user_event, semaphore_manual_wake_discards_an_accepted_sleep_tick)
 {
-  TestBackend backend;
-  CoroutineEventProbe probe;
-  probe.event = newUserEvent(&backend.base, 1, nullptr, nullptr);
-  ASSERT_NE(probe.event, nullptr);
-
-  coroutineTy *coroutine = coroutineNew(externallyWokenSleepCoroutine, &probe, 0x10000);
-  ASSERT_NE(coroutine, nullptr);
-  retainCoroutineEvent(&probe);
-  ASSERT_EQ(coroutineCall(coroutine), 0);
-
-  std::mutex mutex;
-  std::condition_variable changed;
-  bool insideConsume = false;
-  bool allowConsume = false;
-  backend.eventTimerConsumeHook = [&](aioUserEvent*, uint64_t published, uint32_t, uint64_t) {
-    std::unique_lock<std::mutex> lock(mutex);
-    insideConsume = true;
-    changed.notify_all();
-    changed.wait(lock, [&]() {
-      return allowConsume;
-    });
-    return published;
-  };
-  uint32_t generation = eventTimerGeneration(probe.event);
-  std::thread tick([&]() {
-    eventTimerSignal(probe.event, generation, eventHandleGeneration(probe.event), 1);
-  });
-  {
-    std::unique_lock<std::mutex> lock(mutex);
-    ASSERT_TRUE(changed.wait_for(lock, 1500ms, [&]() {
-      return insideConsume;
-    }));
-  }
-  userEventActivate(probe.event);
-  backend.drainCompletions();
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    allowConsume = true;
-  }
-  changed.notify_all();
-  tick.join();
-
-  EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u) << "the simultaneous tick became a semaphore credit after cancelling ioSleep";
-  userEventActivate(probe.event);
-  backend.drainCompletions();
-  EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 2u);
-
-  userEventStopTimer(probe.event);
-  deleteUserEvent(probe.event);
-  backend.drainCompletions();
+  verifyManualWakeDiscardsSleepTick(1, "the simultaneous tick became a semaphore credit after cancelling ioSleep");
 }
 
 TEST(user_event_coroutine, activation_before_wait_is_consumed_as_credit)

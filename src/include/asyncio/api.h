@@ -90,7 +90,6 @@ static inline AsyncFlags operator|(AsyncFlags a, AsyncFlags b) {
 __NO_UNUSED_FUNCTION_END
 #endif
 
-typedef struct ObjectPool ObjectPool;
 typedef struct asyncBase asyncBase;
 typedef struct aioObjectRoot aioObjectRoot;
 typedef struct asyncOpRoot asyncOpRoot;
@@ -316,13 +315,12 @@ static inline int objectPoolGet(ConcurrentQueue *pool, void **result, size_t siz
   return 1;
 }
 
-static inline int objectPoolPut(ConcurrentQueue *pool, void *object, size_t size)
+static inline void objectPoolPut(ConcurrentQueue *pool, void *object, size_t size)
 {
   // Mark before publishing: once the pointer is in the queue another thread
   // may pop and unmark it, and this mark must not land after that
   ASAN_POISON_MEMORY_REGION(object, size);
   concurrentQueuePush(pool, object);
-  return 1;
 }
 
 void eqRemove(List *list, asyncOpRoot *op);
@@ -481,10 +479,12 @@ static inline AsyncOpTaggedPtr taggedAsyncOpStub()
   return result;
 }
 
-static inline AsyncOpTaggedPtr taggedAsyncOpMake(asyncOpRoot *op, uint32_t tag)
+// An op node always enters Head with clean tag bits: signal tags are OR-ed
+// into Head by the counter pushes and never travel on an operation node.
+static inline AsyncOpTaggedPtr taggedAsyncOpMake(asyncOpRoot *op)
 {
   AsyncOpTaggedPtr result;
-  result.data = REINTERPRET_CAST(uintptr_t, op) | tag;
+  result.data = REINTERPRET_CAST(uintptr_t, op);
   return result;
 }
 
@@ -537,7 +537,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
     if (head.data) {
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
-        allocatedTagged = taggedAsyncOpMake(allocated, 0);
+        allocatedTagged = taggedAsyncOpMake(allocated);
       }
 
       allocated->next = head;
@@ -564,7 +564,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
       // Put operation to queue end and try exit combiner
       if (!allocated) {
         allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
-        allocatedTagged = taggedAsyncOpMake(allocated, 0);
+        allocatedTagged = taggedAsyncOpMake(allocated);
       }
 
       combiner(object, taggedAsyncOpStub(), allocatedTagged);
@@ -587,7 +587,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
 static inline void combinerPushOperation(asyncOpRoot *op)
 {
   aioObjectRoot *object = op->object;
-  AsyncOpTaggedPtr opTagged = taggedAsyncOpMake(op, 0);
+  AsyncOpTaggedPtr opTagged = taggedAsyncOpMake(op);
   AsyncOpTaggedPtr newOp;
   AsyncOpTaggedPtr head;
   do {
@@ -688,7 +688,7 @@ static inline void runAioOperation(aioObjectRoot *object,
       // Operation finished already
       addToGlobalQueue(op);
     } else {
-      forRun = taggedAsyncOpMake(op, 0);
+      forRun = taggedAsyncOpMake(op);
     }
 
     combiner(object, taggedAsyncOpStub(), forRun);
@@ -725,7 +725,7 @@ static inline asyncOpRoot *runIoOperation(aioObjectRoot *object,
       // Operation finished already
       addToGlobalQueue(op);
     } else {
-      forRun = taggedAsyncOpMake(op, 0);
+      forRun = taggedAsyncOpMake(op);
     }
 
     combiner(object, taggedAsyncOpStub(), forRun);

@@ -24,14 +24,10 @@ endif()
 
 if (WIN32)
   set(Sources ${Sources} iocp.c coroutineWin32.c deviceWin32.c socketWin32.c)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+  # Android is the Linux kernel too (epoll + POSIX); aarch64/x86_64 coroutine asm both present.
   set(Sources ${Sources} epoll.c devicePosix.c socketPosix.c coroutinePosix.c ${ARCH_NAME}/posix.s)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
-  # Same as Linux (epoll + POSIX); aarch64/x86_64 coroutine asm both present.
-  set(Sources ${Sources} epoll.c devicePosix.c socketPosix.c coroutinePosix.c ${ARCH_NAME}/posix.s)
-elseif (APPLE)
-  set(Sources ${Sources} kqueue.c devicePosix.c socketPosix.c coroutinePosix.c ${ARCH_NAME}/posix.s)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+elseif (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
   set(Sources ${Sources} kqueue.c devicePosix.c socketPosix.c coroutinePosix.c ${ARCH_NAME}/posix.s)
 endif()
 

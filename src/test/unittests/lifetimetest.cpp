@@ -152,15 +152,12 @@ TEST(lifetime, delete_with_connect_in_flight)
 {
   LifetimeContext context(gBase);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  ASSERT_EQ(socketBind(clientSocket, &address), 0);
-  aioObject *client = newSocketIo(gBase, clientSocket);
+  aioObject *client = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(client, nullptr);
   objectSetDestructorCb(aioObjectHandle(client), lifetimeDestructorCb, &context);
 
+  HostAddress address;
+  address.family = AF_INET;
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
   aioConnect(client, &address, 3000000, lifetimeConnectCb, &context);

@@ -1252,47 +1252,17 @@ TEST(zmtp, send_pipelined_with_accept)
 // Same contract as connect.double_connect_rejected on the plain socket: a
 // second handshake operation on a zmtp socket must fail immediately while
 // the first one is still in flight.
-struct zmtpDoubleConnectContext {
-  asyncBase *base;
-  AsyncOpStatus firstStatus;
-  AsyncOpStatus secondStatus;
-  int events;
-  int firstOrder;
-  int secondOrder;
-  zmtpDoubleConnectContext(asyncBase *baseArg) :
-    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
-    events(0), firstOrder(-1), secondOrder(-1) {}
-};
-
-static void zmtp_double_connect_firstcb(AsyncOpStatus status, zmtpSocket*, void *arg)
-{
-  auto ctx = static_cast<zmtpDoubleConnectContext*>(arg);
-  ctx->firstStatus = status;
-  ctx->firstOrder = ctx->events++;
-  if (ctx->events == 2)
-    postQuitOperation(ctx->base);
-}
-
-static void zmtp_double_connect_secondcb(AsyncOpStatus status, zmtpSocket*, void *arg)
-{
-  auto ctx = static_cast<zmtpDoubleConnectContext*>(arg);
-  ctx->secondStatus = status;
-  ctx->secondOrder = ctx->events++;
-  if (ctx->events == 2)
-    postQuitOperation(ctx->base);
-}
-
 TEST(zmtp, double_connect_rejected)
 {
-  zmtpDoubleConnectContext ctx(gBase);
+  DoubleConnectRecorder ctx(gBase);
   zmtpSocket *client = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
 
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("192.0.2.1");
   address.port = 9;
-  aioZmtpConnect(client, &address, afNone, 150000, zmtp_double_connect_firstcb, &ctx);
-  aioZmtpConnect(client, &address, afNone, 150000, zmtp_double_connect_secondcb, &ctx);
+  aioZmtpConnect(client, &address, afNone, 150000, doubleConnectFirstCb<zmtpSocket>, &ctx);
+  aioZmtpConnect(client, &address, afNone, 150000, doubleConnectSecondCb<zmtpSocket>, &ctx);
 
   asyncLoop(gBase);
   zmtpSocketDelete(client);

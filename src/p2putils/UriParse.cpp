@@ -3,17 +3,17 @@
 #include "p2putils/strExtras.h"
 #include <string.h>
 
-int isLetter(char s)
+static int isLetter(char s)
 {
   return (s >= 'A' && s <= 'Z') || (s >= 'a' && s <= 'z');
 }
 
-int isDigit(char s)
+static int isDigit(char s)
 {
   return (s >= '0' && s <= '9');
 }
 
-int isHexDigit(char s)
+static int isHexDigit(char s)
 {
   return ( (s >= '0' && s <= '9') ||
          (s >= 'A' && s <= 'F') ||
@@ -70,7 +70,7 @@ static int isPChar(const char **ptr)
 }
 
 
-int uriParseScheme(const char **ptr, uriParseCb callback, void *arg)
+static int uriParseScheme(const char **ptr, uriParseCb callback, void *arg)
 {
   const char *p = *ptr;
   if (isLetter(*p)) {
@@ -98,7 +98,7 @@ static char decodeHex(char s);
 
 // RFC 3986 IPv6address (IPvFuture not supported); *ptr points just past '[',
 // on success it is moved past ']'
-int uriParseIpLiteral(const char **ptr, uriParseCb callback, void *arg)
+static int uriParseIpLiteral(const char **ptr, uriParseCb callback, void *arg)
 {
   const char *p = *ptr;
   uint16_t groups[8];
@@ -318,7 +318,7 @@ ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uri
   return ParserResultOk;
 }
 
-int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
+static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
 {
   const char *p = *ptr;
 
@@ -373,25 +373,24 @@ int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
 }
 
 
-int uriParseHierPart(const char **ptr, uriParseCb callback, void *arg)
+static int uriParseHierPart(const char **ptr, uriParseCb callback, void *arg)
 {
-  int result = 1;
   const char *p = *ptr;
-  if (*p == '/') {
-    if (*(p+1) == '/') {
-      p += 2;
-      if (!uriParseAuthority(&p, callback, arg))
-        return 0;
-      if (*p == '/') {
-        result = (uriParsePath(&p, p+strlen(p), true, callback, arg) == ParserResultOk);
-      }
-    } else {
+
+  if (p[0] == '/' && p[1] == '/') {
+    // authority form; a failed authority leaves *ptr untouched
+    p += 2;
+    if (!uriParseAuthority(&p, callback, arg))
+      return 0;
+    int result = 1;
+    if (*p == '/')
       result = (uriParsePath(&p, p+strlen(p), true, callback, arg) == ParserResultOk);
-    }
-  } else {
-    result = (uriParsePath(&p, p+strlen(p), true, callback, arg) == ParserResultOk);
+    *ptr = p;
+    return result;
   }
-  
+
+  // with or without a leading '/', everything else is a single path
+  int result = (uriParsePath(&p, p+strlen(p), true, callback, arg) == ParserResultOk);
   *ptr = p;
   return result;
 }

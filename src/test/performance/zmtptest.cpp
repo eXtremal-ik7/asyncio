@@ -78,6 +78,66 @@ struct ReceiverContext {
 };
 __NO_PADDING_END
 
+// The measured send loop shared by every sender flavor: batches of 128
+// packets until gInterval seconds elapse or the send function reports an
+// error. Returns the number of packets sent; the send lambda inlines, so the
+// hot loop compiles to the same code as the former per-sender copies.
+template<typename SendFn>
+uint64_t timedBatchSend(SendFn send)
+{
+  bool run = true;
+  auto startTime = std::chrono::steady_clock::now();
+  uint64_t packetsNum = 0;
+  while (run) {
+    for (unsigned i = 0; i < 128; i++) {
+      if (send() < 0) {
+        run = false;
+        break;
+      }
+      packetsNum++;
+    }
+
+    auto currentTime = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(currentTime-startTime).count() >= gInterval)
+      run = false;
+  }
+
+  return packetsNum;
+}
+
+// An async TCP socket bound to an ephemeral local port; false when the bind
+// fails and the benchmark leg must be skipped.
+bool createBoundClient(socketTy &clientSocket)
+{
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = 0;
+  clientSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  return socketBind(clientSocket, &address) == 0;
+}
+
+// Listener on the benchmark port; the bind retry lets the previous run's
+// socket leave TIME_WAIT. Returns nullptr when the port stays unavailable.
+aioObject *createListener(asyncBase *base, uint16_t port)
+{
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = port;
+  socketTy listener = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  if (socketBind(listener, &address) != 0) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (socketBind(listener, &address) != 0)
+      return nullptr;
+  }
+
+  if (socketListen(listener) != 0)
+    return nullptr;
+
+  return newSocketIo(base, listener);
+}
+
 void senderZMQ(SenderContext *ctx)
 {
   auto zmqCtx = zmq_ctx_new();
@@ -102,25 +162,9 @@ void senderZMQ(SenderContext *ctx)
     // Send first packet
     int sendResult = zmq_send(socket, data.get(), ctx->cfg->packetSize, 0);
     if (sendResult > 0) {
-      bool run = true;
-      auto startTime = std::chrono::steady_clock::now();
-      uint64_t packetsNum = 0;
-      while (run) {
-        for (unsigned i = 0; i < 128; i++) {
-          sendResult = zmq_send(socket, data.get(), ctx->cfg->packetSize, 0);
-          if (sendResult < 0) {
-            run = false;
-            break;
-          }
-          packetsNum++;
-        }
-
-        auto currentTime = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(currentTime-startTime).count() >= gInterval)
-          run = false;
-      }
-
-      ctx->sent += packetsNum;
+      ctx->sent += timedBatchSend([&]() {
+        return zmq_send(socket, data.get(), ctx->cfg->packetSize, 0);
+      });
     } else {
       fprintf(stderr, "senderZMQ: zmq_send (first packet) failed error=%i\n", sendResult);
     }
@@ -195,15 +239,11 @@ void senderAsync(SenderContext *ctx)
 {
   ctx->base = createAsyncBase(amOSDefault, 1);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy senderSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  int bindResult = socketBind(senderSocket, &address);
-  if (bindResult != 0)
+  socketTy senderSocket;
+  if (!createBoundClient(senderSocket))
     return;
 
+  HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = ctx->cfg->port;
@@ -229,30 +269,14 @@ void senderCoroutineProc(void *arg)
     // Send first packet
     ssize_t sendResult = ioZmtpSend(ctx->socket, data.get(), ctx->cfg->packetSize, zmtpMessage, afNone, 1000000);
     if (sendResult > 0) {
-      bool run = true;
-      auto startTime = std::chrono::steady_clock::now();
-      uint64_t packetsNum = 0;
-      while (run) {
-        for (unsigned i = 0; i < 128; i++) {
-          sendResult = ioZmtpSend(ctx->socket, data.get(), ctx->cfg->packetSize, zmtpMessage, afNone, 1000000);
-          if (sendResult < 0) {
-            run = false;
-            break;
-          }
-          packetsNum++;
-        }
-
-        auto currentTime = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(currentTime-startTime).count() >= gInterval)
-          run = false;
-      }
-
-      ctx->sent += packetsNum;
+      ctx->sent += timedBatchSend([&]() {
+        return ioZmtpSend(ctx->socket, data.get(), ctx->cfg->packetSize, zmtpMessage, afNone, 1000000);
+      });
     } else {
-      fprintf(stderr, "senderZMQ: zmq_send (first packet) failed error=%zi\n", -sendResult);
+      fprintf(stderr, "senderCoroutine: ioZmtpSend (first packet) failed error=%zi\n", -sendResult);
     }
   } else {
-    fprintf(stderr, "senderZMQ: zmq_connect failed error=%i\n", connectResult);
+    fprintf(stderr, "senderCoroutine: ioZmtpConnect failed error=%i\n", connectResult);
   }
 
   zmtpSocketDelete(ctx->socket);
@@ -264,13 +288,8 @@ void senderCoroutine(SenderContext *ctx)
 {
   ctx->base = createAsyncBase(amOSDefault, 1);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  socketTy senderSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  int bindResult = socketBind(senderSocket, &address);
-  if (bindResult != 0)
+  socketTy senderSocket;
+  if (!createBoundClient(senderSocket))
     return;
 
   ctx->socket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, senderSocket), zmtpSocketPUSH);
@@ -310,30 +329,14 @@ void senderRawProc(void *arg)
     // Send first packet
     ssize_t sendResult = send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize+2, 0);
     if (sendResult > 0) {
-      bool run = true;
-      auto startTime = std::chrono::steady_clock::now();
-      uint64_t packetsNum = 0;
-      while (run) {
-        for (unsigned i = 0; i < 128; i++) {
-          sendResult = send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize+2, 0);
-          if (sendResult < 0) {
-            run = false;
-            break;
-          }
-          packetsNum++;
-        }
-
-        auto currentTime = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(currentTime-startTime).count() >= gInterval)
-          run = false;
-      }
-
-      ctx->sent += packetsNum;
+      ctx->sent += timedBatchSend([&]() {
+        return send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize+2, 0);
+      });
     } else {
-      fprintf(stderr, "senderZMQ: zmq_send (first packet) failed error=%zi\n", -sendResult);
+      fprintf(stderr, "senderRaw: send (first packet) failed error=%zi\n", -sendResult);
     }
   } else {
-    fprintf(stderr, "senderZMQ: zmq_connect failed error=%i\n", connectResult);
+    fprintf(stderr, "senderRaw: ioZmtpConnect failed error=%i\n", connectResult);
   }
 
   zmtpSocketDelete(ctx->socket);
@@ -344,13 +347,7 @@ void senderRaw(SenderContext *ctx)
 {
   ctx->base = createAsyncBase(amOSDefault, 1);
 
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = 0;
-  ctx->socketId = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  int bindResult = socketBind(ctx->socketId, &address);
-  if (bindResult != 0)
+  if (!createBoundClient(ctx->socketId))
     return;
 
   ctx->socket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, ctx->socketId), zmtpSocketPUSH);
@@ -473,21 +470,10 @@ static void receiverAsyncAcceptCb(AsyncOpStatus status, aioObject*, HostAddress,
 
 static void receiverAsync(ReceiverContext *ctx)
 {
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = ctx->cfg->port;
-  socketTy listener = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  if (socketBind(listener, &address) != 0) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (socketBind(listener, &address) != 0)
-      return;
-  }
-
-  if (socketListen(listener) != 0)
+  aioObject *listenerObject = createListener(ctx->base, ctx->cfg->port);
+  if (!listenerObject)
     return;
 
-  aioObject *listenerObject = newSocketIo(ctx->base, listener);
   aioAccept(listenerObject, 3000000, receiverAsyncAcceptCb, ctx);
   asyncLoop(ctx->base);
   deleteAioObject(listenerObject);
@@ -525,7 +511,7 @@ void receiverCoroutineProc(void *arg)
       ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(endTime-startTime).count();
     }
   } else {
-    fprintf(stderr, "receiverZMQ: zmq_bind failed error=%i\n", acceptResult);
+    fprintf(stderr, "receiverCoroutine: ioZmtpAccept failed error=%i\n", acceptResult);
   }
 
   zmtpSocketDelete(socket);
@@ -534,21 +520,10 @@ void receiverCoroutineProc(void *arg)
 
 static void receiverCoroutine(ReceiverContext *ctx)
 {
-  HostAddress address;
-  address.family = AF_INET;
-  address.ipv4 = INADDR_ANY;
-  address.port = ctx->cfg->port;
-  socketTy listener = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
-  if (socketBind(listener, &address) != 0) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (socketBind(listener, &address) != 0)
-      return;
-  }
-
-  if (socketListen(listener) != 0)
+  ctx->listener = createListener(ctx->base, ctx->cfg->port);
+  if (!ctx->listener)
     return;
 
-  ctx->listener = newSocketIo(ctx->base, listener);
   coroutineCall(coroutineNew(receiverCoroutineProc, ctx, 0x10000));
   asyncLoop(ctx->base);
   deleteAioObject(ctx->listener);
@@ -563,18 +538,18 @@ void runBenchmark(SenderTy senderType, ReceiverTy receiverType, uint16_t port)
   ReceiverContext receiverCtx(&cfg);
   receiverCtx.base = createAsyncBase(amOSDefault, 1);
 
-  std::thread *receiver = nullptr;
-  std::thread *sender = nullptr;
+  std::thread receiver;
+  std::thread sender;
 
   switch (receiverType) {
     case receiverTyZMQ :
-      receiver = new std::thread(receiverZMQ, &receiverCtx);
+      receiver = std::thread(receiverZMQ, &receiverCtx);
       break;
     case receiverTyAio :
-      receiver = new std::thread(receiverAsync, &receiverCtx);
+      receiver = std::thread(receiverAsync, &receiverCtx);
       break;
     case receiverTyCoroutine :
-      receiver = new std::thread(receiverCoroutine, &receiverCtx);
+      receiver = std::thread(receiverCoroutine, &receiverCtx);
       break;
   }
 
@@ -582,23 +557,21 @@ void runBenchmark(SenderTy senderType, ReceiverTy receiverType, uint16_t port)
 
   switch (senderType) {
     case senderTyZMQ :
-      sender = new std::thread(senderZMQ, &senderCtx);
+      sender = std::thread(senderZMQ, &senderCtx);
       break;
     case senderTyAio :
-      sender = new std::thread(senderAsync, &senderCtx);
+      sender = std::thread(senderAsync, &senderCtx);
       break;
     case senderTyCoroutine :
-      sender = new std::thread(senderCoroutine, &senderCtx);
+      sender = std::thread(senderCoroutine, &senderCtx);
       break;
     case senderTyRawSend :
-      sender = new std::thread(senderRaw, &senderCtx);
+      sender = std::thread(senderRaw, &senderCtx);
       break;
   }
 
-  sender->join();
-  receiver->join();
-  delete sender;
-  delete receiver;
+  sender.join();
+  receiver.join();
 
   printf("Sender=%s Receiver=%s ", SenderTyNames[senderType], ReceiverTyNames[receiverType]);
   if (receiverCtx.milliSecondsElapsed)

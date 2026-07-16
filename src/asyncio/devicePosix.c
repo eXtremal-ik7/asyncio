@@ -69,56 +69,37 @@ int serialPortSetConfig(iodevTy port,
   struct termios tios;
   memset(&tios, 0, sizeof(tios));
 
-  speed_t localSpeed;
-  switch (speed) {
-    case 110:
-      localSpeed = B110;
-      break;
-    case 300:
-      localSpeed = B300;
-      break;
-    case 600:
-      localSpeed = B600;
-      break;
-    case 1200:
-      localSpeed = B1200;
-      break;
-    case 2400:
-      localSpeed = B2400;
-      break;
-    case 4800:
-      localSpeed = B4800;
-      break;
-    case 9600:
-      localSpeed = B9600;
-      break;
-    case 19200:
-      localSpeed = B19200;
-      break;
-    case 38400:
-      localSpeed = B38400;
-      break;
-    case 57600:
-      localSpeed = B57600;
-      break;
-    case 115200:
-      localSpeed = B115200;
-      break;
+  // Supported baud rates; an unknown request falls back to 9600.
+  static const struct {
+    int rate;
+    speed_t value;
+  } baudTable[] = {
+    {110, B110},
+    {300, B300},
+    {600, B600},
+    {1200, B1200},
+    {2400, B2400},
+    {4800, B4800},
+    {9600, B9600},
+    {19200, B19200},
+    {38400, B38400},
+    {57600, B57600},
+    {115200, B115200},
 #ifndef OS_QNX
-    case 230400:
-      localSpeed = B230400;
-      break;
+    {230400, B230400},
 #ifndef OS_DARWIN
-    case 460800:
-      localSpeed = B460800;
-      break;
-    case 921600:
-      localSpeed = B921600;
-      break;
+    {460800, B460800},
+    {921600, B921600},
 #endif
 #endif
-    default :
-      localSpeed = B9600;
+  };
+
+  speed_t localSpeed = B9600;
+  for (size_t i = 0; i < sizeof(baudTable) / sizeof(baudTable[0]); i++) {
+    if (baudTable[i].rate == speed) {
+      localSpeed = baudTable[i].value;
+      break;
+    }
   }
 
   if (cfsetispeed(&tios, localSpeed) == -1 ||
