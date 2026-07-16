@@ -60,7 +60,6 @@ static void httpOversizedHeaderScenario()
   // status line, then one header the client can never buffer entirely
   ctx.response = "HTTP/1.1 200 OK\r\nX-Huge-Header: ";
   ctx.response.append(2*65536, 'a');
-  httpParseDefaultInit(&ctx.parseContext);
 
   if (!startTCPServer(ctx.base, httpOversizedHeaderAcceptCb, &ctx, gPort))
     exit(2);
@@ -70,6 +69,7 @@ static void httpOversizedHeaderScenario()
     exit(2);
 
   ctx.client = httpClientNew(ctx.base, clientIo);
+  httpParseDefaultInit(&ctx.parseContext, ctx.client);
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");

@@ -7,104 +7,35 @@
 extern "C" {
 #endif
 
-// Header name tokens, sorted alphabetically; hhUnknown is reported for names
-// missing from the table. Values are compiled into both the library and its
-// users: inserting a new name renumbers the tail, so a full rebuild of all
-// library consumers is required after any change here.
+// Reserved header ids: names the library recognizes with every recognition
+// table - the built-in one (a NULL table argument) and every table built by
+// httpHeaderTablePrepare (user lists may not contain these names). The
+// parser interprets Content-Length and Transfer-Encoding (message framing),
+// the rest are delivered with these ids for the client or a future library
+// feature. Bit 30 keeps the values positive ints usable as C case labels
+// and clear of the user id range [1, 0x3FFFFFFF]; hhUnknown (0) is reported
+// for a valid name missing from the table.
 enum {
   hhUnknown = 0,
-  hhAccept = 1,
-  hhAcceptCH,
-  hhAcceptCharset,
-  hhAcceptEncoding,
-  hhAcceptLanguage,
-  hhAcceptRanges,
-  hhAccessControlAllowCredentials,
-  hhAccessControlAllowHeaders,
-  hhAccessControlAllowMethods,
-  hhAccessControlAllowOrigin,
-  hhAccessControlExposeHeaders,
-  hhAccessControlMaxAge,
-  hhAccessControlRequestHeaders,
-  hhAccessControlRequestMethod,
-  hhAge,
-  hhAllow,
-  hhAltSvc,
-  hhAuthenticationInfo,
-  hhAuthorization,
-  hhCacheControl,
-  hhConnection,
-  hhContentDisposition,
-  hhContentEncoding,
-  hhContentLanguage,
-  hhContentLength,
-  hhContentLocation,
-  hhContentRange,
-  hhContentSecurityPolicy,
-  hhContentType,
-  hhCookie,
-  hhDate,
-  hhETag,
-  hhExpect,
-  hhExpires,
-  hhForwarded,
-  hhFrom,
-  hhHost,
-  hhIfMatch,
-  hhIfModifiedSince,
-  hhIfNoneMatch,
-  hhIfRange,
-  hhIfUnmodifiedSince,
-  hhKeepAlive,
-  hhLastModified,
-  hhLink,
-  hhLocation,
-  hhMaxForwards,
-  hhOrigin,
-  hhPermissionsPolicy,
-  hhPragma,
-  hhPriority,
-  hhProxyAuthenticate,
-  hhProxyAuthenticationInfo,
-  hhProxyAuthorization,
-  hhRange,
-  hhReferer,
-  hhReferrerPolicy,
-  hhRetryAfter,
-  hhSecCHUA,
-  hhSecCHUAMobile,
-  hhSecCHUAPlatform,
-  hhSecFetchDest,
-  hhSecFetchMode,
-  hhSecFetchSite,
-  hhSecFetchUser,
-  hhSecWebSocketAccept,
-  hhSecWebSocketExtensions,
-  hhSecWebSocketKey,
-  hhSecWebSocketProtocol,
-  hhSecWebSocketVersion,
-  hhServer,
-  hhServerTiming,
-  hhSetCookie,
-  hhStrictTransportSecurity,
-  hhTE,
-  hhTrailer,
-  hhTransferEncoding,
-  hhUpgrade,
-  hhUpgradeInsecureRequests,
-  hhUserAgent,
-  hhVary,
-  hhVia,
-  hhWarning,
-  hhWWWAuthenticate,
-  hhXContentTypeOptions,
-  hhXForwardedFor,
-  hhXForwardedHost,
-  hhXForwardedProto,
-  hhXFrameOptions,
-  hhXRealIP,
-  hhXRequestedWith,
-  hhXXSSProtection
+  hhReservedBase = 0x40000000,
+  hhContentLength,  // framing: the value is parsed as the body length
+  hhTransferEncoding,  // framing: "chunked" detection
+  hhContentEncoding,  // reserved for automatic decompression
+  hhConnection,  // connection lifecycle: close / keep-alive / upgrade
+  hhKeepAlive,  // keep-alive parameters
+  hhHost,  // server-side validation and routing
+  hhExpect,  // server-side 100-continue
+  hhUpgrade,  // protocol switching (websocket, h2c)
+  hhLocation   // client-side redirects
+};
+
+// Ids of the recognition table owned by the httpParseDefault callback (the
+// asyncio http client installs that table via httpParseDefaultInit). The
+// composition of the table is an implementation detail of the callback and
+// may change in any release; the ids are ordinary user-range ids of that
+// table, not reserved ones.
+enum {
+  hpdContentType = 1
 };
 
 // Request method tokens (RFC 9110: method names are case-sensitive);

@@ -27,13 +27,17 @@ void httpRequestSetBuffer(HttpRequestParserState *state, const void *buffer, siz
   state->end = state->buffer + size;
 }
 
-ParserResultTy httpRequestParse(HttpRequestParserState *state, httpRequestParseCb callback, void *arg)
+ParserResultTy httpRequestParse(HttpRequestParserState *state, const HttpHeaderTable *table,
+                                httpRequestParseCb callback, void *arg)
 {
   ParserResultTy localResult;
   HttpRequestComponent component;
   UriArg uriArg;
   uriArg.callback = callback;
   uriArg.arg = arg;
+
+  if (!table)
+    table = &httpHeaderDefaultTable;
 
   if (state->state == httpRequestMethod) {
     int token;
@@ -175,7 +179,7 @@ ParserResultTy httpRequestParse(HttpRequestParserState *state, httpRequestParseC
       }
 
       component.type = httpRequestDtHeaderEntry;
-      localResult = parseHeaderLine(state, &component, [&]() {
+      localResult = parseHeaderLine(state, table, &component, [&]() {
         return callback(&component, arg) != 0;
       });
       if (localResult != ParserResultOk)

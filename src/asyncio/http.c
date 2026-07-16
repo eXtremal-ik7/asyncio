@@ -118,7 +118,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
   }
 
   for (;;) {
-    switch (httpParse(&client->state, op->parseCallback, op->parseArg)) {
+    switch (httpParse(&client->state, client->headerTable, op->parseCallback, op->parseArg)) {
       case ParserResultOk : {
         HttpComponent component;
         component.type = httpDtFinalize;
@@ -211,9 +211,11 @@ static HTTPOp *allocHttpOp(aioExecuteProc executeProc,
   return op;
 }
 
-void httpParseDefaultInit(HTTPParseDefaultContext *context)
+void httpParseDefaultInit(HTTPParseDefaultContext *context, HTTPClient *client)
 {
   dynamicBufferInit(&context->buffer, 65536);
+  if (client)
+    httpClientSetHeaderTable(client, &httpParseDefaultTable);
 }
 
 void httpParseDefault(HttpComponent *component, void *arg)
@@ -239,7 +241,7 @@ void httpParseDefault(HttpComponent *component, void *arg)
 
     case httpDtHeaderEntry : {
       switch (component->header.entryType) {
-        case hhContentType : {
+        case hpdContentType : {
           context->contentTypeOffset = context->buffer.offset;
           char *out = (char*)dynamicBufferAlloc(&context->buffer, component->header.stringValue.size+1);
           memcpy(out, component->header.stringValue.data, component->header.stringValue.size);
@@ -307,6 +309,7 @@ static HTTPClient *httpClientNewCommon(asyncBase *base, void *socket, int isHttp
   client->isHttps = isHttps;
   client->inBufferOffset = 0;
   client->requestBytesSent = 0;
+  client->headerTable = 0;
   httpSetBuffer(&client->state, client->inBuffer, 0);
   if (isHttps)
     client->sslSocket = (SSLSocket*)socket;
@@ -323,6 +326,11 @@ HTTPClient *httpClientNew(asyncBase *base, aioObject *socket)
 HTTPClient *httpsClientNew(asyncBase *base, SSLSocket *socket)
 {
   return httpClientNewCommon(base, socket, 1);
+}
+
+void httpClientSetHeaderTable(HTTPClient *client, const HttpHeaderTable *table)
+{
+  client->headerTable = table;
 }
 
 void httpClientDelete(HTTPClient *client)

@@ -7,6 +7,7 @@ extern "C" {
 
 #include "HttpParseCommon.h"
 #include "CommonParse.h"
+#include "HttpHeaderTable.h"
 #include <stddef.h>
 
 typedef enum HttpRequestParserStateTy {
@@ -58,12 +59,10 @@ typedef struct HttpRequestComponent {
 
     // Header
     struct {
-      int entryType;
-      Raw entryName;
-      union {
-        Raw stringValue;
-        size_t sizeValue;
-      };
+      int entryType;    // id from the parse-call table / reserved hh* id / 0
+      Raw entryName;    // the name as it appears in the message
+      Raw stringValue;  // raw value with the OWS trimmed, always filled
+      size_t sizeValue; // parsed number, valid only for hhContentLength
     } header;
   };
   Raw data2;
@@ -73,7 +72,10 @@ typedef int httpRequestParseCb(HttpRequestComponent *component, void *arg);
 
 void httpRequestParserInit(HttpRequestParserState *state);
 void httpRequestSetBuffer(HttpRequestParserState *state, const void *buffer, size_t size);
-ParserResultTy httpRequestParse(HttpRequestParserState *state, httpRequestParseCb callback, void *arg);
+// table types the header names of the message (NULL = the built-in table of
+// the reserved names only); it is read for the duration of the call
+ParserResultTy httpRequestParse(HttpRequestParserState *state, const HttpHeaderTable *table,
+                                httpRequestParseCb callback, void *arg);
 
 const void *httpRequestDataPtr(HttpRequestParserState *state);
 size_t httpRequestDataRemaining(HttpRequestParserState *state);

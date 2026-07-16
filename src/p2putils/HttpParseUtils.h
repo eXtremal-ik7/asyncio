@@ -174,19 +174,22 @@ static inline ParserResultTy skipTrailers(const char **ptr, const char *end)
   }
 }
 
-// One header line shared by the response and request parsers: the name-token
-// lookup plus the Content-Length / string-value branch. The caller sets
-// component->type once and keeps the end-of-headers (empty line) handling to
-// itself; emit() returning false becomes ParserResultCancelled (the response
-// parser cannot cancel, its emitter always returns true and the branch folds
-// away at instantiation).
+// One header line shared by the response and request parsers: the name
+// lookup against the caller's recognition table plus the framing
+// interpretation (Content-Length feeds dataRemaining, Transfer-Encoding the
+// chunked flag). The component is emitted for every header line with the
+// raw value always filled; Content-Length additionally carries the parsed
+// number in sizeValue. The caller sets component->type once and keeps the
+// end-of-headers (empty line) handling to itself; emit() returning false
+// becomes ParserResultCancelled (the response parser cannot cancel, its
+// emitter always returns true and the branch folds away at instantiation).
 template<typename State, typename Component, typename Emit>
-static ParserResultTy parseHeaderLine(State *state, Component *component, Emit emit)
+static ParserResultTy parseHeaderLine(State *state, const HttpHeaderTable *table, Component *component, Emit emit)
 {
   ParserResultTy result;
   int token;
   const char *p = state->ptr;
-  if ((result = httpHeaderNameLookup(&p, state->end, &token)) != ParserResultOk)
+  if ((result = httpHeaderTableLookup(table, &p, state->end, &token)) != ParserResultOk)
     return result;
 
   component->header.entryType = token;
@@ -195,25 +198,25 @@ static ParserResultTy parseHeaderLine(State *state, Component *component, Emit e
   ++p;
   skipOWS(&p, state->end);
 
+  component->header.stringValue.data = p;
+  component->header.sizeValue = 0;
   if (token == hhContentLength) {
     size_t contentSize;
     if ((result = readDec(&p, state->end, &contentSize)) != ParserResultOk)
       return result;
     component->header.sizeValue = contentSize;
     state->dataRemaining = contentSize;
-    if (!emit())
-      return ParserResultCancelled;
   } else {
-    component->header.stringValue.data = p;
     if ((result = readUntilCRLF(&p, state->end)) != ParserResultOk)
       return result;
-    component->header.stringValue.size = static_cast<size_t>(p - component->header.stringValue.data - 2);
-    trimTrailingOWS(&component->header.stringValue);
-    if (token == hhTransferEncoding)
-      state->chunked = isChunkedTransferEncoding(&component->header.stringValue);
-    if (!emit())
-      return ParserResultCancelled;
   }
+
+  component->header.stringValue.size = static_cast<size_t>(p - component->header.stringValue.data - 2);
+  trimTrailingOWS(&component->header.stringValue);
+  if (token == hhTransferEncoding)
+    state->chunked = isChunkedTransferEncoding(&component->header.stringValue);
+  if (!emit())
+    return ParserResultCancelled;
 
   state->ptr = p;
   return ParserResultOk;

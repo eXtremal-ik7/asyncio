@@ -18,13 +18,14 @@ void expectData(const Raw &data, const char *expected)
 }
 
 // Single-buffer request parse driver: init, hand over the whole buffer,
-// return the parser verdict.
-ParserResultTy parseRequest(const void *request, size_t size, httpRequestParseCb *callback, void *arg)
+// return the parser verdict. No table = the reserved names only.
+ParserResultTy parseRequest(const void *request, size_t size, httpRequestParseCb *callback, void *arg,
+                            const HttpHeaderTable *table = nullptr)
 {
   HttpRequestParserState state;
   httpRequestParserInit(&state);
   httpRequestSetBuffer(&state, request, size);
-  return httpRequestParse(&state, callback, arg);
+  return httpRequestParse(&state, table, callback, arg);
 }
 
 void httpRequestCb1Impl(HttpRequestComponent *component, void *arg)
@@ -58,12 +59,15 @@ void httpRequestCb1Impl(HttpRequestComponent *component, void *arg)
     ASSERT_EQ(component->header.entryType, hhHost);
     expectData(component->header.stringValue, "localhost:8080");
   } else if (*callNum == 8) {
+    // not a reserved name: delivered untyped, the name and value are there
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
-    ASSERT_EQ(component->header.entryType, hhUserAgent);
+    ASSERT_EQ(component->header.entryType, hhUnknown);
+    expectData(component->header.entryName, "User-Agent");
     expectData(component->header.stringValue, "curl/7.58.0");
   } else if (*callNum == 9) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
-    ASSERT_EQ(component->header.entryType, hhAccept);
+    ASSERT_EQ(component->header.entryType, hhUnknown);
+    expectData(component->header.entryName, "Accept");
     expectData(component->header.stringValue, "*/*");
   } else if (*callNum == 10) {
     ASSERT_EQ(component->type, httpRequestDtDataLast);
@@ -95,19 +99,24 @@ void httpRequestCb2Impl(HttpRequestComponent *component, void *arg)
     expectData(component->header.stringValue, "localhost:18880");
   } else if (*callNum == 5) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
-    ASSERT_EQ(component->header.entryType, hhUserAgent);
+    ASSERT_EQ(component->header.entryType, hhUnknown);
+    expectData(component->header.entryName, "User-Agent");
     expectData(component->header.stringValue, "curl/7.58.0");
   } else if (*callNum == 6) {
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
-    ASSERT_EQ(component->header.entryType, hhAccept);
+    ASSERT_EQ(component->header.entryType, hhUnknown);
+    expectData(component->header.entryName, "Accept");
     expectData(component->header.stringValue, "*/*");
   } else if (*callNum == 7) {
+    // Content-Length delivers both the parsed number and the raw value
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
     ASSERT_EQ(component->header.entryType, hhContentLength);
     ASSERT_EQ(component->header.sizeValue, 2u);
+    expectData(component->header.stringValue, "2");
   } else if (*callNum == 8) {
+    // Content-Type is not reserved: untyped without a table listing it
     ASSERT_EQ(component->type, httpRequestDtHeaderEntry);
-    ASSERT_EQ(component->header.entryType, hhContentType);
+    ASSERT_EQ(component->header.entryType, hhUnknown);
     expectData(component->header.entryName, "Content-Type");
     expectData(component->header.stringValue, "application/x-www-form-urlencoded");
   } else if (*callNum == 9) {
@@ -166,12 +175,9 @@ int httpRequestTestCb(HttpRequestComponent *component, void *arg)
     case httpRequestDtHeaderEntry :
       ctx->headerTypes.push_back(component->header.entryType);
       ctx->headerNames.emplace_back(component->header.entryName.data, component->header.entryName.size);
-      if (component->header.entryType == hhContentLength) {
+      ctx->headerValues.emplace_back(component->header.stringValue.data, component->header.stringValue.size);
+      if (component->header.entryType == hhContentLength)
         ctx->contentLength = component->header.sizeValue;
-        ctx->headerValues.emplace_back();
-      } else {
-        ctx->headerValues.emplace_back(component->header.stringValue.data, component->header.stringValue.size);
-      }
       break;
     case httpRequestDtData :
       ctx->body.append(component->data.data, component->data.size);
@@ -187,15 +193,17 @@ int httpRequestTestCb(HttpRequestComponent *component, void *arg)
   return 1;
 }
 
-ParserResultTy parseRequest(const void *request, size_t size, HttpRequestTestContext &context)
+ParserResultTy parseRequest(const void *request, size_t size, HttpRequestTestContext &context,
+                            const HttpHeaderTable *table = nullptr)
 {
-  return parseRequest(request, size, httpRequestTestCb, &context);
+  return parseRequest(request, size, httpRequestTestCb, &context, table);
 }
 
 struct HttpResponseTestContext {
   unsigned code = 0;
   std::string description;
   std::vector<int> headerTypes;
+  std::vector<std::string> headerValues;
   size_t contentLength = 0;
   std::string body;
   int finalDataEvents = 0;
@@ -211,6 +219,7 @@ void httpResponseTestCb(HttpComponent *component, void *arg)
       break;
     case httpDtHeaderEntry :
       ctx->headerTypes.push_back(component->header.entryType);
+      ctx->headerValues.emplace_back(component->header.stringValue.data, component->header.stringValue.size);
       if (component->header.entryType == hhContentLength)
         ctx->contentLength = component->header.sizeValue;
       break;
@@ -224,12 +233,13 @@ void httpResponseTestCb(HttpComponent *component, void *arg)
 }
 
 // Response-side driver, symmetric to parseRequest.
-ParserResultTy parseResponse(const void *response, size_t size, HttpResponseTestContext &context)
+ParserResultTy parseResponse(const void *response, size_t size, HttpResponseTestContext &context,
+                             const HttpHeaderTable *table = nullptr)
 {
   HttpParserState state;
   httpInit(&state);
   httpSetBuffer(&state, response, size);
-  return httpParse(&state, httpResponseTestCb, &context);
+  return httpParse(&state, table, httpResponseTestCb, &context);
 }
 
 struct HeaderTokenPair {
@@ -237,39 +247,30 @@ struct HeaderTokenPair {
   int token;
 };
 
-// spot-check of the most common tokens from the generated table; a stale
-// committed table, an edited enum or a hash disagreement between the
-// generator and the runtime lookup shows up here
-const HeaderTokenPair gCommonHeaders[] = {
-  {"Accept", hhAccept},
-  {"Accept-Encoding", hhAcceptEncoding},
-  {"Authorization", hhAuthorization},
-  {"Cache-Control", hhCacheControl},
-  {"Connection", hhConnection},
+// the complete reserved set: every name the library recognizes with any
+// table; a stale committed table, an edited enum or a hash disagreement
+// between the generator and the runtime lookup shows up here
+const HeaderTokenPair gReservedHeaders[] = {
   {"Content-Length", hhContentLength},
-  {"Content-Type", hhContentType},
-  {"Cookie", hhCookie},
-  {"Date", hhDate},
-  {"ETag", hhETag},
-  {"Host", hhHost},
-  {"Location", hhLocation},
-  {"Server", hhServer},
-  {"Set-Cookie", hhSetCookie},
   {"Transfer-Encoding", hhTransferEncoding},
+  {"Content-Encoding", hhContentEncoding},
+  {"Connection", hhConnection},
+  {"Keep-Alive", hhKeepAlive},
+  {"Host", hhHost},
+  {"Expect", hhExpect},
   {"Upgrade", hhUpgrade},
-  {"User-Agent", hhUserAgent},
-  {"X-Forwarded-For", hhXForwardedFor}
+  {"Location", hhLocation}
 };
 
-TEST(http, common_tokens)
+TEST(http, reserved_tokens)
 {
-  const size_t count = sizeof(gCommonHeaders)/sizeof(gCommonHeaders[0]);
+  const size_t count = sizeof(gReservedHeaders)/sizeof(gReservedHeaders[0]);
   std::string request = "GET /x HTTP/1.1\r\n";
   for (size_t i = 0; i < count; i++) {
-    request += gCommonHeaders[i].name;
-    if (gCommonHeaders[i].token == hhContentLength)
+    request += gReservedHeaders[i].name;
+    if (gReservedHeaders[i].token == hhContentLength)
       request += ": 0\r\n";
-    else if (gCommonHeaders[i].token == hhTransferEncoding)
+    else if (gReservedHeaders[i].token == hhTransferEncoding)
       request += ": identity\r\n";
     else
       request += ": x\r\n";
@@ -281,8 +282,8 @@ TEST(http, common_tokens)
   ASSERT_TRUE(context.done);
   ASSERT_EQ(context.headerTypes.size(), count);
   for (size_t i = 0; i < count; i++) {
-    EXPECT_EQ(context.headerTypes[i], gCommonHeaders[i].token) << gCommonHeaders[i].name;
-    EXPECT_EQ(context.headerNames[i], gCommonHeaders[i].name);
+    EXPECT_EQ(context.headerTypes[i], gReservedHeaders[i].token) << gReservedHeaders[i].name;
+    EXPECT_EQ(context.headerNames[i], gReservedHeaders[i].name);
   }
 
   static const HeaderTokenPair methods[] = {
@@ -302,6 +303,66 @@ TEST(http, common_tokens)
     ASSERT_EQ(parseRequest(methodRequest.data(), methodRequest.size(), methodContext), ParserResultOk);
     EXPECT_EQ(methodContext.method, method.token) << method.name;
   }
+}
+
+TEST(http, parser_user_table)
+{
+  enum { myXCustom = 1, myETag = 2 };
+  const HttpHeaderTableEntry entries[] = {{"X-Custom", myXCustom}, {"ETag", myETag}};
+  HttpHeaderTable table;
+  ASSERT_TRUE(httpHeaderTablePrepare(&table, entries, 2));
+
+  // request side: user ids, the riding reserved names and untyped strangers
+  const char request[] = "POST /x HTTP/1.1\r\n"
+                         "X-Custom: a\r\n"
+                         "etag: \"v1\"\r\n"
+                         "Content-Length: 2\r\n"
+                         "Server: s\r\n"
+                         "\r\nab";
+  HttpRequestTestContext context;
+  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context, &table), ParserResultOk);
+  ASSERT_TRUE(context.done);
+  EXPECT_EQ(context.headerTypes,
+            (std::vector<int>{myXCustom, myETag, hhContentLength, hhUnknown}));
+  EXPECT_EQ(context.headerValues,
+            (std::vector<std::string>{"a", "\"v1\"", "2", "s"}));
+  EXPECT_EQ(context.contentLength, 2u);
+  EXPECT_EQ(context.body, "ab");
+
+  // response side shares the lookup
+  const char response[] = "HTTP/1.1 200 OK\r\nETAG: \"v2\"\r\nContent-Length: 0\r\n\r\n";
+  HttpResponseTestContext responseContext;
+  ASSERT_EQ(parseResponse(response, sizeof(response)-1, responseContext, &table), ParserResultOk);
+  EXPECT_EQ(responseContext.headerTypes, (std::vector<int>{myETag, hhContentLength}));
+
+  httpHeaderTableFree(&table);
+}
+
+TEST(http, header_incremental_resume)
+{
+  const HttpHeaderTableEntry entries[] = {{"X-Custom", 7}};
+  HttpHeaderTable table;
+  ASSERT_TRUE(httpHeaderTablePrepare(&table, entries, 1));
+
+  // interrupted mid-name: nothing of the header line is consumed, the caller
+  // re-feeds it from httpRequestDataPtr with more bytes appended
+  HttpRequestTestContext context;
+  HttpRequestParserState state;
+  httpRequestParserInit(&state);
+  const char firstPart[] = "GET /x HTTP/1.1\r\nX-Cus";
+  httpRequestSetBuffer(&state, firstPart, sizeof(firstPart)-1);
+  ASSERT_EQ(httpRequestParse(&state, &table, httpRequestTestCb, &context), ParserResultNeedMoreData);
+  const size_t consumed = sizeof(firstPart)-1 - httpRequestDataRemaining(&state);
+  EXPECT_EQ(std::string(firstPart + consumed), "X-Cus");
+
+  const char resumed[] = "X-Custom: value\r\n\r\n";
+  httpRequestSetBuffer(&state, resumed, sizeof(resumed)-1);
+  ASSERT_EQ(httpRequestParse(&state, &table, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_TRUE(context.done);
+  EXPECT_EQ(context.headerTypes, (std::vector<int>{7}));
+  EXPECT_EQ(context.headerValues, (std::vector<std::string>{"value"}));
+
+  httpHeaderTableFree(&table);
 }
 
 TEST(http, header_name_near_miss)
@@ -407,13 +468,13 @@ TEST(http, incremental_method_resume)
   // starting at httpRequestDataPtr and appends freshly received bytes to it
   const char firstPart[] = "GE";
   httpRequestSetBuffer(&state, firstPart, sizeof(firstPart)-1);
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultNeedMoreData);
+  ASSERT_EQ(httpRequestParse(&state, nullptr, httpRequestTestCb, &context), ParserResultNeedMoreData);
   ASSERT_EQ(httpRequestDataPtr(&state), static_cast<const void*>(firstPart));
   ASSERT_EQ(httpRequestDataRemaining(&state), sizeof(firstPart)-1);
 
   const char request[] = "GET /x HTTP/1.1\r\n\r\n";
   httpRequestSetBuffer(&state, request, sizeof(request)-1);
-  ASSERT_EQ(httpRequestParse(&state, httpRequestTestCb, &context), ParserResultOk);
+  ASSERT_EQ(httpRequestParse(&state, nullptr, httpRequestTestCb, &context), ParserResultOk);
   EXPECT_EQ(context.method, static_cast<int>(hmGet));
   EXPECT_TRUE(context.done);
 }
@@ -441,7 +502,8 @@ TEST(http, response_parser)
     ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
     EXPECT_EQ(context.code, 404u);
     EXPECT_EQ(context.description, "Not Found");
-    EXPECT_EQ(context.headerTypes, (std::vector<int>{hhContentType, hhETag, hhContentLength}));
+    EXPECT_EQ(context.headerTypes, (std::vector<int>{hhUnknown, hhUnknown, hhContentLength}));
+    EXPECT_EQ(context.headerValues, (std::vector<std::string>{"text/html", "\"abc\"", "5"}));
     EXPECT_EQ(context.contentLength, 5u);
     EXPECT_EQ(context.body, "Hello");
     EXPECT_EQ(context.finalDataEvents, 1);

@@ -66,10 +66,14 @@ void httpSetBuffer(HttpParserState *state, const void *buffer, size_t size)
   state->end = state->buffer + size;
 }
 
-ParserResultTy httpParse(HttpParserState *state, httpParseCb callback, void *arg)
+ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
+                         httpParseCb callback, void *arg)
 {
   ParserResultTy result;
   HttpComponent component;
+
+  if (!table)
+    table = &httpHeaderDefaultTable;
 
   if (state->state == httpStStartLine) {
     if ( (result = httpParseStartLine(state, callback, arg)) != ParserResultOk)
@@ -89,7 +93,7 @@ ParserResultTy httpParse(HttpParserState *state, httpParseCb callback, void *arg
       }
 
       component.type = httpDtHeaderEntry;
-      result = parseHeaderLine(state, &component, [&]() {
+      result = parseHeaderLine(state, table, &component, [&]() {
         callback(&component, arg);
         return true;
       });

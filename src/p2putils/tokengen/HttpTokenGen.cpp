@@ -1,7 +1,7 @@
 // HTTP token table generator.
 //
-// Single source of truth for the known HTTP header names and request methods.
-// Emits two files from the lists below:
+// Single source of truth for the reserved HTTP header names and the request
+// methods. Emits two files from the lists below:
 //   <src>/include/p2putils/HttpParseCommon.h - public token enums
 //   <src>/p2putils/HttpTokenTableData.h      - perfect hash tables (data only)
 //
@@ -9,14 +9,16 @@
 // (case-folded) name selects a displacement via its high bits, the displaced
 // low bits select the single slot a name can live in. Displacements are
 // searched here, at generation time, so a lookup probes exactly one slot.
+// User-defined recognition tables are built at runtime with the same layout
+// by httpHeaderTablePrepare, which also embeds the reserved names below.
 //
 // The generator is not wired into the build; run it manually after editing
 // the lists:
 //   c++ -std=c++17 -O2 -o httptokengen HttpTokenGen.cpp
 //   ./httptokengen ../../..   (path to the repository "src" directory)
 //
-// Both output files are committed; test http.known_tokens_coverage checks
-// that the committed tables, enums and the runtime lookup agree.
+// Both output files are committed; test http.reserved_tokens checks that the
+// committed tables, enums and the runtime lookup agree.
 
 #include <algorithm>
 #include <cstdint>
@@ -26,103 +28,34 @@
 #include <string>
 #include <vector>
 
-// Header field names, alphabetical. Sources: RFC 9110/9111/9112 (core HTTP),
-// RFC 6265 (cookies), WHATWG Fetch/CORS, RFC 6455 (WebSocket), W3C security
-// and fetch-metadata headers, plus widely deployed de-facto X-* names.
-// Enum identifiers are derived by dropping '-' and prepending "hh".
-static const char *headerNames[] = {
-  "Accept",
-  "Accept-CH",
-  "Accept-Charset",
-  "Accept-Encoding",
-  "Accept-Language",
-  "Accept-Ranges",
-  "Access-Control-Allow-Credentials",
-  "Access-Control-Allow-Headers",
-  "Access-Control-Allow-Methods",
-  "Access-Control-Allow-Origin",
-  "Access-Control-Expose-Headers",
-  "Access-Control-Max-Age",
-  "Access-Control-Request-Headers",
-  "Access-Control-Request-Method",
-  "Age",
-  "Allow",
-  "Alt-Svc",
-  "Authentication-Info",
-  "Authorization",
-  "Cache-Control",
-  "Connection",
-  "Content-Disposition",
-  "Content-Encoding",
-  "Content-Language",
-  "Content-Length",
-  "Content-Location",
-  "Content-Range",
-  "Content-Security-Policy",
-  "Content-Type",
-  "Cookie",
-  "Date",
-  "ETag",
-  "Expect",
-  "Expires",
-  "Forwarded",
-  "From",
-  "Host",
-  "If-Match",
-  "If-Modified-Since",
-  "If-None-Match",
-  "If-Range",
-  "If-Unmodified-Since",
-  "Keep-Alive",
-  "Last-Modified",
-  "Link",
-  "Location",
-  "Max-Forwards",
-  "Origin",
-  "Permissions-Policy",
-  "Pragma",
-  "Priority",
-  "Proxy-Authenticate",
-  "Proxy-Authentication-Info",
-  "Proxy-Authorization",
-  "Range",
-  "Referer",
-  "Referrer-Policy",
-  "Retry-After",
-  "Sec-CH-UA",
-  "Sec-CH-UA-Mobile",
-  "Sec-CH-UA-Platform",
-  "Sec-Fetch-Dest",
-  "Sec-Fetch-Mode",
-  "Sec-Fetch-Site",
-  "Sec-Fetch-User",
-  "Sec-WebSocket-Accept",
-  "Sec-WebSocket-Extensions",
-  "Sec-WebSocket-Key",
-  "Sec-WebSocket-Protocol",
-  "Sec-WebSocket-Version",
-  "Server",
-  "Server-Timing",
-  "Set-Cookie",
-  "Strict-Transport-Security",
-  "TE",
-  "Trailer",
-  "Transfer-Encoding",
-  "Upgrade",
-  "Upgrade-Insecure-Requests",
-  "User-Agent",
-  "Vary",
-  "Via",
-  "Warning",
-  "WWW-Authenticate",
-  "X-Content-Type-Options",
-  "X-Forwarded-For",
-  "X-Forwarded-Host",
-  "X-Forwarded-Proto",
-  "X-Frame-Options",
-  "X-Real-IP",
-  "X-Requested-With",
-  "X-XSS-Protection"
+// Reserved header names: the library recognizes these with every table (the
+// built-in one and every user table built by httpHeaderTablePrepare, whose
+// lists may not contain them). The parser interprets Content-Length and
+// Transfer-Encoding (message framing); the rest are only delivered with
+// their ids, reserving the name for a future library feature: adding a name
+// here later silently blinds user code that string-matches it under an
+// entryType == 0 gate, so the set errs on the generous side. Enum values are
+// hhReservedBase + 1-based list position.
+static const struct { const char *name; const char *enumName; const char *comment; } reservedHeaderNames[] = {
+  {"Content-Length",    "hhContentLength",    "framing: the value is parsed as the body length"},
+  {"Transfer-Encoding", "hhTransferEncoding", "framing: \"chunked\" detection"},
+  {"Content-Encoding",  "hhContentEncoding",  "reserved for automatic decompression"},
+  {"Connection",        "hhConnection",       "connection lifecycle: close / keep-alive / upgrade"},
+  {"Keep-Alive",        "hhKeepAlive",        "keep-alive parameters"},
+  {"Host",              "hhHost",             "server-side validation and routing"},
+  {"Expect",            "hhExpect",           "server-side 100-continue"},
+  {"Upgrade",           "hhUpgrade",          "protocol switching (websocket, h2c)"},
+  {"Location",          "hhLocation",         "client-side redirects"}
+};
+
+// The recognition table of the httpParseDefault callback: the reserved names
+// ride along as in every table, plus the names the callback itself consumes.
+// The composition is an implementation detail of the callback - extending it
+// is not a contract change; the ids are ordinary user-range ids private to
+// this table (a user never sees them: the callback consumption is exposed
+// through HTTPParseDefaultContext fields).
+static const struct { const char *name; const char *enumName; } defaultParserHeaderNames[] = {
+  {"Content-Type", "hpdContentType"}
 };
 
 // Request methods (RFC 9110, case-sensitive); order is part of the ABI
@@ -170,16 +103,6 @@ static uint64_t fnv1a(const std::string &name, bool caseSensitive)
     hash = (hash ^ folded) * 0x100000001b3ull;
   }
   return hash;
-}
-
-static std::string enumNameForHeader(const std::string &name)
-{
-  std::string result = "hh";
-  for (char c : name) {
-    if (c != '-')
-      result.push_back(c);
-  }
-  return result;
 }
 
 struct Token {
@@ -325,24 +248,17 @@ int main(int argc, char **argv)
   }
 
   std::vector<Token> headers;
-  for (const char *name : headerNames)
-    headers.push_back(Token{name, enumNameForHeader(name), fnv1a(name, false)});
+  for (const auto &header : reservedHeaderNames)
+    headers.push_back(Token{header.name, header.enumName, fnv1a(header.name, false)});
+  std::vector<Token> defaultParserHeaders = headers;
+  for (const auto &header : defaultParserHeaderNames)
+    defaultParserHeaders.push_back(Token{header.name, header.enumName, fnv1a(header.name, false)});
   std::vector<Token> methods;
   for (const auto &method : methodNames)
     methods.push_back(Token{method.name, method.enumName, fnv1a(method.name, true)});
 
-  for (size_t i = 1; i < headers.size(); i++) {
-    if (!std::lexicographical_compare(headers[i-1].name.begin(), headers[i-1].name.end(),
-                                      headers[i].name.begin(), headers[i].name.end(),
-                                      [](char l, char r) { return foldChar(static_cast<unsigned char>(l), false) <
-                                                                  foldChar(static_cast<unsigned char>(r), false); })) {
-      fprintf(stderr, "error: header list is not sorted or contains a duplicate: '%s' >= '%s'\n",
-              headers[i-1].name.c_str(), headers[i].name.c_str());
-      return 1;
-    }
-  }
-
-  PerfectHashTable headerTable = buildSmallestTable(headers, "headers");
+  PerfectHashTable headerTable = buildSmallestTable(headers, "reserved headers");
+  PerfectHashTable defaultParserTable = buildSmallestTable(defaultParserHeaders, "default parser headers");
   PerfectHashTable methodTable = buildSmallestTable(methods, "methods");
 
   const std::string root = argv[1];
@@ -365,17 +281,35 @@ int main(int argc, char **argv)
     out << "extern \"C\" {\n";
     out << "#endif\n";
     out << "\n";
-    out << "// Header name tokens, sorted alphabetically; hhUnknown is reported for names\n";
-    out << "// missing from the table. Values are compiled into both the library and its\n";
-    out << "// users: inserting a new name renumbers the tail, so a full rebuild of all\n";
-    out << "// library consumers is required after any change here.\n";
+    out << "// Reserved header ids: names the library recognizes with every recognition\n";
+    out << "// table - the built-in one (a NULL table argument) and every table built by\n";
+    out << "// httpHeaderTablePrepare (user lists may not contain these names). The\n";
+    out << "// parser interprets Content-Length and Transfer-Encoding (message framing),\n";
+    out << "// the rest are delivered with these ids for the client or a future library\n";
+    out << "// feature. Bit 30 keeps the values positive ints usable as C case labels\n";
+    out << "// and clear of the user id range [1, 0x3FFFFFFF]; hhUnknown (0) is reported\n";
+    out << "// for a valid name missing from the table.\n";
     out << "enum {\n";
     out << "  hhUnknown = 0,\n";
+    out << "  hhReservedBase = 0x40000000,\n";
     for (size_t i = 0; i < headers.size(); i++) {
-      out << "  " << headers[i].enumName;
-      if (i == 0)
-        out << " = 1";
-      out << (i + 1 < headers.size() ? "," : "") << "\n";
+      const char *comment = reservedHeaderNames[i].comment;
+      out << "  " << headers[i].enumName << (i + 1 < headers.size() ? "," : " ")
+          << "  // " << comment << "\n";
+    }
+    out << "};\n";
+    out << "\n";
+    out << "// Ids of the recognition table owned by the httpParseDefault callback (the\n";
+    out << "// asyncio http client installs that table via httpParseDefaultInit). The\n";
+    out << "// composition of the table is an implementation detail of the callback and\n";
+    out << "// may change in any release; the ids are ordinary user-range ids of that\n";
+    out << "// table, not reserved ones.\n";
+    out << "enum {\n";
+    {
+      const size_t count = sizeof(defaultParserHeaderNames)/sizeof(defaultParserHeaderNames[0]);
+      for (size_t i = 0; i < count; i++)
+        out << "  " << defaultParserHeaderNames[i].enumName << " = " << (i + 1)
+            << (i + 1 < count ? "," : "") << "\n";
     }
     out << "};\n";
     out << "\n";
@@ -413,14 +347,8 @@ int main(int argc, char **argv)
     out << "// Include this file only from HttpTokens.c\n";
     out << "\n";
     out << "#include \"p2putils/HttpParseCommon.h\"\n";
+    out << "#include \"HttpTokens.h\"\n";
     out << "#include <stdint.h>\n";
-    out << "\n";
-    out << "typedef struct HttpTokenEntry {\n";
-    out << "  const char *name;\n";
-    out << "  uint32_t length;\n";
-    out << "  int32_t value;\n";
-    out << "  uint64_t hash;\n";
-    out << "} HttpTokenEntry;\n";
     out << "\n";
     out << "// lower case + charset validation, for header names\n";
     emitByteTable(out, "httpTokenFoldTable", false);
@@ -428,7 +356,9 @@ int main(int argc, char **argv)
     out << "// charset validation only, for case-sensitive methods\n";
     emitByteTable(out, "httpTokenCharTable", true);
     out << "\n";
-    emitTokenTable(out, "HttpHeader", headerTable);
+    emitTokenTable(out, "HttpHeaderReserved", headerTable);
+    out << "\n";
+    emitTokenTable(out, "HttpParseDefault", defaultParserTable);
     out << "\n";
     emitTokenTable(out, "HttpMethod", methodTable);
   }

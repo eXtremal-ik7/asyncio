@@ -16,6 +16,7 @@ set(
   coroutinetest.cpp
   uriparsetest.cpp
   httpparsetest.cpp
+  httpheadertabletest.cpp
   coretest.cpp
   timertest.cpp
   eventtest.cpp
@@ -51,5 +52,6 @@ target_include_directories(
   unittest
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../asyncio
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../p2putils
 )
 target_link_libraries(unittest ${LIBRARIES})
