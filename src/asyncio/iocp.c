@@ -666,7 +666,7 @@ uint64_t iocpConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint
 
 void iocpReleaseUserEvent(aioUserEvent *event)
 {
-  aioTimer *timer = eventTimerLoad(event, amoAcquire);
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   if (timer) {
     iocpDisarmWaitableTimer(timer);
     CloseThreadpoolWait(timer->wait);

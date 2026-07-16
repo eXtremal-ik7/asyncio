@@ -352,7 +352,7 @@ struct aioUserEvent {
   //
   // A user publication replaces period/count, advances generation and either
   // acquires a free OWNER or leaves an existing owner in place. On applying a
-  // new generation, OWNER copies its finite counter to timer->userEvent.remaining;
+  // new generation, OWNER copies its finite counter to timer->event.state.remaining;
   // afterwards producers only add kernel inputs to the upper lane. epoll adds
   // one provisional input before OWNER reads the exact timerfd count; kqueue
   // adds its exact batch. The release CAS detects every concurrent publication.

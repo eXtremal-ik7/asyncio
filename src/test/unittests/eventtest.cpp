@@ -485,9 +485,9 @@ TEST(core_user_event, compact_kernel_claim_accepts_matching_generation_wrap)
   __uint64_atomic_store(&event.header.tag.high, fullGeneration, amoRelaxed);
   objectHeaderSetType(&event.header, ohtUserEvent);
 
-  uint64_t encoded = reactorHandleEncode(&event.header);
+  uint64_t encoded = kernelHandleEncode(&event.header);
   uint64_t decodedGeneration = 0;
-  objectHeader *decodedHeader = reactorHandleDecode(encoded, &decodedGeneration);
+  objectHeader *decodedHeader = kernelHandleDecode(encoded, &decodedGeneration);
   aioUserEvent *decoded = (aioUserEvent*)decodedHeader;
   EXPECT_EQ(decodedGeneration, fullGeneration);
   EXPECT_TRUE(eventTimerTryClaimReference(decoded, decodedGeneration));

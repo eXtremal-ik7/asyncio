@@ -29,6 +29,19 @@ typedef struct kqueueBase {
 // bases and let their idents collide inside one kqueue
 static volatile intptr_t timerIdCounter;
 
+enum {
+  timerIdentSeqBits = (int)(sizeof(uint64_t) * 4)
+};
+
+static uint64_t timerNextIdent(aioTimer *timer)
+{
+  uint64_t seqMask = (1ULL << timerIdentSeqBits) - 1;
+  uint64_t base = (uint64_t)timer->fd & ~seqMask;
+  uint64_t seq = ((uint64_t)timer->fd + 1) & seqMask;
+  assert(seq != 0 && "kqueue timer ident sequence exhausted without rotation");
+  return base | seq;
+}
+
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op);
 void kqueuePostEmptyOperation(asyncBase *base);
@@ -60,10 +73,10 @@ static struct asyncImpl kqueueImpl = {combinerTaskHandler,    kqueueEnqueue,    
                                       kqueueAsyncWrite,       kqueueAsyncReadMsg,    kqueueAsyncWriteMsg,      kqueueWakeupLoop,
                                       kqueueUpdateEventTimer, kqueueConsumeEventTimerTick, kqueueReleaseUserEvent};
 
-static int kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, uintptr_t ident, void *ptr)
+static int kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, uintptr_t ident, uint64_t envelope)
 {
   struct kevent event;
-  EV_SET(&event, ident, filter, flags, 0, 0, ptr);
+  EV_SET(&event, ident, filter, flags, 0, 0, (void*)(uintptr_t)envelope);
   int result;
   do {
     result = kevent(kqueueFd, &event, 1, 0, 0, 0);
@@ -186,16 +199,16 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
     unsigned writeEventActivated = (oldIoEvents & IO_EVENT_WRITE) && !(ioEvents & IO_EVENT_WRITE);
     uint64_t encoded = 0;
     if (((newIoEvents & IO_EVENT_READ) && !readEventActivated) || ((newIoEvents & IO_EVENT_WRITE) && !writeEventActivated))
-      encoded = reactorHandleEncode(&fdObject->root.header);
+      encoded = kernelHandleEncode(&fdObject->root.header);
 
     if ((newIoEvents & IO_EVENT_READ) && !readEventActivated)
-      kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_READ, fd, (void*)(uintptr_t)encoded);
+      kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_READ, fd, encoded);
     if (!(newIoEvents & IO_EVENT_READ) && readEventActivated)
-      kqueueControl(base->kqueueFd, EV_DELETE | EV_ONESHOT | EV_EOF, EVFILT_READ, fd, object);
+      kqueueControl(base->kqueueFd, EV_DELETE | EV_ONESHOT | EV_EOF, EVFILT_READ, fd, 0);
     if ((newIoEvents & IO_EVENT_WRITE) && !writeEventActivated)
-      kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, (void*)(uintptr_t)encoded);
+      kqueueControl(base->kqueueFd, EV_ADD | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, encoded);
     if (!(newIoEvents & IO_EVENT_WRITE) && writeEventActivated)
-      kqueueControl(base->kqueueFd, EV_DELETE | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, object);
+      kqueueControl(base->kqueueFd, EV_DELETE | EV_ONESHOT | EV_EOF, EVFILT_WRITE, fd, 0);
   }
 }
 
@@ -238,12 +251,12 @@ void kqueueNextFinishedOperation(asyncBase *base)
         continue;
 
       objectHeader *header;
-      uint64_t generation;
-      header = reactorHandleDecode(envelope, &generation);
+      uint64_t envelopeGeneration;
+      header = kernelHandleDecode(envelope, &envelopeGeneration);
       switch (objectHeaderGetType(header)) {
         case ohtUserEvent: {
           aioUserEvent *event = (aioUserEvent*)header;
-          if (!eventTimerTryClaimReference(event, generation))
+          if (!eventTimerTryClaimReference(event, envelopeGeneration))
             break;
           eventManualReady(event);
           eventDecrementReference(event, 1);
@@ -252,27 +265,29 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
         case ohtTimer: {
           aioTimer *timer = (aioTimer*)header;
-          uint64_t armedGeneration = 0;
-          aioObjectRoot *armedObject = 0;
-          uint64_t armedObjectGeneration = 0;
-          uint64_t armedEventGeneration = 0;
-          switch (reactorTimerDecodeIdentHandle(timer,
-                                                generation,
-                                                (uint64_t)events[n].ident,
-                                                &armedGeneration,
-                                                &armedObject,
-                                                &armedObjectGeneration,
-                                                &armedEventGeneration)) {
-            case rteIgnore: break;
+          uint64_t eventIdent = (uint64_t)events[n].ident;
 
-            case rteUserEvent:
-              eventTimerSignal((aioUserEvent*)timer->target, armedGeneration, armedEventGeneration, (uint64_t)events[n].data);
-              break;
-
-            case rteExpireOperation:
-              (void)opCancel((asyncOpRoot*)timer->target, armedGeneration, aosTimeout, armedObject, armedObjectGeneration);
-              break;
+          // Safely loading timer config
+          int isStale = __uint64_atomic_load(&timer->header.tag.low, amoAcquire) != eventIdent;
+          uint64_t generation;
+          aioObjectRoot *object = 0;
+          uint64_t objectGeneration = 0;
+          uint64_t eventGeneration = 0;
+          generation = __uint64_atomic_load(&timer->header.tag.high, amoAcquire);
+          if (timer->header.timer.kind == tkUserEvent)
+            eventGeneration = __uint64_atomic_load(&timer->event.generation, amoAcquire);
+          else {
+            object = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&timer->operation.object, amoRelaxed);
+            objectGeneration = __uint64_atomic_load(&timer->operation.objectGeneration, amoRelaxed);
           }
+          isStale |= __uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != eventIdent;
+          if (isStale)
+            break;
+
+          if (timer->header.timer.kind == tkUserEvent)
+            eventTimerSignal(timer->event.userEvent, generation, eventGeneration, (uint64_t)events[n].data);
+          else
+            (void)opCancel(timer->operation.op, generation, aosTimeout, object, objectGeneration);
           break;
         }
 
@@ -284,7 +299,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
           else if (events[n].filter == EVFILT_WRITE)
             bits |= COMBINER_TAG_PROGRESS_WRITE;
           if (bits & COMBINER_TAG_PROGRESS_MASK)
-            (void)combinerPushValidated(&object->root, generation, bits);
+            (void)combinerPushValidated(&object->root, envelopeGeneration, bits);
           break;
         }
       }
@@ -344,24 +359,25 @@ void kqueueDeleteObject(aioObject *object)
   objectFree(&objectPool, object, sizeof(aioObject));
 }
 
-static aioTimer *kqueueNewTimer(asyncBase *base, void *target, ReactorTimerKind kind)
+static aioTimer *kqueueNewTimer(asyncBase *base, TimerKind kind)
 {
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
   if (!timer)
     return 0;
-  reactorTimerInitializeSharedState(timer);
+  timerInitialize(timer);
   timer->header.base = base;
-  // Seed the permanent base into the high half; the low half is the arm
-  // sequence, advanced by reactorTimerArmIdent with each arming
-  timer->fd = (intptr_t)((uintptr_t)__sync_fetch_and_add(&timerIdCounter, 1) << rtIdentSeqBits);
-  timer->target = target;
+  // Seed the permanent base into the high half; the low half advances on arm.
+  timer->fd = (intptr_t)((uintptr_t)__sync_fetch_and_add(&timerIdCounter, 1) << timerIdentSeqBits);
   timer->header.timer.kind = (uint8_t)kind;
   return timer;
 }
 
 void kqueueInitializeTimer(asyncBase *base, asyncOpRoot *op)
 {
-  op->timerId = kqueueNewTimer(base, op, rtkOperation);
+  aioTimer *timer = kqueueNewTimer(base, tkOperation);
+  if (timer)
+    timer->operation.op = op;
+  op->timerId = timer;
 }
 
 static aioTimer *kqueuePrepareTimer(asyncOpRoot *op, asyncBase *base)
@@ -373,19 +389,20 @@ static aioTimer *kqueuePrepareTimer(asyncOpRoot *op, asyncBase *base)
   }
   if (!timer)
     return 0;
-  assert(timer->header.timer.kind == rtkOperation);
+  assert(timer->header.timer.kind == tkOperation);
 
-  uintptr_t seqMask = (((uintptr_t)1) << rtIdentSeqBits) - 1;
+  uintptr_t seqMask = (((uintptr_t)1) << timerIdentSeqBits) - 1;
   if (!timer->header.timer.broken && ((uintptr_t)timer->fd & seqMask) != seqMask)
     return timer;
 
   // Allocate and initialize the replacement before tombstoning the old cell.
   // On OOM the old disarmed cell remains attached and can be retried safely.
-  aioTimer *replacement = kqueueNewTimer(base, op, rtkOperation);
+  aioTimer *replacement = kqueueNewTimer(base, tkOperation);
   if (!replacement)
     return 0;
+  replacement->operation.op = op;
 
-  reactorTimerDisarm(timer);
+  timerUnpublish(timer);
   // Permanent tombstone: a stale kevent may retain this timer's pointer.
   timer->header.timer.broken = 1;
   op->timerId = replacement;
@@ -399,14 +416,23 @@ static int kqueueArmTimer(asyncOpRoot *op)
   aioTimer *timer = kqueuePrepareTimer(op, target);
   if (!timer)
     return 0;
-  void *udata = reactorTimerArmIdentGeneration(timer, op, opGetGeneration(op));
-  EV_SET(&event, timer->fd, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_USECONDS, op->timeout, udata);
+  uint64_t ident = timerNextIdent(timer);
+  aioObjectRoot *object = op->object;
+
+  timerPublishBegin(timer);
+    timer->fd = (intptr_t)ident;
+    __pointer_atomic_store((void *volatile*)&timer->operation.object, object, amoRelaxed);
+    __uint64_atomic_store(&timer->operation.objectGeneration, objectHeaderGeneration(&object->header), amoRelaxed);
+  timerPublishEnd(timer, opGetGeneration(op), ident);
+
+  uint64_t envelope = kernelHandleEncode(&timer->header);
+  EV_SET(&event, timer->fd, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_USECONDS, op->timeout, (void*)(uintptr_t)envelope);
   int result;
   do {
     result = kevent(((kqueueBase*)target)->kqueueFd, &event, 1, 0, 0, 0);
   } while (result == -1 && errno == EINTR);
   if (result == -1) {
-    reactorTimerDisarm(timer);
+    timerUnpublish(timer);
     return 0;
   }
   timer->header.base = target;
@@ -422,7 +448,7 @@ void kqueueStartTimer(asyncOpRoot *op)
 static int kqueueDisarmTimer(aioTimer *timer)
 {
   struct kevent event;
-  reactorTimerDisarm(timer);
+  timerUnpublish(timer);
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
   // ENOENT is the normal outcome whenever the oneshot already fired and was
   // harvested (every expiry-driven stop) or the timer was never armed
@@ -453,10 +479,9 @@ void kqueueStopTimer(asyncOpRoot *op)
 
 int kqueueInitializeUserEvent(aioUserEvent *event)
 {
-  uint64_t encoded = reactorHandleEncode(&event->header);
+  uint64_t encoded = kernelHandleEncode(&event->header);
   event->activationId = (uint64_t)(uintptr_t)event;
-  void *udata = (void*)(uintptr_t)encoded;
-  if (kqueueControl(((kqueueBase*)event->header.base)->kqueueFd, EV_ADD | EV_CLEAR, EVFILT_USER, (uintptr_t)event, udata) == 0)
+  if (kqueueControl(((kqueueBase*)event->header.base)->kqueueFd, EV_ADD | EV_CLEAR, EVFILT_USER, (uintptr_t)event, encoded) == 0)
     return 1;
   event->activationId = UINT64_MAX;
   return 0;
@@ -465,7 +490,7 @@ int kqueueInitializeUserEvent(aioUserEvent *event)
 int kqueueActivate(aioUserEvent *event)
 {
   struct kevent kernelEvent;
-  EV_SET(&kernelEvent, event->activationId, EVFILT_USER, 0, NOTE_TRIGGER, 0, (void*)(uintptr_t)reactorHandleEncode(&event->header));
+  EV_SET(&kernelEvent, event->activationId, EVFILT_USER, 0, NOTE_TRIGGER, 0, (void*)(uintptr_t)kernelHandleEncode(&event->header));
   int result;
   do {
     result = kevent(((kqueueBase*)event->header.base)->kqueueFd, &kernelEvent, 1, 0, 0, 0);
@@ -477,21 +502,23 @@ static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event)
 {
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   if (!timer) {
-    timer = kqueueNewTimer(event->header.base, event, rtkUserEvent);
+    timer = kqueueNewTimer(event->header.base, tkUserEvent);
     if (!timer)
       return 0;
+    timer->event.userEvent = event;
     eventTimerStore(event, timer, amoRelaxed);
   }
 
-  uintptr_t seqMask = (((uintptr_t)1) << rtIdentSeqBits) - 1;
+  uintptr_t seqMask = (((uintptr_t)1) << timerIdentSeqBits) - 1;
   if (!timer->header.timer.broken && ((uintptr_t)timer->fd & seqMask) != seqMask)
     return timer;
 
-  aioTimer *replacement = kqueueNewTimer(event->header.base, event, rtkUserEvent);
+  aioTimer *replacement = kqueueNewTimer(event->header.base, tkUserEvent);
   if (!replacement)
     return 0;
+  replacement->event.userEvent = event;
 
-  reactorTimerDisarm(timer);
+  timerUnpublish(timer);
   timer->header.timer.broken = 1;
   eventTimerStore(event, replacement, amoRelaxed);
   return replacement;
@@ -503,14 +530,21 @@ static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_
   aioTimer *timer = kqueuePrepareEventTimer(event);
   if (!timer)
     return 0;
-  void *udata = reactorTimerArmEventIdentGeneration(timer, event, generation);
-  EV_SET(&kernelEvent, timer->fd, EVFILT_TIMER, EV_ADD | EV_ENABLE, NOTE_USECONDS, period, udata);
+  uint64_t ident = timerNextIdent(timer);
+
+  timerPublishBegin(timer);
+    timer->fd = (intptr_t)ident;
+    __uint64_atomic_store(&timer->event.generation, eventHandleGeneration(event), amoRelease);
+  timerPublishEnd(timer, generation, ident);
+
+  void *envelope = (void*)kernelHandleEncode(&timer->header);
+  EV_SET(&kernelEvent, timer->fd, EVFILT_TIMER, EV_ADD | EV_ENABLE, NOTE_USECONDS, period, envelope);
   int result;
   do {
     result = kevent(((kqueueBase*)event->header.base)->kqueueFd, &kernelEvent, 1, 0, 0, 0);
   } while (result == -1 && errno == EINTR);
   if (result == -1) {
-    reactorTimerDisarm(timer);
+    timerUnpublish(timer);
     return 0;
   }
   timer->header.base = event->header.base;
@@ -520,7 +554,8 @@ static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_
 int kqueueUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period)
 {
   switch (update) {
-    case etuStart: return kqueueArmEventTimer(event, generation, period);
+    case etuStart:
+      return kqueueArmEventTimer(event, generation, period);
     case etuStop: {
       aioTimer *timer = eventTimerLoad(event, amoRelaxed);
       assert(timer && "Stopping a user-event timer which was never armed");
@@ -548,9 +583,9 @@ void kqueueReleaseUserEvent(aioUserEvent *event)
     event->activationId = UINT64_MAX;
   }
 #ifndef NDEBUG
-  aioTimer *timer = eventTimerLoad(event, amoAcquire);
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   if (timer)
-    assert(__uint64_atomic_load(&timer->header.tag.low, amoAcquire) == 0 && "Recycling an armed user-event timer");
+    assert(__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) == 0 && "Recycling an armed user-event timer");
 #endif
   // EV_DELETE/expiry has made the knote inert, but harvested kevents may
   // retain timer's address indefinitely. Park the immutable event/timer pair

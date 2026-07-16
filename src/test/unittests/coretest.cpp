@@ -1628,11 +1628,11 @@ TEST(core_head, fd_handle_roundtrips_pointer_and_generation)
   __uint64_atomic_store(&object->root.header.tag.high, 0x055555u, amoRelaxed);
   objectHeaderSetType(&object->root.header, ohtObject);
 
-  uint64_t encoded = reactorHandleEncode(&object->root.header);
+  uint64_t encoded = kernelHandleEncode(&object->root.header);
   EXPECT_NE(encoded, 0u);
 
   uint64_t generation = 0;
-  objectHeader *decoded = reactorHandleDecode(encoded, &generation);
+  objectHeader *decoded = kernelHandleDecode(encoded, &generation);
   EXPECT_EQ(decoded, &object->root.header);
   EXPECT_EQ(generation,
             __uint64_atomic_load(&object->root.header.tag.high, amoRelaxed));
@@ -1650,9 +1650,9 @@ TEST(core_head, user_event_handle_roundtrips_pointer_and_generation)
                          amoRelaxed);
   objectHeaderSetType(&event->header, ohtUserEvent);
 
-  uint64_t encoded = reactorHandleEncode(&event->header);
+  uint64_t encoded = kernelHandleEncode(&event->header);
   uint64_t generation = 0;
-  objectHeader *decoded = reactorHandleDecode(encoded, &generation);
+  objectHeader *decoded = kernelHandleDecode(encoded, &generation);
   EXPECT_EQ(decoded, &event->header);
   EXPECT_EQ(generation, (UINT64_C(1) << 40) | 0x12345u);
   alignedFree(event);
@@ -1664,7 +1664,7 @@ TEST(core_head, nonnull_header_never_encodes_as_zero)
     static_cast<objectHeader*>(alignedMalloc(sizeof(objectHeader), 64));
   ASSERT_NE(header, nullptr);
   __uint64_atomic_store(&header->tag.high, 0, amoRelaxed);
-  EXPECT_NE(reactorHandleEncode(header), 0u);
+  EXPECT_NE(kernelHandleEncode(header), 0u);
   alignedFree(header);
 }
 
@@ -1676,9 +1676,9 @@ TEST(core_head, fd_handle_generation_wraps_modulo_compact_field)
   uint64_t fullGeneration = REACTOR_HANDLE_GENERATION_MASK + 18;
   __uint64_atomic_store(&object->root.header.tag.high, fullGeneration, amoRelaxed);
 
-  uint64_t encoded = reactorHandleEncode(&object->root.header);
+  uint64_t encoded = kernelHandleEncode(&object->root.header);
   uint64_t decodedGeneration = 0;
-  objectHeader *decoded = reactorHandleDecode(encoded, &decodedGeneration);
+  objectHeader *decoded = kernelHandleDecode(encoded, &decodedGeneration);
   EXPECT_EQ(decoded, &object->root.header);
   EXPECT_EQ(decodedGeneration, fullGeneration);
   alignedFree(object);
@@ -1739,9 +1739,9 @@ TEST(core_head, validated_push_accepts_matching_compact_generation_after_wrap)
                          amoRelaxed);
 
   aioObject *object = reinterpret_cast<aioObject*>(&cell);
-  uint64_t encoded = reactorHandleEncode(&object->root.header);
+  uint64_t encoded = kernelHandleEncode(&object->root.header);
   uint64_t decodedGeneration = 0;
-  objectHeader *decoded = reactorHandleDecode(encoded, &decodedGeneration);
+  objectHeader *decoded = kernelHandleDecode(encoded, &decodedGeneration);
   EXPECT_EQ(decodedGeneration, fullGeneration);
   EXPECT_TRUE(combinerPushValidated((aioObjectRoot*)decoded,
                                     decodedGeneration,

@@ -216,11 +216,11 @@ struct TestBackend: asyncBase {
       aioTimer *timer = static_cast<aioTimer*>(alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT));
       if (!timer)
         return 0;
-      reactorTimerInitializeSharedState(timer);
+      timerInitialize(timer);
       timer->header.base = event->header.base;
-      timer->header.timer.kind = rtkUserEvent;
+      timer->header.timer.kind = tkUserEvent;
       timer->fd = -1;
-      timer->target = event;
+      timer->event.userEvent = event;
       eventTimerStore(event, timer, amoRelaxed);
       backend.eventTimers.push_back(timer);
     }
