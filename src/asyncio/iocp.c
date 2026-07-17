@@ -382,7 +382,11 @@ void iocpNextFinishedOperation(asyncBase *base)
         AsyncOpStatus result = iocpGetOverlappedResult(op);
         if (result == aosSuccess) {
           aioObject *object = (aioObject*)op->info.root.object;
-          int isBuffered = op->info.root.opCode == actRead && op->info.transactionSize < object->buffer.totalSize;
+          // Must mirror the submit-side test in iocpAsyncRead exactly: a read
+          // of precisely the buffer capacity is posted into the object buffer,
+          // and treating it as unbuffered here would account the bytes against
+          // a user buffer that never received them.
+          int isBuffered = op->info.root.opCode == actRead && op->info.transactionSize <= object->buffer.totalSize;
           if (!isBuffered)
             op->info.bytesTransferred += entry->dwNumberOfBytesTransferred;
           else
@@ -481,6 +485,7 @@ aioObject *iocpNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 
   object->buffer.offset = 0;
   object->buffer.dataSize = 0;
+  ioBufferEnsureCapacity(&object->buffer, DEFAULT_SOCKET_BUFFER_SIZE);
   return object;
 }
 
@@ -731,6 +736,11 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
   DWORD flags = 0;
 
   if (copyFromBuffer(op->info.buffer, &op->info.bytesTransferred, sb, op->info.transactionSize))
+    return aosSuccess;
+  // A partial hit from the read-ahead buffer completes a non-afWaitAll read,
+  // matching the reactor backends: parking here would hold already delivered
+  // bytes hostage to future traffic.
+  if (op->info.bytesTransferred != 0 && !(opptr->flags & afWaitAll))
     return aosSuccess;
 
   if (op->info.transactionSize <= object->buffer.totalSize) {

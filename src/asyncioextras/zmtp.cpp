@@ -683,7 +683,6 @@ zmtpSocket *zmtpSocketNew(asyncBase *base, aioObject *plainSocket, zmtpSocketTy 
   socket->plainSocket = plainSocket;
   socket->type = type;
   socket->needSendMore = false;
-  setSocketBuffer(plainSocket, 256);
   return socket;
 }
 

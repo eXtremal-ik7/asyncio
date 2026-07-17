@@ -159,7 +159,8 @@ void epollEnqueue(asyncBase *base, asyncOpRoot *op)
 {
   epollBase *localBase = (epollBase*)base;
   concurrentQueuePush(&base->globalQueue, op);
-  eventfd_write(localBase->eventFd, 1);
+  if (enqueueNeedsDoorbell(base, op))
+    eventfd_write(localBase->eventFd, 1);
 }
 
 void epollPostEmptyOperation(asyncBase *base)
@@ -353,6 +354,7 @@ aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data)
   object->Registered = 0;
   object->Object.buffer.offset = 0;
   object->Object.buffer.dataSize = 0;
+  ioBufferEnsureCapacity(&object->Object.buffer, DEFAULT_SOCKET_BUFFER_SIZE);
   return &object->Object;
 }
 

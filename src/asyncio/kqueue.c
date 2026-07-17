@@ -140,7 +140,8 @@ asyncBase *kqueueNewAsyncBase()
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op)
 {
   concurrentQueuePush(&base->globalQueue, op);
-  kqueueDoorbell((kqueueBase*)base);
+  if (enqueueNeedsDoorbell(base, op))
+    kqueueDoorbell((kqueueBase*)base);
 }
 
 void kqueuePostEmptyOperation(asyncBase *base)
@@ -292,6 +293,7 @@ aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data)
 
   object->buffer.offset = 0;
   object->buffer.dataSize = 0;
+  ioBufferEnsureCapacity(&object->buffer, DEFAULT_SOCKET_BUFFER_SIZE);
   return object;
 }
 

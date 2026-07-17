@@ -11,6 +11,7 @@
 
 __tls unsigned currentFinishedSync;
 __tls unsigned messageLoopThreadId;
+__tls asyncBase *loopThreadBase;
 static __tls unsigned loopThreadSlotOwned;
 
 void eqRemove(List *list, asyncOpRoot *op)
@@ -783,6 +784,7 @@ int loopThreadEnter(asyncBase *base)
     if (!(old & bit)) {
       messageLoopThreadId = id;
       loopThreadSlotOwned = 1;
+      loopThreadBase = base;
       __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 1, amoSeqCst);
       return 1;
     }
@@ -808,6 +810,7 @@ unsigned loopThreadExit(asyncBase *base)
   unsigned remaining = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, (unsigned)-1, amoSeqCst) - 1;
   __uintptr_atomic_fetch_and(&base->loopThreadSlots[word], ~bit, amoRelease);
   loopThreadSlotOwned = 0;
+  loopThreadBase = 0;
   return remaining;
 }
 

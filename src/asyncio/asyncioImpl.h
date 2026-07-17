@@ -181,6 +181,21 @@ struct ioBuffer {
   size_t offset;
 };
 
+// Default read-ahead capacity of a stream object: reads smaller than the
+// capacity are served from one large recv instead of a syscall each. Pooled
+// objects keep the largest capacity ever requested across recycles.
+#define DEFAULT_SOCKET_BUFFER_SIZE 16384
+
+__NO_UNUSED_FUNCTION_BEGIN
+static inline void ioBufferEnsureCapacity(struct ioBuffer *buffer, size_t size)
+{
+  if (size > buffer->totalSize) {
+    buffer->ptr = realloc(buffer->ptr, size);
+    buffer->totalSize = size;
+  }
+}
+__NO_UNUSED_FUNCTION_END
+
 struct aioObject {
   aioObjectRoot root;
   union {
@@ -563,6 +578,24 @@ __NO_UNUSED_FUNCTION_END
 // release returns the number of loop invocations still active after exit.
 int loopThreadEnter(asyncBase *base);
 unsigned loopThreadExit(asyncBase *base);
+
+// The base whose message loop this thread is currently running (set between
+// loopThreadEnter and loopThreadExit), zero on any other thread.
+extern __tls asyncBase *loopThreadBase;
+
+// An enqueue doorbell syscall exists to wake a sleeping loop thread. When the
+// base can only ever have one loop thread and that thread is the caller, the
+// wakeup is wasted: every backend loop fully drains the global queue right
+// before it can go to sleep, so a completion the loop thread pushes itself is
+// always consumed first, and the doorbell would only buy an extra empty loop
+// turn. The quit marker (op == 0) always rings: it is posted from arbitrary
+// threads, has to reach a sleeper, and is too rare to matter.
+__NO_UNUSED_FUNCTION_BEGIN
+static inline int enqueueNeedsDoorbell(asyncBase *base, asyncOpRoot *op)
+{
+  return !(op && base->loopThreadLimit == 1 && loopThreadBase == base);
+}
+__NO_UNUSED_FUNCTION_END
 
 int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size);
 #ifdef __cplusplus

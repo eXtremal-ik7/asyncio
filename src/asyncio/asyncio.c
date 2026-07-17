@@ -249,10 +249,7 @@ void postQuitOperation(asyncBase *base)
 
 void setSocketBuffer(aioObject *socket, size_t bufferSize)
 {
-  if (bufferSize > socket->buffer.totalSize) {
-    socket->buffer.ptr = realloc(socket->buffer.ptr, bufferSize);
-    socket->buffer.totalSize = bufferSize;
-  }
+  ioBufferEnsureCapacity(&socket->buffer, bufferSize);
 }
 
 static uint32_t eventTimerNextGeneration(uint32_t generation)

@@ -8,7 +8,11 @@
 #include <openssl/ssl.h>
 #include <string.h>
 
-#define DEFAULT_SSL_READ_BUFFER_SIZE 16384
+// One full TLS record on the wire is 16384 bytes of plaintext plus header and
+// AEAD overhead; a transport buffer of exactly 16384 would split every full
+// record into two recv/BIO_write rounds. 32K holds a complete record with room
+// to start the next one.
+#define DEFAULT_SSL_READ_BUFFER_SIZE 32768
 
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
