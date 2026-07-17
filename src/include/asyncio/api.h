@@ -282,19 +282,18 @@ void objectFree(ConcurrentQueue *pool, void *object, size_t size);
 void *__tagged_pointer_make(void *ptr, uintptr_t data);
 void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData);
 
-// Recycling pools for objects. Pooled memory is never returned to the
-// allocator, in every build: under the address sanitizer a parked object is
-// marked with the manual poisoning API instead, so the allocation pattern
-// stays identical to production while any touch beyond the generation head
-// between objectFree and objectAlloc reports use-after-poison. Kernel event
-// batches carry a compact pointer/generation handle and may inspect only Head
-// before a successful validation.
-// The marks deliberately cover objects only. Operations cannot be marked:
-// the timeout grid keeps op pointers past the operation's lifetime and
-// lazily cancels through them when their second arrives - that is safe
-// exactly because recycled operation memory stays type-stable and the
-// generation tag rejects the stale cancel. User events own their platform
-// timer and follow the operation contract.
+// Recycling pools. Pooled memory is never returned to the allocator, in
+// every build: under the address sanitizer a parked cell is marked with the
+// manual poisoning API instead, so the allocation pattern stays identical to
+// production while any illegal touch between free and the next alloc reports
+// use-after-poison. What stays readable mirrors each type's stale-access
+// contract: an object keeps its header (tag + immutable type) - harvested
+// kernel envelopes validate through it; a parked operation keeps only the
+// leading tag word - timeout-grid links and realtime timer envelopes hold op
+// pointers past the operation's lifetime, and their generation CAS on the
+// tag is what rejects them (nothing beyond the tag may be touched until that
+// CAS succeeds, see asyncOpRoot); a grid link itself has no stale readers
+// and parks fully poisoned.
 #if defined(__has_include)
 #if __has_include(<sanitizer/asan_interface.h>)
 #include <sanitizer/asan_interface.h>  // ASAN_(UN)POISON_MEMORY_REGION expand to no-ops without asan
@@ -306,6 +305,46 @@ void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData);
 #define ASAN_POISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
 #define ASAN_UNPOISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
 #endif
+
+// True only when the address sanitizer is actually active: gates the small
+// pool-size bookkeeping that operation marks need, so production builds
+// carry no extra work on the release path
+#if defined(__SANITIZE_ADDRESS__)
+#define ASYNCIO_POOL_MARKS 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ASYNCIO_POOL_MARKS 1
+#endif
+#endif
+#ifndef ASYNCIO_POOL_MARKS
+#define ASYNCIO_POOL_MARKS 0
+#endif
+
+// Leak-scanner handoff for allocations deliberately retained by parked
+// pooled cells: operation scratch, object read-ahead, SSL rings, paired
+// timer cells. A parked owner is ASAN-poisoned and the leak scanner does
+// not read pointers out of poisoned words, so such caches would report as
+// leaks. Their lifetime belongs to the pool; a genuinely lost owner still
+// reports as its own leak.
+#if ASYNCIO_POOL_MARKS && defined(__has_include)
+#if __has_include(<sanitizer/lsan_interface.h>)
+#include <sanitizer/lsan_interface.h>
+#define ASYNCIO_LSAN_HANDOFF 1
+#endif
+#endif
+#ifndef ASYNCIO_LSAN_HANDOFF
+#define ASYNCIO_LSAN_HANDOFF 0
+#endif
+
+static inline void poolCacheHandoff(const void *ptr)
+{
+#if ASYNCIO_LSAN_HANDOFF
+  if (ptr)
+    __lsan_ignore_object(ptr);
+#else
+  (void)ptr;
+#endif
+}
 
 static inline int objectPoolGet(ConcurrentQueue *pool, void **result, size_t size)
 {
@@ -406,6 +445,16 @@ struct asyncOpRoot {
   };
   AsyncOpRunningTy running;
 };
+
+// A parked operation is ASAN-poisoned beyond its first word; stale grid and
+// timer holders are entitled to exactly the tag
+#ifdef __cplusplus
+static_assert(offsetof(asyncOpRoot, tag) == 0, "tag must start asyncOpRoot");
+#elif defined(_MSC_VER) && !defined(__clang__)
+typedef char tagMustStartOpRoot[offsetof(asyncOpRoot, tag) == 0 ? 1 : -1];
+#else
+_Static_assert(offsetof(asyncOpRoot, tag) == 0, "tag must start asyncOpRoot");
+#endif
 
 void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aioObjectDestructor destructor);
 
@@ -676,10 +725,12 @@ static inline void runAioOperation(aioObjectRoot *object,
       } else {
         // Budget exhausted: this completion goes through the loop, the inline
         // window restarts - without the reset a thread that never drains the
-        // queues would lose the fast path forever after the first 32 calls
+        // queues would lose the fast path forever after the first 32 calls.
+        // The transfer itself already happened: the op only carries the
+        // completion, so the write-payload capture copy is skipped (afNoCopy)
         if (flags & afActiveOnce)
           currentFinishedSync = 0;
-        asyncOpRoot *op = createAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
+        asyncOpRoot *op = createAsyncOp(object, flags | afNoCopy, usTimeout, callback, arg, opCode, contextPtr);
         initOp(op, contextPtr);
         opForceStatus(op, aosSuccess);
         addToGlobalQueue(op);
@@ -714,9 +765,11 @@ static inline asyncOpRoot *runIoOperation(aioObjectRoot *object,
       if (!(++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
         // The fairness fallback re-queues the completed sync result; the
         // operation must keep the caller's flags (afRealtime, afWaitAll, ...)
-        // and the inline window restarts, same as in runAioOperation
+        // and the inline window restarts, same as in runAioOperation.
+        // The transfer itself already happened, so the write-payload capture
+        // copy is skipped (afNoCopy)
         currentFinishedSync = 0;
-        op = createAsyncOp(object, flags | afCoroutine, usTimeout, 0, 0, opCode, contextPtr);
+        op = createAsyncOp(object, flags | afCoroutine | afNoCopy, usTimeout, 0, 0, opCode, contextPtr);
         initOp(op, contextPtr);
         opForceStatus(op, aosSuccess);
         addToGlobalQueue(op);

@@ -192,6 +192,7 @@ static inline void ioBufferEnsureCapacity(struct ioBuffer *buffer, size_t size)
   if (size > buffer->totalSize) {
     buffer->ptr = realloc(buffer->ptr, size);
     buffer->totalSize = size;
+    poolCacheHandoff(buffer->ptr);
   }
 }
 __NO_UNUSED_FUNCTION_END
@@ -333,6 +334,7 @@ static inline void *opEnsureTimerCell(asyncOpRoot *op)
   if (!op->timerId) {
     asyncBase *base = op->object->header.base;
     base->methodImpl.initializeTimer(base, op);
+    poolCacheHandoff(op->timerId);
   }
   return op->timerId;
 }
@@ -345,6 +347,7 @@ static inline void asyncOpEnsureInternalBuffer(void **buffer, size_t *bufferSize
   if (*bufferSize < required) {
     *buffer = realloc(*buffer, required);
     *bufferSize = required;
+    poolCacheHandoff(*buffer);
   }
 }
 __NO_UNUSED_FUNCTION_END

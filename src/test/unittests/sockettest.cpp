@@ -1191,6 +1191,69 @@ TEST(socket, test_udp_fire_and_forget_sync_result)
   deleteAioObject(context.serverSocket);
 }
 
+// The coroutine datagram variants have a single reporting channel - the
+// return value - but two delivery paths behind it: the inline syscall
+// result, and a loop round trip when the consecutive-synchronous-completion
+// budget runs out. The rerouted completion op is created without a payload
+// capture (the datagram already left through the syscall), so the
+// transferred byte count must be carried on the op explicitly: losing it
+// turns every budget-boundary write into a reported zero-byte transfer.
+// The thread-local budget counter starts at an arbitrary in-window value
+// (previous tests moved it), so the test does not predict which calls hit
+// the boundary - it demands the count from every call, and enough calls are
+// made to cross the boundary several times whatever the starting point.
+struct UdpCoroutineBudgetContext {
+  asyncBase *base;
+  aioObject *serverSocket = nullptr;
+  aioObject *clientSocket = nullptr;
+  HostAddress address;
+  uint32_t writePayload[udpBudgetTotal];
+  uint32_t readPayload[udpBudgetTotal];
+  ssize_t writeResult[udpBudgetTotal];
+  ssize_t readResult[udpBudgetTotal];
+  UdpCoroutineBudgetContext(asyncBase *baseArg) : base(baseArg) {}
+};
+
+static void udpCoroutineBudgetProc(void *arg)
+{
+  UdpCoroutineBudgetContext *ctx = static_cast<UdpCoroutineBudgetContext*>(arg);
+  for (unsigned i = 0; i < udpBudgetTotal; i++) {
+    ctx->writePayload[i] = i;
+    ctx->writeResult[i] = ioWriteMsg(ctx->clientSocket, &ctx->address, &ctx->writePayload[i], sizeof(uint32_t), afNone, 1000000);
+  }
+  for (unsigned i = 0; i < udpBudgetTotal; i++)
+    ctx->readResult[i] = ioReadMsg(ctx->serverSocket, &ctx->readPayload[i], sizeof(uint32_t), afNone, 1000000);
+  postQuitOperation(ctx->base);
+}
+
+TEST(socket, test_udp_coroutine_sync_budget)
+{
+  UdpCoroutineBudgetContext context(gBase);
+  context.serverSocket = startUDPServer(gBase, nullptr, nullptr, nullptr, 0, gPort);
+  context.clientSocket = initializeUDPClient(gBase);
+  ASSERT_NE(context.serverSocket, nullptr);
+  ASSERT_NE(context.clientSocket, nullptr);
+
+  context.address.family = AF_INET;
+  context.address.ipv4 = inet_addr("127.0.0.1");
+  context.address.port = gPort;
+
+  coroutineTy *coroutine = coroutineNew(udpCoroutineBudgetProc, &context, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  ASSERT_EQ(coroutineCall(coroutine), 0);
+  asyncLoop(gBase);
+
+  for (unsigned i = 0; i < udpBudgetTotal; i++) {
+    EXPECT_EQ(context.writeResult[i], (ssize_t)sizeof(uint32_t)) << "write " << i;
+    EXPECT_EQ(context.readResult[i], (ssize_t)sizeof(uint32_t)) << "read " << i;
+    // loopback keeps datagrams ordered: every payload landed in the buffer
+    // of its own read no matter which path reported the completion
+    EXPECT_EQ(context.readPayload[i], i) << "read " << i;
+  }
+  deleteAioObject(context.clientSocket);
+  deleteAioObject(context.serverSocket);
+}
+
 // The kernel reports some socket failures only through the "exceptional"
 // poll state: on Linux EPOLLERR/EPOLLHUP are delivered regardless of the
 // interest mask and can arrive with no readable/writable bit at all. Two

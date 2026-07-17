@@ -81,7 +81,10 @@ static void rwFinish(asyncOpRoot *opptr)
 static void releaseOp(asyncOpRoot *opptr)
 {
   SSLOp *op = (SSLOp*)opptr;
-  if (op->internalBuffer) {
+  // Pool-sized scratch stays with the pooled operation for the next parked
+  // write (a full 16K TLS-record payload fits); only oversized bulk captures
+  // go back to the allocator
+  if (op->internalBufferSize > DEFAULT_SOCKET_BUFFER_SIZE) {
     free(op->internalBuffer);
     op->internalBuffer = 0;
     op->internalBufferSize = 0;
@@ -161,6 +164,7 @@ static size_t copyFromOut(SSLSocket *S)
   if (nBytes > S->sslWriteBufferSize) {
     S->sslWriteBuffer = realloc(S->sslWriteBuffer, nBytes);
     S->sslWriteBufferSize = nBytes;
+    poolCacheHandoff(S->sslWriteBuffer);
   }
 
   // TODO: correct processing >4Gb data blocks
@@ -292,6 +296,8 @@ SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket, SSL_CTX *userContext
     S->sslReadBuffer = (uint8_t*)malloc(S->sslReadBufferSize);
     S->sslWriteBufferSize = DEFAULT_SSL_READ_BUFFER_SIZE;
     S->sslWriteBuffer = (uint8_t*)malloc(S->sslWriteBufferSize);
+    poolCacheHandoff(S->sslReadBuffer);
+    poolCacheHandoff(S->sslWriteBuffer);
     if (!S->sslReadBuffer || !S->sslWriteBuffer) {
       free(S->sslReadBuffer);
       free(S->sslWriteBuffer);

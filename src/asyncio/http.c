@@ -8,6 +8,11 @@ static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
 static ConcurrentQueue objectPool;
 
+// Pooled operations keep their scratch buffer up to this size (matches the
+// transport's default read-ahead buffer); larger request captures are
+// returned to the allocator on completion
+static const size_t POOLED_BUFFER_SIZE_LIMIT = 16384;
+
 typedef enum {
   httpOpConnect = 0
 } HttpOpTy;
@@ -179,7 +184,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
 static void releaseProc(asyncOpRoot *opptr)
 {
   HTTPOp *op = (HTTPOp*)opptr;
-  if (op->internalBuffer) {
+  if (op->internalBufferSize > POOLED_BUFFER_SIZE_LIMIT) {
     free(op->internalBuffer);
     op->internalBuffer = 0;
     op->internalBufferSize = 0;
@@ -346,6 +351,7 @@ static void httpOpSetData(HTTPOp *op, const void *data, size_t size)
   if (op->internalBufferSize < size) {
     op->internalBuffer = realloc(op->internalBuffer, size);
     op->internalBufferSize = size;
+    poolCacheHandoff(op->internalBuffer);
   }
 
   op->dataSize = size;

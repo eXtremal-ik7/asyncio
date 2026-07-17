@@ -46,6 +46,10 @@ struct MessageHeader {
 #pragma pack(pop)
 
 constexpr int USERSPACE_BUFFER_SIZE=1472;
+// Pooled operations keep their scratch buffer up to this size (matches the
+// transport's default read-ahead buffer); larger captures - block-sized
+// payloads reach megabytes - are returned to the allocator on completion
+constexpr size_t POOLED_BUFFER_SIZE_LIMIT=16384;
 
 enum btcOpTy {
   btcOpRecv = OPCODE_READ,
@@ -161,7 +165,7 @@ static void sendFinish(asyncOpRoot *opptr)
 static void releaseProc(asyncOpRoot *opptr)
 {
   btcOp *op = (btcOp*)opptr;
-  if (op->internalBuffer) {
+  if (op->internalBufferSize > POOLED_BUFFER_SIZE_LIMIT) {
     free(op->internalBuffer);
     op->internalBuffer = 0;
     op->internalBufferSize = 0;
@@ -221,9 +225,11 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
     if (op->internalBuffer == nullptr) {
       op->internalBuffer = malloc(context->TransactionSize);
       op->internalBufferSize = context->TransactionSize;
+      poolCacheHandoff(op->internalBuffer);
     } else if (op->internalBufferSize < context->TransactionSize) {
       op->internalBufferSize = context->TransactionSize;
       op->internalBuffer = realloc(op->internalBuffer, context->TransactionSize);
+      poolCacheHandoff(op->internalBuffer);
     }
 
     memcpy(op->internalBuffer, context->Buffer, context->TransactionSize);

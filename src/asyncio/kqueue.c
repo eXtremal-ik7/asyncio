@@ -426,6 +426,7 @@ static aioTimer *kqueuePrepareEventTimer(aioUserEvent *event)
       return 0;
     timer->event.userEvent = event;
     eventTimerStore(event, timer, amoRelaxed);
+    poolCacheHandoff(timer);
   }
 
   return timer;

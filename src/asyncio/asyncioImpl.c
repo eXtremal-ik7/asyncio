@@ -255,6 +255,51 @@ void opForceStatus(asyncOpRoot *op, AsyncOpStatus status)
   __uintptr_atomic_store(&op->tag, (__uintptr_atomic_load(&op->tag, amoRelaxed) & TAG_GENERATION_MASK) | (uintptr_t)status, amoRelaxed);
 }
 
+#if ASYNCIO_POOL_MARKS
+// Pool -> element size map, filled at the first fresh allocation from each
+// pool (a pool's first put cannot precede its first alloc, so release always
+// finds its entry). It lets releaseAsyncOp poison the parked operation
+// without threading a size through every release path. Racing registrations
+// of one pool may produce duplicates; lookup takes the first match and the
+// sizes are equal, so they are harmless.
+typedef struct OpPoolSizeEntry {
+  ConcurrentQueue * volatile pool;
+  size_t size;
+} OpPoolSizeEntry;
+
+static OpPoolSizeEntry opPoolSizes[32];
+static volatile unsigned opPoolSizeCount;
+
+static void opPoolSizeRegister(ConcurrentQueue *pool, size_t size)
+{
+  for (;;) {
+    unsigned count = __uint_atomic_load(&opPoolSizeCount, amoAcquire);
+    for (unsigned i = 0; i < count; i++) {
+      if (__pointer_atomic_load((void *volatile*)&opPoolSizes[i].pool, amoAcquire) == pool)
+        return;
+    }
+    if (count >= sizeof(opPoolSizes) / sizeof(opPoolSizes[0]))
+      return;  // overflow: operations of extra pools park unmarked
+    if (__uint_atomic_compare_and_swap(&opPoolSizeCount, count, count + 1, amoSeqCst)) {
+      opPoolSizes[count].size = size;
+      // Size is written before the pool pointer publishes the entry
+      __pointer_atomic_store((void *volatile*)&opPoolSizes[count].pool, pool, amoRelease);
+      return;
+    }
+  }
+}
+
+static size_t opPoolSizeLookup(ConcurrentQueue *pool)
+{
+  unsigned count = __uint_atomic_load(&opPoolSizeCount, amoAcquire);
+  for (unsigned i = 0; i < count; i++) {
+    if (__pointer_atomic_load((void *volatile*)&opPoolSizes[i].pool, amoAcquire) == pool)
+      return opPoolSizes[i].size;
+  }
+  return 0;
+}
+#endif
+
 int asyncOpAlloc(asyncBase *base,
                  size_t size,
                  int isRealTime,
@@ -271,12 +316,19 @@ int asyncOpAlloc(asyncBase *base,
       *result = 0;
       return 0;
     }
-    if (isRealTime)
+    if (isRealTime) {
       base->methodImpl.initializeTimer(base, op);
-    else
+      poolCacheHandoff(op->timerId);
+    } else {
       op->timerId = 0;
+    }
     op->tag = 0;
     hasAllocatedNew = 1;
+#if ASYNCIO_POOL_MARKS
+    opPoolSizeRegister(buffer, size);
+  } else {
+    ASAN_UNPOISON_MEMORY_REGION(op, size);
+#endif
   }
 
   op->objectPool = buffer;
@@ -287,7 +339,16 @@ int asyncOpAlloc(asyncBase *base,
 void releaseAsyncOp(asyncOpRoot *op)
 {
   aioObjectRoot *object = op->object;
-  concurrentQueuePush(op->objectPool, op);
+  ConcurrentQueue *pool = op->objectPool;
+#if ASYNCIO_POOL_MARKS
+  // Mark before publishing: once the pointer is in the pool another thread
+  // may pop and unmark it. The leading tag word stays readable - stale grid
+  // links and realtime timer envelopes validate through it (see asyncOpRoot)
+  size_t size = opPoolSizeLookup(pool);
+  if (size)
+    ASAN_POISON_MEMORY_REGION((uint8_t*)op + sizeof(op->tag), size - sizeof(op->tag));
+#endif
+  concurrentQueuePush(pool, op);
   objectDecrementReference(object, 1);
 }
 

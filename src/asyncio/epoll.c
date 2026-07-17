@@ -586,6 +586,7 @@ int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t
         timer->event.userEvent = event;
         timer->header.timer.kind = tkUserEvent;
         eventTimerStore(event, timer, amoRelaxed);
+        poolCacheHandoff(timer);
       }
       return epollStartTimerGeneration(event, timer, generation, period);
     case etuStop: {

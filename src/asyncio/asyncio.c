@@ -100,7 +100,11 @@ void eventExecuteQueuedTask(asyncOpRoot *node)
 static void releaseOp(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
-  if (op->internalBuffer) {
+  // Pool-sized scratch stays with the pooled operation for the next parked
+  // write or accept; only oversized captures (large payloads under
+  // backpressure) go back to the allocator, so a pooled operation retains
+  // at most the default buffer size
+  if (op->internalBufferSize > DEFAULT_SOCKET_BUFFER_SIZE) {
     free(op->internalBuffer);
     op->internalBuffer = 0;
     op->internalBufferSize = 0;
@@ -952,7 +956,11 @@ static ssize_t datagramRejectClosing(aioObject *object,
 {
   if (callback == 0)
     return -(ssize_t)aosCanceled;
-  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, callback, arg, opCode, context);
+  // The rejected operation only delivers aosCanceled; nothing ever reads a
+  // write payload from it, so skip the capture copy. This also keeps the op
+  // pools clean: this op bypasses opRelease, so a captured buffer would ride
+  // into the pool around the releaseMethod size cap
+  asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afNoCopy, usTimeout, callback, arg, opCode, context);
   if (opCode == actReadMsg)
     memset(&op->host, 0, sizeof(op->host));
   opForceStatus(&op->root, aosCanceled);
@@ -972,27 +980,26 @@ ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flag
   int truncated;
   ssize_t result = readMsgSyscall(object, buffer, size, &source, &truncated);
 
-  struct Context context;
-  fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
   if (truncated || result >= 0) {
     // Either data arrived synchronously, or the datagram was consumed but cut
     // down to the buffer size - a truncated datagram cannot be retried and
     // must complete as aosBufferTooSmall, or it would be lost with no
     // completion at all
-    HostAddress host;
-    sockaddrToHostAddress(&source, &host);
-    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
+    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION))
       return truncated ? -(ssize_t)aosBufferTooSmall : result;
-    } else {
-      if (flags & afActiveOnce)
-        currentFinishedSync = 0;
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-      op->bytesTransferred = truncated ? size : (size_t)result;
-      op->host = host;
-      opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
-      addToGlobalQueue(&op->root);
-    }
+
+    if (flags & afActiveOnce)
+      currentFinishedSync = 0;
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
+    op->bytesTransferred = truncated ? size : (size_t)result;
+    sockaddrToHostAddress(&source, &op->host);
+    opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
+    addToGlobalQueue(&op->root);
   } else {
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
     asyncOpRoot *op = newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
     combinerPushOperation(op);
   }
@@ -1018,20 +1025,23 @@ ssize_t aioWriteMsg(aioObject *object,
   // Datagram socket can be accessed by multiple threads without lock
   ssize_t result = writeMsgSyscall(object, address, buffer, size);
 
-  struct Context context;
-  fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
   if (result >= 0) {
-    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
+    if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION))
       return result;
-    } else {
-      if (flags & afActiveOnce)
-        currentFinishedSync = 0;
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
-      op->bytesTransferred = (size_t)result;
-      opForceStatus(&op->root, aosSuccess);
-      addToGlobalQueue(&op->root);
-    }
+
+    if (flags & afActiveOnce)
+      currentFinishedSync = 0;
+    // The datagram already left through the syscall; the op only carries
+    // the completion, so the payload capture copy is skipped (afNoCopy)
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afNoCopy, usTimeout, (void*)callback, arg, actWriteMsg, &context);
+    op->bytesTransferred = (size_t)result;
+    opForceStatus(&op->root, aosSuccess);
+    addToGlobalQueue(&op->root);
   } else {
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actWriteMsg, &context);
     op->host = *address;
     combinerPushOperation(&op->root);
@@ -1102,25 +1112,26 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
   int truncated;
   ssize_t result = readMsgSyscall(object, buffer, size, &source, &truncated);
 
-  struct Context context;
-  fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
   if (truncated || result >= 0) {
     // Either data arrived synchronously, or the datagram was consumed but cut
     // down to the buffer size - a truncated datagram cannot be retried and
     // must complete as aosBufferTooSmall, or it would be lost with no
     // completion at all
-    if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
-      op->bytesTransferred = truncated ? size : (size_t)result;
-      opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
-      addToGlobalQueue(&op->root);
-      coroutineYield();
-      return coroutineRwFinish(op);
-    } else {
+    if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)
       return truncated ? -(ssize_t)aosBufferTooSmall : result;
-    }
+
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
+    op->bytesTransferred = truncated ? size : (size_t)result;
+    opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
+    addToGlobalQueue(&op->root);
+    coroutineYield();
+    return coroutineRwFinish(op);
   }
 
+  struct Context context;
+  fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
   combinerPushOperation(&op->root);
   coroutineYield();
@@ -1136,22 +1147,26 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
   // Datagram socket can be accessed by multiple threads without lock
   ssize_t result = writeMsgSyscall(object, address, buffer, size);
 
-  struct Context context;
-  fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
   if (result != -1) {
     // Data received synchronously
-    if (++currentFinishedSync >= MAX_SYNCHRONOUS_FINISHED_OPERATION) {
-      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actWriteMsg, &context);
-      op->host = *address;
-      opForceStatus(&op->root, aosSuccess);
-      addToGlobalQueue(&op->root);
-      coroutineYield();
-      return coroutineRwFinish(op);
-    } else {
+    if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)
       return result;
-    }
+
+    // The datagram already left through the syscall; the op only carries
+    // the completion, so the payload capture copy is skipped (afNoCopy)
+    struct Context context;
+    fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
+    asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine | afNoCopy, usTimeout, 0, 0, actWriteMsg, &context);
+    op->host = *address;
+    op->bytesTransferred = (size_t)result;
+    opForceStatus(&op->root, aosSuccess);
+    addToGlobalQueue(&op->root);
+    coroutineYield();
+    return coroutineRwFinish(op);
   }
 
+  struct Context context;
+  fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actWriteMsg, &context);
   op->host = *address;
   combinerPushOperation(&op->root);

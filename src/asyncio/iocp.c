@@ -611,6 +611,7 @@ static aioTimer *iocpEnsureEventTimer(aioUserEvent *event)
   if (!timer)
     return 0;
   eventTimerStore(event, timer, amoRelaxed);
+  poolCacheHandoff(timer);
   return timer;
 }
 

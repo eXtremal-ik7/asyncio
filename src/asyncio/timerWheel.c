@@ -305,6 +305,11 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
         __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoSeqCst);
       if (wakeTick < earliest)
         earliest = wakeTick;
+      // A covering sleeper fixes the decision as "no kick"; later slots can
+      // only lower the minimum further. No such exit for UINTPTR_MAX: an
+      // awake slot covers nothing, a later slot may still demand the kick
+      if (earliest <= (uintptr_t)(deadline + 1))
+        break;
     }
     if (earliest != UINTPTR_MAX && earliest > (uintptr_t)(deadline + 1))
       base->methodImpl.wakeupLoop(base);
