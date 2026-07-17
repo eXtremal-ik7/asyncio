@@ -79,31 +79,45 @@ struct btcOp {
   size_t internalBufferSize;
 };
 
+namespace {
+// The checksum runs twice per message (send and receive); a per-call
+// EVP_MD_CTX_create/destroy pair costs a heap round trip each time.
+// EVP_DigestInit fully reinitializes the context, so one context per thread
+// is equivalent.
+struct Sha256Ctx {
+  EVP_MD_CTX *ctx = EVP_MD_CTX_create();
+  ~Sha256Ctx() { EVP_MD_CTX_destroy(ctx); }
+};
+}
+
 static uint32_t calculateCheckSum(void *data, size_t size)
 {
   unsigned char hash[32];
   unsigned char hash2[32];
 
-  EVP_MD_CTX *ctx = EVP_MD_CTX_create();
-  EVP_DigestInit(ctx, EVP_sha256());
-  EVP_DigestUpdate(ctx, data, size);
-  EVP_DigestFinal(ctx, hash, 0);
-  EVP_DigestInit(ctx, EVP_sha256());
-  EVP_DigestUpdate(ctx, hash, 32);
-  EVP_DigestFinal(ctx, hash2, 0);
-  EVP_MD_CTX_destroy(ctx);
+  static thread_local Sha256Ctx tls;
+  EVP_DigestInit(tls.ctx, EVP_sha256());
+  EVP_DigestUpdate(tls.ctx, data, size);
+  EVP_DigestFinal(tls.ctx, hash, 0);
+  EVP_DigestInit(tls.ctx, EVP_sha256());
+  EVP_DigestUpdate(tls.ctx, hash, 32);
+  EVP_DigestFinal(tls.ctx, hash2, 0);
   return *reinterpret_cast<uint32_t*>(hash2);
 }
 
-// One builder covers both command sources: user-supplied C strings and
-// op->command. The latter is itself a strncpy image of the user string, so
-// re-copying it through strncpy reads at most its 12 bytes and reproduces the
-// exact same NUL-padded field.
+// A command is a NUL-padded field that carries no terminator when the name
+// fills it completely, and its sources are both C strings and other command
+// fields: strnlen bounds the read to the field size for the latter.
+static void copyCommand(char *dst, size_t dstSize, const char *src)
+{
+  memset(dst, 0, dstSize);
+  memcpy(dst, src, strnlen(src, dstSize));
+}
+
 static void buildMessageHeader(MessageHeader *out, uint32_t magic, const char *command, void *data, uint32_t size)
 {
   out->magic = xhtole(magic);
-  memset(out->command, 0, sizeof(out->command));
-  strncpy(out->command, command, sizeof(out->command));
+  copyCommand(out->command, sizeof(out->command), command);
   out->length = xhtole(size);
   out->checksum = xhtole(calculateCheckSum(data, size));
 }
@@ -220,7 +234,7 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
 
   op->size = context->TransactionSize;
   op->stream = nullptr;
-  strncpy(op->command, context->Command, sizeof(op->command));
+  copyCommand(op->command, sizeof(op->command), context->Command);
   return &op->root;
 }
 

@@ -86,6 +86,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android
   # Android is a Linux kernel (epoll + POSIX sockets); reuse the Linux paths.
   set(OS_LINUX 1)
   set(OS_COMMONUNIX 1)
+  # glibc gates the accept4 declaration behind _GNU_SOURCE
+  add_definitions(-D_GNU_SOURCE)
 elseif (APPLE)
   set(OS_DARWIN 1)
   set(OS_COMMONUNIX 1)

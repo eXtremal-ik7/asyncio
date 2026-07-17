@@ -9,14 +9,19 @@
 
 socketTy socketCreate(int af, int type, int protocol, int isAsync)
 {
+#ifdef SOCK_NONBLOCK
+  int hSocket = socket(af, isAsync ? type | SOCK_NONBLOCK : type, protocol);
+#else
   int hSocket = socket(af, type, protocol);
   if (isAsync) {
     int current = fcntl(hSocket, F_GETFL);
     fcntl(hSocket, F_SETFL, O_NONBLOCK | current);
   }
+#endif
 
   int optval = 1;
-  setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&optval, sizeof(optval) );
+  if (type == SOCK_STREAM)
+    setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&optval, sizeof(optval));
 #ifdef SO_NOSIGPIPE
   setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
 #endif

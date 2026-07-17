@@ -181,11 +181,17 @@ static inline AsyncOpStatus acceptSyscall(asyncOpRoot *opptr)
   asyncOp *op = (asyncOp*)opptr;
   int fd = getFd((aioObject*)op->root.object);
   socklen_t clientAddrSize = sizeof(clientAddr);
+#ifdef SOCK_NONBLOCK
+  op->acceptSocket = accept4(fd, (struct sockaddr*)&clientAddr, &clientAddrSize, SOCK_NONBLOCK);
+#else
   op->acceptSocket = accept(fd, (struct sockaddr*)&clientAddr, &clientAddrSize);
+#endif
 
   if (op->acceptSocket != -1) {
+#ifndef SOCK_NONBLOCK
     int current = fcntl(op->acceptSocket, F_GETFL);
     fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current);
+#endif
     sockaddrToHostAddress(&clientAddr, &op->host);
     return aosSuccess;
   } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EPROTO || errno == EINTR) {
