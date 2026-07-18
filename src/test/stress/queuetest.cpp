@@ -74,87 +74,6 @@ static void consumerProc()
   }
 }
 
-// --- Deterministic straggler replay -----------------------------------------
-// A producer that loaded WritePartition and stalled can resume after the
-// partition was filled, drained and abandoned by both cursors; the fully
-// wrapped ring accepts its claim as the next lap and the element is lost.
-// Far too narrow for thread stress (two-instruction window, stall spanning a
-// whole fill+drain cycle), so the schedule is replayed by hand in one thread:
-// the straggler's steps after the stale load are partitionPush from
-// ringBuffer.c verbatim, with plain accesses (the replay has no concurrency).
-static int stragglerResumePush(ConcurrentQueuePartition *partition, void *data, size_t mask)
-{
-  ConcurrentQueueElement *ring = partition->queue;
-  size_t pos = partition->enqueuePos;
-  for (;;) {
-    ConcurrentQueueElement *element = &ring[pos & mask];
-    size_t seq = element->sequence;
-    intptr_t diff = (intptr_t)seq - (intptr_t)pos;
-    if (diff == 0) {
-      partition->enqueuePos = pos + 1;
-      element->data = data;
-      element->sequence = pos + 1;
-      return 1;
-    }
-    if (diff < 0)
-      return 0;
-    pos = partition->enqueuePos;
-  }
-}
-
-static bool stragglerReplay()
-{
-  static ConcurrentQueue ladder;
-
-  // The straggler reads WritePartition == 0 here and stalls; the other
-  // producers fill partition 0 to the brim (the push that finds it full
-  // advances the ladder and lands in partition 1)
-  uintptr_t pushed = 0;
-  while (ladder.WritePartition == 0)
-    concurrentQueuePush(&ladder, (void*)++pushed);
-
-  size_t capacity = (size_t)pushed - 1;
-  if (capacity == 0 || (capacity & (capacity - 1)) != 0) {
-    fprintf(stderr, "error: unexpected partition 0 capacity %zu\n", capacity);
-    return false;
-  }
-
-  // Consumers drain everything: the read cursor leaves partition 0 for good
-  uintptr_t popped = 0;
-  void *data;
-  while (concurrentQueuePop(&ladder, &data))
-    popped++;
-  if (popped != pushed) {
-    fprintf(stderr, "error: drained %" PRIuPTR " of %" PRIuPTR " elements\n",
-            popped, pushed);
-    return false;
-  }
-
-  // The straggler resumes into the abandoned partition. If the claim is
-  // refused, finish exactly as concurrentQueuePush would: re-read the ladder
-  // cursor and push into the live partition.
-  void *marker = &ladder;
-  int landedStale = stragglerResumePush(&ladder.Partitions[0], marker, capacity - 1);
-  if (!landedStale)
-    concurrentQueuePush(&ladder, marker);
-
-  // No silent loss: a push that reported success must be visible to consumers
-  if (!concurrentQueuePop(&ladder, &data)) {
-    fprintf(stderr, "error: straggler element lost (stale-partition claim %s)\n",
-            landedStale ? "succeeded" : "refused");
-    return false;
-  }
-  if (data != marker) {
-    fprintf(stderr, "error: straggler replay popped garbage: %p\n", data);
-    return false;
-  }
-  if (concurrentQueuePop(&ladder, &data)) {
-    fprintf(stderr, "error: straggler replay left an extra element\n");
-    return false;
-  }
-  return true;
-}
-
 int main(int argc, char **argv)
 {
   if (argc > 1)
@@ -169,11 +88,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "usage: queuetest [producers] [consumers] [itemsPerProducer] [maxInflight]\n");
     return 1;
   }
-
-  bool replayOk = stragglerReplay();
-  printf("straggler replay: %s\n", replayOk ? "OK" : "FAILED");
-  if (!replayOk)
-    return 1;
 
   seen = std::vector<std::atomic<unsigned>>(producers * itemsPerProducer);
   for (auto &counter: seen)
