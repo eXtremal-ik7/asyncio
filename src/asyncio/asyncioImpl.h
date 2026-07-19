@@ -40,8 +40,10 @@ typedef struct timerWheel {
   // Occupancy bitmap, one bit per slot (64-bit words - the wheel already
   // requires a 64-bit target). The loops derive their sleep horizon from it
   // instead of polling at the grid tick while links are parked. Protocol:
-  // a producer sets the bit with a seq-cst RMW after publishing into a slot
-  // it observed empty (activation pays the extra RMW, not every link); a
+  // every producer sets the bit with a seq-cst RMW after its publish CAS -
+  // unconditionally, not only on the empty -> non-empty transition, so an
+  // arm stacked onto a live chain never depends on the first publisher
+  // (possibly stalled between its CAS and its set) for visibility; a
   // sleeper publishes its horizon seq-cst before scanning the words with
   // seq-cst loads, and the producer reads those horizons seq-cst after the
   // bit set. The resulting store/load order closes the lost-wakeup race
@@ -49,10 +51,16 @@ typedef struct timerWheel {
   // visitor clears the bit right before its drain CAS, so a publication into
   // the reopened incarnation is ordered after the clear and its set wins, and
   // an idempotent visitor that lost the drain race re-sets the bit when it
-  // still observes a chain. Invariant: a slot holding a chain has its bit set
-  // (or the publisher is still between the publish and the set, which the
-  // wakeup kick in addToTimeoutQueue covers); a set bit over an empty slot is
-  // legal and only costs a spurious wakeup - the next visit clears it.
+  // still observes a chain. Invariant: a slot holding a chain published by a
+  // returned insert has its bit set - a producer still inside the insert has
+  // completed nothing anyone waits on, and its own set runs before it
+  // returns - EXCEPT while a visit of the slot's window is in flight between
+  // its bit clear and its drain CAS; that state is confined to the windows
+  // of the unconfirmed cursor tick (visits run in cursor order, a confirmed
+  // tick has all its windows drained), and timerLoopPrepareSleep validates
+  // exactly those by reading the pairs, so a stalled visitor never hides a
+  // chain from sleep planning. A set bit over an empty slot is legal and
+  // only costs a spurious wakeup - the next visit clears it.
   uintptr_t occupancy[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS / 64];
 } timerWheel;
 
@@ -86,7 +94,6 @@ typedef enum IoActionTy {
 // node. Either may be empty.
 typedef void combinerTaskHandlerTy(aioObjectRoot*, asyncOpRoot*, uint32_t);
 typedef void enqueueOperationTy(asyncBase*, asyncOpRoot*);
-typedef void postEmptyOperationTy(asyncBase*);
 typedef void loopWakeupTy(asyncBase*);
 typedef void nextFinishedOperationTy(asyncBase*);
 typedef aioObject *newAioObjectTy(asyncBase*, IoObjectTy, void*);
@@ -115,7 +122,6 @@ typedef void releaseUserEventTy(aioUserEvent*);
 struct asyncImpl {
   combinerTaskHandlerTy *combinerTaskHandler;
   enqueueOperationTy *enqueue;
-  postEmptyOperationTy *postEmptyOperation;
   nextFinishedOperationTy *nextFinishedOperation;
   newAioObjectTy *newAioObject;
   newAsyncOpTy *newAsyncOp;
@@ -131,9 +137,9 @@ struct asyncImpl {
   aioExecuteProc *write;
   aioExecuteProc *readMsg;
   aioExecuteProc *writeMsg;
-  // Pure kick of one sleeping loop thread (no queue traffic, unlike
-  // postEmptyOperation whose empty node is the quit marker): eventfd write /
-  // EVFILT_USER trigger / posted completion with a byte count
+  // Pure kick of one sleeping loop thread, no queue traffic: eventfd write /
+  // EVFILT_USER trigger / posted completion packet. Serves both the timer
+  // producers and the quit doorbell; async-signal-safe (one write syscall)
   loopWakeupTy *wakeupLoop;
   updateEventTimerTy *updateEventTimer;
   consumeEventTimerTickTy *consumeEventTimerTick;
@@ -168,6 +174,19 @@ struct asyncBase {
   unsigned loopThreadSlotWords;
   unsigned loopThreadLimit;
   volatile unsigned messageLoopThreadCounter;
+  // Sticky level-triggered quit (postQuitOperation sets, resetQuitOperation
+  // clears in quiescence). Every loop iteration reads it after draining the
+  // global queue and exits when set; the exiting thread re-rings wakeupLoop
+  // while other threads remain registered, so one doorbell reaches every
+  // sleeper. A late entrant cannot miss it: if the last exiting thread saw
+  // remaining == 0 (and skipped the re-ring), the entrant's counter increment
+  // reads-from that exit's decrement, which is program-ordered after the
+  // exiting thread's load of this word - the entrant's own first-iteration
+  // load happens-after the poster's seq-cst set through that RMW chain. A
+  // thread already inside the kernel wait is covered by the doorbell instead:
+  // the write either precedes the wait entry (the fd stays readable, the wait
+  // returns at once) or wakes it
+  uintptr_t quitRequested;
 
 #ifndef NDEBUG
   int opsCount;

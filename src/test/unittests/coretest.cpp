@@ -461,15 +461,11 @@ TEST(core_cancel, submission_after_cancel_boundary_survives)
   deleteOwner(backend, object);
 }
 
-// TDD regression: the object-global CancelIoFlag is consumed by
-// the reapObject sweep at the EARLIEST captured-chain position carrying a
-// CANCEL bit. When an older positional CANCEL (a grid timeout) precedes the
-// cancelIo() bit, the flag-driven sweep runs before the operations submitted
-// between the two positions have started, and the cancelIo() position itself
-// finds the flag already zero - operations submitted BEFORE cancelIo()
-// survive it, breaking the documented "everything submitted before the
-// cancel gets swept" invariant. The first/second expectations are
-// intentionally red until the sweep honors the cancelIo() position.
+// Regression: the bulk sweep belongs to the CANCELIO position alone. A grid
+// timeout lands an ordinary CANCEL bit on an earlier chain position; if that
+// position could spend the cancelIo() request, the sweep would run before
+// the operations submitted between the two positions have started and they
+// would survive a cancel issued after them.
 TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submitted_before_cancel_io)
 {
   TestBackend backend;
@@ -503,27 +499,80 @@ TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submit
   EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
   EXPECT_EQ(opGetStatus(&timedOut.root), aosTimeout);
   EXPECT_EQ(opGetStatus(&first.root), aosCanceled)
-    << "the early grid-timeout position consumed the flag and exempted a pre-cancel submission";
+    << "the early grid-timeout position spent the cancelIo request and exempted a pre-cancel submission";
   EXPECT_EQ(opGetStatus(&second.root), aosCanceled)
-    << "the cancelIo position found the flag already consumed by the earlier CANCEL position";
+    << "the cancelIo position arrived with its request already spent by the earlier CANCEL position";
 
   if (opGetStatus(&first.root) == aosPending || opGetStatus(&second.root) == aosPending)
     cancelAndDrain(backend, object);
   deleteOwner(backend, object);
 }
 
-TEST(core_cancel, repeated_request_while_flag_is_set_does_not_push_second_signal)
+// Regression: every cancelIo() call publishes its own positional boundary.
+// A second call while an earlier request was still undrained used to
+// coalesce into an object-global counter without a position of its own; the
+// earlier boundary's sweep consumed the whole counter, and an operation
+// submitted between the two calls survived the second one although the
+// "everything submitted before the cancel gets swept" contract covers it.
+TEST(core_cancel, repeated_cancel_io_publishes_its_own_boundary)
 {
   TestBackend backend;
   TestObject object(backend);
-  object.root.CancelIoFlag = 1;
+  TestOp active(object), between(object), after(object);
+  active.setResults({aosPending});
+  between.setResults({aosPending});
+  after.setResults({aosPending});
+  active.executeHook = [&](TestOp &op) {
+    if (op.executeCalls != 1)
+      return;
+    // The combiner is busy running this execute: the first cancelIo lands
+    // its boundary on the current chain position...
+    cancelIo(&object.root);
+    // ...the user submits another operation on top of that boundary...
+    combinerPushOperation(&between.root);
+    // ...and cancels again: the second call must cover the new submission.
+    cancelIo(&object.root);
+    // An operation submitted after the second call must survive both.
+    combinerPushOperation(&after.root);
+  };
 
-  cancelIo(&object.root);
+  combinerPushOperation(&active.root);
+  backend.drainCompletions();
 
-  EXPECT_EQ(object.root.CancelIoFlag, 2u);
-  EXPECT_TRUE(backend.handledSignals.empty());
-  EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
-  object.root.CancelIoFlag = 0;
+  EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
+  EXPECT_EQ(opGetStatus(&between.root), aosCanceled)
+    << "the second cancelIo was coalesced into the already-published request and lost its boundary";
+  EXPECT_EQ(opGetStatus(&after.root), aosPending)
+    << "a submission after the last cancelIo must not be swept";
+
+  cancelAndDrain(backend, object);
+  deleteOwner(backend, object);
+}
+
+// Back-to-back cancelIo calls with no submission in between land on the same
+// head word: the second OR is idempotent, both requests share one position
+// and one sweep covers them - repeated requests must not multiply sweeps.
+TEST(core_cancel, back_to_back_cancel_io_requests_coalesce_into_one_position)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp active(object);
+  active.setResults({aosPending});
+  active.executeHook = [&](TestOp &op) {
+    if (op.executeCalls != 1)
+      return;
+    cancelIo(&object.root);
+    cancelIo(&object.root);
+  };
+
+  combinerPushOperation(&active.root);
+  backend.drainCompletions();
+
+  EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
+  unsigned cancelioPositions = 0;
+  for (uint32_t sig: backend.handledSignals)
+    cancelioPositions += (sig & COMBINER_TAG_CANCELIO) ? 1 : 0;
+  EXPECT_EQ(cancelioPositions, 1u);
   deleteOwner(backend, object);
 }
 
@@ -1030,7 +1079,7 @@ TEST(core_object_storage, generation_advances_before_user_destructor)
   EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.high, amoRelaxed), before + 1);
 }
 
-TEST(core_global_queue, callbacks_release_operations_and_quit_marker_stops_drain)
+TEST(core_global_queue, callbacks_release_operations_and_drain_empties_queue)
 {
   TestBackend backend;
   TestObject object(backend);
@@ -1041,9 +1090,8 @@ TEST(core_global_queue, callbacks_release_operations_and_quit_marker_stops_drain
   currentFinishedSync = 17;
   concurrentQueuePush(&backend.base.globalQueue, &callbackOp.root);
   concurrentQueuePush(&backend.base.globalQueue, &noCallbackOp.root);
-  concurrentQueuePush(&backend.base.globalQueue, nullptr);
 
-  EXPECT_EQ(executeGlobalQueue(&backend.base), 0);
+  executeGlobalQueue(&backend.base);
   EXPECT_EQ(callbackOp.finishCalls, 1u);
   EXPECT_EQ(callbackOp.callbackStatus, aosSuccess);
   EXPECT_EQ(noCallbackOp.finishCalls, 0u);
@@ -1573,7 +1621,7 @@ TEST(core_global_queue, coroutine_completion_resumes_and_recycles_operation)
   backend.completions.clear();
   concurrentQueuePush(&backend.base.globalQueue, op);
 
-  EXPECT_EQ(executeGlobalQueue(&backend.base), 1);
+  executeGlobalQueue(&backend.base);
   EXPECT_TRUE(scenario.returned);
   EXPECT_EQ(scenario.status, aosSuccess);
   objectDelete(&object.root);

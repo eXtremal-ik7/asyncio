@@ -232,6 +232,7 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   memset(&base->globalQueue, 0, sizeof(base->globalQueue));
   memset(&base->eventPool, 0, sizeof(base->eventPool));
   base->messageLoopThreadCounter = 0;
+  base->quitRequested = 0;
   base->timerSleep = timerSleep;
   base->loopThreadSlots = loopThreadSlots;
   base->loopThreadSlotWords = (unsigned)loopThreadSlotWords;
@@ -248,7 +249,33 @@ void asyncLoop(asyncBase *base)
 
 void postQuitOperation(asyncBase *base)
 {
-  base->methodImpl.postEmptyOperation(base);
+  // Level, not edge: the sticky word stops the threads already looping, the
+  // ones asleep in the kernel wait and the ones that have not entered
+  // asyncLoop yet (see the litmus at asyncBase.quitRequested). One doorbell
+  // is enough - each exiting thread re-rings while others remain. The
+  // RMW-plus-write pair keeps this callable from a signal handler: no queue
+  // traffic, no allocation, no lock
+  __uintptr_atomic_fetch_or(&base->quitRequested, 1, amoSeqCst);
+  base->methodImpl.wakeupLoop(base);
+}
+
+void resetQuitOperation(asyncBase *base)
+{
+  // Quiescent-only by contract: every asyncLoop returned and no concurrent
+  // postQuitOperation/asyncLoop/reset. The store stays atomic, so a racing
+  // quit is not UB - it lands on the old round (erased here) or on the next
+  // one, unspecified which. Everything else the loops touched is already in
+  // its entry state after a clean exit (slots and counter zero, horizons
+  // parked at UINTPTR_MAX, leftover queue items and armed timers are next
+  // round's legitimate work; a residual doorbell costs one spurious wakeup)
+  assert(__uint_atomic_load(&base->messageLoopThreadCounter, amoSeqCst) == 0 &&
+         "resetQuitOperation while asyncLoop threads are still registered");
+#ifndef NDEBUG
+  for (unsigned i = 0; i < base->loopThreadSlotWords; i++)
+    assert(__uintptr_atomic_load(&base->loopThreadSlots[i], amoSeqCst) == 0 &&
+           "resetQuitOperation while a loop slot is still owned");
+#endif
+  __uintptr_atomic_store(&base->quitRequested, 0, amoRelaxed);
 }
 
 void setSocketBuffer(aioObject *socket, size_t bufferSize)

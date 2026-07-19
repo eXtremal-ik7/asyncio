@@ -194,9 +194,10 @@ extern __tls unsigned messageLoopThreadId;
 // derived from object/operation state, not carried in the node. Progress is
 // always emitted; cancel only by the status-race winner (invariant 1).
 // CANCELIO is the cancelIo() request: same terminal scan as CANCEL, plus the
-// position defines the CancelIoFlag sweep boundary - a distinct bit, so an
-// older CANCEL position (grid timeout/opCancel) cannot consume the flag early
-// and exempt operations submitted before the cancelIo() call.
+// position bounds a bulk sweep of everything parked on the object. The bit
+// itself is the request - each call ORs its own sweep boundary onto the
+// current head; distinct from CANCEL so an older timeout/opCancel position
+// cannot spend the request early.
 #define COMBINER_TAG_SIZE           6
 #define COMBINER_TAG_PROGRESS_READ  (1u << 0)
 #define COMBINER_TAG_PROGRESS_WRITE (1u << 1)
@@ -390,13 +391,12 @@ struct aioObjectRoot {
   List readQueue;
   List writeQueue;
 
-  volatile uint32_t CancelIoFlag;
   // Set by objectDelete, never cleared: the object is dying, every combiner
-  // pass sweeps the queues once more before releasing ownership. A plain
-  // CancelIoFlag pass is positionally sloppy - it runs at the node its tag
-  // landed on, so a submission parked later in the same captured chain
-  // starts after the sweep; with no timeout armed such an operation would
-  // hold its object reference forever and the DELETE tag would never fire
+  // pass sweeps the queues once more before releasing ownership - the
+  // positional CANCELIO sweep stops at its call boundary, and a submission
+  // parked later in the captured chain would otherwise hold its object
+  // reference forever. Sticky state needs this dedicated word: combiner bits
+  // are consumed by their position
   volatile uint32_t DeletePending;
   // Optional one-shot transport initialization (TCP connect, SSL/ZMTP
   // handshake). It must be submitted before ordinary I/O; operations submitted
@@ -486,7 +486,7 @@ int opCancel(asyncOpRoot *op,
 void resumeParent(asyncOpRoot *op, AsyncOpStatus status);
 
 void addToGlobalQueue(asyncOpRoot *op);
-int executeGlobalQueue(asyncBase *base);
+void executeGlobalQueue(asyncBase *base);
 
 typedef asyncOpRoot *CreateAsyncOpProc(aioObjectRoot*, AsyncFlags, uint64_t, void*, void*, int, void*);
 typedef asyncOpRoot *SyncImplProc(aioObjectRoot*, AsyncFlags, uint64_t, void*, void*, void*);

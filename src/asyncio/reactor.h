@@ -329,8 +329,8 @@ typedef struct {
 //     sweep, so queued operations inherit a connect failure, not
 //     aosDisconnected;
 //  3. CANCEL/CANCELIO reap: a timeout/opCancel/cancelIo set the status and
-//     asked for a scan; the CANCELIO position additionally drives the
-//     CancelIoFlag sweep;
+//     asked for a scan; the CANCELIO position additionally bounds the bulk
+//     cancelIo() sweep;
 //  4. the error sweep (kernel EOF/half-close arrives as COMBINER_TAG_ERROR):
 //     a read side with nothing left buffered and the whole write side die as
 //     aosDisconnected;

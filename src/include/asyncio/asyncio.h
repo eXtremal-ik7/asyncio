@@ -170,7 +170,25 @@ void ioSleep(aioUserEvent *event, uint64_t usTimeout);
 void ioWaitUserEvent(aioUserEvent *event);
 
 void asyncLoop(asyncBase *base);
+// Sticky level-triggered stop: every current and future asyncLoop invocation
+// on the base drains the already-queued callbacks and returns. Stops the
+// processing, not the work - pending operations, armed timers and queued
+// callbacks survive and are picked up by the next round after
+// resetQuitOperation. Idempotent, callable from any context including a
+// POSIX signal handler (one atomic RMW plus one doorbell write; no queue
+// traffic, no allocation).
 void postQuitOperation(asyncBase *base);
+// Rearms the base after postQuitOperation. NOT thread-safe: requires
+// quiescence - every asyncLoop has returned (threads joined) and no
+// concurrent postQuitOperation/asyncLoop/reset runs. The quit word itself
+// stays atomic, so a racing postQuitOperation is not undefined behavior -
+// but whether it lands on the old round (erased by this reset) or on the
+// next one is unspecified; a signal-driven quit must be externally masked
+// around the reset if the application cares. After the call the base is
+// fully operational; timers armed before the pause fire late by the stopped
+// interval at most (the sweep catches up), a residual doorbell costs one
+// spurious wakeup.
+void resetQuitOperation(asyncBase *base);
 
 #ifdef __cplusplus
 }

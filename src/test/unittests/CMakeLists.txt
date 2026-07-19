@@ -20,6 +20,7 @@ set(
   coretest.cpp
   timertest.cpp
   eventtest.cpp
+  looptest.cpp
   clocksteptest.cpp
 )
 

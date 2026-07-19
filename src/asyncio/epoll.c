@@ -42,7 +42,6 @@ __NO_PADDING_END
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void epollEnqueue(asyncBase *base, asyncOpRoot *op);
-void epollPostEmptyOperation(asyncBase *base);
 void epollWakeupLoop(asyncBase *base);
 void epollNextFinishedOperation(asyncBase *base);
 aioObject *epollNewAioObject(asyncBase *base, IoObjectTy type, void *data);
@@ -62,7 +61,6 @@ static int epollTimerPublish(aioTimer *timer, asyncBase *target, uint64_t envelo
 static struct asyncImpl epollImpl = {
   combinerTaskHandler,
   epollEnqueue,
-  epollPostEmptyOperation,
   epollNextFinishedOperation,
   epollNewAioObject,
   newAsyncOp,
@@ -163,17 +161,11 @@ void epollEnqueue(asyncBase *base, asyncOpRoot *op)
     eventfd_write(localBase->eventFd, 1);
 }
 
-void epollPostEmptyOperation(asyncBase *base)
-{
-  epollEnqueue(base, 0);
-}
-
 void epollWakeupLoop(asyncBase *base)
 {
-  // Pure kick: no queue node (an empty node is the quit marker). The eventfd
-  // is EPOLLIN|EPOLLET-registered: the write raises an edge that wakes one
-  // sleeper, which drains the counter; with nobody sleeping the next
-  // epoll_wait returns once immediately
+  // Pure kick, no queue node. The eventfd is EPOLLIN|EPOLLET-registered: the
+  // write raises an edge that wakes one sleeper, which drains the counter;
+  // with nobody sleeping the next epoll_wait returns once immediately
   eventfd_write(((epollBase*)base)->eventFd, 1);
 }
 
@@ -233,10 +225,14 @@ void epollNextFinishedOperation(asyncBase *base)
 
   while (1) {
     do {
-      if (!executeGlobalQueue(base)) {
-        unsigned threadsRunning = loopThreadExit(base);
-        if (threadsRunning)
-          epollEnqueue(base, 0);
+      executeGlobalQueue(base);
+
+      // Checked after the drain (already-queued callbacks run) and before
+      // every kernel wait; the exit re-rings the doorbell while other threads
+      // remain registered, so one postQuitOperation reaches every sleeper
+      if (__uintptr_atomic_load(&base->quitRequested, amoAcquire)) {
+        if (loopThreadExit(base))
+          epollWakeupLoop(base);
         return;
       }
 

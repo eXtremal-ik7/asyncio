@@ -70,7 +70,6 @@ static void iocpInitializeTimerState(aioTimer *timer, asyncBase *base, void *tar
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void iocpEnqueue(asyncBase *base, asyncOpRoot *op);
-void postEmptyOperation(asyncBase *base);
 void iocpWakeupLoop(asyncBase *base);
 void iocpNextFinishedOperation(asyncBase *base);
 aioObject *iocpNewAioObject(asyncBase *base, IoObjectTy type, void *data);
@@ -95,7 +94,6 @@ AsyncOpStatus iocpAsyncWriteMsg(asyncOpRoot *op);
 static struct asyncImpl iocpImpl = {
   combinerTaskHandler,
   iocpEnqueue,
-  postEmptyOperation,
   iocpNextFinishedOperation,
   iocpNewAioObject,
   iocpNewAsyncOp,
@@ -248,8 +246,8 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
 
   if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
     processInitializationOp(object, &needStart);
-  // CANCEL/CANCELIO: the CANCELIO position additionally drives the
-  // CancelIoFlag sweep
+  // CANCEL/CANCELIO: the CANCELIO position additionally bounds the bulk
+  // cancelIo() sweep
   if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
     reapObject(object, sig, &needStart);
 
@@ -264,15 +262,10 @@ void iocpEnqueue(asyncBase *base, asyncOpRoot *op)
   PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 0, (ULONG_PTR)op, 0);
 }
 
-void postEmptyOperation(asyncBase *base)
-{
-  PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 0, 0, 0);
-}
-
 void iocpWakeupLoop(asyncBase *base)
 {
-  // Pure kick of one sleeper: key 0 + overlapped 0 is the quit marker, the
-  // byte count 1 tells the loop's marker branch apart from it
+  // Pure kick of one sleeper: a key 0 + overlapped 0 packet is consumed by
+  // the dispatch as a no-op
   PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 1, 0, 0);
 }
 
@@ -329,9 +322,19 @@ void iocpNextFinishedOperation(asyncBase *base)
   while (1) {
     ULONG N, i;
 
+    // Checked after the previous batch was fully dispatched and before every
+    // kernel wait (the timeout path re-enters through here too); the exit
+    // re-rings the doorbell while other threads remain registered, so one
+    // postQuitOperation reaches every sleeper
+    if (__uintptr_atomic_load(&base->quitRequested, amoAcquire)) {
+      if (loopThreadExit(base))
+        iocpWakeupLoop(base);
+      return;
+    }
+
     // An idle base gets UINT32_MAX from timerLoopPrepareSleep, which is
-    // exactly INFINITE: the port then blocks until a completion, a posted
-    // kick or the quit packet.
+    // exactly INFINITE: the port then blocks until a completion or a posted
+    // kick.
     BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort,
                                               entries,
                                               maxEntriesNum,
@@ -444,14 +447,10 @@ void iocpNextFinishedOperation(asyncBase *base)
 
         opSetStatus(&op->info.root, opGetGeneration(&op->info.root), result);
         combinerPushProgress(&op->info.root);
-      } else if (entry->dwNumberOfBytesTransferred) {
-        // Wakeup kick from a timer producer: the wait already returned and
-        // the sweep at the loop top delivers, nothing to do with the entry
       } else {
-        unsigned threadsRunning = loopThreadExit(base);
-        if (threadsRunning)
-          postEmptyOperation(base);
-        return;
+        // Wakeup kick (timer producer or quit doorbell): the wait already
+        // returned; the sweep and the quit check at the loop top do the
+        // work, nothing to do with the entry itself
       }
     }
   }

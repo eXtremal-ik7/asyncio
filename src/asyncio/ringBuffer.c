@@ -7,7 +7,9 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#ifndef CONCURRENT_QUEUE_INITIAL_SIZE_LOG2
 #define CONCURRENT_QUEUE_INITIAL_SIZE_LOG2 12
+#endif
 
 // A drained, abandoned partition has enqueuePos pinned here forever: 2^62 is
 // beyond any reachable position (the largest ring holds 2^43 elements), so

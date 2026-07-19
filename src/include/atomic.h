@@ -1,7 +1,10 @@
 #ifndef __ATOMIC_H_
 #define __ATOMIC_H_
 
+#include <stdint.h>
+#ifdef _MSC_VER
 #include "asyncio/asyncioTypes.h"
+#endif
 #include "macro.h"
 
 typedef enum AtomicMemoryOrder {

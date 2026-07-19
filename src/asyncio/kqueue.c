@@ -47,7 +47,6 @@ static uint64_t timerNextIdent(aioTimer *timer)
 
 void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig);
 void kqueueEnqueue(asyncBase *base, asyncOpRoot *op);
-void kqueuePostEmptyOperation(asyncBase *base);
 void kqueueWakeupLoop(asyncBase *base);
 void kqueueNextFinishedOperation(asyncBase *base);
 aioObject *kqueueNewAioObject(asyncBase *base, IoObjectTy type, void *data);
@@ -65,7 +64,6 @@ AsyncOpStatus kqueueAsyncWrite(asyncOpRoot *opptr);
 static struct asyncImpl kqueueImpl = {
   combinerTaskHandler,
   kqueueEnqueue,
-  kqueuePostEmptyOperation,
   kqueueNextFinishedOperation,
   kqueueNewAioObject,
   newAsyncOp,
@@ -144,16 +142,11 @@ void kqueueEnqueue(asyncBase *base, asyncOpRoot *op)
     kqueueDoorbell((kqueueBase*)base);
 }
 
-void kqueuePostEmptyOperation(asyncBase *base)
-{
-  kqueueEnqueue(base, 0);
-}
-
 void kqueueWakeupLoop(asyncBase *base)
 {
-  // Pure kick: trigger the user event without a queue node (an empty node is
-  // the quit marker). One sleeper wakes; the loop's udata==0 branch is a
-  // no-op and EV_CLEAR resets the event on delivery
+  // Pure kick: trigger the user event without a queue node. One sleeper
+  // wakes; the loop's udata==0 branch is a no-op and EV_CLEAR resets the
+  // event on delivery
   kqueueDoorbell((kqueueBase*)base);
 }
 
@@ -193,10 +186,14 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
   while (1) {
     do {
-      if (!executeGlobalQueue(base)) {
-        unsigned threadsRunning = loopThreadExit(base);
-        if (threadsRunning)
-          kqueueEnqueue(base, 0);
+      executeGlobalQueue(base);
+
+      // Checked after the drain (already-queued callbacks run) and before
+      // every kernel wait; the exit re-rings the doorbell while other threads
+      // remain registered, so one postQuitOperation reaches every sleeper
+      if (__uintptr_atomic_load(&base->quitRequested, amoAcquire)) {
+        if (loopThreadExit(base))
+          kqueueWakeupLoop(base);
         return;
       }
 

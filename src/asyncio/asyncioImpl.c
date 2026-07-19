@@ -194,7 +194,6 @@ void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aio
   object->destructor = destructor;
   object->destructorCb = 0;
   object->destructorCbArg = 0;
-  __uint_atomic_store(&object->CancelIoFlag, 0, amoRelaxed);
   __uint_atomic_store(&object->DeletePending, 0, amoRelaxed);
   __uintptr_atomic_store(&object->initializationOp, 0, amoRelaxed);
 }
@@ -213,12 +212,7 @@ void eventSetDestructorCb(aioUserEvent *event, userEventDestructorCb callback, v
 
 void cancelIo(aioObjectRoot *object)
 {
-  // The dedicated bit makes the sweep positional to THIS call: reapObject
-  // consumes the flag only on a CANCELIO position, so an older plain CANCEL
-  // (grid timeout/opCancel) in the same captured chain cannot spend it before
-  // the operations submitted prior to this call have entered the queues
-  if (__uint_atomic_fetch_and_add(&object->CancelIoFlag, 1, amoSeqCst) == 0)
-    combinerPushCounter(object, COMBINER_TAG_CANCELIO);
+  combinerPushCounter(object, COMBINER_TAG_CANCELIO);
 }
 
 void objectDelete(aioObjectRoot *object)
@@ -488,7 +482,7 @@ static void cancelInitializationOp(aioObjectRoot *object, AsyncOpStatus status)
 }
 
 // The one bulk-cancel of everything parked on an object: the initialization
-// slot and both queues. Shared by the three sweep positions (CANCELIO flag,
+// slot and both queues. Shared by the three sweep positions (CANCELIO tag,
 // DELETE tag, DeletePending at ownership release), which must stay in sync.
 static void cancelAllObjectOperations(aioObjectRoot *object)
 {
@@ -612,20 +606,12 @@ static void reapQueue(List *list, uint32_t tag, uint32_t *needStart)
 // initialization slot and both queues.
 void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
 {
-  // cancelIo sweep, positional: the CANCELIO bit was OR-ed onto the chain
-  // entry that was the head at cancelIo() time, and the backend starts that
-  // entry's operation before calling here - so everything submitted before
-  // the cancel is already in the queues and gets swept, while entries pushed
-  // after it sit above the bit and survive. The sweep is gated on the
-  // CANCELIO position itself: an older plain CANCEL position in the same
-  // captured chain must not consume the flag before the submissions between
-  // the two positions have started. Cheap relaxed load keeps the hot path
-  // free of RMW; consuming the counter before the sweep (not after) means a
-  // cancelIo racing with the sweep sees 0, increments and pushes a fresh
-  // CANCELIO pass - a coalesced request cannot be lost
-  if ((tag & COMBINER_TAG_CANCELIO) &&
-      __uint_atomic_load(&object->CancelIoFlag, amoRelaxed) != 0 &&
-      __uint_atomic_exchange(&object->CancelIoFlag, 0, amoSeqCst) != 0)
+  // Positional cancelIo sweep: the CANCELIO bit rides the chain entry that
+  // was the head at cancelIo() time, and the backend starts that entry's
+  // operation before calling here - everything submitted before the call is
+  // already in the queues and gets swept, entries pushed after it sit above
+  // the bit and survive
+  if (tag & COMBINER_TAG_CANCELIO)
     cancelAllObjectOperations(object);
 
   asyncOpRoot *ex = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
@@ -709,7 +695,7 @@ void executeOperationList(List *list)
 
 void cancelOperationList(List *list, AsyncOpStatus status)
 {
-  // Positional-aware bulk cancel (CancelIoFlag / DeletePending / disconnect /
+  // Positional-aware bulk cancel (cancelIo / DeletePending / disconnect /
   // connect-fail cascade). An in-flight operation whose cancelMethod returns 0
   // (a proactor abort request the kernel owns until its completion arrives) must
   // stay on its head so the late positional PROGRESS_* signal still finds and
@@ -781,13 +767,11 @@ void addToGlobalQueue(asyncOpRoot *op)
   op->object->header.base->methodImpl.enqueue(op->object->header.base, op);
 }
 
-int executeGlobalQueue(asyncBase *base)
+void executeGlobalQueue(asyncBase *base)
 {
   asyncOpRoot *op;
   while (concurrentQueuePop(&base->globalQueue, (void**)&op)) {
-    if (!op)
-      return 0;
-
+    assert(op && "empty node in the global queue (the quit marker is gone)");
     if (eventIsQueueTask(op)) {
       eventExecuteQueuedTask(op);
       continue;
@@ -804,8 +788,6 @@ int executeGlobalQueue(asyncBase *base)
       releaseAsyncOp(op);
     }
   }
-
-  return 1;
 }
 
 int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
@@ -878,7 +860,7 @@ unsigned loopThreadExit(asyncBase *base)
 static inline int combinerTaskHandlerCommon(aioObjectRoot *object, uint32_t tag)
 {
   // The cancelIo sweep lives in reapObject(), driven by the position of the
-  // CANCEL bit in the captured chain - an eager sweep here would run before
+  // CANCELIO bit in the captured chain - an eager sweep here would run before
   // the captured submissions are started and let an operation submitted
   // before the cancelIo() call escape it
   if (tag & COMBINER_TAG_DELETE) {
@@ -929,8 +911,9 @@ void combiner(aioObjectRoot *object, AsyncOpTaggedPtr stackTop, AsyncOpTaggedPtr
       // A dying object is swept once more at every ownership-release point:
       // this is the only position that is guaranteed to come after every
       // action of the captured chains, so a submission that slipped past the
-      // CancelIoFlag pass cannot survive the delete and pin the object
-      // (sticky flag; the sweep is idempotent, re-runs only cost a re-check)
+      // positional CANCELIO sweep cannot survive the delete and pin the
+      // object (sticky DeletePending; the sweep is idempotent, re-runs only
+      // cost a re-check)
       if (__uint_atomic_load(&object->DeletePending, amoRelaxed))
         cancelAllObjectOperations(object);
       if (__uint64_atomic_compare_and_swap(&object->header.tag.low, stackTop.data, 0, amoSeqCst))

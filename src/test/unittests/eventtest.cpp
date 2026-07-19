@@ -152,6 +152,10 @@ public:
     if (loop.joinable()) {
       postQuitOperation(base);
       loop.join();
+      // The quit is sticky and the joined loop leaves the base quiescent:
+      // rearm right away so a later loop round on the same base (a second
+      // helper invocation inside one test) runs instead of replaying the stop
+      resetQuitOperation(base);
     }
   }
 
