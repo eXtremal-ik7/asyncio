@@ -1,8 +1,14 @@
 #include "p2putils/uriParse.h"
 #include "gtest/gtest.h"
 #include <stdint.h>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
+
+typedef ParserResultTy UriRangeParser(const char **ptr, const char *end,
+                                      bool uriOnly, uriParseCb callback, void *arg);
 
 // Expected URI::ipv6 layout: groups in the order they are written in the
 // literal, each group in host byte order.
@@ -13,6 +19,150 @@ void expectIpv6Host(const URI &uri, const uint16_t (&groups)[8])
     EXPECT_EQ(uri.ipv6[i], groups[i]) << "group " << i;
 }
 
+void expectTruncatedEscapeNeedsMore(UriRangeParser *parser,
+                                    const char *source, size_t size)
+{
+  // Keep the allocation exact: there is deliberately no readable NUL byte
+  // after end, so ASan catches either byte of percent-escape lookahead.
+  char *buffer = new char[size];
+  for (size_t i = 0; i < size; i++)
+    buffer[i] = source[i];
+
+  const char *ptr = buffer;
+  int callbackCount = 0;
+  ParserResultTy result = parser(&ptr, buffer + size, false,
+    [](URIComponent*, void *arg) -> int {
+      ++*static_cast<int*>(arg);
+      return 1;
+    }, &callbackCount);
+
+  EXPECT_EQ(result, ParserResultNeedMoreData);
+  EXPECT_EQ(ptr, buffer);
+  EXPECT_EQ(callbackCount, 0);
+  delete[] buffer;
+}
+
+struct QueryCapture {
+  std::vector<std::pair<std::string, std::string> > elements;
+  std::string raw;
+};
+
+int captureQuery(URIComponent *component, void *arg)
+{
+  QueryCapture *capture = static_cast<QueryCapture*>(arg);
+  if (component->type == uriCtQueryElement) {
+    capture->elements.push_back(std::make_pair(
+      std::string(component->raw.data, component->raw.size),
+      std::string(component->raw2.data, component->raw2.size)));
+  } else if (component->type == uriCtQuery) {
+    capture->raw.assign(component->raw.data, component->raw.size);
+  }
+  return 1;
+}
+
+struct RawComponentCapture {
+  int type;
+  std::vector<std::string> values;
+};
+
+int captureRawComponent(URIComponent *component, void *arg)
+{
+  RawComponentCapture *capture = static_cast<RawComponentCapture*>(arg);
+  if (component->type == capture->type)
+    capture->values.push_back(std::string(component->raw.data, component->raw.size));
+  return 1;
+}
+
+}
+
+TEST(uriparse, test_path_pct_escape_missing_both_hex_digits)
+{
+  const char path[] = {'/', '%'};
+  expectTruncatedEscapeNeedsMore(uriParsePath, path, sizeof(path));
+}
+
+TEST(uriparse, test_path_pct_escape_missing_last_hex_digit)
+{
+  const char path[] = {'/', '%', 'A'};
+  expectTruncatedEscapeNeedsMore(uriParsePath, path, sizeof(path));
+}
+
+TEST(uriparse, test_query_pct_escape_truncated_at_either_hex_digit)
+{
+  const char missingBoth[] = {'%'};
+  expectTruncatedEscapeNeedsMore(uriParseQuery, missingBoth, sizeof(missingBoth));
+
+  const char missingLast[] = {'%', 'A'};
+  expectTruncatedEscapeNeedsMore(uriParseQuery, missingLast, sizeof(missingLast));
+}
+
+TEST(uriparse, test_fragment_pct_escape_truncated_at_either_hex_digit)
+{
+  const char missingBoth[] = {'%'};
+  expectTruncatedEscapeNeedsMore(uriParseFragment, missingBoth, sizeof(missingBoth));
+
+  const char missingLast[] = {'%', 'A'};
+  expectTruncatedEscapeNeedsMore(uriParseFragment, missingLast, sizeof(missingLast));
+}
+
+TEST(uriparse, valid_pct_escape_at_exact_range_end)
+{
+  struct TestCase {
+    UriRangeParser *parser;
+    int componentType;
+  } cases[] = {
+    {uriParsePath, uriCtPath},
+    {uriParseQuery, uriCtQuery},
+    {uriParseFragment, uriCtFragment}
+  };
+
+  for (const TestCase &test : cases) {
+    const char source[] = {'%', '4', '1'};
+    const char *ptr = source;
+    RawComponentCapture capture = {test.componentType, {}};
+
+    ASSERT_EQ(test.parser(&ptr, source + sizeof(source), true,
+                          captureRawComponent, &capture), ParserResultOk);
+    EXPECT_EQ(ptr, source + sizeof(source));
+    ASSERT_EQ(capture.values.size(), 1u);
+    EXPECT_EQ(capture.values[0], "%41");
+  }
+}
+
+TEST(uriparse, path_accepts_every_pchar_class)
+{
+  const char source[] = "AZaz09-._~!$&'()*+,;=:@%41 ";
+  const char *ptr = source;
+  RawComponentCapture path = {uriCtPath, {}};
+
+  ASSERT_EQ(uriParsePath(&ptr, source + sizeof(source) - 1, false,
+                         captureRawComponent, &path), ParserResultOk);
+  EXPECT_EQ(ptr, source + sizeof(source) - 2);
+  ASSERT_EQ(path.values.size(), 1u);
+  EXPECT_EQ(path.values[0], "AZaz09-._~!$&'()*+,;=:@%41");
+}
+
+TEST(uriparse, malformed_pct_escape_must_fail_the_whole_uri)
+{
+  static const char *uris[] = {
+    "http://%",
+    "http://%A",
+    "http://%zz/",
+    "http://example.com/%",
+    "http://example.com/%A",
+    "http://example.com/%zz",
+    "http://example.com/?q=%",
+    "http://example.com/?q=%A",
+    "http://example.com/?q=%zz",
+    "http://example.com/#%",
+    "http://example.com/#%A",
+    "http://example.com/#%zz"
+  };
+
+  for (const char *source : uris) {
+    URI uri;
+    EXPECT_EQ(uriParse(source, &uri), 0) << source;
+  }
 }
 
 TEST(uriparse, test_scheme_and_dns_host)
@@ -80,6 +230,50 @@ TEST(uriparse, test_query_full_component)
   URI uri;
   ASSERT_EQ(uriParse("http://example.com/p?x=1&y=2", &uri), 1);
   EXPECT_EQ(uri.query, "x=1&y=2");
+}
+
+TEST(uriparse, query_elements_continue_after_ampersand)
+{
+  const char source[] = "a=b&c=d ";
+  const char *ptr = source;
+  QueryCapture capture;
+
+  ASSERT_EQ(uriParseQuery(&ptr, source + sizeof(source) - 1, false,
+                          captureQuery, &capture), ParserResultOk);
+  EXPECT_EQ(ptr, source + sizeof(source) - 2);
+  ASSERT_EQ(capture.elements.size(), 2u);
+  EXPECT_EQ(capture.elements[0], std::make_pair(std::string("a"), std::string("b")));
+  EXPECT_EQ(capture.elements[1], std::make_pair(std::string("c"), std::string("d")));
+  EXPECT_EQ(capture.raw, "a=b&c=d");
+}
+
+TEST(uriparse, dangling_query_name_after_ampersand_is_not_a_pair)
+{
+  const char source[] = "a=b&c ";
+  const char *ptr = source;
+  QueryCapture capture;
+
+  ASSERT_EQ(uriParseQuery(&ptr, source + sizeof(source) - 1, false,
+                          captureQuery, &capture), ParserResultOk);
+  EXPECT_EQ(ptr, source + sizeof(source) - 2);
+  ASSERT_EQ(capture.elements.size(), 1u);
+  EXPECT_EQ(capture.elements[0], std::make_pair(std::string("a"), std::string("b")));
+  EXPECT_EQ(capture.raw, "a=b&c");
+}
+
+TEST(uriparse, pct_decode_compacts_adjacent_escapes_and_embedded_nul)
+{
+  URI uri;
+  ASSERT_EQ(uriParse("http://%41%42x%00@example.com/%43%44x%00?q=%45%46#%47%48",
+                     &uri), 1);
+
+  const char expectedUserInfo[] = {'A', 'B', 'x', '\0'};
+  const char expectedPath[] = {'/', 'C', 'D', 'x', '\0'};
+  EXPECT_EQ(uri.userInfo,
+            std::string(expectedUserInfo, sizeof(expectedUserInfo)));
+  EXPECT_EQ(uri.path, std::string(expectedPath, sizeof(expectedPath)));
+  EXPECT_EQ(uri.query, "q=EF");
+  EXPECT_EQ(uri.fragment, "GH");
 }
 
 // B2: regname after userinfo ("user@host") never leaves the StWaitRegname

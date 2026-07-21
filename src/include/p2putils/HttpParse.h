@@ -15,7 +15,8 @@ typedef enum HttpParserStateTy {
   httpStStartLine = 0,
   httpStHeader,  
   httpStBody,
-  httpStLast
+  httpStLast,
+  httpStTrailer
 } HttpParserStateTy;
 
 typedef enum HttpParserDataTy {
@@ -29,11 +30,12 @@ typedef enum HttpParserDataTy {
 
 typedef struct HttpParserState {
   HttpParserStateTy state;
-  const char *buffer;
+  uint8_t chunked;
+  uint8_t firstFragment;
+  uint8_t seenContentLength;
+  uint8_t seenTransferEncoding;
   const char *ptr;
   const char *end;
-  int chunked;
-  int firstFragment;
   size_t dataRemaining;
 } HttpParserState;
 

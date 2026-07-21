@@ -1,14 +1,14 @@
 #pragma once
 
 // Shared low-level helpers of the HTTP response (HttpParse.cpp) and request
-// (HttpRequestParse.cpp) parsers. All scanning helpers advance the caller's
-// pointer only on ParserResultOk, so an interrupted line is rescanned from
-// its beginning once more data arrives.
+// (HttpRequestParse.cpp) parsers. Line scanners advance the caller's pointer
+// only on ParserResultOk; parseTrailers is the deliberate exception and
+// commits each complete field before returning NeedMoreData.
 
 #include "p2putils/CommonParse.h"
 #include "p2putils/HttpParseCommon.h"
 #include "HttpTokens.h"
-#include <algorithm>
+#include "macro.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -61,19 +61,20 @@ static inline void trimTrailingOWS(Raw *value)
 static inline ParserResultTy readUntilCRLF(const char **ptr, const char *end)
 {
   const char *p = *ptr;
-  for (;;) {
-    size_t available = static_cast<size_t>(end - p);
-    if (available < 2)
-      return ParserResultNeedMoreData;
-    const char *cr = static_cast<const char*>(memchr(p, '\r', available));
-    if (!cr || cr == end - 1)
-      return ParserResultNeedMoreData;
-    if (cr[1] == '\n') {
-      *ptr = cr + 2;
-      return ParserResultOk;
-    }
-    p = cr + 1;
-  }
+  const size_t size = static_cast<size_t>(end - p);
+  const char *cr = static_cast<const char*>(memchr(p, '\r', size));
+  const size_t prefixSize = cr ? static_cast<size_t>(cr - p) : size;
+  const char *lf = static_cast<const char*>(memchr(p, '\n', prefixSize));
+  if (!cr)
+    return lf ? ParserResultError : ParserResultNeedMoreData;
+  if (lf)
+    return ParserResultError;
+  if (cr + 1 == end)
+    return ParserResultNeedMoreData;
+  if (cr[1] != '\n')
+    return ParserResultError;
+  *ptr = cr + 2;
+  return ParserResultOk;
 }
 
 // decimal Content-Length value followed by CRLF; empty values, values with
@@ -103,8 +104,8 @@ static inline ParserResultTy readDec(const char **ptr, const char *end, size_t *
   return ParserResultOk;
 }
 
-// hexadecimal chunk size; chunk extensions (";name=value") are skipped
-// without validation up to CRLF
+// hexadecimal chunk size; after the required ';', chunk-extension contents
+// are skipped without validation up to CRLF
 static inline ParserResultTy readHex(const char **ptr, const char *end, size_t *size)
 {
   const char *p = *ptr;
@@ -126,8 +127,14 @@ static inline ParserResultTy readHex(const char **ptr, const char *end, size_t *
     digits++;
   }
 
-  while (p != end && *p != '\r' && *p != '\n')
-    p++;
+  if (p != end && *p != '\r') {
+    // chunk-ext starts with ';'; arbitrary text after the size is not an
+    // extension and must not be skipped as if it were one
+    if (*p != ';')
+      return ParserResultError;
+    while (p != end && *p != '\r' && *p != '\n')
+      p++;
+  }
   if (!canRead(p, end, 2))
     return ParserResultNeedMoreData;
   if (digits == 0 || p[0] != '\r' || p[1] != '\n')
@@ -151,33 +158,38 @@ static inline int isChunkedTransferEncoding(const Raw *value)
   }
   if (value->size == sizeof(chunked)-1)
     return 1;
-  char before = tail[-1];
-  return before == ',' || before == ' ' || before == '\t';
+  const char *separator = tail;
+  while (separator != value->data &&
+         (separator[-1] == ' ' || separator[-1] == '\t'))
+    separator--;
+  return separator != value->data && separator[-1] == ',';
 }
 
-// trailer section after the last chunk: optional trailer fields are skipped
-// up to the terminating empty line
-static inline ParserResultTy skipTrailers(const char **ptr, const char *end)
+// Commit complete trailer fields one by one, retaining only the unfinished
+// line across buffers. The terminating empty line is committed by the caller
+// after its final callback succeeds.
+static inline ParserResultTy parseTrailers(const char **ptr, const char *end,
+                                           const char **trailersEnd)
 {
   const char *p = *ptr;
   for (;;) {
-    if (!canRead(p, end, 2))
-      return ParserResultNeedMoreData;
-    if (p[0] == '\r' && p[1] == '\n') {
-      *ptr = p + 2;
+    if (canRead(p, end, 2) && p[0] == '\r' && p[1] == '\n') {
+      *trailersEnd = p + 2;
       return ParserResultOk;
     }
 
     ParserResultTy result = readUntilCRLF(&p, end);
     if (result != ParserResultOk)
       return result;
+    *ptr = p;
   }
 }
 
 // One header line shared by the response and request parsers: the name
 // lookup against the caller's recognition table plus the framing
 // interpretation (Content-Length feeds dataRemaining, Transfer-Encoding the
-// chunked flag). The component is emitted for every header line with the
+// chunked flag; conflicting repeats and CL+TE combinations are rejected).
+// The component is emitted for every header line with the
 // raw value always filled; Content-Length additionally carries the parsed
 // number in sizeValue. The caller sets component->type once and keeps the
 // end-of-headers (empty line) handling to itself; emit() returning false
@@ -204,8 +216,13 @@ static ParserResultTy parseHeaderLine(State *state, const HttpHeaderTable *table
     size_t contentSize;
     if ((result = readDec(&p, state->end, &contentSize)) != ParserResultOk)
       return result;
+    // Framing conflicts are smuggling vectors: Content-Length next to
+    // Transfer-Encoding is rejected, a repeat only accepted when identical
+    if (state->seenTransferEncoding || (state->seenContentLength && state->dataRemaining != contentSize))
+      return ParserResultError;
     component->header.sizeValue = contentSize;
     state->dataRemaining = contentSize;
+    state->seenContentLength = 1;
   } else {
     if ((result = readUntilCRLF(&p, state->end)) != ParserResultOk)
       return result;
@@ -213,8 +230,14 @@ static ParserResultTy parseHeaderLine(State *state, const HttpHeaderTable *table
 
   component->header.stringValue.size = static_cast<size_t>(p - component->header.stringValue.data - 2);
   trimTrailingOWS(&component->header.stringValue);
-  if (token == hhTransferEncoding)
+  if (token == hhTransferEncoding) {
+    // a coding listed after chunked would make chunked non-final; next to
+    // Content-Length the framings conflict - both are rejected
+    if (state->seenContentLength || state->chunked)
+      return ParserResultError;
     state->chunked = isChunkedTransferEncoding(&component->header.stringValue);
+    state->seenTransferEncoding = 1;
+  }
   if (!emit())
     return ParserResultCancelled;
 
@@ -224,49 +247,41 @@ static ParserResultTy parseHeaderLine(State *state, const HttpHeaderTable *table
 
 // The chunked-body machine shared by the response and request parsers: data
 // of the current chunk (emitted as it arrives), the CRLF closing a non-first
-// chunk, the size line of the next one, and the zero chunk with its trailers.
-// The parsers differ only in the emitted component constants and in the
-// cancellation contract, so both variations live in the emit callables (a
-// false return becomes ParserResultCancelled); lastState is the parser's
-// terminal state, stored once the zero chunk is consumed. The non-chunked
-// body branches genuinely differ between the parsers and stay with them.
-template<typename State, typename StateValue, typename EmitFragment, typename EmitLast>
-static ParserResultTy parseChunkedBody(State *state, StateValue lastState, EmitFragment emitFragment, EmitLast emitLast)
+// chunk and the size line of the next one. The zero chunk transitions to a
+// separate trailer state so complete trailer lines can be discarded while
+// streaming. The parsers differ only in their fragment emitter.
+template<typename State, typename StateValue, typename EmitFragment>
+static ParserResultTy parseChunkedBody(State *state, StateValue trailerState,
+                                       EmitFragment emitFragment)
 {
   ParserResultTy result;
   const char *p = state->ptr;
 
   for (;;) {
     if (state->dataRemaining) {
-      bool needMoreData = false;
       const char *readyChunk = p;
-      size_t readyChunkSize;
-      if (canRead(p, state->end, state->dataRemaining)) {
-        readyChunkSize = state->dataRemaining;
-        p += state->dataRemaining;
-        state->dataRemaining = 0;
-        state->firstFragment = false;
-      } else {
-        readyChunkSize = std::min(state->dataRemaining, static_cast<size_t>(state->end - p));
-        p += readyChunkSize;
-        state->dataRemaining -= readyChunkSize;
-        needMoreData = true;
-      }
+      const size_t remaining = state->dataRemaining;
+      const bool complete = canRead(p, state->end, remaining);
+      const size_t readyChunkSize = complete
+          ? remaining : static_cast<size_t>(state->end - p);
 
-      if (readyChunkSize) {
-        if (!emitFragment(readyChunk, readyChunkSize))
-          return ParserResultCancelled;
-        state->ptr = p;
-      }
+      if (readyChunkSize && !emitFragment(readyChunk, readyChunkSize))
+        return ParserResultCancelled;
 
-      if (needMoreData)
+      p += readyChunkSize;
+      state->ptr = p;
+      state->dataRemaining = remaining - readyChunkSize;
+      if (!complete)
         return ParserResultNeedMoreData;
+      state->firstFragment = false;
     } else {
       // we at begin of next chunk
       if (!state->firstFragment) {
-        // skip CRLF for non-first chunk
+        // every non-final chunk is followed by an exact CRLF
         if (!canRead(p, state->end, 2))
           return ParserResultNeedMoreData;
+        if (p[0] != '\r' || p[1] != '\n')
+          return ParserResultError;
         p += 2;
       }
 
@@ -275,15 +290,14 @@ static ParserResultTy parseChunkedBody(State *state, StateValue lastState, EmitF
         return result;
 
       if (chunkSize == 0) {
-        if ((result = skipTrailers(&p, state->end)) != ParserResultOk)
-          return result;
-        if (!emitLast(p))
-          return ParserResultCancelled;
-        state->state = lastState;
         state->ptr = p;
+        state->state = trailerState;
         return ParserResultOk;
       }
 
+      // The size line is complete even when no payload byte is available yet.
+      // Commit it so a resumed buffer starts at the payload, not at the size.
+      state->ptr = p;
       state->dataRemaining = chunkSize;
     }
   }

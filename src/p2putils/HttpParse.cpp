@@ -1,6 +1,5 @@
 #include "p2putils/HttpParse.h"
 #include "HttpParseUtils.h"
-#include <algorithm>
 
 static ParserResultTy httpParseStartLine(HttpParserState *state, httpParseCb callback, void *arg)
 {
@@ -55,67 +54,34 @@ static ParserResultTy httpParseStartLine(HttpParserState *state, httpParseCb cal
 void httpInit(HttpParserState *state)
 {
   state->state = httpStStartLine;
+  state->ptr = nullptr;
+  state->end = nullptr;
   state->chunked = false;
   state->dataRemaining = 0;
   state->firstFragment = true;
+  state->seenContentLength = 0;
+  state->seenTransferEncoding = 0;
 }
 
 void httpSetBuffer(HttpParserState *state, const void *buffer, size_t size)
 {
-  state->ptr = state->buffer = static_cast<const char*>(buffer);
-  state->end = state->buffer + size;
+  state->ptr = static_cast<const char*>(buffer);
+  state->end = state->ptr + size;
 }
 
-ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
-                         httpParseCb callback, void *arg)
+static __NOINLINE ParserResultTy
+httpParseBody(HttpParserState *state, httpParseCb callback, void *arg)
 {
   ParserResultTy result;
   HttpComponent component;
 
-  if (!table)
-    table = &httpHeaderDefaultTable;
-
-  if (state->state == httpStStartLine) {
-    if ( (result = httpParseStartLine(state, callback, arg)) != ParserResultOk)
-      return result;
-    state->state = httpStHeader;
-  }
-
-  if (state->state == httpStHeader) {
-    for (;;) {
-      if (!canRead(state->ptr, state->end, 2))
-        return ParserResultNeedMoreData;
-
-      if (state->ptr[0] == '\r' && state->ptr[1] == '\n') {
-        state->ptr += 2;
-        state->state = httpStBody;
-        break;
-      }
-
-      component.type = httpDtHeaderEntry;
-      result = parseHeaderLine(state, table, &component, [&]() {
-        callback(&component, arg);
-        return true;
-      });
-      if (result != ParserResultOk)
-        return result;
-    }
-  }
-
   if (state->state == httpStBody) {
     if (state->chunked) {
-      result = parseChunkedBody(state, httpStLast,
+      result = parseChunkedBody(state, httpStTrailer,
         [&](const char *data, size_t size) {
           component.type = httpDtDataFragment;
           component.data.data = data;
           component.data.size = size;
-          callback(&component, arg);
-          return true;
-        },
-        [&](const char *trailersEnd) {
-          component.type = httpDtData;
-          component.data.data = trailersEnd;
-          component.data.size = 0;
           callback(&component, arg);
           return true;
         });
@@ -132,7 +98,7 @@ ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
         state->state = httpStLast;
       } else {
         if (p != state->end) {
-          size_t size = std::min(state->dataRemaining, static_cast<size_t>(state->end - p));
+          size_t size = static_cast<size_t>(state->end - p);
           component.type = httpDtDataFragment;
           component.data.data = p;
           component.data.size = size;
@@ -146,7 +112,75 @@ ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
     }
   }
 
+  if (state->state == httpStTrailer) {
+    const char *trailersEnd;
+    result = parseTrailers(&state->ptr, state->end, &trailersEnd);
+    if (result != ParserResultOk)
+      return result;
+
+    component.type = httpDtData;
+    component.data.data = trailersEnd;
+    component.data.size = 0;
+    callback(&component, arg);
+    state->ptr = trailersEnd;
+    state->state = httpStLast;
+  }
+
   return ParserResultOk;
+}
+
+static __NOINLINE ParserResultTy
+httpParseHead(HttpParserState *state, const HttpHeaderTable *table,
+              httpParseCb callback, void *arg)
+{
+  ParserResultTy result;
+  HttpComponent component;
+
+  if (state->state == httpStStartLine) {
+    if ( (result = httpParseStartLine(state, callback, arg)) != ParserResultOk)
+      return result;
+    state->state = httpStHeader;
+  }
+
+  if (state->state == httpStHeader) {
+    if (!table)
+      table = &httpHeaderDefaultTable;
+    for (;;) {
+      if (!canRead(state->ptr, state->end, 2))
+        return ParserResultNeedMoreData;
+
+      if (state->ptr[0] == '\r' && state->ptr[1] == '\n') {
+        state->ptr += 2;
+        // Transfer-Encoding without a final chunked means read-until-close
+        // framing, which this parser does not have; the old silent zero-length
+        // framing desynchronized the connection
+        if (state->seenTransferEncoding && !state->chunked)
+          return ParserResultError;
+        state->state = httpStBody;
+        break;
+      }
+
+      component.type = httpDtHeaderEntry;
+      result = parseHeaderLine(state, table, &component, [&]() {
+        callback(&component, arg);
+        return true;
+      });
+      if (result != ParserResultOk)
+        return result;
+    }
+  }
+
+  return httpParseBody(state, callback, arg);
+}
+
+ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
+                         httpParseCb callback, void *arg)
+{
+  if (state->state == httpStLast)
+    return ParserResultOk;
+  if (state->state >= httpStBody)
+    return httpParseBody(state, callback, arg);
+  return httpParseHead(state, table, callback, arg);
 }
 
 const void *httpDataPtr(HttpParserState *state)

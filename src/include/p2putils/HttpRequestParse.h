@@ -9,17 +9,18 @@ extern "C" {
 #include "CommonParse.h"
 #include "HttpHeaderTable.h"
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum HttpRequestParserStateTy {
   httpRequestMethod = 0,
   httpRequestUriPath,
-  httpRequestUriQueryBegin,
   httpRequestUriQuery,
   httpRequestUriFragment,
   httpRequestVersion,
   httpRequestHeader,
   httpRequestBody,
-  httpRequestStLast
+  httpRequestStLast,
+  httpRequestTrailer
 } HttpRequestParserStateTy;
 
 typedef enum HttpRequestParserDataTy {
@@ -36,12 +37,12 @@ typedef enum HttpRequestParserDataTy {
 
 typedef struct HttpRequestParserState {
   HttpRequestParserStateTy state;
-  const char *buffer;
+  uint8_t chunked;
+  uint8_t firstFragment;
+  uint8_t seenContentLength;
+  uint8_t seenTransferEncoding;
   const char *ptr;
   const char *end;
-  int haveBody;
-  int chunked;
-  int firstFragment;
   size_t dataRemaining;
 } HttpRequestParserState;
 

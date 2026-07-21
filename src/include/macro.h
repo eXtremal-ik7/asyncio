@@ -27,4 +27,12 @@
 #define __NO_UNUSED_FUNCTION_END
 #endif
 
+#if defined(_MSC_VER)
+#define __NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define __NOINLINE __attribute__((noinline))
+#else
+#define __NOINLINE
+#endif
+
 #endif

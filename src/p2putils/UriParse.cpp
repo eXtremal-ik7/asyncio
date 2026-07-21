@@ -45,28 +45,61 @@ static int isUnreserved(char s)
          s == '~';
 }
 
-static int isPctEncoded(const char **ptr)
+enum UriCharacterResult {
+  UriCharacterAccepted,
+  UriCharacterNeedMore,
+  UriCharacterInvalid
+};
+
+static UriCharacterResult consumePctEncoded(const char **ptr, const char *end)
 {
   const char *p = *ptr;
-  if (*p == '%' && isHexDigit(*(p+1)) && isHexDigit(*(p+2))) {
-    *ptr += 3;
-    return 1;
-  } else {
-    return 0;
-  }
+  if (*p != '%')
+    return UriCharacterInvalid;
+
+  p++;
+  if (p == end)
+    return UriCharacterNeedMore;
+  if (!isHexDigit(*p))
+    return UriCharacterInvalid;
+
+  p++;
+  if (p == end)
+    return UriCharacterNeedMore;
+  if (!isHexDigit(*p))
+    return UriCharacterInvalid;
+
+  *ptr = p + 1;
+  return UriCharacterAccepted;
 }
 
-static int isPChar(const char **ptr)
+// NUL-terminated counterpart used by the full-URI authority parser. Check
+// one byte at a time so "%" and "%A" never read past the terminator, without
+// a preliminary strlen pass over the remaining URI.
+static int consumePctEncodedZ(const char **ptr)
 {
   const char *p = *ptr;
-  if (isUnreserved(*p) || isSubDelims(*p) || *p == ':' || *p == '@') {
-    *ptr = p+1;
-    return 1;
-  } else if (isPctEncoded(ptr)) {
-    return 1;
-  } else {
+  if (*p != '%')
     return 0;
-  } 
+  if (!isHexDigit(*++p))
+    return 0;
+  if (!isHexDigit(*++p))
+    return 0;
+  *ptr = p + 1;
+  return 1;
+}
+
+// ASCII bitmap for RFC 3986 pchar without pct-encoded, which is handled by
+// the bounded slow path below each scanner.
+static inline int isPChar(char s)
+{
+  const unsigned value = static_cast<unsigned char>(s);
+  if (value >= 128)
+    return 0;
+  const uint64_t mask = value < 64
+      ? UINT64_C(0x2fff7fd200000000)
+      : UINT64_C(0x47fffffe87ffffff);
+  return (mask >> (value & 63)) & 1;
 }
 
 
@@ -244,7 +277,7 @@ static size_t uriParseRegnameHost(const char **ptr, uriParseCb callback, void *a
   for (;;) {
     if (isUnreserved(*p) || isSubDelims(*p)) {
       p++;
-    } else if (isPctEncoded(&p)) {
+    } else if (consumePctEncodedZ(&p)) {
       continue;
     } else {
       break;
@@ -277,9 +310,18 @@ ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uri
   const char *p = *ptr;
   const char *lastElement = p;
   while (p != end) {
-    if (isPChar(&p)) {
+    if (isPChar(*p)) {
+      ++p;
       continue;
-    } else if (*p == '/') {
+    }
+    if (*p == '%') {
+      UriCharacterResult result = consumePctEncoded(&p, end);
+      if (result == UriCharacterAccepted)
+        continue;
+      if (result == UriCharacterNeedMore)
+        return ParserResultNeedMoreData;
+    }
+    if (*p == '/') {
       if (p != *ptr) {
         component.type = uriCtPathElement;
         component.raw.data = lastElement;
@@ -295,10 +337,10 @@ ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uri
     }
   }
 
-  if (p != *ptr) {
-    if (p == end && !uriOnly)
-      return ParserResultNeedMoreData;
+  if (p == end && !uriOnly)
+    return ParserResultNeedMoreData;
 
+  if (p != *ptr) {
     // send last fragment
     component.type = uriCtPathElement;
     component.raw.data = lastElement;
@@ -327,7 +369,7 @@ static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
   for (;;) {
     if (isUnreserved(*scan) || isSubDelims(*scan) || *scan == ':') {
       scan++;
-    } else if (isPctEncoded(&scan)) {
+    } else if (consumePctEncodedZ(&scan)) {
       continue;
     } else {
       break;
@@ -363,17 +405,19 @@ static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
     callback(&component, arg);
   }
 
-  if (*p == '/') {
-    if (uriParsePath(&p, p+strlen(p), true, callback, arg) != ParserResultOk)
-      return 0;
-  }
-
   *ptr = p;
   return 1;
 }
 
+static const char *uriStringEnd(const char *p, const char **cachedEnd)
+{
+  if (!*cachedEnd)
+    *cachedEnd = p + strlen(p);
+  return *cachedEnd;
+}
 
-static int uriParseHierPart(const char **ptr, uriParseCb callback, void *arg)
+static int uriParseHierPart(const char **ptr, const char **cachedEnd,
+                            uriParseCb callback, void *arg)
 {
   const char *p = *ptr;
 
@@ -384,13 +428,15 @@ static int uriParseHierPart(const char **ptr, uriParseCb callback, void *arg)
       return 0;
     int result = 1;
     if (*p == '/')
-      result = (uriParsePath(&p, p+strlen(p), true, callback, arg) == ParserResultOk);
+      result = (uriParsePath(&p, uriStringEnd(p, cachedEnd), true,
+                             callback, arg) == ParserResultOk);
     *ptr = p;
     return result;
   }
 
   // with or without a leading '/', everything else is a single path
-  int result = (uriParsePath(&p, p+strlen(p), true, callback, arg) == ParserResultOk);
+  int result = (uriParsePath(&p, uriStringEnd(p, cachedEnd), true,
+                             callback, arg) == ParserResultOk);
   *ptr = p;
   return result;
 }
@@ -421,22 +467,33 @@ ParserResultTy uriParseQuery(const char **ptr, const char *end, bool uriOnly, ur
       }
       p++;
       lastName = p;
-    } else if (isPChar(&p)) {
-      continue;
-    } else if (*p == '/' || *p == '?') {
-      p++;
-      continue;
+      lastValue = nullptr;
+      lastNameSize = 0;
     } else {
-      if (p != *ptr) {
+      if (isPChar(*p)) {
+        ++p;
+        continue;
+      }
+      if (*p == '%') {
+        UriCharacterResult result = consumePctEncoded(&p, end);
+        if (result == UriCharacterAccepted)
+          continue;
+        if (result == UriCharacterNeedMore)
+          return ParserResultNeedMoreData;
+      }
+      if (*p == '/' || *p == '?') {
+        p++;
+        continue;
+      } else {
         break;
       }
     }
   }
 
-  if (p != *ptr) {
-    if (p == end && !uriOnly)
-      return ParserResultNeedMoreData;
+  if (p == end && !uriOnly)
+    return ParserResultNeedMoreData;
 
+  if (p != *ptr) {
     if (lastValue) {
       component.type = uriCtQueryElement;
       component.raw.data = lastName;
@@ -462,9 +519,18 @@ ParserResultTy uriParseFragment(const char **ptr, const char *end, bool uriOnly,
 {
   const char *p = *ptr;
   while (p != end) {
-    if (isPChar(&p)) {
+    if (isPChar(*p)) {
+      ++p;
       continue;
-    } else if (*p == '/' || *p == '?') {
+    }
+    if (*p == '%') {
+      UriCharacterResult result = consumePctEncoded(&p, end);
+      if (result == UriCharacterAccepted)
+        continue;
+      if (result == UriCharacterNeedMore)
+        return ParserResultNeedMoreData;
+    }
+    if (*p == '/' || *p == '?') {
       p++;
       continue;
     } else {
@@ -472,10 +538,10 @@ ParserResultTy uriParseFragment(const char **ptr, const char *end, bool uriOnly,
     }
   }
   
-  if (p != *ptr) {
-    if (p == end && !uriOnly)
-      return ParserResultNeedMoreData;
+  if (p == end && !uriOnly)
+    return ParserResultNeedMoreData;
 
+  if (p != *ptr) {
     URIComponent component;
     component.type = uriCtFragment;
     component.raw.data = *ptr;
@@ -491,26 +557,29 @@ ParserResultTy uriParseFragment(const char **ptr, const char *end, bool uriOnly,
 int uriParse(const char *uri, uriParseCb callback, void *arg)
 { 
   const char *ptr = uri;
+  const char *end = nullptr;
   if (!uriParseScheme(&ptr, callback, arg))
     return 0;
   if (*ptr++ != ':')
     return 0;
-  if (!uriParseHierPart(&ptr, callback, arg))
+  if (!uriParseHierPart(&ptr, &end, callback, arg))
     return 0;
   
   if (*ptr == '?') {
     ptr++;
-    if (uriParseQuery(&ptr, ptr + strlen(ptr), true, callback, arg) != ParserResultOk)
+    if (uriParseQuery(&ptr, uriStringEnd(ptr, &end), true,
+                      callback, arg) != ParserResultOk)
       return 0;
   }
   
   if (*ptr == '#') {
     ptr++;
-    if (uriParseFragment(&ptr, ptr + strlen(ptr), true, callback, arg) != ParserResultOk)
+    if (uriParseFragment(&ptr, uriStringEnd(ptr, &end), true,
+                         callback, arg) != ParserResultOk)
       return 0;
   }
   
-  return 1;
+  return *ptr == 0;
 }
 
 // host[:port] only (no scheme/userinfo/path), the whole string must match;
@@ -571,17 +640,23 @@ static char encodeHex(char s)
 
 static void uriPctDecode(const char *ptr, size_t size, std::string &out)
 {
-  out.clear();
-  const char *p = ptr, *e = ptr+size;
-  while (p < e) {
-    if (*p == '%' && (e-p) >= 3 && isHexDigit(*(p+1)) && isHexDigit(*(p+2))) {
-      int s = (decodeHex(*(p+1)) << 4) + decodeHex(*(p+2));
-      out.push_back(static_cast<char>(s));
-      p += 3;
+  out.assign(ptr, size);
+  size_t read = out.find('%');
+  if (read == std::string::npos)
+    return;
+
+  size_t write = read;
+  while (read < size) {
+    if (out[read] == '%' && size-read >= 3 &&
+        isHexDigit(out[read+1]) && isHexDigit(out[read+2])) {
+      int s = (decodeHex(out[read+1]) << 4) + decodeHex(out[read+2]);
+      out[write++] = static_cast<char>(s);
+      read += 3;
     } else {
-      out.push_back(*p++);
+      out[write++] = out[read++];
     }
   }
+  out.resize(write);
 }
 
 static void uriPctEncode(const char *ptr, size_t size, const char *extra, std::string &out)
