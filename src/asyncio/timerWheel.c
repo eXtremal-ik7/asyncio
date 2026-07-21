@@ -163,35 +163,47 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
 {
   uint64_t deadline = link->deadlineTick;
 
-  // The deadline's tick is already confirmed swept: its window was visited,
-  // the arm is late. Strictly "<": tick == cursor is the first unconfirmed
-  // tick, its window may not have been visited yet and the deadline is not
-  // due before that visit anyway - expiring it here would fire early
-  if (deadline < cursor)
-    return 0;
-
   for (;;) {
-    uint64_t diff = deadline ^ cursor;
-    if (diff >> (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS)) {
-      // Beyond the wheel range: clamp into the farthest future slot of the
-      // top level; its visit re-cascades the link with a fresher cursor, so
-      // no precision is lost - the link carries the exact deadline. That slot
-      // is almost a whole top-level rotation ahead of the sweep, its visit
-      // cannot race this publication - attaching to the observed incarnation
-      // is safe here and only here
+    // The deadline's tick is already confirmed swept: its window was visited,
+    // the arm is late. Strictly "<": tick == cursor is the first unconfirmed
+    // tick, its window may not have been visited yet and the deadline is not
+    // due before that visit anyway - expiring it here would fire early.
+    // Re-checked after each far-branch cursor refresh
+    if (deadline < cursor)
+      return 0;
+
+    if ((deadline - cursor) >> (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS)) {
+      // Far by numeric distance - the XOR image mistakes a near deadline
+      // across a range binary boundary for far. The farthest top-level
+      // slot's visit precedes the deadline and re-cascades the exact tick;
+      // an incarnation mismatch means a stale hint - reroute from the
+      // authoritative cursor
       unsigned level = TIMER_WHEEL_LEVELS - 1;
       unsigned index = ((unsigned)(cursor >> (TIMER_WHEEL_LEVEL_BITS * level)) + TIMER_WHEEL_SLOTS - 1) %
                        TIMER_WHEEL_SLOTS;
+      uint64_t windowStart = (cursor & ~(timerWheelPeriod(level) - 1)) +
+                             (uint64_t)index * timerWheelWidth(level);
+      uint64_t expectedBase = windowStart > cursor ? windowStart
+                                                   : windowStart + timerWheelPeriod(level);
       volatile uint128 *slot = &base->timerWheel.slots[level][index];
       // Routing snapshot only; the successful DWCAS inside the publish helper
       // is the publication acquire and validates both possibly torn words.
       uint128 observed = __uint128_atomic_load_relaxed(slot);
-      while (!timerWheelTryPublish(base, level, index, &observed, link))
-        continue;
-      return 1;
+      while (observed.high == expectedBase) {
+        if (timerWheelTryPublish(base, level, index, &observed, link))
+          return 1;
+      }
+      cursor = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire);
+      continue;
     }
 
+    // XOR picks the level; across a range binary boundary it overshoots the
+    // top level for an in-range distance - clamp, expectedBase still targets
+    // the deadline's own window
+    uint64_t diff = deadline ^ cursor;
     unsigned level = diff ? highestBitIndex64(diff) / TIMER_WHEEL_LEVEL_BITS : 0;
+    if (level >= TIMER_WHEEL_LEVELS)
+      level = TIMER_WHEEL_LEVELS - 1;
     unsigned index = (unsigned)(deadline >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
     uint64_t expectedBase = deadline & ~(timerWheelWidth(level) - 1);
 
@@ -340,6 +352,14 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
 {
   unsigned index = (unsigned)(windowStart >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
   volatile uint128 *slot = &base->timerWheel.slots[level][index];
+  // Bracket identity: a loop thread of this base owns a TimerSleepSlot,
+  // anyone else shares the overflow word
+  TimerSleepSlot *visitor =
+    loopThreadBase == base && base->timerSleep && messageLoopThreadId < base->loopThreadLimit
+      ? &base->timerSleep[messageLoopThreadId] : 0;
+  uintptr_t sequence = 0;
+  int opened = 0;
+  asyncOpListLink *chain = 0;
 
   uint128 observed = __uint128_atomic_load_relaxed(slot);
   for (;;) {
@@ -352,23 +372,46 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
       // when a chain is observed (over-setting is a spurious wakeup at worst)
       if (observed.low)
         timerWheelMarkOccupied(base, level, index);
-      return 0;
+      break;
+    }
+    if (!opened) {
+      // Open the pre-clear bracket before the first destructive clear. The
+      // odd value need only reach threads that observed the clear itself:
+      // the plain store rides on the seq-cst clear RMW that follows it
+      opened = 1;
+      if (visitor) {
+        sequence = __uintptr_atomic_load(&visitor->preclearSequence, amoRelaxed);
+        __uintptr_atomic_store(&visitor->preclearSequence, sequence + 1, amoRelaxed);
+      } else {
+        __uintptr_atomic_fetch_and_add(&base->timerPreclearOverflow,
+                                       timerPreclearOverflowEntry,
+                                       amoSeqCst);
+      }
     }
     // Clear the occupancy bit strictly before the drain CAS: a publication
     // into the reopened incarnation is ordered after that CAS, so its set
     // cannot be erased by this clear; a bit re-set by a producer pushing into
     // the closing window survives past the drain as a spurious one. Between
     // this clear and the CAS the live chain sits bitless - sleepers stay
-    // safe against a visitor stalled here because timerLoopPrepareSleep
-    // validates the unconfirmed cursor tick's windows by their pairs, never
-    // by the bitmap alone
+    // safe because the bracket around this window is still open
     timerWheelClearOccupied(base, level, index);
     uint128 desired;
     desired.low = 0;
     desired.high = windowStart + timerWheelPeriod(level);
-    if (__uint128_atomic_compare_and_swap(slot, &observed, desired))
-      return (asyncOpListLink*)(uintptr_t)observed.low;
+    if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
+      chain = (asyncOpListLink*)(uintptr_t)observed.low;
+      break;
+    }
   }
+  if (opened) {
+    // Release order: a sleeper reading the even value must also see the bit
+    // repair / drain resolution ordered before it
+    if (visitor)
+      __uintptr_atomic_store(&visitor->preclearSequence, sequence + 2, amoRelease);
+    else
+      __uintptr_atomic_fetch_and_add(&base->timerPreclearOverflow, ~(uintptr_t)0, amoRelease);
+  }
+  return chain;
 }
 
 // Deliver, drop or re-cascade a detached chain. The chain is private to the
@@ -487,9 +530,8 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
 // depends on. The full 68-word sweep runs only on the way into a deep sleep;
 // a busy wheel terminates the level-0 pass on its first occupied word.
 // The conclusion is bitmap-only and therefore blind to a chain whose bit an
-// in-flight visit already cleared - the caller closes that for the only
-// windows where it can happen by validating the unconfirmed cursor tick's
-// pairs directly
+// in-flight visit already cleared - the caller closes that by checking the
+// pre-clear brackets around the scan
 static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from)
 {
   uint64_t best = UINT64_MAX;
@@ -535,6 +577,28 @@ static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from)
   return best;
 }
 
+// Sum and parity of every pre-clear bracket (per-slot sequences plus the
+// overflow word). Components only grow, so equal sums mean no bracket
+// turnover between two snapshots.
+typedef struct TimerPreclearSnapshot {
+  uintptr_t sum;
+  int active;
+} TimerPreclearSnapshot;
+
+static TimerPreclearSnapshot timerPreclearSnapshot(asyncBase *base)
+{
+  TimerPreclearSnapshot snapshot = {0, 0};
+  for (unsigned i = 0; i < base->loopThreadLimit; i++) {
+    uintptr_t sequence = __uintptr_atomic_load(&base->timerSleep[i].preclearSequence, amoAcquire);
+    snapshot.sum += sequence;
+    snapshot.active |= (int)(sequence & 1);
+  }
+  uintptr_t overflow = __uintptr_atomic_load(&base->timerPreclearOverflow, amoAcquire);
+  snapshot.sum += overflow;
+  snapshot.active |= (overflow & timerPreclearOverflowActiveMask) != 0;
+  return snapshot;
+}
+
 uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t currentTick, uint32_t fallbackMs)
 {
   const uint32_t tickMs = TIMER_TICK_MICROSECONDS / 1000;
@@ -560,36 +624,31 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
   // of hiding behind a full window
   uint64_t cursor = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire);
   uint64_t from = cursor < currentTick ? cursor : currentTick;
-  uint64_t wake = timerWheelNearestWake(base, from);
 
-  // The bitmap is authoritative for every confirmed tick, but not for the
-  // cursor tick: its visitor clears a slot's bit strictly before the drain
-  // CAS, so a visitor stalled between the two leaves a live due chain the
-  // scan cannot see, and a helper that would drain it is exactly the loop
-  // about to sleep here. That state is confined to the windows visited at
-  // the unconfirmed tick - visits run in cursor order and a confirmed tick
-  // proves all its windows drained - so validate those (at most one per
-  // level) by the pair itself: an unreopened window with a chain is due
-  // backlog, wake right behind the cursor and drain it as a helper. The
-  // cursor is re-read after the scan: missing a bit whose clear the scan
-  // observed orders this load (through the seq-cst clear and the release
-  // confirms below it) after that visit's tick became the cursor, so the
-  // windows checked here are never older than any visit the scan missed.
-  // The pair load needs no validating CAS: the hazard is a stalled visitor,
-  // a stable state any read observes; every racing transition means the
-  // visitor or a publisher is live and their own protocol covers the
-  // deadline, and a torn read errs toward one spurious early wake at worst
-  uint64_t confirmed = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire);
-  for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; level++) {
-    if (level && (confirmed & (timerWheelWidth(level) - 1)))
+  // A visitor between its pre-clear and its drain CAS leaves a live chain
+  // bitless anywhere in the wheel (the bit has no incarnation), invisible to
+  // the scan. Trust the scan only when no bracket was open at either
+  // snapshot and none turned over in between: reading a cleared bit orders
+  // the bracket open before the closing snapshot, a close mid-scan changes
+  // the sum - one re-scan then sees the repaired bit. Both parity checks are
+  // load-bearing: an overflow exit is the one negative sum term and can
+  // cancel a slot close, but it presupposes a bracket already open at the
+  // opening snapshot. Otherwise cap at one tick behind the scan origin: due
+  // backlog drains immediately, the pair-driven sweep delivers without the
+  // bitmap
+  uint64_t wake;
+  TimerPreclearSnapshot before = timerPreclearSnapshot(base);
+  for (unsigned attempt = 0;;) {
+    wake = timerWheelNearestWake(base, from);
+    TimerPreclearSnapshot after = timerPreclearSnapshot(base);
+    if (!before.active && !after.active && after.sum == before.sum)
       break;
-    unsigned index = (unsigned)(confirmed >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
-    uint128 pair = __uint128_atomic_load(&base->timerWheel.slots[level][index]);
-    if (pair.low && pair.high <= confirmed) {
-      if (confirmed + 1 < wake)
-        wake = confirmed + 1;
+    if (before.active || after.active || ++attempt == 2) {
+      if (wake > from + 1)
+        wake = from + 1;
       break;
     }
+    before = after;
   }
 
   if (wake == UINT64_MAX) {

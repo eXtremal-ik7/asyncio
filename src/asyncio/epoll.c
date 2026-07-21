@@ -238,7 +238,9 @@ void epollNextFinishedOperation(asyncBase *base)
 
       // UINT32_MAX = wait with no timeout: an idle base blocks until queue
       // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
-      uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500);
+      uint64_t sleepFrom = getMonotonicTicks();
+      uint32_t sleepMs = timerSleepShrinkElapsed(sleepFrom,
+        timerLoopPrepareSleep(base, messageLoopThreadId, sleepFrom, 500));
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
       timerLoopCancelSleep(base, messageLoopThreadId);
       // Unconditional sweep (the modulo election is gone): an idle pass costs

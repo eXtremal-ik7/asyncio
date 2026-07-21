@@ -319,38 +319,49 @@ void iocpNextFinishedOperation(asyncBase *base)
   if (!loopThreadEnter(base))
     return;
 
+  int quitting = 0;
   while (1) {
     ULONG N, i;
+    BOOL status;
 
-    // Checked after the previous batch was fully dispatched and before every
-    // kernel wait (the timeout path re-enters through here too); the exit
-    // re-rings the doorbell while other threads remain registered, so one
-    // postQuitOperation reaches every sleeper
-    if (__uintptr_atomic_load(&base->quitRequested, amoAcquire)) {
-      if (loopThreadExit(base))
-        iocpWakeupLoop(base);
-      return;
+    if (!quitting)
+      quitting = __uintptr_atomic_load(&base->quitRequested, amoAcquire) != 0;
+
+    if (quitting) {
+      // Drain the port dry before leaving (the FIFO semantics of the old
+      // quit packet): completions enqueued before the stop still dispatch.
+      // The exit re-rings the doorbell while other threads remain registered
+      status = GetQueuedCompletionStatusEx(localBase->completionPort,
+                                           entries, maxEntriesNum, &N, 0, FALSE);
+      if (status == FALSE) {
+        if (loopThreadExit(base))
+          iocpWakeupLoop(base);
+        return;
+      }
+    } else {
+      // An idle base gets UINT32_MAX from timerLoopPrepareSleep, which is
+      // exactly INFINITE: the port then blocks until a completion or a
+      // posted kick.
+      uint64_t sleepFrom = getMonotonicTicks();
+      uint32_t sleepMs = timerSleepShrinkElapsed(sleepFrom,
+        timerLoopPrepareSleep(base, messageLoopThreadId, sleepFrom, 500));
+      status = GetQueuedCompletionStatusEx(localBase->completionPort,
+                                           entries,
+                                           maxEntriesNum,
+                                           &N,
+                                           sleepMs,
+                                           FALSE);
+      timerLoopCancelSleep(base, messageLoopThreadId);
+
+      // Unconditional sweep (the modulo election is gone): an idle pass
+      // costs one relaxed load, and the wakeup handshake relies on whichever
+      // thread the kick lands on doing the sweep itself
+      processTimeoutQueue(base, getMonotonicTicks());
+
+      // ignore false status
+      if (status == FALSE)
+        continue;
     }
-
-    // An idle base gets UINT32_MAX from timerLoopPrepareSleep, which is
-    // exactly INFINITE: the port then blocks until a completion or a posted
-    // kick.
-    BOOL status = GetQueuedCompletionStatusEx(localBase->completionPort,
-                                              entries,
-                                              maxEntriesNum,
-                                              &N,
-                                              timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 500),
-                                              FALSE);
-    timerLoopCancelSleep(base, messageLoopThreadId);
-
-    // Unconditional sweep (the modulo election is gone): an idle pass costs
-    // one relaxed load, and the wakeup handshake relies on whichever thread
-    // the kick lands on doing the sweep itself
-    processTimeoutQueue(base, getMonotonicTicks());
-
-    // ignore false status
-    if (status == FALSE)
-      continue;
 
     for (i = 0; i < N; i++) {
       OVERLAPPED_ENTRY *entry = &entries[i];

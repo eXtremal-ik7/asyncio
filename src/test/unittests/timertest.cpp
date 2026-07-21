@@ -288,6 +288,26 @@ TEST(timer_grid, ordinary_operation_arms_monotonic_grid_timer)
   objectDelete(&object.root);
 }
 
+TEST(timer_grid, huge_timeout_saturates_instead_of_wrapping)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp op(object, OPCODE_READ, afNone, UINT64_MAX);
+  op.setResults({aosPending});
+
+  // UINT64_MAX must mean "practically never": unsaturated now + timeout
+  // wraps to nowUs - 1 and fires at once
+  combinerPushOperation(&op.root);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+
+  processTimeoutQueue(&backend.base, getMonotonicTicks() + 2);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+
+  cancelIo(&object.root);
+  backend.drainCompletions();
+  objectDelete(&object.root);
+}
+
 TEST(timer_wheel, detach_reopens_and_is_idempotent_per_incarnation)
 {
   TestBackend backend;
@@ -562,13 +582,14 @@ TEST(timer_wheel, boundary_deadline_at_top_level_window_start_fires_at_its_visit
   objectDelete(&object.root);
 }
 
-TEST(timer_wheel, beyond_range_deadline_clamps_and_reclamps_keeping_its_exact_tick)
+TEST(timer_wheel, beyond_range_deadline_clamps_then_recascades_to_its_exact_slot)
 {
   TestBackend backend;
+  timerWheelInit(&backend.base, 5);
   TestObject object(backend);
   TestOp op(object);
-  // The deadline differs from cursor 0 above the wheel's addressable bits: no
-  // slot covers it yet, the arm clamps into the farthest top-level slot
+  // The deadline differs from the cursor above the wheel's addressable bits:
+  // no slot covers it yet, the arm clamps into the farthest top-level slot
   const uint64_t wheelRange = uint64_t{1} << (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS);
   const uint64_t topWidth = uint64_t{1} << (3 * TIMER_WHEEL_LEVEL_BITS);
   op.root.endTime = (wheelRange + 5) * TIMER_TICK_MICROSECONDS;
@@ -576,18 +597,66 @@ TEST(timer_wheel, beyond_range_deadline_clamps_and_reclamps_keeping_its_exact_ti
   auto *link = static_cast<asyncOpListLink*>(op.root.timerId);
   ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low, reinterpret_cast<uint64_t>(link));
 
-  // The far slot's visit re-cascades; from this window's position the
-  // deadline is still beyond range, so it clamps again - parked with its
-  // exact deadline tick intact, neither delivered early nor dropped
+  // From the far window the deadline is within range (topWidth + 5 ahead):
+  // it must re-route into its exact slot - the next rotation of slot 0 -
+  // not re-clamp almost a whole rotation out
   const uint64_t farWindow = (TIMER_WHEEL_SLOTS - 1) * topWidth;
   timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 3, farWindow), farWindow);
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
   EXPECT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 1).low, 0u);
-  ASSERT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low, reinterpret_cast<uint64_t>(link));
+  EXPECT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low, 0u);
+  ASSERT_EQ(peekWheelSlot(backend, 3, 0).low, reinterpret_cast<uint64_t>(link));
+  EXPECT_EQ(peekWheelSlot(backend, 3, 0).high, wheelRange);
+  EXPECT_TRUE(wheelSlotOccupied(backend, 3, 0));
   EXPECT_EQ(link->deadlineTick, wheelRange + 5);
 
   // Still pending and parked: the wheel teardown recycles the link without
   // delivering it
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wheel, near_deadline_across_range_boundary_is_delivered_not_clamped)
+{
+  const uint64_t range = uint64_t{1} << (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS);
+  TestBackend backend;
+  timerWheelInit(&backend.base, range - 1);
+  TestObject object(backend);
+  TestOp op(object);
+
+  // One tick ahead, but across the 2^40 binary boundary - only the XOR
+  // image looks out-of-range
+  op.root.endTime = range * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_EQ(opGetStatus(&op.root), aosPending);
+
+  // Two sweep ticks cover the deadline: the timeout is due here
+  processTimeoutQueue(&backend.base, range + 1);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+  EXPECT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low, 0u);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wheel, far_insert_with_stale_cursor_refuses_already_swept_deadline)
+{
+  const uint64_t range = uint64_t{1} << (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS);
+  TestBackend backend;
+  timerWheelInit(&backend.base, range + 10);
+  TestObject object(backend);
+  TestOp op(object);
+
+  // Stale hint (allowed by contract) from before the boundary, deadline
+  // already behind the confirmed sweep: the insert must refuse, not park
+  // the link into a future incarnation
+  asyncOpListLink *link = makeHeapLink(op, object, opGetGeneration(&op.root), range + 2);
+  int inserted = timerWheelInsert(&backend.base, link, range - 1);
+  EXPECT_EQ(inserted, 0);
+  EXPECT_EQ(peekWheelSlot(backend, 3, TIMER_WHEEL_SLOTS - 2).low, 0u);
+  if (!inserted)
+    free(link);
+
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
 }
@@ -748,16 +817,18 @@ TEST(timer_wakeup, stalled_visitor_between_clear_and_drain_does_not_hide_due_cha
   ASSERT_EQ(backend.base.timerCloseCursor, 5u);
   ASSERT_TRUE(wheelSlotOccupied(backend, 0, 5));
 
-  // The tick-5 visitor performs exactly the first half of timerWheelDetach -
-  // the occupancy clear - and stalls before the drain CAS: the slot still
-  // holds the live due chain, the bitmap no longer shows it
+  // The tick-5 visitor opens its bracket, performs the occupancy clear and
+  // stalls before the drain CAS: the slot still holds the live due chain,
+  // the bitmap no longer shows it
+  __uintptr_atomic_fetch_and_add(&backend.base.timerPreclearOverflow,
+                                 timerPreclearOverflowEntry, amoSeqCst);
   __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][0],
                              ~(static_cast<uintptr_t>(1) << 5), amoSeqCst);
   ASSERT_NE(peekWheelSlot(backend, 0, 5).low, 0u);
 
-  // Another loop planning its sleep must not trust the cleared bit for the
-  // unconfirmed cursor tick: an eternal wait here would park the loop until
-  // the stalled visitor resumes
+  // Another loop planning its sleep sees the open bracket and must not trust
+  // its empty scan: an eternal wait here would park the loop until the
+  // stalled visitor resumes
   EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 5, 1000), 125u);
   EXPECT_EQ(backend.sleepSlots[0].wakeTick, 6u);
   timerLoopCancelSleep(&backend.base, 0);
@@ -767,6 +838,8 @@ TEST(timer_wakeup, stalled_visitor_between_clear_and_drain_does_not_hide_due_cha
   processTimeoutQueue(&backend.base, 6);
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
   EXPECT_EQ(peekWheelSlot(backend, 0, 5).low, 0u);
+  __uintptr_atomic_fetch_and_add(&backend.base.timerPreclearOverflow,
+                                 ~static_cast<uintptr_t>(0), amoRelease);
 
   objectDecrementReference(&object.root, 1);
   objectDelete(&object.root);
@@ -786,20 +859,26 @@ TEST(timer_wakeup, stalled_boundary_visitor_does_not_hide_cascading_window)
   processTimeoutQueue(&backend.base, 4096);
   ASSERT_EQ(backend.base.timerCloseCursor, 4096u);
 
-  // The boundary visitor clears the level-1 bit and stalls before its drain
-  // CAS; the cascade the sleeper counts on has not happened
+  // The boundary visitor opens its bracket, clears the level-1 bit and
+  // stalls before its drain CAS; the cascade the sleeper counts on has not
+  // happened
+  __uintptr_atomic_fetch_and_add(&backend.base.timerPreclearOverflow,
+                                 timerPreclearOverflowEntry, amoSeqCst);
   __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[1][0],
                              ~(static_cast<uintptr_t>(1) << 4), amoSeqCst);
 
-  // The cursor tick's boundary window still holds the chain: the sleeper
-  // must wake right behind the cursor instead of waiting eternally
+  // The boundary window still holds the chain behind the open bracket: the
+  // sleeper must wake right behind the cursor instead of waiting eternally
   EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 4096, 1000), 125u);
   EXPECT_EQ(backend.sleepSlots[0].wakeTick, 4097u);
   timerLoopCancelSleep(&backend.base, 0);
 
-  // The woken helper performs the visit: the chain cascades into level 0
-  // with its own bit and the following scan stretches to the exact deadline
+  // The woken helper performs the visit and the stalled visitor resumes
+  // (losing CAS, closed bracket): the chain cascades into level 0 with its
+  // own bit and the following scan stretches to the exact deadline
   processTimeoutQueue(&backend.base, 4097);
+  __uintptr_atomic_fetch_and_add(&backend.base.timerPreclearOverflow,
+                                 ~static_cast<uintptr_t>(0), amoRelease);
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
   EXPECT_TRUE(wheelSlotOccupied(backend, 0, 5000 % TIMER_WHEEL_SLOTS));
   EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 4097, 1000), (5001u - 4097u) * 125u);
@@ -809,6 +888,94 @@ TEST(timer_wakeup, stalled_boundary_visitor_does_not_hide_cascading_window)
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
 
   objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wakeup, stale_clear_of_reopened_slot_caps_sleep_while_visitor_is_parked)
+{
+  TestBackend backend;
+  timerWheelInit(&backend.base, 1023);
+  TestObject object(backend);
+  TestOp op(object);
+
+  // The tick-1023 visitor loads the pair {*, baseTick 1023} and stalls
+  // before its occupancy pre-clear (executed below); a helper sweeps the
+  // tick, reopens the physical slot for baseTick 2047 and confirms the cursor
+  processTimeoutQueue(&backend.base, 1024);
+  ASSERT_EQ(backend.base.timerCloseCursor, 1024u);
+  ASSERT_EQ(peekWheelSlot(backend, 0, 1023).high, 2047u);
+
+  // A fresh arm parks tick 2047 into the reopened incarnation
+  op.root.endTime = 2047 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &op.root);
+  ASSERT_TRUE(wheelSlotOccupied(backend, 0, 1023));
+  ASSERT_NE(peekWheelSlot(backend, 0, 1023).low, 0u);
+
+  // The stale visitor resumes inside its still-open bracket and its
+  // pre-clear lands on the NEW incarnation's bit (the bit carries no
+  // incarnation number); it stalls again before its losing CAS
+  __uintptr_atomic_fetch_and_add(&backend.base.timerPreclearOverflow,
+                                 timerPreclearOverflowEntry, amoSeqCst);
+  __uintptr_atomic_fetch_and(&backend.base.timerWheel.occupancy[0][1023 >> 6],
+                             ~(static_cast<uintptr_t>(1) << (1023 & 63)), amoSeqCst);
+
+  // CONTRACT: the open bracket forbids committing to an eternal wait - the
+  // sleep is capped at one grid tick however long the visitor stays parked,
+  // so delivery does not hinge on the guilty thread's schedule
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 1024, 1000), 125u);
+  EXPECT_EQ(backend.sleepSlots[0].wakeTick, 1025u);
+  timerLoopCancelSleep(&backend.base, 0);
+
+  // The visitor's resume: the losing CAS refreshes the pair, the repair
+  // re-sets the bit, the bracket closes
+  timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 0, 1023), 1023);
+  EXPECT_TRUE(wheelSlotOccupied(backend, 0, 1023));
+  __uintptr_atomic_fetch_and_add(&backend.base.timerPreclearOverflow,
+                                 ~static_cast<uintptr_t>(0), amoRelease);
+
+  // The next sleep decision takes the clean path to the exact horizon
+  EXPECT_EQ(timerLoopPrepareSleep(&backend.base, 0, 1024, 1000), (2048u - 1024u) * 125u);
+  timerLoopCancelSleep(&backend.base, 0);
+  processTimeoutQueue(&backend.base, 2048);
+  EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
+
+  objectDecrementReference(&object.root, 1);
+  objectDelete(&object.root);
+}
+
+TEST(timer_wheel, detach_bracket_routes_by_visitor_identity)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp first(object), second(object);
+
+  first.root.endTime = 5 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &first.root);
+  second.root.endTime = 6 * TIMER_TICK_MICROSECONDS;
+  addToTimeoutQueue(&backend.base, &second.root);
+
+  // A foreign thread (no loop identity) brackets through the overflow word:
+  // one completed entry stays recorded in the high half
+  timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 0, 5), 5);
+  EXPECT_EQ(opGetStatus(&first.root), aosTimeout);
+  EXPECT_EQ(backend.base.timerPreclearOverflow, timerPreclearOverflowEntry - 1);
+  EXPECT_EQ(backend.sleepSlots[3].preclearSequence, 0u);
+
+  // A loop thread of this base brackets through its own slot
+  loopThreadBase = &backend.base;
+  messageLoopThreadId = 3;
+  timerWheelProcessDetached(&backend.base, timerWheelDetach(&backend.base, 0, 6), 6);
+  loopThreadBase = nullptr;
+  messageLoopThreadId = 0;
+  EXPECT_EQ(opGetStatus(&second.root), aosTimeout);
+  EXPECT_EQ(backend.sleepSlots[3].preclearSequence, 2u);
+  EXPECT_EQ(backend.base.timerPreclearOverflow, timerPreclearOverflowEntry - 1);
+
+  // A visit of an already-reopened window opens no bracket
+  EXPECT_EQ(timerWheelDetach(&backend.base, 0, 5), nullptr);
+  EXPECT_EQ(backend.base.timerPreclearOverflow, timerPreclearOverflowEntry - 1);
+
+  objectDecrementReference(&object.root, 2);
   objectDelete(&object.root);
 }
 

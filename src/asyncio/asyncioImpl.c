@@ -393,8 +393,11 @@ static void opArmTimer(asyncOpRoot *op)
       // start timer for this operation
       base->methodImpl.startTimer(op);
     } else {
-      // add operation to timeout grid
-      op->endTime = getMonotonicTicks() * TIMER_TICK_MICROSECONDS + op->timeout;
+      // Saturating add: a huge timeout must not wrap into the past
+      uint64_t nowUs = getMonotonicTicks() * TIMER_TICK_MICROSECONDS;
+      op->endTime = nowUs + op->timeout;
+      if (op->endTime < nowUs)
+        op->endTime = UINT64_MAX;
       addToTimeoutQueue(base, op);
     }
   }

@@ -237,8 +237,11 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   base->loopThreadSlots = loopThreadSlots;
   base->loopThreadSlotWords = (unsigned)loopThreadSlotWords;
   base->loopThreadLimit = loopThreadLimit;
-  for (unsigned i = 0; i < loopThreadLimit; i++)
+  base->timerPreclearOverflow = 0;
+  for (unsigned i = 0; i < loopThreadLimit; i++) {
     base->timerSleep[i].wakeTick = UINTPTR_MAX;
+    base->timerSleep[i].preclearSequence = 0;
+  }
   return base;
 }
 

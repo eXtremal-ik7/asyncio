@@ -23,9 +23,13 @@ extern "C" {
 // compile-time constant: changing the resolution later renumbers deadlines
 // but does not touch the architecture.
 #define TIMER_TICK_MICROSECONDS 125000
+#ifndef TIMER_WHEEL_LEVEL_BITS
 #define TIMER_WHEEL_LEVEL_BITS 10
+#endif
 #define TIMER_WHEEL_SLOTS (1u << TIMER_WHEEL_LEVEL_BITS)
+#ifndef TIMER_WHEEL_LEVELS
 #define TIMER_WHEEL_LEVELS 4
+#endif
 
 // Slot = atomic {head, baseTick} pair changed only by DWCAS: drain and reopen
 // are one transition, and a link can never be published into a foreign slot
@@ -54,13 +58,13 @@ typedef struct timerWheel {
   // still observes a chain. Invariant: a slot holding a chain published by a
   // returned insert has its bit set - a producer still inside the insert has
   // completed nothing anyone waits on, and its own set runs before it
-  // returns - EXCEPT while a visit of the slot's window is in flight between
-  // its bit clear and its drain CAS; that state is confined to the windows
-  // of the unconfirmed cursor tick (visits run in cursor order, a confirmed
-  // tick has all its windows drained), and timerLoopPrepareSleep validates
-  // exactly those by reading the pairs, so a stalled visitor never hides a
-  // chain from sleep planning. A set bit over an empty slot is legal and
-  // only costs a spurious wakeup - the next visit clears it.
+  // returns - EXCEPT while some visit sits between its bit clear and its
+  // drain CAS. The bit carries no incarnation number, so a stale visitor can
+  // clear the bit of the chain living in the slot now; each visitor keeps a
+  // pre-clear bracket open for that window (TimerSleepSlot.preclearSequence
+  // odd / overflow word active) and timerLoopPrepareSleep validates its scan
+  // against the brackets. A set bit over an empty slot is legal and only
+  // costs a spurious wakeup - the next visit clears it.
   uintptr_t occupancy[TIMER_WHEEL_LEVELS][TIMER_WHEEL_SLOTS / 64];
 } timerWheel;
 
@@ -75,10 +79,20 @@ typedef struct timerWheel {
 // threads from false-sharing their per-wait publications.
 typedef struct TimerSleepSlot {
   volatile uintptr_t wakeTick;
-  uint8_t pad[CACHE_LINE_SIZE - sizeof(uintptr_t)];
+  // Pre-clear bracket of this loop thread's window visits: odd between the
+  // occupancy pre-clear and the drain CAS resolution, +2 per visit.
+  // Single-writer plain stores; the open rides on the seq-cst clear that
+  // follows it, the close is a release over the bit repair.
+  volatile uintptr_t preclearSequence;
+  uint8_t pad[CACHE_LINE_SIZE - 2 * sizeof(uintptr_t)];
 } TimerSleepSlot;
 
 static const uintptr_t timerSleepEternal = UINTPTR_MAX - 1;
+
+// Pre-clear bracket word for visitors without an own TimerSleepSlot: low
+// half = visitors inside a bracket, high half = brackets ever entered.
+static const uintptr_t timerPreclearOverflowEntry = ((uintptr_t)1 << 32) + 1;
+static const uintptr_t timerPreclearOverflowActiveMask = ((uintptr_t)1 << 32) - 1;
 
 typedef enum IoActionTy {
   actAccept = OPCODE_READ,
@@ -174,6 +188,9 @@ struct asyncBase {
   unsigned loopThreadSlotWords;
   unsigned loopThreadLimit;
   volatile unsigned messageLoopThreadCounter;
+  // Shared pre-clear bracket for visitors without an own TimerSleepSlot
+  // (layout at timerPreclearOverflowEntry)
+  volatile uintptr_t timerPreclearOverflow;
   // Sticky level-triggered quit (postQuitOperation sets, resetQuitOperation
   // clears in quiescence). Every loop iteration reads it after draining the
   // global queue and exits when set; the exiting thread re-rings wakeupLoop
@@ -567,12 +584,14 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
 // call may commit to), then derives the real wake tick from the occupancy
 // bitmap: the earliest upcoming visit of an occupied slot across all levels
 // (a cascade must not oversleep its boundary). Every bitmap word the
-// decision rests on is read with a seq-cst RMW, pairing with the producer's
-// set of the same word - either the scan sees the fresh bit and the sleep
-// shrinks to the exact wake tick, or the producer sees the published horizon
-// and wakes one loop through methodImpl.wakeupLoop. An empty bitmap makes
-// the wait unbounded - UINT32_MAX, which the backends pass to the kernel as
-// "no timeout".
+// decision rests on is read with a seq-cst load, pairing with the producer's
+// seq-cst set of the same word - either the scan sees the fresh bit and the
+// sleep shrinks to the exact wake tick, or the producer sees the published
+// horizon and wakes one loop through methodImpl.wakeupLoop. The scan runs
+// between pre-clear snapshots: an open visitor bracket caps the wait at one
+// grid tick, a bracket closed mid-scan repeats the scan; only a clean empty
+// scan makes the wait unbounded - UINT32_MAX, which the backends pass to the
+// kernel as "no timeout".
 // After the wait returns, the slot is parked at UINTPTR_MAX (awake threads
 // sweep on their own and must not attract kicks). Returns the wait bound in
 // milliseconds; currentTick is the caller's getMonotonicTicks() reading.
@@ -592,6 +611,18 @@ __NO_UNUSED_FUNCTION_BEGIN
 static inline uint64_t timerDeadlineTick(uint64_t endTime)
 {
   return endTime / TIMER_TICK_MICROSECONDS + (endTime % TIMER_TICK_MICROSECONDS != 0);
+}
+
+// Shrinks a planned kernel-wait by the time elapsed since sleepFromTick: a
+// preemption between planning and syscall must not extend the sleep past the
+// wake. UINT32_MAX passes through. The instructions up to the syscall stay
+// unguarded - closing that needs absolute kernel timers.
+static inline uint32_t timerSleepShrinkElapsed(uint64_t sleepFromTick, uint32_t sleepMs)
+{
+  if (sleepMs == UINT32_MAX)
+    return sleepMs;
+  uint64_t elapsedMs = (getMonotonicTicks() - sleepFromTick) * (TIMER_TICK_MICROSECONDS / 1000);
+  return elapsedMs < sleepMs ? sleepMs - (uint32_t)elapsedMs : 0;
 }
 __NO_UNUSED_FUNCTION_END
 

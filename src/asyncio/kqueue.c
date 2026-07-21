@@ -199,7 +199,9 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
       // UINT32_MAX = wait with no timeout: an idle base blocks until queue
       // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
-      uint32_t sleepMs = timerLoopPrepareSleep(base, messageLoopThreadId, getMonotonicTicks(), 1000);
+      uint64_t sleepFrom = getMonotonicTicks();
+      uint32_t sleepMs = timerSleepShrinkElapsed(sleepFrom,
+        timerLoopPrepareSleep(base, messageLoopThreadId, sleepFrom, 1000));
       struct timespec timeout;
       timeout.tv_sec = sleepMs / 1000;
       timeout.tv_nsec = (long)(sleepMs % 1000) * 1000000;
