@@ -421,6 +421,12 @@ void iocpNextFinishedOperation(asyncBase *base)
                                  &remoteAddrLength);
             if (localAddr && remoteAddr) {
               sockaddrToHostAddress((struct sockaddr_storage*)remoteAddr, &op->info.host);
+              // AcceptEx counterpart of SO_UPDATE_CONNECT_CONTEXT below: without
+              // it shutdown/getsockname/getpeername stay broken. On failure the
+              // release path closes the accepted socket
+              if (setsockopt(op->info.acceptSocket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                             (const char*)&object->hSocket, sizeof(object->hSocket)) == SOCKET_ERROR)
+                result = aosUnknownError;
             } else {
               result = aosUnknownError;
             }
@@ -721,11 +727,16 @@ AsyncOpStatus iocpAsyncAccept(asyncOpRoot *opptr)
 
   struct sockaddr_storage listenAddr;
   int listenAddrLen = sizeof(listenAddr);
-  getsockname(object->hSocket, (struct sockaddr*)&listenAddr, &listenAddrLen);
+  if (getsockname(object->hSocket, (struct sockaddr*)&listenAddr, &listenAddrLen) == SOCKET_ERROR)
+    return aosUnknownError;
 
   u_long arg = 1;
   op->info.acceptSocket = WSASocket(listenAddr.ss_family, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-  ioctlsocket(op->info.acceptSocket, FIONBIO, &arg);
+  if (op->info.acceptSocket == INVALID_SOCKET)
+    return aosUnknownError;
+  // Failure past this point leaves the socket in the op; the release path closes it
+  if (ioctlsocket(op->info.acceptSocket, FIONBIO, &arg) == SOCKET_ERROR)
+    return aosUnknownError;
 
   memset(&op->overlapped, 0, sizeof(op->overlapped));
   int result = AcceptEx(object->hSocket, op->info.acceptSocket, op->info.internalBuffer, 0, addrSize, addrSize, NULL, &op->overlapped);
@@ -765,7 +776,7 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
         return aosUnknownError;
     } else {
       wsabuf.buf = sb->ptr;
-      wsabuf.len = (ULONG)sb->totalSize;
+      wsabuf.len = wsaChunkSize(sb->totalSize);
       int result = WSARecv(object->hSocket, &wsabuf, 1, NULL, &flags, &op->overlapped, NULL);
       if (result == 0 || WSAGetLastError() == WSA_IO_PENDING)
         return aosPending;
@@ -774,7 +785,7 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
     }
   } else {
     wsabuf.buf = (CHAR*)op->info.buffer + op->info.bytesTransferred;
-    wsabuf.len = (ULONG)(op->info.transactionSize - op->info.bytesTransferred);
+    wsabuf.len = wsaChunkSize(op->info.transactionSize - op->info.bytesTransferred);
     memset(&op->overlapped, 0, sizeof(op->overlapped));
     if (object->root.header.objectType == ioObjectDevice) {
       // TODO: check totalSize > 4Gb
@@ -802,7 +813,6 @@ AsyncOpStatus iocpAsyncWrite(asyncOpRoot *opptr)
   WSABUF wsabuf;
   iocpOp *op = (iocpOp*)opptr;
   aioObject *object = getObject(op);
-  // TODO: correct processing >4Gb data blocks
   memset(&op->overlapped, 0, sizeof(op->overlapped));
   if (object->root.header.objectType == ioObjectDevice) {
     // TODO: check totalSize > 4Gb
@@ -817,7 +827,7 @@ AsyncOpStatus iocpAsyncWrite(asyncOpRoot *opptr)
       return aosUnknownError;
   } else {
     wsabuf.buf = (CHAR*)op->info.buffer + op->info.bytesTransferred;
-    wsabuf.len = (ULONG)(op->info.transactionSize - op->info.bytesTransferred);
+    wsabuf.len = wsaChunkSize(op->info.transactionSize - op->info.bytesTransferred);
     int result = WSASend(object->hSocket, &wsabuf, 1, NULL, 0, &op->overlapped, NULL);
     if (result == 0 || WSAGetLastError() == WSA_IO_PENDING)
       return aosPending;

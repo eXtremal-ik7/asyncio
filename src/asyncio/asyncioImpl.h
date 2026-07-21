@@ -334,14 +334,17 @@ void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe);
 // is momentarily empty or full: the operation stays pending and is retried on
 // the next readiness event. EPIPE (peer gone, broken pipe) and ENOTCONN (the
 // socket was never connected) both normalize to aosNotConnected, so callers can
-// tell an absent/lost connection from an opaque failure; every other errno
-// collapses to aosUnknownError (errno is not otherwise surfaced by the API).
+// tell an absent/lost connection from an opaque failure; ECONNRESET (TCP RST)
+// is aosDisconnected, matching the kqueue EV_EOF and iocp WSAECONNRESET paths;
+// every other errno collapses to aosUnknownError (errno is not otherwise
+// surfaced by the API).
 static inline AsyncOpStatus socketStatusFromErrno(int error)
 {
   switch (error) {
     case EAGAIN: return aosPending;
     case EPIPE:
     case ENOTCONN: return aosNotConnected;
+    case ECONNRESET: return aosDisconnected;
     default: return aosUnknownError;
   }
 }

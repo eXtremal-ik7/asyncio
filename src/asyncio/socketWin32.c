@@ -48,9 +48,8 @@ int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, siz
   DWORD bytesNum = 0;
   WSABUF wsabuf;
   if (!waitAll) {
-    // TODO: correct processing >4Gb data blocks
     wsabuf.buf = buffer;
-    wsabuf.len = (ULONG)size;
+    wsabuf.len = wsaChunkSize(size);
     DWORD flags = 0;
     if (WSARecv(hSocket, &wsabuf, 1, &bytesNum, &flags, 0, 0) == 0 && bytesNum != 0) {
       *bytesTransferred = bytesNum;
@@ -65,9 +64,9 @@ int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, siz
       flags = 0;
       transferred += (size_t)bytesNum;
       wsabuf.buf = (uint8_t*)buffer + transferred;
-      // TODO: correct processing >4Gb data blocks
-      wsabuf.len = (ULONG)(size - transferred);
-    } while (transferred != size && WSARecv(hSocket, &wsabuf, 1, &bytesNum, &flags, 0, 0) == 0);
+      wsabuf.len = wsaChunkSize(size - transferred);
+      // Zero-byte success = orderly EOF, not progress: unguarded, the loop spins hot
+    } while (transferred != size && WSARecv(hSocket, &wsabuf, 1, &bytesNum, &flags, 0, 0) == 0 && bytesNum != 0);
     *bytesTransferred = transferred;
     return transferred == size;
   }
@@ -78,9 +77,8 @@ int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitA
   DWORD bytesNum = 0;
   WSABUF wsabuf;
   if (!waitAll) {
-    // TODO: correct processing >4Gb data blocks
     wsabuf.buf = (char*)buffer;
-    wsabuf.len = (ULONG)size;
+    wsabuf.len = wsaChunkSize(size);
     if (WSASend(hSocket, &wsabuf, 1, &bytesNum, 0, 0, 0) == 0 && bytesNum != 0) {
       *bytesTransferred = bytesNum;
       return 1;
@@ -93,9 +91,9 @@ int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitA
     do {
       transferred += (size_t)bytesNum;
       wsabuf.buf = (uint8_t*)buffer + transferred;
-      // TODO: correct processing >4Gb data blocks
-      wsabuf.len = (ULONG)(size - transferred);
-    } while (transferred != size && WSASend(hSocket, &wsabuf, 1, &bytesNum, 0, 0, 0) == 0);
+      wsabuf.len = wsaChunkSize(size - transferred);
+      // Same guard as the read loop: a zero-byte success must not spin
+    } while (transferred != size && WSASend(hSocket, &wsabuf, 1, &bytesNum, 0, 0, 0) == 0 && bytesNum != 0);
     *bytesTransferred = transferred;
     return transferred == size;
   }

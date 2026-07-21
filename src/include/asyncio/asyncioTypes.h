@@ -12,9 +12,16 @@
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <windows.h>
+#include <limits.h>
 typedef HANDLE iodevTy;
 typedef SOCKET socketTy;
 typedef int socketLenTy;
+// Winsock buffer lengths are ULONG: clamp each chunk so a >4Gb remainder
+// never truncates to len == 0 (a phantom EOF/empty transfer)
+static inline ULONG wsaChunkSize(size_t remaining)
+{
+  return remaining > ULONG_MAX ? ULONG_MAX : (ULONG)remaining;
+}
 #if defined(_MSC_VER)
 #include <BaseTsd.h>
 typedef SSIZE_T ssize_t;

@@ -111,6 +111,17 @@ static void releaseOp(asyncOpRoot *opptr)
   }
 }
 
+static void releaseAcceptOp(asyncOpRoot *opptr)
+{
+  asyncOp *op = (asyncOp*)opptr;
+  // Failed aioAccept may still own a created fd/socket; close it here.
+  if (op->acceptSocket != INVALID_SOCKET && opGetStatus(opptr) != aosSuccess) {
+    socketClose(op->acceptSocket);
+    op->acceptSocket = INVALID_SOCKET;
+  }
+  releaseOp(opptr);
+}
+
 static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
                                AsyncFlags flags,
                                uint64_t usTimeout,
@@ -126,7 +137,7 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
                   context->StartProc,
                   base->methodImpl.cancelAsyncOp,
                   context->FinishProc,
-                  releaseOp,
+                  opCode == actAccept ? releaseAcceptOp : releaseOp,
                   object,
                   callback,
                   arg,
