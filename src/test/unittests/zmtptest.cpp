@@ -1,5 +1,6 @@
 #include "unittest.h"
 #include <asyncio/coroutine.h>
+#include <asyncio/socket.h>
 #include <asyncioextras/zmtp.h>
 #include <zmq.h>
 #include <atomic>
@@ -1080,6 +1081,8 @@ struct zmtpPipelineContext {
   zmtpSocket *serverSocket;
   zmtpStream stream;
   reqStruct serverReq;
+  socketTy rawServerFd;
+  std::thread rawSender;
   AsyncOpStatus connectStatus;
   AsyncOpStatus acceptStatus;
   AsyncOpStatus sendStatus;
@@ -1087,6 +1090,7 @@ struct zmtpPipelineContext {
   int pending;
   zmtpPipelineContext(asyncBase *baseArg) :
     base(baseArg), listener(nullptr), clientSocket(nullptr), serverSocket(nullptr),
+    rawServerFd(0),
     connectStatus(aosUnknown), acceptStatus(aosUnknown),
     sendStatus(aosUnknown), recvStatus(aosUnknown), pending(0) {}
   void completed() {
@@ -1246,6 +1250,360 @@ TEST(zmtp, send_pipelined_with_accept)
   zmtpSocketDelete(ctx.clientSocket);
   if (ctx.serverSocket)
     zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+static void capture_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
+    aioZmtpAccept(ctx->serverSocket, afNone, 3000000, send_pipeline_zmtpacceptcb, ctx);
+    // queued behind the accept from a scoped buffer: without afNoCopy the
+    // payload must be captured before the call returns
+    reqStruct req;
+    req.a = 11;
+    req.b = 77;
+    aioZmtpSend(ctx->serverSocket, &req, sizeof(req), zmtpMessage, afNone, 3000000, pipeline_sendcb, ctx);
+    memset(&req, 0xAA, sizeof(req));
+  } else {
+    ctx->pending -= 2;  // neither accept nor send will be submitted
+    ctx->completed();
+  }
+}
+
+TEST(zmtp, queued_send_captures_payload)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 4;  // connect, recv, accept, send
+  ctx.listener = startTCPServer(gBase, capture_pipeline_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, send_pipeline_connectcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.acceptStatus, aosSuccess);
+  EXPECT_EQ(ctx.sendStatus, aosSuccess);
+  EXPECT_EQ(ctx.recvStatus, aosSuccess);
+  if (ctx.recvStatus == aosSuccess) {
+    ASSERT_EQ(ctx.stream.sizeOf(), sizeof(reqStruct));
+    reqStruct *req = ctx.stream.data<reqStruct>();
+    EXPECT_EQ(req->a, 11u);
+    EXPECT_EQ(req->b, 77u);
+  }
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.serverSocket)
+    zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+// After its handshake the server writes one frame to the raw fd in two
+// chunks split inside the 2-byte short header: the length byte arrives a
+// pause later than the flags byte, so the receiver must wait for it instead
+// of decoding a stale one.
+static void split_header_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->acceptStatus = status;
+  if (status == aosSuccess) {
+    ctx->rawSender = std::thread([ctx]() {
+      uint8_t frame[2 + sizeof(reqStruct)];
+      reqStruct req;
+      req.a = 11;
+      req.b = 77;
+      frame[0] = 0;
+      frame[1] = sizeof(req);
+      memcpy(frame + 2, &req, sizeof(req));
+      send(ctx->rawServerFd, reinterpret_cast<const char*>(frame), 1, 0);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      send(ctx->rawServerFd, reinterpret_cast<const char*>(frame) + 1, sizeof(frame) - 1, 0);
+    });
+  }
+  ctx->completed();
+}
+
+static void split_header_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->rawServerFd = acceptSocket;
+    ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
+    aioZmtpAccept(ctx->serverSocket, afNone, 3000000, split_header_zmtpacceptcb, ctx);
+  } else {
+    ctx->pending -= 1;  // the accept that will never be submitted
+    ctx->completed();
+  }
+}
+
+TEST(zmtp, recv_split_frame_header)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 3;  // connect, recv, accept
+  ctx.listener = startTCPServer(gBase, split_header_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, send_pipeline_connectcb, &ctx);
+
+  asyncLoop(gBase);
+  if (ctx.rawSender.joinable())
+    ctx.rawSender.join();
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.acceptStatus, aosSuccess);
+  EXPECT_EQ(ctx.recvStatus, aosSuccess);
+  if (ctx.recvStatus == aosSuccess) {
+    ASSERT_EQ(ctx.stream.sizeOf(), sizeof(reqStruct));
+    reqStruct *req = ctx.stream.data<reqStruct>();
+    EXPECT_EQ(req->a, 11u);
+    EXPECT_EQ(req->b, 77u);
+  }
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.serverSocket)
+    zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+// 6+6 multipart via the raw fd: each frame alone fits the receive limit of 8,
+// the accumulated message must not
+static void multipart_limit_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->acceptStatus = status;
+  if (status == aosSuccess) {
+    uint8_t frames[16];
+    frames[0] = 1;  // MORE
+    frames[1] = 6;
+    memset(frames + 2, 'A', 6);
+    frames[8] = 0;  // final
+    frames[9] = 6;
+    memset(frames + 10, 'B', 6);
+    send(ctx->rawServerFd, reinterpret_cast<const char*>(frames), sizeof(frames), 0);
+  }
+  ctx->completed();
+}
+
+static void multipart_limit_connectcb(AsyncOpStatus status, zmtpSocket *socket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->connectStatus = status;
+  if (status == aosSuccess) {
+    aioZmtpRecv(socket, ctx->stream, 8, afNone, 3000000, pipeline_recvcb, ctx);
+  } else {
+    ctx->completed();  // the recv that will never be submitted
+  }
+  ctx->completed();
+}
+
+static void multipart_limit_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->rawServerFd = acceptSocket;
+    ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
+    aioZmtpAccept(ctx->serverSocket, afNone, 3000000, multipart_limit_zmtpacceptcb, ctx);
+  } else {
+    ctx->pending -= 1;  // the accept that will never be submitted
+    ctx->completed();
+  }
+}
+
+TEST(zmtp, recv_limit_caps_whole_message)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 3;  // connect, recv, accept
+  ctx.listener = startTCPServer(gBase, multipart_limit_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, multipart_limit_connectcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.acceptStatus, aosSuccess);
+  EXPECT_EQ(ctx.recvStatus, aosBufferTooSmall);
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.serverSocket)
+    zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+// ZMTP 3.0 mandates peer socket-type validation: PUSH pairs only with PULL,
+// so a PUSH client must be rejected by a PUSH server on the accept side
+static void incompat_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->acceptStatus = status;
+  ctx->completed();
+}
+
+static void incompat_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
+    aioZmtpAccept(ctx->serverSocket, afNone, 300000, incompat_zmtpacceptcb, ctx);
+  } else {
+    ctx->pending -= 1;  // the accept that will never be submitted
+    ctx->completed();
+  }
+}
+
+static void incompat_connectcb(AsyncOpStatus status, zmtpSocket*, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  ctx->connectStatus = status;
+  ctx->completed();
+}
+
+TEST(zmtp, accept_rejects_incompatible_peer)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 2;  // connect, accept
+  ctx.listener = startTCPServer(gBase, incompat_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 300000, incompat_connectcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.acceptStatus, aosUnknownError);
+  EXPECT_NE(ctx.connectStatus, aosSuccess);
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.serverSocket)
+    zmtpSocketDelete(ctx.serverSocket);
+  deleteAioObject(ctx.listener);
+}
+
+// Scripted greeting plus READY(PUSH) written to the raw fd in one shot: the
+// connect side itself must parse the READY and reject the incompatible peer
+static void scripted_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->rawServerFd = acceptSocket;
+    static const uint8_t script[] = {
+      0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F,                                    // signature
+      3,                                                                     // major
+      0,                                                                     // minor
+      'N', 'U', 'L', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // mechanism
+      0,                                                                     // as-server
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                       // filler
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0x04, 0x1A,                                                            // command frame
+      5, 'R', 'E', 'A', 'D', 'Y',
+      11, 'S', 'o', 'c', 'k', 'e', 't', '-', 'T', 'y', 'p', 'e',
+      0, 0, 0, 4, 'P', 'U', 'S', 'H'
+    };
+    static_assert(sizeof(script) == 10 + 1 + 53 + 2 + 26, "greeting+READY layout");
+    send(acceptSocket, reinterpret_cast<const char*>(script), sizeof(script), 0);
+  }
+  ctx->completed();
+}
+
+// The same scripted handshake, but the READY payload sits in a plain data
+// frame (no COMMAND flag) with a compatible Socket-Type: the connect side
+// must reject it by the frame type alone
+static void data_frame_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
+{
+  auto ctx = static_cast<zmtpPipelineContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status == aosSuccess) {
+    ctx->rawServerFd = acceptSocket;
+    static const uint8_t script[] = {
+      0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F,                                    // signature
+      3,                                                                     // major
+      0,                                                                     // minor
+      'N', 'U', 'L', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // mechanism
+      0,                                                                     // as-server
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                       // filler
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0x00, 0x1A,                                                            // data frame
+      5, 'R', 'E', 'A', 'D', 'Y',
+      11, 'S', 'o', 'c', 'k', 'e', 't', '-', 'T', 'y', 'p', 'e',
+      0, 0, 0, 4, 'P', 'U', 'L', 'L'
+    };
+    static_assert(sizeof(script) == 10 + 1 + 53 + 2 + 26, "greeting+READY layout");
+    send(acceptSocket, reinterpret_cast<const char*>(script), sizeof(script), 0);
+  }
+  ctx->completed();
+}
+
+TEST(zmtp, connect_rejects_ready_without_command_flag)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 2;  // connect, raw accept
+  ctx.listener = startTCPServer(gBase, data_frame_ready_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, incompat_connectcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosUnknownError);
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.rawServerFd)
+    socketClose(ctx.rawServerFd);
+  deleteAioObject(ctx.listener);
+}
+
+TEST(zmtp, connect_rejects_incompatible_ready)
+{
+  zmtpPipelineContext ctx(gBase);
+  ctx.pending = 2;  // connect, raw accept
+  ctx.listener = startTCPServer(gBase, scripted_ready_tcpacceptcb, &ctx, gPort);
+  ASSERT_NE(ctx.listener, nullptr);
+  ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, incompat_connectcb, &ctx);
+
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.connectStatus, aosUnknownError);
+
+  zmtpSocketDelete(ctx.clientSocket);
+  if (ctx.rawServerFd)
+    socketClose(ctx.rawServerFd);
   deleteAioObject(ctx.listener);
 }
 

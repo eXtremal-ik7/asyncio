@@ -38,7 +38,7 @@ if (ASYNCIO_ENABLE_SSL)
 endif()
 
 if (ASYNCIO_ENABLE_ZMTP)
-  set(SOURCES ${SOURCES} zmtptest.cpp)
+  set(SOURCES ${SOURCES} zmtptest.cpp zmtpprototest.cpp)
   set(LIBRARIES ${LIBRARIES} ZeroMQ::libzmq-static)
   if (WIN32)
     set(LIBRARIES ${LIBRARIES} iphlpapi)

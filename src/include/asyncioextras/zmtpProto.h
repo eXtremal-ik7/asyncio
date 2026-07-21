@@ -8,8 +8,25 @@ private:
   static int rawDataCmp(RawData data, const void *m, size_t msize) {
     return data.size == msize && memcmp(data.data, m, msize) == 0;
   }
+
+  static uint8_t asciiLower(uint8_t c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<uint8_t>(c + 32) : c;
+  }
+
+  // metadata property names are case-insensitive (ZMTP 3.0), command names
+  // are not
+  static int metadataKeyCmp(RawData key, const char *m, size_t msize) {
+    if (key.size != msize)
+      return 0;
+    for (size_t i = 0; i < msize; i++) {
+      if (asciiLower(key.data[i]) != asciiLower(static_cast<uint8_t>(m[i])))
+        return 0;
+    }
+    return 1;
+  }
   
   bool readKeyValue(RawData *key, RawData *value) {
+    // TODO: validate metadata key length and characters.
     key->size = read<uint8_t>();
     if ( !(key->data = seek(key->size)) )
       return false;
@@ -66,13 +83,14 @@ public:
       if (!cmdData.readKeyValue(&key, &value))
         return false;
       
-      if (rawDataCmp(key, sSocketType, sizeof(sSocketType)-1))
+      if (metadataKeyCmp(key, sSocketType, sizeof(sSocketType)-1))
         *socketType = value;
-      if (rawDataCmp(key, sIdentity, sizeof(sIdentity) - 1))
+      if (metadataKeyCmp(key, sIdentity, sizeof(sIdentity) - 1))
         *identity = value;
     }
     
-    return (socketType != nullptr);
+    // Socket-Type is the mandatory READY property
+    return socketType->data != nullptr;
   }
   
   void writeReadyCmd(const char *socketType, const char *identity) {

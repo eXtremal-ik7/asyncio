@@ -148,26 +148,31 @@ public:
       memcpy(data, p, size);
   }
   
+  // the cursor moves by arbitrary byte offsets, so scalar accesses go through
+  // fixed-size memcpy: compiles to the same single unaligned load/store, but
+  // without the alignment UB of dereferencing a misaligned T*
   template<typename T> T read() {
     T *p = seek<T>(1);
-    return p ? *p : T();
+    T value;
+    if (!p)
+      return T();
+    memcpy(&value, p, sizeof(T));
+    return value;
   }
-  
+
   template<typename T> T readle() {
-    T *p = seek<T>(1);
-    return p ? xletoh<T>(*p) : T();
+    return xletoh<T>(read<T>());
   }
 
   template<typename T> T readbe() {
-    T *p = seek<T>(1);
-    return p ? xbetoh<T>(*p) : T();
+    return xbetoh<T>(read<T>());
   }
-  
+
   // write functions
   void write(const void *data, size_t size) { memcpy(reserve(size), data, size); }
-  template<typename T> void write(const T& data) { *reserve<T>(1) = data; }
-  template<typename T> void writele(T data) { *reserve<T>(1) = xhtole(data); }
-  template<typename T> void writebe(T data) { *reserve<T>(1) = xhtobe(data); }
+  template<typename T> void write(const T& data) { memcpy(reserve<T>(1), &data, sizeof(T)); }
+  template<typename T> void writele(T data) { T value = xhtole(data); memcpy(reserve<T>(1), &value, sizeof(T)); }
+  template<typename T> void writebe(T data) { T value = xhtobe(data); memcpy(reserve<T>(1), &value, sizeof(T)); }
 
   void write(const char *data) {
     write(data, strlen(data));
