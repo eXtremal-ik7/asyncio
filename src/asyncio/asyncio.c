@@ -200,20 +200,22 @@ aioObjectRoot *aioObjectHandle(aioObject *object)
   return &object->root;
 }
 
-void initializeAsyncIo(AsyncInitFlags flags)
+int initializeAsyncIo(AsyncInitFlags flags)
 {
 #ifdef OS_WINDOWS
   (void)flags;
   WSADATA wsadata;
-  WSAStartup(MAKEWORD(2, 2), &wsadata);
+  return WSAStartup(MAKEWORD(2, 2), &wsadata);
 #else
   if (flags & aiIgnoreSigpipe) {
     struct sigaction ignoreAction;
     memset(&ignoreAction, 0, sizeof(ignoreAction));
     ignoreAction.sa_handler = SIG_IGN;
-    sigaction(SIGPIPE, &ignoreAction, 0);
+    if (sigaction(SIGPIPE, &ignoreAction, 0) == -1)
+      return -1;
     sigpipeIgnored = 1;
   }
+  return 0;
 #endif
 }
 

@@ -17,8 +17,9 @@ iodevTy aioObjectDevice(aioObject *object);
 aioObjectRoot *aioObjectHandle(aioObject *object);
 
 // Library-wide one-time initialization; must be called before any other API.
-// Replaces initializeSocketSubsystem().
-void initializeAsyncIo(AsyncInitFlags flags);
+// Returns 0 on success and a platform error code on failure. Replaces
+// initializeSocketSubsystem().
+int initializeAsyncIo(AsyncInitFlags flags);
 
 // loopThreads is the maximum number of threads that will run asyncLoop() on
 // this base concurrently (0 is treated as 1). It sizes the timer-wakeup slot

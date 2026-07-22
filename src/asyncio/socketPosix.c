@@ -13,11 +13,17 @@ socketTy socketCreate(int af, int type, int protocol, int isAsync)
   int hSocket = socket(af, isAsync ? type | SOCK_NONBLOCK : type, protocol);
 #else
   int hSocket = socket(af, type, protocol);
-  if (isAsync) {
+  if (hSocket != INVALID_SOCKET && isAsync) {
     int current = fcntl(hSocket, F_GETFL);
-    fcntl(hSocket, F_SETFL, O_NONBLOCK | current);
+    if (current == -1 || fcntl(hSocket, F_SETFL, O_NONBLOCK | current) == -1) {
+      close(hSocket);
+      return INVALID_SOCKET;
+    }
   }
 #endif
+
+  if (hSocket == INVALID_SOCKET)
+    return INVALID_SOCKET;
 
   int optval = 1;
   if (type == SOCK_STREAM)

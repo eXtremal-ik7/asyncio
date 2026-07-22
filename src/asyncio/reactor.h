@@ -168,9 +168,10 @@ static inline AsyncOpStatus connectSyscall(asyncOpRoot *opptr)
     else
       return aosPending;
   } else {
-    int error;
+    int error = 0;
     socklen_t size = sizeof(error);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == -1)
+      return aosUnknownError;
     return (error == 0) ? aosSuccess : aosUnknownError;
   }
 }
@@ -190,7 +191,11 @@ static inline AsyncOpStatus acceptSyscall(asyncOpRoot *opptr)
   if (op->acceptSocket != -1) {
 #ifndef SOCK_NONBLOCK
     int current = fcntl(op->acceptSocket, F_GETFL);
-    fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current);
+    if (current == -1 || fcntl(op->acceptSocket, F_SETFL, O_NONBLOCK | current) == -1) {
+      close(op->acceptSocket);
+      op->acceptSocket = INVALID_SOCKET;
+      return aosUnknownError;
+    }
 #endif
     sockaddrToHostAddress(&clientAddr, &op->host);
     return aosSuccess;

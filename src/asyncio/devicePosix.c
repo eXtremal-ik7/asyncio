@@ -166,17 +166,29 @@ void serialPortFlush(iodevTy port)
 int pipeCreate(struct pipeTy *pipePtr, int isAsync)
 {
   int fd[2];
+  pipePtr->read = INVALID_DEVICE;
+  pipePtr->write = INVALID_DEVICE;
   int result = pipe(fd);
-  pipePtr->read = fd[0];
-  pipePtr->write = fd[1];
-  if (result == 0 && isAsync) {
+  if (result != 0)
+    return result;
+
+  if (isAsync) {
     int rstate = fcntl(fd[0], F_GETFL);
     int wstate = fcntl(fd[1], F_GETFL);
-    fcntl(fd[0], F_SETFL, O_NONBLOCK | rstate);
-    fcntl(fd[1], F_SETFL, O_NONBLOCK | wstate);
+    if (rstate == -1 || wstate == -1 ||
+        fcntl(fd[0], F_SETFL, O_NONBLOCK | rstate) == -1 ||
+        fcntl(fd[1], F_SETFL, O_NONBLOCK | wstate) == -1) {
+      int error = errno;
+      close(fd[0]);
+      close(fd[1]);
+      errno = error;
+      return -1;
+    }
   }
 
-  return result;
+  pipePtr->read = fd[0];
+  pipePtr->write = fd[1];
+  return 0;
 }
 
 void pipeClose(struct pipeTy pipePtr)
