@@ -43,6 +43,15 @@ static const AsyncFlags afSyncStarted = afNone;
 static const AsyncFlags afSyncStarted = afRunning;
 #endif
 
+static void threadYield(void)
+{
+#ifdef OS_WINDOWS
+  SwitchToThread();
+#else
+  sched_yield();
+#endif
+}
+
 struct Context {
   aioExecuteProc *StartProc;
   aioFinishProc *FinishProc;
@@ -560,24 +569,25 @@ void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t ev
 
 static void eventCoroutineResume(aioUserEvent *event, uintptr_t count, int manual, uint32_t generation)
 {
-  uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
+  uint128 expected = __uint128_atomic_load_relaxed(&event->waiter);
   for (;;) {
-    int kind = (int)(expected & ewtMask);
+    int kind = (int)(expected.low & ewtMask);
     if (kind == ewtDeleted)
       return;
     // A manual wake publishes cancellation before competing for an ioSleep
-    // waiter. A timer validates after loading waiter, so a failed CAS observes
-    // the winner before it can turn an old tick into a later credit.
+    // waiter. A timer validates after loading waiter: any interleaved
+    // transition bumps the sequence and fails the CAS, so an old tick can
+    // steal neither a later credit nor a reinstalled identical sleeper.
     if (manual && kind == ewtSleep)
       eventTimerPublishConfig(event, 0, 0, 0, 0);
     else if (generation && eventTimerGeneration(event) != generation)
       return;
-    uintptr_t desired = kind ? (count - 1) * ewtCreditUnit : expected + count * ewtCreditUnit;
-    if (!__uintptr_atomic_compare_exchange(&event->waiter, &expected, desired, amoAcquire))
+    uint128 desired = {kind ? (count - 1) * ewtCreditUnit : expected.low + count * ewtCreditUnit, expected.high + 1};
+    if (!__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired))
       continue;
     if (!kind)
       return;
-    coroutineTy *coroutine = (coroutineTy*)(expected & ~(uintptr_t)ewtMask);
+    coroutineTy *coroutine = (coroutineTy*)(uintptr_t)(expected.low & ~(uint64_t)ewtMask);
     assert(coroutineIsMain() && "User-event coroutine delivery must run in the main coroutine");
     coroutineCall(coroutine);
     return;
@@ -586,15 +596,16 @@ static void eventCoroutineResume(aioUserEvent *event, uintptr_t count, int manua
 
 static void eventCoroutineCancel(aioUserEvent *event)
 {
-  uintptr_t old = __uintptr_atomic_load(&event->waiter, amoRelaxed);
+  uint128 old = __uint128_atomic_load_relaxed(&event->waiter);
   for (;;) {
-    unsigned kind = (unsigned)(old & ewtMask);
+    unsigned kind = (unsigned)(old.low & ewtMask);
     if (kind == ewtDeleted)
       return;
-    if (__uintptr_atomic_compare_exchange(&event->waiter, &old, ewtDeleted, amoAcquire)) {
+    uint128 desired = {ewtDeleted, old.high + 1};
+    if (__uint128_atomic_compare_and_swap(&event->waiter, &old, desired)) {
       if (kind == ewtUser || kind == ewtSleep) {
         assert(coroutineIsMain() && "User-event coroutine cancellation must run in the main coroutine");
-        coroutineCall((coroutineTy*)(old & ~(uintptr_t)ewtMask));
+        coroutineCall((coroutineTy*)(uintptr_t)(old.low & ~(uint64_t)ewtMask));
       }
       return;
     }
@@ -603,15 +614,17 @@ static void eventCoroutineCancel(aioUserEvent *event)
 
 static int eventInstallWaiter(aioUserEvent *event, unsigned waiterKind)
 {
-  uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
-  if ((expected & ewtMask) == ewtDeleted)
-    return 0;
-  assert((expected & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");
-  if (expected == 0) {
-    uintptr_t coroutine = (uintptr_t)coroutineCurrent();
-    assert(coroutine && !(coroutine & ewtMask) && "Coroutine pointer is not sufficiently aligned");
-    uintptr_t desired = coroutine | waiterKind;
-    if (__uintptr_atomic_compare_exchange(&event->waiter, &expected, desired, amoRelease)) {
+  uint128 expected = __uint128_atomic_load_relaxed(&event->waiter);
+  for (;;) {
+    if ((expected.low & ewtMask) == ewtDeleted)
+      return 0;
+    assert((expected.low & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");
+    if (expected.low == 0) {
+      uintptr_t coroutine = (uintptr_t)coroutineCurrent();
+      assert(coroutine && !(coroutine & ewtMask) && "Coroutine pointer is not sufficiently aligned");
+      uint128 desired = {coroutine | waiterKind, expected.high + 1};
+      if (!__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired))
+        continue;
       // The second same-word RMW against Delete schedules cancellation.
       uint64_t oldTag = __uint64_atomic_fetch_and_add(&event->header.tag.low, TAG_EVENT_WAITER_COMMITTED, amoRelease);
       if (oldTag & TAG_EVENT_DELETE) {
@@ -620,12 +633,12 @@ static int eventInstallWaiter(aioUserEvent *event, unsigned waiterKind)
       }
       return 1;
     }
-    if ((expected & ewtMask) == ewtDeleted)
+    // Credits are consumed by CAS only: a concurrent delete may replace them
+    // with the terminal sentinel, which arithmetic would corrupt.
+    uint128 desired = {expected.low - ewtCreditUnit, expected.high + 1};
+    if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired))
       return 0;
   }
-
-  (void)__uintptr_atomic_fetch_and_add(&event->waiter, (uintptr_t)0 - ewtCreditUnit, amoAcquire);
-  return 0;
 }
 
 static void eventFinishWaiter(aioUserEvent *event)
@@ -685,9 +698,17 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
     state->armed = 0;
     state->period = 0;
   }
+  // The schedule generation survives reuse: reactors validate a stale
+  // envelope against the live tag.high and read the CURRENT incarnation from
+  // timer->event.generation, so restarting the numbering at 1 would let the
+  // previous incarnation's unprocessed readiness pass every gate. Only
+  // pending ticks, the finite counter and OWNER reset (a pooled cell's owner
+  // has always released: OWNER-clear is the resting state).
+  uint64_t scheduleGeneration = (uint32_t)__uint64_atomic_load(&event->timerControl.high, amoRelaxed);
   __uint64_atomic_store(&event->timerControl.low, 0, amoRelaxed);
-  __uint64_atomic_store(&event->timerControl.high, 0, amoRelaxed);
-  __uintptr_atomic_store(&event->waiter, 0, amoRelaxed);
+  __uint64_atomic_store(&event->timerControl.high, scheduleGeneration, amoRelaxed);
+  __uint64_atomic_store(&event->waiter.low, 0, amoRelaxed);
+  __uint64_atomic_store(&event->waiter.high, 0, amoRelaxed);
   __uintptr_atomic_store(&event->signalState, 0, amoRelaxed);
   event->destructorCb = 0;
   event->destructorCbArg = 0;
@@ -785,8 +806,16 @@ void userEventActivate(aioUserEvent *event)
 
   // The personal descriptor/completion is only a manual doorbell. Once one is
   // pending, signalState carries the exact count or the coalescing gate.
-  if (old == 0)
-    event->header.base->methodImpl.activate(event);
+  // The 0->nonzero edge owns the single doorbell: a swallowed post would
+  // wedge the gate forever, since later activations skip it. Retry transient
+  // kernel failures; teardown makes delivery moot.
+  if (old == 0) {
+    while (!event->header.base->methodImpl.activate(event)) {
+      if (eventReferenceIsDeleting(event))
+        return;
+      threadYield();
+    }
+  }
 }
 
 void deleteUserEvent(aioUserEvent *event)
@@ -1268,11 +1297,16 @@ void ioSleep(aioUserEvent *event, uint64_t usTimeout)
   if (eventReferenceIsDeleting(event))
     return;
 
-  uintptr_t expected = __uintptr_atomic_load(&event->waiter, amoRelaxed);
-  assert((expected & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");
-  if (expected) {
-    (void)__uintptr_atomic_fetch_and_add(&event->waiter, (uintptr_t)0 - ewtCreditUnit, amoAcquire);
-    return;
+  uint128 expected = __uint128_atomic_load_relaxed(&event->waiter);
+  while (expected.low) {
+    // Same CAS-only credit consume as eventInstallWaiter: a delete landing
+    // after the liveness check above must find its sentinel intact.
+    if ((expected.low & ewtMask) == ewtDeleted)
+      return;
+    assert((expected.low & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");
+    uint128 desired = {expected.low - ewtCreditUnit, expected.high + 1};
+    if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired))
+      return;
   }
 
   assert(usTimeout > 0 && "ioSleep timeout must be non-zero");

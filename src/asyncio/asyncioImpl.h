@@ -446,15 +446,18 @@ struct aioUserEvent {
   // gating lives in header.tag's DELETE bit, checked in the publish loop.
   volatile uint128 timerControl;
 
+  // Coroutine rendezvous pair. low: tags identify ordinary/ioSleep waiters,
+  // aligned nonzero values encode credits, zero is empty (coroutine pointers
+  // are at least four-byte aligned); lifetime while installed belongs to the
+  // helper's caller-owned strong reference. high: sequence bumped by every
+  // transition, so a reinstalled bit-identical waiter cannot satisfy a stale
+  // wake CAS (ABA). Every transition is a CAS - credit arithmetic included,
+  // as a blind fetch-add could corrupt a concurrently installed sentinel.
+  volatile uint128 waiter;
+
   // Null until the first timer start. POSIX keeps this kernel-visible timer
   // paired with the pooled event cell; IOCP clears it after closing the timer.
   aioTimer *volatile timer;
-
-  // One-word coroutine rendezvous. Tags identify ordinary/ioSleep waiters;
-  // aligned nonzero values encode credits and zero is empty. Coroutine
-  // pointers are at least four-byte aligned. Lifetime while installed belongs
-  // to the helper's caller-owned strong reference, not to this word.
-  volatile uintptr_t waiter;
 
   userEventDestructorCb *destructorCb;
   void *destructorCbArg;
@@ -462,6 +465,7 @@ struct aioUserEvent {
 
 typedef char aioUserEventMustFitTwoCacheLines[sizeof(struct aioUserEvent) <= 2 * CACHE_LINE_SIZE ? 1 : -1];
 typedef char aioUserEventTimerStateStartsOnSecondCacheLine[offsetof(struct aioUserEvent, timerControl) == CACHE_LINE_SIZE ? 1 : -1];
+typedef char aioUserEventWaiterIsDwcasAligned[offsetof(struct aioUserEvent, waiter) % 16 == 0 ? 1 : -1];
 
 static inline uint64_t eventHandleGeneration(aioUserEvent *event)
 {

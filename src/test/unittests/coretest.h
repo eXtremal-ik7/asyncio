@@ -87,6 +87,8 @@ struct TestBackend: asyncBase {
   unsigned consumeTimerCalls = 0;
   unsigned initializeTimerCalls = 0;
   unsigned wakeupCalls = 0;
+  unsigned activateCalls = 0;
+  unsigned activateFailures = 0;
   uintptr_t nextTimerTag = 1;
   uint32_t lastEventTimerGeneration = 0;
   uint64_t lastEventTimerPeriod = 0;
@@ -203,6 +205,13 @@ struct TestBackend: asyncBase {
   static int initializeUserEvent(aioUserEvent*) { return 1; }
 
   static int activateEvent(aioUserEvent *event) {
+    TestBackend &backend = from(event->header.base);
+    backend.activateCalls++;
+    // A rejected kernel post claims nothing: no envelope, no reference.
+    if (backend.activateFailures) {
+      backend.activateFailures--;
+      return 0;
+    }
     // Model a kernel readiness envelope that successfully claimed the live
     // generation. Its reference spans the queued record and delivery.
     eventIncrementReference(event, 1);

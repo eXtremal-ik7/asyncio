@@ -553,7 +553,15 @@ TEST(core_user_event, stale_timer_incarnation_cannot_claim_recycled_event)
 
   userEventStartTimer(second, 100, 1);
   uint32_t secondGeneration = backend.lastEventTimerGeneration;
-  EXPECT_EQ(secondGeneration, firstGeneration) << "schedule generations may restart because event incarnation is the ABA guard";
+  EXPECT_NE(secondGeneration, firstGeneration) << "schedule generations must continue across reuse: reactors read the CURRENT event incarnation from the paired timer, so the generation is the only stale-envelope guard";
+
+  // Model the real reactor path for a stale envelope of the previous
+  // incarnation's arm: the timer generation is the old one, but the event
+  // incarnation is re-read from the live paired timer, already overwritten
+  // by the new arm (epoll/kqueue load timer->event.generation).
+  eventTimerSignal(second, firstGeneration, secondIncarnation, 1);
+  backend.drainCompletions();
+  EXPECT_EQ(secondContext.finishes, 0u);
 
   // Model a stale kernel envelope whose generation happens to match the live
   // bucket but whose arm belonged to the previous logical event.
@@ -1774,7 +1782,7 @@ TEST(core_user_event, delete_cancellation_is_sticky_against_late_timer_delivery)
   tick.join();
 
   EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u);
-  EXPECT_EQ(__uintptr_atomic_load(&probe.event->waiter, amoRelaxed), (uintptr_t)ewtDeleted);
+  EXPECT_EQ(__uint64_atomic_load(&probe.event->waiter.low, amoRelaxed), (uint64_t)ewtDeleted);
   EXPECT_EQ(lifetime.destructors, 0u);
   eventDecrementReference(probe.event, 1);
   EXPECT_EQ(lifetime.destructors, 1u);
@@ -2127,11 +2135,49 @@ TEST(event, recycled_compact_event_reinitializes_protocol_fields)
   ASSERT_EQ(second, first);
   EXPECT_EQ(eventHandleGeneration(second) & REACTOR_HANDLE_GENERATION_MASK, (firstIncarnation & REACTOR_HANDLE_GENERATION_MASK) + 1);
   EXPECT_EQ(__uintptr_atomic_load(&second->signalState, amoRelaxed), 0u);
-  EXPECT_EQ(__uintptr_atomic_load(&second->waiter, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&second->waiter.low, amoRelaxed), 0u);
+  EXPECT_EQ(__uint64_atomic_load(&second->waiter.high, amoRelaxed), 0u);
   EXPECT_EQ(eventTimerLoad(second, amoRelaxed), nullptr);
   EXPECT_EQ(second->callback, reinterpret_cast<void*>(coreEventCallback));
   EXPECT_EQ(second->arg, &secondContext);
   deleteUserEvent(second);
+}
+
+TEST(event, manual_activation_survives_doorbell_failure)
+{
+  TestBackend backend;
+  EventContext context;
+  aioUserEvent *event = newUserEvent(&backend.base, 1, coreEventCallback, &context);
+  ASSERT_NE(event, nullptr);
+
+  // Transient kernel rejections of the 0->nonzero doorbell must be retried:
+  // the gate stays nonzero, so no later activation would re-ring it.
+  backend.activateFailures = 3;
+  userEventActivate(event);
+  EXPECT_EQ(backend.activateCalls, 4u);
+  backend.drainCompletions();
+  EXPECT_EQ(context.finishes, 1u);
+  deleteUserEvent(event);
+}
+
+TEST(event, iosleep_leaves_deleted_sentinel_intact)
+{
+  TestBackend backend;
+  aioUserEvent *event = newUserEvent(&backend.base, 0, nullptr, nullptr);
+  ASSERT_NE(event, nullptr);
+
+  // A delete can land between ioSleep's liveness check and its credit
+  // inspection; the consume must back off instead of doing arithmetic on the
+  // terminal sentinel.
+  __uint64_atomic_store(&event->waiter.low, ewtDeleted, amoRelaxed);
+  __uint64_atomic_store(&event->waiter.high, 7, amoRelaxed);
+  ioSleep(event, 1000);
+  EXPECT_EQ(__uint64_atomic_load(&event->waiter.low, amoRelaxed), (uint64_t)ewtDeleted);
+  EXPECT_EQ(__uint64_atomic_load(&event->waiter.high, amoRelaxed), 7u);
+
+  __uint64_atomic_store(&event->waiter.low, 0, amoRelaxed);
+  __uint64_atomic_store(&event->waiter.high, 0, amoRelaxed);
+  deleteUserEvent(event);
 }
 
 TEST(event, user_event_delivery_resets_sync_budget)
