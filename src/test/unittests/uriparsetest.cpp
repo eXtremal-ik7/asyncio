@@ -172,7 +172,7 @@ TEST(uriparse, test_scheme_and_dns_host)
   EXPECT_EQ(uri.schema, "http");
   EXPECT_EQ(uri.hostType, static_cast<int>(URI::HostTypeDNS));
   EXPECT_EQ(uri.domain, "example.com");
-  EXPECT_EQ(uri.port, 0);
+  EXPECT_EQ(uri.port, -1);
   EXPECT_TRUE(uri.userInfo.empty());
   EXPECT_TRUE(uri.path.empty());
   EXPECT_TRUE(uri.query.empty());
@@ -285,7 +285,7 @@ TEST(uriparse, test_dns_host_with_userinfo)
   EXPECT_EQ(uri.userInfo, "user");
   EXPECT_EQ(uri.hostType, static_cast<int>(URI::HostTypeDNS));
   EXPECT_EQ(uri.domain, "example.com");
-  EXPECT_EQ(uri.port, 0);
+  EXPECT_EQ(uri.port, -1);
 
   ASSERT_EQ(uriParse("http://user@example.com", &uri), 1);
   EXPECT_EQ(uri.userInfo, "user");
@@ -474,4 +474,101 @@ TEST(uriparse, test_hostport_must_reject)
   EXPECT_EQ(uriParseHostPort("http://example.com", &uri, 0), 0);
   EXPECT_EQ(uriParseHostPort("[::1", &uri, 0), 0);
   EXPECT_EQ(uriParseHostPort("[::1]x", &uri, 0), 0);
+}
+
+namespace {
+
+void expectUriFieldsEqual(const URI &expected, const URI &actual)
+{
+  EXPECT_EQ(actual.schema, expected.schema);
+  EXPECT_EQ(actual.userInfo, expected.userInfo);
+  ASSERT_EQ(actual.hostType, expected.hostType);
+  if (expected.hostType == URI::HostTypeIPv4) {
+    EXPECT_EQ(actual.ipv4, expected.ipv4);
+  } else if (expected.hostType == URI::HostTypeIPv6) {
+    for (int i = 0; i < 8; i++)
+      EXPECT_EQ(actual.ipv6[i], expected.ipv6[i]) << "group " << i;
+  } else if (expected.hostType == URI::HostTypeDNS) {
+    EXPECT_EQ(actual.domain, expected.domain);
+  }
+  EXPECT_EQ(actual.port, expected.port);
+  EXPECT_EQ(actual.path, expected.path);
+  EXPECT_EQ(actual.query, expected.query);
+  EXPECT_EQ(actual.fragment, expected.fragment);
+}
+
+// parse source, build, compare with the canonical form, then re-parse the
+// built string and require component-level equality with the first parse
+void expectRoundTrip(const char *source, const char *canonical)
+{
+  URI uri;
+  ASSERT_EQ(uriParse(source, &uri), 1) << source;
+
+  std::string built;
+  uri.build(built);
+  EXPECT_EQ(built, canonical) << source;
+
+  URI reparsed;
+  ASSERT_EQ(uriParse(built.c_str(), &reparsed), 1)
+    << source << " built as " << built;
+  expectUriFieldsEqual(uri, reparsed);
+}
+
+}
+
+// RFC 5952 canonical form: lowercase hex, no leading zeros, the longest run
+// of two or more zero groups compressed to "::", leftmost run on a tie
+TEST(uriparse, build_roundtrip_ipv6_hosts)
+{
+  expectRoundTrip("http://[::1]/", "http://[::1]/");
+  expectRoundTrip("http://[::]", "http://[::]");
+  expectRoundTrip("http://[fe80::]", "http://[fe80::]");
+  expectRoundTrip("http://[2001:db8::1]", "http://[2001:db8::1]");
+  expectRoundTrip("http://[2001:0db8:0001:0002:0003:0004:0005:0006]",
+                  "http://[2001:db8:1:2:3:4:5:6]");
+  expectRoundTrip("http://[::ffff:192.168.0.1]", "http://[::ffff:c0a8:1]");
+  expectRoundTrip("http://[1:0:2:3:4:5:6:7]", "http://[1:0:2:3:4:5:6:7]");
+  expectRoundTrip("http://[1:0:0:2:0:0:3:4]", "http://[1::2:0:0:3:4]");
+  expectRoundTrip("http://[1:0:0:2:0:0:0:3]", "http://[1:0:0:2::3]");
+  expectRoundTrip("http://[::1]:8080/", "http://[::1]:8080/");
+}
+
+TEST(uriparse, build_omits_absent_port)
+{
+  URI uri;
+  ASSERT_EQ(uriParse("http://example.com/", &uri), 1);
+  EXPECT_EQ(uri.port, -1);
+
+  expectRoundTrip("http://example.com/", "http://example.com/");
+  expectRoundTrip("http://example.com", "http://example.com");
+  expectRoundTrip("http://user@example.com/a/b?x=1#f",
+                  "http://user@example.com/a/b?x=1#f");
+}
+
+TEST(uriparse, build_keeps_explicit_port)
+{
+  expectRoundTrip("http://example.com:8080/x", "http://example.com:8080/x");
+  expectRoundTrip("http://example.com:0/", "http://example.com:0/");
+  expectRoundTrip("http://192.168.0.1:3357", "http://192.168.0.1:3357");
+}
+
+// high bytes must be encoded from their unsigned value: 0xD0 is "%D0", not
+// the sign-extended garbage "%40"
+TEST(uriparse, build_pct_encodes_high_bytes)
+{
+  expectRoundTrip("http://example.com/%D0%BF?q=%D0%96#%D1%8F",
+                  "http://example.com/%D0%BF?q=%D0%96#%D1%8F");
+  expectRoundTrip("http://us%D0%AFer@example.com/",
+                  "http://us%D0%AFer@example.com/");
+}
+
+TEST(uriparse, build_pct_encodes_embedded_nul)
+{
+  URI uri;
+  ASSERT_EQ(uriParse("http://us%00er@example.com/a%00b", &uri), 1);
+
+  std::string built;
+  uri.build(built);
+  EXPECT_EQ(built.find('\0'), std::string::npos);
+  EXPECT_EQ(built, "http://us%00er@example.com/a%00b");
 }

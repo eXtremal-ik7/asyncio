@@ -73,8 +73,8 @@ public:
     uint16_t ipv6[8];
   };
   
-  std::string domain;  
-  int port;
+  std::string domain;
+  int port;   // -1 = no explicit port; build() emits the port only when >= 0
   
   std::string path;
   std::string query;

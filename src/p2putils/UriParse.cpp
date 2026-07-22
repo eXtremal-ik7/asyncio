@@ -663,16 +663,18 @@ static void uriPctEncode(const char *ptr, size_t size, const char *extra, std::s
 {
   const char *p = ptr, *e = ptr+size;
   while (p < e) {
-    if (isUnreserved(*p) || isSubDelims(*p) || strchr(extra, *p)) {
+    // encode from the unsigned value: high bytes must not sign-extend, and
+    // NUL must not match the extra string terminator
+    if (*p && (isUnreserved(*p) || isSubDelims(*p) || strchr(extra, *p))) {
       out.push_back(*p);
     } else {
+      unsigned char c = static_cast<unsigned char>(*p);
       out.push_back('%');
-      out.push_back(encodeHex(*p >> 4));
-      out.push_back(encodeHex(*p & 0xF));
+      out.push_back(encodeHex(c >> 4));
+      out.push_back(encodeHex(c & 0xF));
     }
     p++;
   }
-  
 }
 
 static int stdCb(URIComponent *component, void *arg)
@@ -719,7 +721,7 @@ int uriParse(const char *uri, URI *data)
   data->schema.clear();
   data->userInfo.clear();
   data->hostType = URI::HostTypeNone;
-  data->port = 0;
+  data->port = -1;
   data->path.clear();
   data->query.clear();
   data->fragment.clear();
@@ -779,10 +781,46 @@ void URI::build(std::string &out)
       break;
     }
     case URI::HostTypeIPv6 : {
+      // RFC 5952: lowercase hex without leading zeros; the longest run of
+      // two or more zero groups becomes "::", the leftmost one on a tie
+      int zeroStart = -1;
+      int zeroSize = 1;
+      for (int i = 0; i < 8; i++) {
+        if (ipv6[i] != 0)
+          continue;
+        int j = i;
+        while (j < 8 && ipv6[j] == 0)
+          j++;
+        if (j - i > zeroSize) {
+          zeroStart = i;
+          zeroSize = j - i;
+        }
+        i = j - 1;
+      }
+
       out.push_back('[');
+      for (int i = 0; i < 8; ) {
+        if (i == zeroStart) {
+          out.push_back(':');
+          out.push_back(':');
+          i += zeroSize;
+          continue;
+        }
+
+        static const char digits[] = "0123456789abcdef";
+        int shift = 12;
+        while (shift && !((ipv6[i] >> shift) & 0xF))
+          shift -= 4;
+        for (; shift >= 0; shift -= 4)
+          out.push_back(digits[(ipv6[i] >> shift) & 0xF]);
+
+        i++;
+        if (i < 8 && i != zeroStart)
+          out.push_back(':');
+      }
       out.push_back(']');
       break;
-    }    
+    }
     
     case URI::HostTypeDNS : {
       uriPctEncode(domain.c_str(), domain.length(), "", out);
@@ -790,7 +828,7 @@ void URI::build(std::string &out)
     }
   }
   
-  if (port != -1) {
+  if (port >= 0) {
     char x1[16];
     xitoa(port, x1);
     out.push_back(':');
