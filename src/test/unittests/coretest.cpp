@@ -2,6 +2,7 @@
 #include "reactor.h"
 
 #include "asyncio/asyncio.h"
+#include "asyncio/dynamicBuffer.h"
 #include "asyncio/socket.h"
 
 #include <algorithm>
@@ -1814,5 +1815,36 @@ TEST(core_status, errno_maps_retry_and_broken_connection_distinctly)
 }
 #endif
 
+TEST(core_dynamic_buffer, zero_init_free_without_use)
+{
+  dynamicBuffer buffer;
+  dynamicBufferInit(&buffer, 0);
+  EXPECT_EQ(buffer.data, nullptr);
+  EXPECT_EQ(buffer.allocatedSize, 0u);
+  dynamicBufferFree(&buffer);
+}
+
+TEST(core_dynamic_buffer, zero_init_first_write_grows)
+{
+  dynamicBuffer buffer;
+  dynamicBufferInit(&buffer, 0);
+  const char payload[] = "lazy allocation";
+  dynamicBufferWrite(&buffer, payload, sizeof(payload));
+  ASSERT_NE(buffer.data, nullptr);
+  EXPECT_EQ(buffer.size, sizeof(payload));
+  EXPECT_EQ(memcmp(buffer.data, payload, sizeof(payload)), 0);
+  dynamicBufferFree(&buffer);
+}
+
+TEST(core_dynamic_buffer, zero_init_growth_converges_past_floor)
+{
+  dynamicBuffer buffer;
+  dynamicBufferInit(&buffer, 0);
+  void *ptr = dynamicBufferAlloc(&buffer, 1000);
+  ASSERT_NE(ptr, nullptr);
+  EXPECT_GE(buffer.allocatedSize, 1000u);
+  memset(ptr, 0xAB, 1000);
+  dynamicBufferFree(&buffer);
+}
 
 } // namespace

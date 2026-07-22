@@ -7,6 +7,7 @@ extern "C" {
 
 #include "asyncio/asyncioTypes.h"
 
+// Returns INVALID_DEVICE on failure.
 iodevTy serialPortOpen(const char *name);
 
 struct pipeTy {

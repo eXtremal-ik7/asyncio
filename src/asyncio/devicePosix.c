@@ -50,9 +50,7 @@ void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe)
 
 iodevTy serialPortOpen(const char *name)
 {
-  int port = open(name, O_RDWR | O_NOCTTY | O_NONBLOCK);
-  return port != -1 ?
-    port : 0;
+  return open(name, O_RDWR | O_NOCTTY | O_NONBLOCK);
 }
 
 void serialPortClose(iodevTy port)

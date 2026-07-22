@@ -1,15 +1,10 @@
 #include "asyncio/device.h"
-#include <stdlib.h>
+#include <stdio.h>
 
 iodevTy serialPortOpen(const char *name)
 {
-  HANDLE hFile =
-    CreateFile(name, GENERIC_READ|GENERIC_WRITE, 0, NULL,
-               OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-  if (hFile != INVALID_HANDLE_VALUE)
-    return hFile;
-  else
-    return 0;
+  return CreateFile(name, GENERIC_READ|GENERIC_WRITE, 0, NULL,
+                    OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 }
 
 void serialPortClose(iodevTy port)
@@ -89,16 +84,25 @@ void serialPortFlush(iodevTy port)
 
 int pipeCreate(struct pipeTy *pipePtr, int isAsync)
 {
-  char pipeName[] = "\\\\.\\pipe\\00000000000000000000000000000000";
+  // Overlapped-capable pipes must be named (anonymous pipes reject
+  // FILE_FLAG_OVERLAPPED). The name is pid + process-wide counter;
+  // FILE_FLAG_FIRST_PIPE_INSTANCE with a single instance turns any name
+  // collision into a clean failure feeding the retry loop, and the client
+  // CreateFile only ever reaches the instance created right above - a
+  // squatted name can deny service but never cross-connect the ends.
+  static volatile LONG pipeCounter;
+  char pipeName[64];
 
-  for (unsigned i = 0; i < 32; i++) {
-    for (unsigned i = 0; i < 32; i++)
-      pipeName[i+9] = 'a' + (rand() % ('z'-'a'));
+  for (unsigned attempt = 0; attempt < 32; attempt++) {
+    snprintf(pipeName, sizeof(pipeName), "\\\\.\\pipe\\asyncio-%08x-%08x",
+             (unsigned)GetCurrentProcessId(),
+             (unsigned)InterlockedIncrement(&pipeCounter));
 
     HANDLE hPipe = CreateNamedPipe(pipeName,
-                                   PIPE_ACCESS_DUPLEX | (isAsync ? FILE_FLAG_OVERLAPPED : 0),
+                                   PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                                     (isAsync ? FILE_FLAG_OVERLAPPED : 0),
                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
-                                   PIPE_UNLIMITED_INSTANCES,
+                                   1,
                                    4096,
                                    4096,
                                    0,
@@ -113,7 +117,7 @@ int pipeCreate(struct pipeTy *pipePtr, int isAsync)
                                0,
                                NULL,
                                OPEN_EXISTING,
-                               FILE_FLAG_OVERLAPPED,
+                               isAsync ? FILE_FLAG_OVERLAPPED : 0,
                                NULL);
 
     if (hPipe2 == INVALID_HANDLE_VALUE) {

@@ -303,11 +303,6 @@ static uint32_t eventTimerNextGeneration(uint32_t generation)
   return generation ? generation : 1;
 }
 
-static uint32_t eventTimerControlTickDelta(uint128 applied, uint128 current)
-{
-  return (uint32_t)(eventTimerControlCounter(current) - eventTimerControlCounter(applied));
-}
-
 static void eventTimerStop(aioUserEvent *event, aioTimer *timer)
 {
   if (!timer)
@@ -320,23 +315,42 @@ static void eventTimerStop(aioUserEvent *event, aioTimer *timer)
   state->armed = 0;
 }
 
-static aioTimer *eventTimerApplyConfig(aioUserEvent *event, aioTimer *timer, uint128 *applied, uint128 current)
+// One attempt at applying the CONFIG in *current: extract its parameters,
+// flip the word to ACTIVE with zero ticks, then arm the backend. Arming
+// strictly after the flip is the ordering that lets every observer decide
+// the word's variant by a generation compare alone (a tick of generation G
+// can only be produced by a timer armed for G, hence after ACTIVE(G)).
+// Returns nonzero on success; on failure a newer config landed, *current is
+// refreshed and the caller retries against it (this config dies unapplied).
+static int eventTimerApplyConfig(aioUserEvent *event, aioTimer **timer, uint128 *current)
 {
-  eventTimerStop(event, timer);
+  eventTimerStop(event, *timer);
 
-  *applied = current;
-  uint64_t period = eventTimerControlPeriod(current);
-  if (period && !(current.low & EVENT_TIMER_TERMINAL)) {
-    uint32_t remaining = eventTimerControlIsFinite(current) ? eventTimerControlCounter(current) : 0;
-    int armed = event->header.base->methodImpl.updateEventTimer(event, etuStart, eventTimerControlGeneration(current), period);
-    timer = eventTimerLoad(event, amoRelaxed);
-    if (timer) {
-      aioTimerUserEventState *state = eventTimerState(timer);
-      state->remaining = remaining;
+  uint64_t period = eventTimerControlPeriod(*current);
+  uint32_t counter = eventTimerControlCounter(*current);
+  uint32_t generation = eventTimerControlGeneration(*current);
+
+  uint128 active = {0, (uint64_t)generation | EVENT_TIMER_OWNER};
+  uint128 expected = *current;
+  if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, active)) {
+    *current = expected;
+    return 0;
+  }
+  *current = active;
+
+  if (period) {
+    int armed = event->header.base->methodImpl.updateEventTimer(event, etuStart, generation, period);
+    *timer = eventTimerLoad(event, amoRelaxed);
+    if (*timer) {
+      // Owner-exclusive writes; remaining == 0 means unlimited, so an armed
+      // schedule's finiteness is readable from remaining alone.
+      aioTimerUserEventState *state = eventTimerState(*timer);
+      state->remaining = counter;
       state->armed = (uint32_t)armed;
+      state->period = period;
     }
   }
-  return timer;
+  return 1;
 }
 
 // One attempt of the owner's release CAS: drop the OWNER bit from the control
@@ -345,7 +359,7 @@ static aioTimer *eventTimerApplyConfig(aioUserEvent *event, aioTimer *timer, uin
 static inline int eventTimerTryRelease(aioUserEvent *event, uint128 *current)
 {
   uint128 unlocked = *current;
-  unlocked.low &= ~EVENT_TIMER_OWNER;
+  unlocked.high &= ~EVENT_TIMER_OWNER;
   uint128 expected = *current;
   if (__uint128_atomic_compare_and_swap(&event->timerControl, &expected, unlocked))
     return 1;
@@ -357,23 +371,32 @@ static void eventTimerProcessUserOwner(aioUserEvent *event, uint128 applied, uin
 {
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   aioTimerUserEventState *state = timer ? eventTimerState(timer) : 0;
+  uint32_t appliedGeneration = eventTimerControlGeneration(applied);
 
   for (;;) {
-    if (eventTimerControlGeneration(current) != eventTimerControlGeneration(applied)) {
-      timer = eventTimerApplyConfig(event, timer, &applied, current);
+    if (eventTimerControlGeneration(current) != appliedGeneration) {
+      if (eventTimerApplyConfig(event, &timer, &current))
+        appliedGeneration = eventTimerControlGeneration(current);
       state = timer ? eventTimerState(timer) : 0;
+      continue;
     }
 
-    uint32_t published = eventTimerControlTickDelta(applied, current);
-    if (published) {
+    uint64_t pending = eventTimerControlPendingTicks(current);
+    if (pending) {
       // A user owner discards the raced input without spending the private
       // counter. Zero tells an IOCP backend to rearm even a one-shot last tick.
-      applied.high = current.high;
+      uint128 drained = {0, current.high};
+      uint128 expected = current;
+      if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, drained)) {
+        current = expected;
+        continue;
+      }
+      current = drained;
       if (state && state->armed)
         (void)event->header.base->methodImpl.consumeEventTimerTick(event,
                                                                   0,
-                                                                  eventTimerControlGeneration(applied),
-                                                                  eventTimerControlPeriod(applied));
+                                                                  appliedGeneration,
+                                                                  state->period);
       continue;
     }
 
@@ -386,26 +409,35 @@ static uintptr_t eventTimerProcessKernelOwner(aioUserEvent *event, uint128 appli
 {
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   aioTimerUserEventState *state = timer ? eventTimerState(timer) : 0;
+  uint32_t appliedGeneration = eventTimerControlGeneration(applied);
   uintptr_t deliveryCount = 0;
 
   for (;;) {
-    if (eventTimerControlGeneration(current) != eventTimerControlGeneration(applied)) {
-      timer = eventTimerApplyConfig(event, timer, &applied, current);
+    if (eventTimerControlGeneration(current) != appliedGeneration) {
+      if (eventTimerApplyConfig(event, &timer, &current))
+        appliedGeneration = eventTimerControlGeneration(current);
       state = timer ? eventTimerState(timer) : 0;
+      continue;
     }
 
-    uint32_t published = eventTimerControlTickDelta(applied, current);
-    if (published) {
-      uint32_t generation = eventTimerControlGeneration(applied);
-      applied.high = current.high;
+    uint64_t pending = eventTimerControlPendingTicks(current);
+    if (pending) {
+      uint128 drained = {0, current.high};
+      uint128 expected = current;
+      if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, drained)) {
+        current = expected;
+        continue;
+      }
+      current = drained;
       if (!state || !state->armed)
         continue;
 
       uint64_t count = event->header.base->methodImpl.consumeEventTimerTick(event,
-                                                                            published,
-                                                                            generation,
-                                                                            eventTimerControlPeriod(applied));
-      if (eventTimerControlIsFinite(applied)) {
+                                                                            pending,
+                                                                            appliedGeneration,
+                                                                            state->period);
+      if (state->remaining) {
+        // Armed finite schedule (unlimited keeps remaining at zero).
         if (count > state->remaining)
           count = state->remaining;
         state->remaining -= (uint32_t)count;
@@ -413,9 +445,9 @@ static uintptr_t eventTimerProcessKernelOwner(aioUserEvent *event, uint128 appli
           eventTimerStop(event, timer);
       }
       if (count) {
-        if (!event->callback && *deliveryGeneration != generation)
+        if (!event->callback && *deliveryGeneration != appliedGeneration)
           deliveryCount = 0;
-        *deliveryGeneration = generation;
+        *deliveryGeneration = appliedGeneration;
         deliveryCount += count;
       }
       continue;
@@ -428,9 +460,17 @@ static uintptr_t eventTimerProcessKernelOwner(aioUserEvent *event, uint128 appli
 
 static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint32_t requiredGeneration, int terminal)
 {
+  // The single saturation point for event periods: userEventStartTimer and
+  // ioSleep both funnel through here (stop/terminal calls pass 0)
+  if (period > MAX_TIMEOUT_US)
+    period = MAX_TIMEOUT_US;
   for (;;) {
-    uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
-    if ((old.low & EVENT_TIMER_TERMINAL) && !terminal)
+    // The acquire load pairs with the terminal publication's CAS: a word that
+    // shows any post-terminal state guarantees the DELETE bit below is
+    // visible, so no publication can slip in after the terminal one. The
+    // deletion's own publication is the single exemption from that gate.
+    uint128 old = __uint128_atomic_load(&event->timerControl);
+    if (!terminal && eventReferenceIsDeleting(event))
       return 0;
 
     uint32_t generation = eventTimerControlGeneration(old);
@@ -439,13 +479,13 @@ static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, in
 
     uint32_t nextGeneration = eventTimerNextGeneration(generation);
     uint32_t finiteCounter = counter > 0 ? (uint32_t)counter : 0;
-    uint128 desired = {period | EVENT_TIMER_OWNER | (terminal ? EVENT_TIMER_TERMINAL : 0) | (counter > 0 ? EVENT_TIMER_FINITE : 0),
-                       nextGeneration | ((uint64_t)finiteCounter << EVENT_TIMER_COUNTER_SHIFT)};
+    uint128 desired = {period,
+                       (uint64_t)nextGeneration | ((uint64_t)finiteCounter << EVENT_TIMER_COUNTER_SHIFT) | EVENT_TIMER_OWNER};
     uint128 expected = old;
     if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired))
       continue;
 
-    if (!(old.low & EVENT_TIMER_OWNER))
+    if (!(old.high & EVENT_TIMER_OWNER))
       eventTimerProcessUserOwner(event, old, desired);
     return nextGeneration;
   }
@@ -485,15 +525,15 @@ void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t ev
 
   for (;;) {
     uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
-    if (eventTimerControlGeneration(old) != timerGeneration || !eventTimerControlPeriod(old) || (old.low & EVENT_TIMER_TERMINAL)) {
+    // A generation match proves the ACTIVE variant: the timer producing this
+    // tick was armed strictly after the CONFIG->ACTIVE flip of the same
+    // generation, and any stop/cancel/delete advances the generation.
+    if (eventTimerControlGeneration(old) != timerGeneration) {
       eventDecrementReference(event, 1);
       return;
     }
 
-    uint128 desired = old;
-    desired.low |= EVENT_TIMER_OWNER;
-    desired.high += (uint64_t)(uint32_t)tickCount << EVENT_TIMER_COUNTER_SHIFT;
-
+    uint128 desired = {old.low + tickCount, old.high | EVENT_TIMER_OWNER};
     uint128 expected = old;
     if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, desired)) {
       if (eventTimerControlGeneration(expected) != timerGeneration) {
@@ -503,7 +543,7 @@ void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t ev
       continue;
     }
 
-    if (!(old.low & EVENT_TIMER_OWNER)) {
+    if (!(old.high & EVENT_TIMER_OWNER)) {
       uint32_t deliveryGeneration = 0;
       uintptr_t deliveryCount = eventTimerProcessKernelOwner(event, old, desired, &deliveryGeneration);
       if (deliveryCount) {
@@ -643,6 +683,7 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
     aioTimerUserEventState *state = eventTimerState(timer);
     state->remaining = 0;
     state->armed = 0;
+    state->period = 0;
   }
   __uint64_atomic_store(&event->timerControl.low, 0, amoRelaxed);
   __uint64_atomic_store(&event->timerControl.high, 0, amoRelaxed);
@@ -718,7 +759,6 @@ asyncBase *aioGetBase(aioObject *object)
 void userEventStartTimer(aioUserEvent *event, uint64_t usTimeout, int counter)
 {
   assert(usTimeout > 0 && "A user-event timer period must be non-zero");
-  assert(usTimeout <= (uint64_t)INT64_MAX / 10 && "A user-event timer period exceeds the supported range");
   if (eventReferenceIsDeleting(event))
     return;
   eventTimerPublishConfig(event, usTimeout, counter, 0, 0);
@@ -1236,7 +1276,6 @@ void ioSleep(aioUserEvent *event, uint64_t usTimeout)
   }
 
   assert(usTimeout > 0 && "ioSleep timeout must be non-zero");
-  assert(usTimeout <= (uint64_t)INT64_MAX / 10 && "ioSleep timeout exceeds the supported range");
   uint32_t generation = eventTimerPublishConfig(event, usTimeout, 1, 0, 0);
   if (!generation)
     return;

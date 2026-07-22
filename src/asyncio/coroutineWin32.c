@@ -121,6 +121,9 @@ int coroutineFinished(coroutineTy *coroutine)
 
 coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
 {
+  // Contract (coroutine.h): a request below the 1 KiB floor still gets 1 KiB.
+  if (stackSize < 1024)
+    stackSize = 1024;
 #ifdef BUILD_SANITIZE_ADDRESS
   // The ASan bootstrap needs a fiber to return to before coroutineCall().
   ensureCurrentCoroutine();

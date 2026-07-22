@@ -39,7 +39,7 @@ void deletingTimerCallback(aioUserEvent *event, void *arg)
 {
   EventContext *context = static_cast<EventContext*>(arg);
   context->finishes++;
-  context->timerOwnerObserved = (__uint128_atomic_load_relaxed(&event->timerControl).low & EVENT_TIMER_OWNER) != 0;
+  context->timerOwnerObserved = (__uint128_atomic_load_relaxed(&event->timerControl).high & EVENT_TIMER_OWNER) != 0;
   deleteUserEvent(event);
 }
 
@@ -399,14 +399,14 @@ TEST(core_user_event, timerfd_count_replaces_the_provisional_tick)
   EXPECT_EQ(readCalls, 1u);
   EXPECT_EQ(context.finishes, 1u);
   EXPECT_EQ(eventTimerState(eventTimerLoad(event, amoRelaxed))->remaining, 2u);
-  EXPECT_EQ(eventTimerControlCounter(__uint128_atomic_load_relaxed(&event->timerControl)), 4u);
+  EXPECT_EQ(eventTimerControlPendingTicks(__uint128_atomic_load_relaxed(&event->timerControl)), 0u);
 
   eventTimerSignal(event, generation, incarnation, 1);
   EXPECT_EQ(readCalls, 2u);
   EXPECT_EQ(context.finishes, 3u);
   EXPECT_EQ(backend.stopTimerCalls, 1u);
   EXPECT_EQ(eventTimerState(eventTimerLoad(event, amoRelaxed))->remaining, 0u);
-  EXPECT_EQ(eventTimerControlCounter(__uint128_atomic_load_relaxed(&event->timerControl)), 5u);
+  EXPECT_EQ(eventTimerControlPendingTicks(__uint128_atomic_load_relaxed(&event->timerControl)), 0u);
 
   deleteUserEvent(event);
 }
@@ -427,6 +427,26 @@ TEST(core_user_event, supplied_tick_count_is_batched_and_clamped)
   EXPECT_EQ(backend.consumeTimerCalls, 1u);
 
   eventTimerSignal(event, generation, incarnation, 4);
+  EXPECT_EQ(context.finishes, 5u);
+  EXPECT_EQ(backend.stopTimerCalls, 1u);
+
+  deleteUserEvent(event);
+}
+
+TEST(core_user_event, giant_kqueue_batch_is_delivered_exactly)
+{
+  TestBackend backend;
+  EventContext context;
+  aioUserEvent *event = newUserEvent(&backend.base, 1, coreEventCallback, &context);
+  ASSERT_NE(event, nullptr);
+
+  userEventStartTimer(event, 100, 5);
+  uint32_t generation = backend.lastEventTimerGeneration;
+  uint64_t incarnation = eventHandleGeneration(event);
+
+  // An exact multiple of 2^32 must not alias to zero in the 32-bit control
+  // lane: the precise batch travels in the side accumulator.
+  eventTimerSignal(event, generation, incarnation, (uint64_t)1 << 32);
   EXPECT_EQ(context.finishes, 5u);
   EXPECT_EQ(backend.stopTimerCalls, 1u);
 
@@ -1666,6 +1686,14 @@ void longSleepCoroutine(void *arg)
   probe->phase.store(1, std::memory_order_release);
 }
 
+void hugeSleepCoroutine(void *arg)
+{
+  CoroutineEventProbe *probe = static_cast<CoroutineEventProbe*>(arg);
+  ioSleep(probe->event, UINT64_MAX);
+  releaseCoroutineEvent(probe);
+  probe->phase.store(1, std::memory_order_release);
+}
+
 TEST(core_user_event, timer_batch_resumes_once_and_preserves_remaining_credits)
 {
   TestBackend backend;
@@ -1943,6 +1971,36 @@ TEST(user_event_coroutine, pending_credit_makes_sleep_return_without_arming)
   deleteUserEvent(probe.event);
   if (!finished)
     drainQueuedUserEvents(gBase);
+}
+
+// ioSleep bypasses userEventStartTimer, so its period must saturate inside
+// the eventTimerPublishConfig funnel itself: unclamped it reaches the kernel
+// wrapped (kqueue fires a negative period immediately, the iocp due time
+// lands in the past) and "sleep practically forever" returns at once.
+TEST(user_event_coroutine, huge_sleep_saturates_instead_of_returning_at_once)
+{
+  CoroutineEventProbe probe;
+  probe.event = newUserEvent(gBase, 0, nullptr, nullptr);
+  ASSERT_NE(probe.event, nullptr);
+
+  coroutineTy *coroutine = coroutineNew(hugeSleepCoroutine, &probe, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  retainCoroutineEvent(&probe);
+  ASSERT_EQ(coroutineCall(coroutine), 0);
+
+  EventLoopThread loop(gBase);
+  std::this_thread::sleep_for(300ms);
+  EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 0u) << "a practically-infinite ioSleep returned early";
+
+  // manual wake is the sanctioned way out of a parked sleep
+  userEventActivate(probe.event);
+  bool woken = waitForCoroutinePhase(probe, 1);
+  userEventStopTimer(probe.event);
+  loop.stop();
+
+  EXPECT_TRUE(woken);
+  deleteUserEvent(probe.event);
+  drainQueuedUserEvents(gBase);
 }
 
 TEST(user_event_coroutine, external_wake_cancels_sleep_without_crediting_next_wait)

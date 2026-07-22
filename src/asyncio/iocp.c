@@ -130,6 +130,21 @@ static AsyncOpStatus iocpInlineErrorStatus(void)
   return WSAGetLastError() == WSAENOTCONN ? aosNotConnected : aosUnknownError;
 }
 
+// Device (pipe/file) error mapping, shared by the completion path and the
+// immediate ReadFile/WriteFile failures: a closed pipe / end-of-stream is the
+// counterpart of the POSIX zero read (transferStatus) and normalizes to
+// aosDisconnected, an abort is a cancel, the rest stays opaque.
+static AsyncOpStatus iocpDeviceErrorStatus(DWORD error)
+{
+  if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED ||
+      error == ERROR_NO_DATA || error == ERROR_HANDLE_EOF)
+    return aosDisconnected;
+  else if (error == ERROR_OPERATION_ABORTED)
+    return aosCanceled;
+  else
+    return aosUnknownError;
+}
+
 static AsyncOpStatus iocpGetOverlappedResult(iocpOp *op)
 {
   DWORD bytesTransferred;
@@ -159,7 +174,7 @@ static AsyncOpStatus iocpGetOverlappedResult(iocpOp *op)
     }
   } else {
     result = GetOverlappedResult(object->hDevice, &op->overlapped, &bytesTransferred, FALSE);
-    return result == TRUE ? aosSuccess : aosUnknownError;
+    return result == TRUE ? aosSuccess : iocpDeviceErrorStatus(GetLastError());
   }
 }
 
@@ -675,8 +690,10 @@ uint64_t iocpConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   aioTimerUserEventState *state = eventTimerState(timer);
   uint128 control = __uint128_atomic_load_relaxed(&event->timerControl);
-  if (eventTimerControlGeneration(control) == generation && eventTimerControlPeriod(control) && !(control.low & EVENT_TIMER_TERMINAL) &&
-      (!eventTimerControlIsFinite(control) || state->remaining > published)) {
+  // The generation compare is the whole liveness gate - stop, cancel and
+  // delete each advance it. remaining == 0 means an unlimited schedule.
+  if (eventTimerControlGeneration(control) == generation &&
+      (!state->remaining || state->remaining > published)) {
     if (!iocpArmEventTimer(event, timer, generation, period))
       state->armed = 0;
   }
@@ -770,10 +787,10 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
     if (object->root.header.objectType == ioObjectDevice) {
       // TODO: check totalSize > 4Gb
       int result = ReadFile(object->hDevice, sb->ptr, (DWORD)sb->totalSize, 0, &op->overlapped);
-      if (result == TRUE || GetLastError() == WSA_IO_PENDING)
+      if (result == TRUE)
         return aosPending;
-      else
-        return aosUnknownError;
+      DWORD error = GetLastError();
+      return error == ERROR_IO_PENDING ? aosPending : iocpDeviceErrorStatus(error);
     } else {
       wsabuf.buf = sb->ptr;
       wsabuf.len = wsaChunkSize(sb->totalSize);
@@ -794,10 +811,10 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
                             (DWORD)(op->info.transactionSize - op->info.bytesTransferred),
                             0,
                             &op->overlapped);
-      if (result == TRUE || GetLastError() == WSA_IO_PENDING)
+      if (result == TRUE)
         return aosPending;
-      else
-        return aosUnknownError;
+      DWORD error = GetLastError();
+      return error == ERROR_IO_PENDING ? aosPending : iocpDeviceErrorStatus(error);
     } else {
       int result = WSARecv(object->hSocket, &wsabuf, 1, NULL, &flags, &op->overlapped, NULL);
       if (result == 0 || WSAGetLastError() == WSA_IO_PENDING)
@@ -821,10 +838,10 @@ AsyncOpStatus iocpAsyncWrite(asyncOpRoot *opptr)
                             (DWORD)(op->info.transactionSize - op->info.bytesTransferred),
                             0,
                             &op->overlapped);
-    if (result == TRUE || GetLastError() == WSA_IO_PENDING)
+    if (result == TRUE)
       return aosPending;
-    else
-      return aosUnknownError;
+    DWORD error = GetLastError();
+    return error == ERROR_IO_PENDING ? aosPending : iocpDeviceErrorStatus(error);
   } else {
     wsabuf.buf = (CHAR*)op->info.buffer + op->info.bytesTransferred;
     wsabuf.len = wsaChunkSize(op->info.transactionSize - op->info.bytesTransferred);

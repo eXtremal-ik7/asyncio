@@ -232,9 +232,18 @@ coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
   // Create main fiber if it not exists
   ensureCurrentCoroutine();
 
+  // Contract (coroutine.h): a request below the 1 KiB floor still gets 1 KiB;
+  // rounding to 16 keeps the initial SP aligned. size_t math with a saturate,
+  // so a near-UINT_MAX request fails in the allocator instead of wrapping.
+  size_t alignedStackSize = ((size_t)stackSize + 15) & ~(size_t)15;
+  if (alignedStackSize < stackSize)
+    alignedStackSize = SIZE_MAX & ~(size_t)15;
+  if (alignedStackSize < 1024)
+    alignedStackSize = 1024;
+
   coroutineTy *coroutine;
   if (posix_memalign((void**)&coroutine, 8, sizeof(coroutineTy)) == 0) {
-    if (fiberInit(coroutine, stackSize)) {
+    if (fiberInit(coroutine, alignedStackSize)) {
       coroutine->entryPoint = entry;
       coroutine->arg = arg;
       coroutine->prev = currentCoroutine;
@@ -245,7 +254,7 @@ coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
 #ifdef BUILD_SANITIZE_ADDRESS
       coroutine->asanFakeStack = 0;
       coroutine->asanStackBottom = coroutine->stack;
-      coroutine->asanStackSize = stackSize;
+      coroutine->asanStackSize = alignedStackSize;
       coroutine->asanPrevious = 0;
 #endif
 #ifdef BUILD_SANITIZE_THREAD

@@ -263,11 +263,15 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
         case ohtObject: {
           aioObject *object = (aioObject*)header;
-          uint32_t bits = (events[n].flags & EV_EOF) ? COMBINER_TAG_ERROR : 0;
+          // EV_EOF raises the error sweep only from the read filter, where it
+          // means the peer half-closed. On EVFILT_WRITE it means our transmit
+          // path is dead: plain write progress lets the parked ops fail on
+          // the syscall per-op instead of a wrong-direction sweep.
+          uint32_t bits = 0;
           if (events[n].filter == EVFILT_READ)
-            bits |= COMBINER_TAG_PROGRESS_READ;
+            bits = COMBINER_TAG_PROGRESS_READ | ((events[n].flags & EV_EOF) ? COMBINER_TAG_ERROR : 0);
           else if (events[n].filter == EVFILT_WRITE)
-            bits |= COMBINER_TAG_PROGRESS_WRITE;
+            bits = COMBINER_TAG_PROGRESS_WRITE;
           if (bits & COMBINER_TAG_PROGRESS_MASK)
             (void)combinerPushValidated(&object->root, envelopeGeneration, bits);
           break;
@@ -473,7 +477,8 @@ uint64_t kqueueConsumeEventTimerTick(aioUserEvent *event, uint64_t published, ui
   __UNUSED(event);
   __UNUSED(generation);
   __UNUSED(period);
-  // EVFILT_TIMER is periodic and kevent.data already carried the exact batch.
+  // EVFILT_TIMER is periodic and the exact kevent batch arrived through the
+  // 64-bit pending-tick word intact.
   return published;
 }
 

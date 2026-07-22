@@ -38,8 +38,8 @@ int socketShutdown(socketTy hSocket, int how)
 
 void socketReuseAddr(socketTy hSocket)
 {
-  char optval = 1;
-  setsockopt(hSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(int));
+  int optval = 1;
+  setsockopt(hSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
 }
 
 

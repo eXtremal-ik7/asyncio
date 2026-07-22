@@ -11,7 +11,9 @@
 #include <vector>
 
 #ifdef OS_COMMONUNIX
+#include <fcntl.h>
 #include <unistd.h>
+#include <sys/time.h>
 #endif
 
 void test_connect_accept_readcb(AsyncOpStatus status, aioObject *socket, size_t transferred, void *arg)
@@ -1398,6 +1400,149 @@ TEST(socket, test_udp_icmp_error_wakes_parked_read)
   EXPECT_NE(context.status, aosSuccess);
   EXPECT_NE(context.status, aosTimeout) << "the ICMP error did not wake the parked read";
   deleteAioObject(object);
+}
+
+#ifdef OS_COMMONUNIX
+// A peer that shut down its transmit half (shutdown(SHUT_WR), a plain FIN)
+// has only said "no more requests": it still reads, and our transmit path
+// toward it is fully alive. The classic client pattern - send the request,
+// half-close, collect the whole response - relies on that, and IOCP (which
+// has no readiness-level EOF signal) always let the response finish. So on
+// the reactor backends EPOLLRDHUP/EV_EOF may kill reads once nothing is left
+// buffered, but a parked write must survive and complete against the peer's
+// open receive half. The write is parked by real backpressure (tiny kernel
+// buffers, payload far larger); the armed read both mirrors a server awaiting
+// its next request and keeps read readiness registered so the kernel EOF
+// event is delivered; the client half-closes and only starts draining after
+// a delay, so the EOF event provably meets the parked write.
+struct HalfCloseContext {
+  asyncBase *base;
+  AsyncOpStatus writeStatus = aosPending;
+  AsyncOpStatus readStatus = aosPending;
+  size_t writeTransferred = 0;
+  int callbacksFired = 0;
+
+  explicit HalfCloseContext(asyncBase *baseArg) : base(baseArg) {}
+};
+
+static void test_halfclose_writecb(AsyncOpStatus status, aioObject*, size_t transferred, void *arg)
+{
+  HalfCloseContext *ctx = static_cast<HalfCloseContext*>(arg);
+  ctx->writeStatus = status;
+  ctx->writeTransferred = transferred;
+  if (++ctx->callbacksFired == 2)
+    postQuitOperation(ctx->base);
+}
+
+static void test_halfclose_readcb(AsyncOpStatus status, aioObject*, size_t, void *arg)
+{
+  HalfCloseContext *ctx = static_cast<HalfCloseContext*>(arg);
+  ctx->readStatus = status;
+  if (++ctx->callbacksFired == 2)
+    postQuitOperation(ctx->base);
+}
+
+TEST(socket, test_halfclose_peer_keeps_parked_write_alive)
+{
+  HalfCloseContext context(gBase);
+
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(listener, 0);
+  sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = inet_addr("127.0.0.1");
+  ASSERT_EQ(bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  socklen_t addressLength = sizeof(address);
+  ASSERT_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &addressLength), 0);
+  ASSERT_EQ(listen(listener, 1), 0);
+
+  int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(clientFd, 0);
+  int bufferSize = 16384;
+  setsockopt(clientFd, SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize));
+  timeval receiveTimeout = {10, 0};  // hang belt: drain must never block forever
+  setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, sizeof(receiveTimeout));
+  ASSERT_EQ(connect(clientFd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  int serverFd = accept(listener, nullptr, nullptr);
+  ASSERT_GE(serverFd, 0);
+  close(listener);
+  setsockopt(serverFd, SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize));
+  ASSERT_NE(fcntl(serverFd, F_SETFL, fcntl(serverFd, F_GETFL) | O_NONBLOCK), -1);
+
+  std::vector<uint8_t> payload(1 << 20);
+  for (size_t i = 0; i < payload.size(); i++)
+    payload[i] = static_cast<uint8_t>(i);
+
+  aioObject *object = newSocketIo(gBase, serverFd);
+  uint8_t requestBuffer[16];
+  aioRead(object, requestBuffer, sizeof(requestBuffer), afNone, 5000000, test_halfclose_readcb, &context);
+  aioWrite(object, payload.data(), payload.size(), afWaitAll, 5000000, test_halfclose_writecb, &context);
+
+  size_t clientReceived = 0;
+  bool clientOrdered = true;
+  std::thread client([&]() {
+    shutdown(clientFd, SHUT_WR);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    uint8_t chunk[16384];
+    ssize_t bytes;
+    while ((bytes = recv(clientFd, chunk, sizeof(chunk), 0)) > 0) {
+      for (ssize_t i = 0; i < bytes; i++)
+        clientOrdered &= (chunk[i] == static_cast<uint8_t>(clientReceived + i));
+      clientReceived += static_cast<size_t>(bytes);
+    }
+  });
+
+  asyncLoop(gBase);
+  deleteAioObject(object);
+  client.join();
+  close(clientFd);
+
+  EXPECT_EQ(context.readStatus, aosDisconnected);
+  EXPECT_EQ(context.writeStatus, aosSuccess);
+  EXPECT_EQ(context.writeTransferred, payload.size());
+  EXPECT_EQ(clientReceived, payload.size());
+  EXPECT_TRUE(clientOrdered);
+}
+#endif
+
+// A "practically infinite" realtime timeout must arm and wait, not complete:
+// unclamped it reached the kernel as a wrapped interval - kqueue rejects the
+// negative payload (EINVAL -> prompt aosUnknownError), the iocp due time
+// wraps into the past (instant aosTimeout) - turning "wait forever" into an
+// immediate completion.
+struct RealtimeTimeoutProbe {
+  std::atomic<bool> fired{false};
+  std::atomic<AsyncOpStatus> status{aosPending};
+};
+
+static void test_realtime_huge_timeout_readcb(AsyncOpStatus status, aioObject*, HostAddress, size_t, void *arg)
+{
+  RealtimeTimeoutProbe *probe = static_cast<RealtimeTimeoutProbe*>(arg);
+  probe->status.store(status, std::memory_order_relaxed);
+  probe->fired.store(true, std::memory_order_release);
+}
+
+TEST(socket, test_realtime_huge_timeout_does_not_fire_early)
+{
+  asyncBase *base = createAsyncBase(amOSDefault, 1);
+  std::thread loopThread([base]() { asyncLoop(base); });
+
+  RealtimeTimeoutProbe probe;
+  aioObject *object = initializeUDPClient(base);
+  ASSERT_NE(object, nullptr);
+  uint32_t buffer;
+  aioReadMsg(object, &buffer, sizeof(buffer), afRealtime, UINT64_MAX, test_realtime_huge_timeout_readcb, &probe);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_FALSE(probe.fired.load(std::memory_order_acquire))
+    << "practically-infinite realtime timeout completed with status "
+    << probe.status.load(std::memory_order_relaxed);
+
+  deleteAioObject(object);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  postQuitOperation(base);
+  loopThread.join();
 }
 
 void test_timeout_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)

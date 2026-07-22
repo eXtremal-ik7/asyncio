@@ -371,7 +371,7 @@ void initAsyncOpRoot(asyncOpRoot *op,
   op->opCode = opCode;
   op->callback = callback;
   op->arg = arg;
-  op->timeout = timeout;
+  op->timeout = timeout < MAX_TIMEOUT_US ? timeout : MAX_TIMEOUT_US;
   op->running = (flags & afRunning) ? arRunning : arWaiting;
   objectIncrementReference(object, 1);
   // Publish the tag last, with release ordering. Until this store lands the

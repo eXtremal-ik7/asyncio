@@ -136,9 +136,8 @@ public:
   }
 
   template<typename T=uint8_t> void seekEnd(size_t num, bool setEof = false) {
-    size_t size = sizeof(T)*num;
-    size_t diff = std::min(size, _size);
-    _p = _m + size - diff;
+    size_t size = (num > SIZE_MAX / sizeof(T)) ? SIZE_MAX : sizeof(T)*num;
+    _p = _m + (_size - std::min(size, _size));
     if (num == 0 && setEof)
       _eof = true;
   }

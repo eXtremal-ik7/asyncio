@@ -339,9 +339,12 @@ typedef struct {
 //  3. CANCEL/CANCELIO reap: a timeout/opCancel/cancelIo set the status and
 //     asked for a scan; the CANCELIO position additionally bounds the bulk
 //     cancelIo() sweep;
-//  4. the error sweep (kernel EOF/half-close arrives as COMBINER_TAG_ERROR):
-//     a read side with nothing left buffered and the whole write side die as
-//     aosDisconnected;
+//  4. the error sweep (kernel read-side EOF/half-close arrives as
+//     COMBINER_TAG_ERROR): a read side with nothing left buffered dies as
+//     aosDisconnected. The write side is deliberately left alone: EOF only
+//     says the peer stopped sending - after shutdown(SHUT_WR) it still reads
+//     and a parked response must complete (IOCP parity); on a truly dead
+//     connection the writes fail per-op with EPIPE/ECONNRESET;
 //  5. execute whatever became startable.
 // A dying object gets no fd readiness processing: its operations are being
 // cancelled wholesale anyway, and its descriptor may already be closed; the
@@ -372,12 +375,15 @@ static inline CombinerPassEvents reactorCombinerCore(aioObjectRoot *object, aioO
     reapObject(object, sig, &needStart);
 
   if (ioEvents & IO_EVENT_ERROR) {
-    int available;
+    // FIONREAD failure (ENOTTY on an exotic device fd) counts as drained:
+    // an error event with unknowable backlog must resolve to a deterministic
+    // disconnect, not a read queue waiting forever
+    int available = 0;
     int fd = getFd(fdObject);
-    ioctl(fd, FIONREAD, &available);
+    if (ioctl(fd, FIONREAD, &available) == -1)
+      available = 0;
     if (available == 0)
       cancelOperationList(&object->readQueue, aosDisconnected);
-    cancelOperationList(&object->writeQueue, aosDisconnected);
   }
 
   if (needStart & IO_EVENT_READ)

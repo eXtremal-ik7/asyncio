@@ -82,6 +82,12 @@ typedef enum AsyncOpRunningTy {
   arCancelling
 } AsyncOpRunningTy;
 
+// Every usTimeout silently saturates here (~142 years): the tightest backend
+// range is the kqueue timer, whose microsecond payload the kernel converts to
+// nanoseconds in a signed 64-bit word - 2^52 us * 1000 stays under INT64_MAX
+// with a 2x margin (iocp 100ns units and the epoll timerfd are looser).
+#define MAX_TIMEOUT_US (1ULL << 52)
+
 #ifdef __cplusplus
 __NO_UNUSED_FUNCTION_BEGIN
 static inline AsyncFlags operator|(AsyncFlags a, AsyncFlags b) {

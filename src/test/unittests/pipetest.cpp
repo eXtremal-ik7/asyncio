@@ -178,3 +178,52 @@ TEST(pipe, test_error_on_idle_object_keeps_loop_asleep)
   loopThread.join();
 }
 #endif
+
+#ifdef OS_WINDOWS
+// Both halves of the device EOF contract: a pipe whose peer is gone completes
+// the read with aosDisconnected, whether ReadFile refuses right at submit
+// (peer closed first) or the close finishes an already parked overlapped read.
+void test_pipe_eof_readcb(AsyncOpStatus status, aioObject*, size_t, void *arg)
+{
+  ErrorWakeupContext *ctx = static_cast<ErrorWakeupContext*>(arg);
+  ctx->status = status;
+  ctx->callbackFired = true;
+  postQuitOperation(ctx->base);
+}
+
+TEST(pipe, test_pipe_read_after_writer_closed)
+{
+  ErrorWakeupContext context(gBase);
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+
+  aioObject *pipeRead = newDeviceIo(gBase, unnamedPipe.read);
+  CloseHandle(unnamedPipe.write);
+
+  char payload;
+  aioRead(pipeRead, &payload, sizeof(payload), afNone, 1000000, test_pipe_eof_readcb, &context);
+  asyncLoop(gBase);
+  EXPECT_TRUE(context.callbackFired);
+  EXPECT_EQ(context.status, aosDisconnected);
+  deleteAioObject(pipeRead);
+}
+
+TEST(pipe, test_pipe_writer_close_wakes_parked_read)
+{
+  ErrorWakeupContext context(gBase);
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+
+  aioObject *pipeRead = newDeviceIo(gBase, unnamedPipe.read);
+  char payload;
+  aioRead(pipeRead, &payload, sizeof(payload), afNone, 1000000, test_pipe_eof_readcb, &context);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  CloseHandle(unnamedPipe.write);
+
+  asyncLoop(gBase);
+  EXPECT_TRUE(context.callbackFired);
+  EXPECT_EQ(context.status, aosDisconnected);
+  deleteAioObject(pipeRead);
+}
+#endif

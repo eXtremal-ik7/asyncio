@@ -27,10 +27,12 @@ void initializeAsyncIo(AsyncInitFlags flags);
 // Returns 0 when the OS multiplexor cannot be created (descriptor or handle
 // exhaustion) or memory allocation fails.
 asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads);
+
 // Return 0 on allocation failure or an address outside the supported kernel
 // handle model; the descriptor is then still owned by the caller, who closes
 // it. On success the object owns the descriptor until deleteAioObject.
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket);
+
 aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice);
 void deleteAioObject(aioObject *object);
 asyncBase *aioGetBase(aioObject *object);
@@ -56,7 +58,8 @@ void setSocketBuffer(aioObject *socket, size_t bufferSize);
 aioUserEvent *newUserEvent(asyncBase* base, int isSemaphore, aioEventCb callback, void* arg);
 
 // Starts a periodic timer and replaces the previous timer schedule. usTimeout
-// > 0 is the period; counter > 0 limits the number of delivered timer
+// > 0 is the period, silently saturated at MAX_TIMEOUT_US like every timeout
+// in the API; counter > 0 limits the number of delivered timer
 // activations, while counter <= 0 repeats until stopped. Calls to Start/Stop
 // for the same event must be externally serialized; overlapping timer-control
 // calls are a caller error. Every caller must own a strong reference. Timer
@@ -159,6 +162,7 @@ ssize_t ioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, u
 ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
+
 // Coroutine-only helpers for a dedicated event created with callback == NULL.
 // Calls on that event are serialized by the coroutine; only activation and the
 // single delete may overlap from other threads. The caller must own a strong
@@ -167,9 +171,11 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
 // sole reference between a waiting coroutine and a deleting thread is a
 // contract violation. A pending activation is consumed without suspending.
 void ioSleep(aioUserEvent *event, uint64_t usTimeout);
+
 void ioWaitUserEvent(aioUserEvent *event);
 
 void asyncLoop(asyncBase *base);
+
 // Sticky level-triggered stop: every current and future asyncLoop invocation
 // on the base drains the already-queued callbacks and returns. Stops the
 // processing, not the work - pending operations, armed timers and queued
@@ -178,6 +184,7 @@ void asyncLoop(asyncBase *base);
 // POSIX signal handler (one atomic RMW plus one doorbell write; no queue
 // traffic, no allocation).
 void postQuitOperation(asyncBase *base);
+
 // Rearms the base after postQuitOperation. NOT thread-safe: requires
 // quiescence - every asyncLoop has returned (threads joined) and no
 // concurrent postQuitOperation/asyncLoop/reset runs. The quit word itself

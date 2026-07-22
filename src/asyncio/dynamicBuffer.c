@@ -6,9 +6,12 @@
 
 static void dynamicBufferGrow(dynamicBuffer *buffer, size_t extra)
 {
-  size_t newMemorySize = buffer->allocatedSize;
-  while (newMemorySize < buffer->offset + extra)
-    newMemorySize *= 2;
+  // The doubling needs a non-zero seed (a zero-sized buffer allocates lazily)
+  // and saturates instead of wrapping when it cannot double up to the request.
+  size_t required = (extra <= SIZE_MAX - buffer->offset) ? buffer->offset + extra : SIZE_MAX;
+  size_t newMemorySize = buffer->allocatedSize ? buffer->allocatedSize : 64;
+  while (newMemorySize < required)
+    newMemorySize = (newMemorySize <= SIZE_MAX / 2) ? newMemorySize * 2 : required;
 
   if (newMemorySize != buffer->allocatedSize) {
     buffer->data = buffer->data ? realloc(buffer->data, newMemorySize) : malloc(newMemorySize);
@@ -19,8 +22,7 @@ static void dynamicBufferGrow(dynamicBuffer *buffer, size_t extra)
 
 void dynamicBufferInit(dynamicBuffer *buffer, size_t initialSize)
 {
-  if (initialSize)
-    buffer->data = malloc(initialSize);
+  buffer->data = initialSize ? malloc(initialSize) : NULL;
   buffer->offset = 0;
   buffer->size = 0;
   buffer->allocatedSize = initialSize;

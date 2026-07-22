@@ -16,7 +16,10 @@ coroutineTy *coroutineCurrent();
 int coroutineFinished(coroutineTy *coroutine);
 
 // Create a suspended coroutine. It frees itself when entry returns, inside
-// the coroutineCall invocation that observes the finish.
+// the coroutineCall invocation that observes the finish. stackSize has a
+// 1 KiB floor: a smaller request still gets a 1 KiB stack (the size may also
+// be rounded up for platform stack alignment). Stacks have no guard pages;
+// sizing for entry's real call depth is the caller's responsibility.
 coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize);
 
 // Same, plus finishCb: runs on the thread that observed the finish, after the

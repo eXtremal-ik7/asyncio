@@ -22,6 +22,21 @@ TEST(coroutine, create)
   ASSERT_EQ(x, 1);
 }
 
+TEST(coroutine, tiny_stack_clamped_to_floor)
+{
+  // Undersized or oddly-aligned stack requests must be raised to the 1 KiB
+  // floor (and platform alignment) instead of placing the initial SP outside
+  // or misaligned within the allocation.
+  for (unsigned stackSize : {0u, 1u, 100u, 1000u, 1030u}) {
+    int x = 0;
+    coroutineTy *coro = coroutineNew(coroutine_create_proc, &x, stackSize);
+    ASSERT_NE(coro, nullptr);
+    while (!coroutineCall(coro))
+      continue;
+    ASSERT_EQ(x, 1);
+  }
+}
+
 void coroutine_yield_proc(void *arg)
 {
   int *x = static_cast<int*>(arg);

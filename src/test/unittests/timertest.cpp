@@ -308,6 +308,37 @@ TEST(timer_grid, huge_timeout_saturates_instead_of_wrapping)
   objectDelete(&object.root);
 }
 
+TEST(timer_grid, timeout_saturates_at_documented_maximum)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  // The public contract: usTimeout saturates at MAX_TIMEOUT_US right at op
+  // initialization, so every backend arm (wheel, timerfd, kevent, waitable
+  // timer) stays inside its kernel range instead of wrapping there. The
+  // assert must precede the push: the grid arm repurposes the union slot
+  // as the absolute endTime.
+  TestOp op(object, OPCODE_READ, afNone, UINT64_MAX);
+  op.setResults({aosPending});
+  EXPECT_EQ(op.root.timeout, MAX_TIMEOUT_US);
+
+  combinerPushOperation(&op.root);
+  EXPECT_EQ(opGetStatus(&op.root), aosPending);
+  cancelIo(&object.root);
+  backend.drainCompletions();
+
+  // The realtime arm hands op->timeout to the backend as-is: the clamped
+  // period is what reaches the kernel
+  TestOp realtimeOp(object, OPCODE_READ, afRealtime, UINT64_MAX);
+  realtimeOp.setResults({aosPending});
+  combinerPushOperation(&realtimeOp.root);
+  EXPECT_EQ(realtimeOp.root.timeout, MAX_TIMEOUT_US);
+  EXPECT_EQ(backend.startTimerCalls, 1u);
+
+  cancelIo(&object.root);
+  backend.drainCompletions();
+  objectDelete(&object.root);
+}
+
 TEST(timer_wheel, detach_reopens_and_is_idempotent_per_incarnation)
 {
   TestBackend backend;

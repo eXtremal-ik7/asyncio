@@ -396,6 +396,9 @@ typedef struct aioTimer aioTimer;
 typedef struct aioTimerUserEventState {
   uint32_t remaining;
   uint32_t armed;
+  // The ACTIVE control word no longer carries the period; the owner saves it
+  // here at apply time (IOCP re-arms one-shot timers from it).
+  uint64_t period;
 } aioTimerUserEventState;
 
 struct aioUserEvent {
@@ -421,24 +424,26 @@ struct aioUserEvent {
   uint64_t activationId;
 
   // One DWCAS word is both the latest logical timer state and the owner
-  // mailbox. It is laid out as follows (bit 0 is the least-significant bit):
+  // mailbox. It is a tagged union of two variants sharing the generation and
+  // OWNER fields (bit 0 is the least-significant bit):
   //
-  //   low  0..59  period in microseconds
-  //        60     reserved
-  //        61     terminal Delete publication
-  //        62     finite-count marker
-  //        63     backend-syscall OWNER
-  //   high 0..31  schedule generation
-  //        32..63 new-config counter payload, then kernel-input sequence
+  //   high 0..31  schedule generation (both variants)
+  //        32..62 CONFIG: finite counter payload; ACTIVE: zero
+  //        63     OWNER (both variants)
+  //   low         CONFIG: period in microseconds (0..59, below 2^60)
+  //               ACTIVE: full 64-bit pending-tick counter
   //
-  // A user publication replaces period/count, advances generation and either
-  // acquires a free OWNER or leaves an existing owner in place. On applying a
-  // new generation, OWNER copies its finite counter to timer->event.state.remaining;
-  // afterwards producers only add kernel inputs to the upper lane. epoll adds
-  // one provisional input before OWNER reads the exact timerfd count; kqueue
-  // adds its exact batch. The release CAS detects every concurrent publication.
-  // The public period limit is below 2^60, leaving the control bits without
-  // reducing the API range.
+  // A user publication installs CONFIG with generation+1 and either acquires
+  // a free OWNER or leaves the existing owner in place. The owner extracts
+  // the parameters into aioTimerUserEventState, flips CONFIG to ACTIVE with
+  // zero ticks in one CAS, and only then arms the backend. Ticks of a
+  // generation therefore exist only while the word is ACTIVE of that same
+  // generation, so every observer decides the variant by comparing
+  // generations alone - no discriminator bit is stored. A tick publication
+  // adds its whole batch to the low word in one CAS; the owner harvests it by
+  // CASing low back to zero, exact at full 64-bit width. The release CAS
+  // detects every concurrent publication, config and tick alike. Terminal
+  // gating lives in header.tag's DELETE bit, checked in the publish loop.
   volatile uint128 timerControl;
 
   // Null until the first timer start. POSIX keeps this kernel-visible timer
@@ -478,30 +483,31 @@ static inline aioTimerUserEventState *eventTimerState(aioTimer *timer)
   return (aioTimerUserEventState*)((uint8_t*)timer + sizeof(objectHeader));
 }
 
-#define EVENT_TIMER_PERIOD_MASK ((1ULL << 60) - 1)
-#define EVENT_TIMER_TERMINAL (1ULL << 61)
-#define EVENT_TIMER_FINITE (1ULL << 62)
+// OWNER and the CONFIG counter live in the high word; the low word is the
+// whole variant payload (period or pending ticks).
 #define EVENT_TIMER_OWNER (1ULL << 63)
 #define EVENT_TIMER_COUNTER_SHIFT 32
 
+// CONFIG-variant accessors: valid only before the owner's ACTIVE flip.
 static inline uint64_t eventTimerControlPeriod(uint128 control)
 {
-  return control.low & EVENT_TIMER_PERIOD_MASK;
+  return control.low;
+}
+
+static inline uint32_t eventTimerControlCounter(uint128 control)
+{
+  return (uint32_t)((control.high >> EVENT_TIMER_COUNTER_SHIFT) & 0x7FFFFFFF);
+}
+
+// ACTIVE-variant accessor.
+static inline uint64_t eventTimerControlPendingTicks(uint128 control)
+{
+  return control.low;
 }
 
 static inline uint32_t eventTimerControlGeneration(uint128 control)
 {
   return (uint32_t)control.high;
-}
-
-static inline uint32_t eventTimerControlCounter(uint128 control)
-{
-  return (uint32_t)(control.high >> EVENT_TIMER_COUNTER_SHIFT);
-}
-
-static inline int eventTimerControlIsFinite(uint128 control)
-{
-  return (control.low & EVENT_TIMER_FINITE) != 0;
 }
 
 static inline uint32_t eventTimerGeneration(aioUserEvent *event)

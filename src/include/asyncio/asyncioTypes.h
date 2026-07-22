@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <limits.h>
 typedef HANDLE iodevTy;
+#define INVALID_DEVICE INVALID_HANDLE_VALUE
 typedef SOCKET socketTy;
 typedef int socketLenTy;
 // Winsock buffer lengths are ULONG: clamp each chunk so a >4Gb remainder
@@ -32,6 +33,7 @@ typedef SSIZE_T ssize_t;
 #include <sys/types.h>
 #include <sched.h>
 typedef int iodevTy;
+#define INVALID_DEVICE -1
 typedef int socketTy;
 typedef socklen_t socketLenTy;
 #define INVALID_SOCKET -1
