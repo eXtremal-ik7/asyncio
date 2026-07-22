@@ -2,9 +2,93 @@
 
 #include "asyncio/http.h"
 #include "asyncio/socket.h"
+#include "p2putils/HttpHeaderTable.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
+
+namespace {
+
+// Standalone httpParseDefault driver with the same component envelope the
+// client machinery uses: Initialize, one whole-buffer httpParse, Finalize
+void parseDefaultResponse(HTTPParseDefaultContext &context, const char *response)
+{
+  HttpComponent component;
+  component.type = httpDtInitialize;
+  httpParseDefault(&component, &context);
+
+  HttpParserState state;
+  httpInit(&state);
+  httpSetBuffer(&state, response, strlen(response));
+  ASSERT_EQ(httpParse(&state, &httpParseDefaultTable, httpParseDefault, &context),
+            ParserResultOk);
+
+  component.type = httpDtFinalize;
+  httpParseDefault(&component, &context);
+}
+
+}
+
+// Content-Type is the first thing stored into the accumulation buffer, so it
+// legitimately lands at offset 0; the absent-field marker must not swallow it
+TEST(http, parse_default_reports_content_type)
+{
+  HTTPParseDefaultContext context;
+  httpParseDefaultInit(&context, nullptr);
+  parseDefaultResponse(context,
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 5\r\n"
+    "\r\n"
+    "hello");
+
+  EXPECT_EQ(context.resultCode, 200u);
+  ASSERT_EQ(context.contentType.size, strlen("text/html"));
+  ASSERT_NE(context.contentType.data, nullptr);
+  EXPECT_EQ(memcmp(context.contentType.data, "text/html", context.contentType.size), 0);
+  ASSERT_EQ(context.body.size, strlen("hello"));
+  EXPECT_EQ(memcmp(context.body.data, "hello", context.body.size), 0);
+  dynamicBufferFree(&context.buffer);
+}
+
+// Without Content-Type the body starts at offset 0 too; the second chunk must
+// not be mistaken for the body start
+TEST(http, parse_default_chunked_body_keeps_first_fragment)
+{
+  HTTPParseDefaultContext context;
+  httpParseDefaultInit(&context, nullptr);
+  parseDefaultResponse(context,
+    "HTTP/1.1 200 OK\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "\r\n"
+    "5\r\nhello\r\n"
+    "6\r\n world\r\n"
+    "0\r\n\r\n");
+
+  ASSERT_EQ(context.body.size, strlen("hello world"));
+  EXPECT_EQ(memcmp(context.body.data, "hello world", context.body.size), 0);
+  dynamicBufferFree(&context.buffer);
+}
+
+TEST(http, parse_default_empty_body_with_content_type)
+{
+  HTTPParseDefaultContext context;
+  httpParseDefaultInit(&context, nullptr);
+  parseDefaultResponse(context,
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html\r\n"
+    "Content-Length: 0\r\n"
+    "\r\n");
+
+  ASSERT_EQ(context.contentType.size, strlen("text/html"));
+  ASSERT_NE(context.contentType.data, nullptr);
+  EXPECT_EQ(memcmp(context.contentType.data, "text/html", context.contentType.size), 0);
+  EXPECT_EQ(context.body.size, 0u);
+  ASSERT_NE(context.body.data, nullptr);
+  EXPECT_EQ(context.body.data[0], 0);
+  dynamicBufferFree(&context.buffer);
+}
 
 // The server streams a header block larger than the client's fixed 64KB
 // input buffer. The request must fail with aosBufferTooSmall instead of

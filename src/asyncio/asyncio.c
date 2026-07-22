@@ -123,8 +123,13 @@ static void releaseOp(asyncOpRoot *opptr)
 static void releaseAcceptOp(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
-  // Failed aioAccept may still own a created fd/socket; close it here.
-  if (op->acceptSocket != INVALID_SOCKET && opGetStatus(opptr) != aosSuccess) {
+  // Ownership leaves the operation through the success callback (aio flavor)
+  // or through the resumed coroutine reading the fields (io flavor); anything
+  // still owned here - a failed accept, or a callback-less aioAccept that
+  // nobody can receive - is closed
+  if (op->acceptSocket != INVALID_SOCKET &&
+      (opGetStatus(opptr) != aosSuccess ||
+       (opptr->callback == 0 && !(opptr->flags & afCoroutine)))) {
     socketClose(op->acceptSocket);
     op->acceptSocket = INVALID_SOCKET;
   }
@@ -987,6 +992,7 @@ void aioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeou
 
 void aioAccept(aioObject *object, uint64_t usTimeout, aioAcceptCb callback, void *arg)
 {
+  assert(callback && "aioAccept requires a callback: it is the only channel that can receive the accepted socket");
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.accept, acceptFinish, 0, 0);
   asyncOpRoot *op = newAsyncOp(&object->root, afSyncStarted, usTimeout, (void*)callback, arg, actAccept, &context);

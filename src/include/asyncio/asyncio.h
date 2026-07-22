@@ -112,6 +112,9 @@ void aioConnect(aioObject *object,
                 aioConnectCb callback,
                 void *arg);
 
+// The callback is mandatory: it is the only channel that can receive the
+// accepted socket (fire-and-forget accept has nowhere to hand it over; such
+// a connection is closed at operation release)
 void aioAccept(aioObject *object,
                uint64_t usTimeout,
                aioAcceptCb callback,

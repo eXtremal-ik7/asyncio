@@ -118,6 +118,20 @@ static void copyCommand(char *dst, size_t dstSize, const char *src)
   memcpy(dst, src, strnlen(src, dstSize));
 }
 
+// Receiver-side mirror of the same field contract: nothing may follow the
+// first NUL, and a name filling the whole field is legal
+static bool commandValid(const char *command, size_t size)
+{
+  size_t i = 0;
+  while (i < size && command[i] != 0)
+    i++;
+  for (; i < size; i++) {
+    if (command[i] != 0)
+      return false;
+  }
+  return true;
+}
+
 static void buildMessageHeader(MessageHeader *out, uint32_t magic, const char *command, void *data, uint32_t size)
 {
   out->magic = xhtole(magic);
@@ -266,7 +280,7 @@ static AsyncOpStatus startBtcRecv(asyncOpRoot *opptr)
         decodeMessageHeader(header);
         if (header->magic != socket->magic)
           return btcMakeStatus(btcInvalidMagic);
-        if (header->command[11] != 0)
+        if (!commandValid(header->command, sizeof(header->command)))
           return btcMakeStatus(btcInvalidCommand);
         if (op->size < header->length)
           return aosBufferTooSmall;
@@ -313,11 +327,12 @@ static asyncOpRoot *implBtcRecv(BTCSocket *socket,
   if ( !(childOp = implRead(socket->plainSocket, header, sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, nullptr, &bytes)) ) {
     state = stFinished;
     decodeMessageHeader(header);
+    // first failed check wins, same order as the async path
     if (header->magic != socket->magic)
       result = btcMakeStatus(btcInvalidMagic);
-    if (header->command[11] != 0)
+    else if (!commandValid(header->command, sizeof(header->command)))
       result = btcMakeStatus(btcInvalidCommand);
-    if (sizeLimit < header->length)
+    else if (sizeLimit < header->length)
       result = aosBufferTooSmall;
 
     stream.reset();

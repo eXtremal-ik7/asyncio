@@ -223,13 +223,18 @@ void httpParseDefaultInit(HTTPParseDefaultContext *context, HTTPClient *client)
     httpClientSetHeaderTable(client, &httpParseDefaultTable);
 }
 
+// Offset 0 is a real position in the accumulation buffer (Content-Type is
+// stored first when present, a body without Content-Type starts at 0 too),
+// so the absent-field marker must live outside the valid range
+static const size_t absentOffset = (size_t)-1;
+
 void httpParseDefault(HttpComponent *component, void *arg)
 {
   HTTPParseDefaultContext *context = (HTTPParseDefaultContext*)arg;
   switch (component->type) {
     case httpDtInitialize : {
-      context->contentTypeOffset = 0;
-      context->bodyOffset = 0;
+      context->contentTypeOffset = absentOffset;
+      context->bodyOffset = absentOffset;
       context->contentType.data = 0;
       context->contentType.size = 0;
       context->body.data = 0;
@@ -261,7 +266,7 @@ void httpParseDefault(HttpComponent *component, void *arg)
 
     case httpDtData :
     case httpDtDataFragment : {
-      if (context->bodyOffset == 0)
+      if (context->bodyOffset == absentOffset)
           context->bodyOffset = context->buffer.offset;
 
       char *out = (char*)dynamicBufferAlloc(&context->buffer, component->data.size);
@@ -271,10 +276,16 @@ void httpParseDefault(HttpComponent *component, void *arg)
 
     case httpDtFinalize : {
       *(char*)dynamicBufferAlloc(&context->buffer, 1) = 0;
-      if (context->contentTypeOffset)
+      if (context->contentTypeOffset != absentOffset)
         context->contentType.data = (char*)context->buffer.data + context->contentTypeOffset;
-      context->body.data = (char*)context->buffer.data + context->bodyOffset;
-      context->body.size = context->buffer.size - context->bodyOffset - 1;
+      if (context->bodyOffset != absentOffset) {
+        context->body.data = (char*)context->buffer.data + context->bodyOffset;
+        context->body.size = context->buffer.size - context->bodyOffset - 1;
+      } else {
+        // no body: keep the "valid NUL-terminated string" shape of the field
+        context->body.data = (char*)context->buffer.data + context->buffer.size - 1;
+        context->body.size = 0;
+      }
       break;
     }
   }
