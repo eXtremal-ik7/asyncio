@@ -179,6 +179,10 @@ void senderZMQ(SenderContext *ctx)
 static void senderAsyncSendCb(AsyncOpStatus status, zmtpSocket *socket, void *arg)
 {
   auto ctx = static_cast<SenderContext*>(arg);
+  // Completions still queued behind the cutoff arrive after zmtpSocketDelete:
+  // the socket is gone, they must not pump new sends into it
+  if (ctx->deleted.load(std::memory_order_relaxed) != 0)
+    return;
   if (status == aosSuccess) {
     if (ctx->sent == 0 && ctx->counter == 0)
       ctx->startPoint = std::chrono::steady_clock::now();
@@ -204,9 +208,10 @@ static void senderAsyncSendCb(AsyncOpStatus status, zmtpSocket *socket, void *ar
         ctx->counter = 0;
         auto endPoint = std::chrono::steady_clock::now();
         auto diff = std::chrono::duration_cast<std::chrono::seconds>(endPoint - ctx->startPoint).count();
-        if (diff >= 10 && ctx->deleted.fetch_add(1) == 0) {
+        if (diff >= gInterval && ctx->deleted.fetch_add(1) == 0) {
           zmtpSocketDelete(socket);
           postQuitOperation(ctx->base);
+          return;
         }
       }
     }
@@ -399,6 +404,10 @@ void receiverZMQ(ReceiverContext *ctx)
 static void receiverAsyncRecvCb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsgTy, zmtpStream *stream, void *arg)
 {
   auto ctx = static_cast<ReceiverContext*>(arg);
+  // Same cutoff contract as the sender: late completions arrive after
+  // zmtpSocketDelete and must not touch the socket
+  if (ctx->deleted.load(std::memory_order_relaxed) != 0)
+    return;
   if (status == aosSuccess) {
     if (ctx->received == 0 && ctx->counter == 0)
       ctx->startPoint = std::chrono::steady_clock::now();

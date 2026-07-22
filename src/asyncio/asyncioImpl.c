@@ -672,6 +672,13 @@ void executeOperationList(List *list)
       continue;
     }
 
+    // Dying object: nothing new may start. A run-to-completion submission
+    // would finish inside this very pass, dodge the ownership-release sweep
+    // (it only reaps queued operations) and let a flood pin the object past
+    // objectDelete forever; leave it queued for the sweep to cancel
+    if (__uint_atomic_load(&op->object->DeletePending, amoRelaxed))
+      break;
+
     status = op->executeMethod(op);
     if (status == aosPending) {
       op->running = arRunning;

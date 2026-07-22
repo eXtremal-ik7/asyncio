@@ -80,21 +80,22 @@ static const char base64EncodeTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
 
 size_t base64GetDecodeLength(const char *in)
 {
+  // Count the valid prefix only - exactly what base64Decode consumes. No
+  // padding subtraction: malformed '=' runs can no longer underflow the size
   const uint8_t *p = (const uint8_t*)in;
   while (base64DecodeTable[*p++] <= 63)
     continue;
-  --p;
-  size_t padding = 0;
-  while (*p++ == '=')
-    padding++;
-
-  return 3*((p-(const uint8_t*)in)/4) - padding;
+  size_t n = (size_t)(p - (const uint8_t*)in) - 1;
+  return n/4*3 + n%4*3/4 + 1;
 }
 
 
 size_t base64getEncodeLength(size_t len)
 {
-    return ((len + 2) / 3 * 4);
+  size_t groups = len/3 + (len%3 != 0);
+  if (groups > (SIZE_MAX-1)/4)
+    return 0;
+  return groups*4 + 1;
 }
 
 size_t base64Decode(uint8_t *out, const char *in)
@@ -109,7 +110,7 @@ size_t base64Decode(uint8_t *out, const char *in)
     while (base64DecodeTable[*(p++)] <= 63)
       continue;
     bytesRemaining = (p - (const unsigned char *) in) - 1;
-    bytesDecoded = ((bytesRemaining + 3) / 4) * 3;
+    bytesDecoded = bytesRemaining/4*3 + bytesRemaining%4*3/4;
   }
 
   while (bytesRemaining > 4) {
@@ -129,7 +130,6 @@ size_t base64Decode(uint8_t *out, const char *in)
     *pOut++ = (uint8_t)(base64DecodeTable[pIn[2]] << 6 | base64DecodeTable[pIn[3]]);
 
   *pOut = '\0';
-  bytesDecoded -= (4 - bytesRemaining) & 3;
   return bytesDecoded;
 }
 

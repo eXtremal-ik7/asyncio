@@ -73,10 +73,10 @@ typedef struct SMTPOp {
 static inline size_t putBase64(dynamicBuffer *buffer, const void *data, size_t *size)
 {
   size_t length = strlen(data);
-  size_t base64Length = base64getEncodeLength(length);
   size_t offset = buffer->offset;
-  char *ptr = dynamicBufferAlloc(buffer, base64Length + 2);
-  base64Encode(ptr, data, length);
+  // Helper returns the buffer size incl. NUL; CRLF reuses the NUL slot + 1
+  char *ptr = dynamicBufferAlloc(buffer, base64getEncodeLength(length) + 1);
+  size_t base64Length = base64Encode(ptr, data, length);
   ptr[base64Length]   = '\r';
   ptr[base64Length+1] = '\n';
   *size = base64Length+2;

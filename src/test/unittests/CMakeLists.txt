@@ -17,6 +17,7 @@ set(
   uriparsetest.cpp
   httpparsetest.cpp
   httpheadertabletest.cpp
+  base64test.cpp
   coretest.cpp
   timertest.cpp
   eventtest.cpp
@@ -49,6 +50,9 @@ endif()
 set(LIBRARIES ${LIBRARIES} ${PLATFORM_LIBRARIES})
 
 add_executable(unittest ${SOURCES})
+if(MSVC)
+  target_compile_definitions(unittest PRIVATE NOMINMAX)
+endif()
 target_include_directories(
   unittest
   PRIVATE

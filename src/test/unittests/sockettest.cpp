@@ -180,6 +180,81 @@ TEST(socket, test_tcp_rw_ipv6)
   ASSERT_TRUE(context.success);
 }
 
+// A non-afWaitAll read that picks up a partial tail from the read-ahead
+// buffer must complete with those bytes: chasing the drained socket with one
+// more syscall would park the operation and strand the already delivered
+// bytes until unrelated traffic or the timeout.
+struct BufferedPartialContext {
+  asyncBase *base;
+  aioObject *client;
+  aioObject *conn;
+  ssize_t firstRead;
+  ssize_t secondRead;
+  uint8_t firstByte;
+  uint8_t buf[16];
+  explicit BufferedPartialContext(asyncBase *baseArg)
+    : base(baseArg), client(nullptr), conn(nullptr), firstRead(-1), secondRead(-1), firstByte(0)
+  {
+    memset(buf, 0, sizeof(buf));
+  }
+};
+
+static void bufferedPartialAcceptCb(AsyncOpStatus status, aioObject *listener, HostAddress, socketTy acceptSocket, void *arg)
+{
+  __UNUSED(listener);
+  BufferedPartialContext *ctx = static_cast<BufferedPartialContext*>(arg);
+  EXPECT_EQ(status, aosSuccess);
+  if (status != aosSuccess) {
+    postQuitOperation(ctx->base);
+    return;
+  }
+  ctx->conn = newSocketIo(ctx->base, acceptSocket);
+  static const uint8_t payload[5] = {1, 2, 3, 4, 5};
+  aioWrite(ctx->conn, payload, sizeof(payload), afWaitAll, 0, nullptr, nullptr);
+}
+
+static void bufferedPartialReadProc(void *arg)
+{
+  BufferedPartialContext *ctx = static_cast<BufferedPartialContext*>(arg);
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  if (ioConnect(ctx->client, &address, 1000000) == 0) {
+    // One byte: the whole 5-byte segment lands in the read-ahead buffer
+    ctx->firstRead = ioRead(ctx->client, ctx->buf, 1, afNone, 2000000);
+    ctx->firstByte = ctx->buf[0];
+    // Asks for more than the 4 buffered bytes: must return them at once
+    // instead of waiting out the 500 ms timeout on the drained socket
+    ctx->secondRead = ioRead(ctx->client, ctx->buf, sizeof(ctx->buf), afNone, 500000);
+  }
+  postQuitOperation(ctx->base);
+}
+
+TEST(socket, test_tcp_read_buffered_partial_completes)
+{
+  BufferedPartialContext ctx(gBase);
+  aioObject *listener = startTCPServer(gBase, bufferedPartialAcceptCb, &ctx, gPort);
+  ASSERT_NE(listener, nullptr);
+  ctx.client = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(ctx.client, nullptr);
+
+  coroutineTy *coroutine = coroutineNew(bufferedPartialReadProc, &ctx, 0x10000);
+  ASSERT_EQ(coroutineCall(coroutine), 0);
+  asyncLoop(gBase);
+
+  EXPECT_EQ(ctx.firstRead, 1);
+  EXPECT_EQ(ctx.firstByte, 1);
+  EXPECT_EQ(ctx.secondRead, 4);
+  EXPECT_EQ(ctx.buf[0], 2);
+  EXPECT_EQ(ctx.buf[3], 5);
+
+  deleteAioObject(listener);
+  deleteAioObject(ctx.client);
+  if (ctx.conn)
+    deleteAioObject(ctx.conn);
+}
+
 struct IoAcceptTimeoutContext {
   asyncBase *base;
   aioObject *listener;

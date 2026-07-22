@@ -249,6 +249,10 @@ static inline AsyncOpStatus readSyscall(asyncOpRoot *opptr)
 
   if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize))
     return aosSuccess;
+  // A partial hit from the read-ahead buffer completes a non-afWaitAll read
+  // (shared contract with implRead and the iocp executor)
+  if (op->bytesTransferred != 0 && !(opptr->flags & afWaitAll))
+    return aosSuccess;
 
   if (op->transactionSize <= object->buffer.totalSize) {
     while (op->bytesTransferred < op->transactionSize) {
@@ -261,6 +265,10 @@ static inline AsyncOpStatus readSyscall(asyncOpRoot *opptr)
 
       if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize) || !(opptr->flags & afWaitAll))
         break;
+      // A short read means the queue is drained: stay parked instead of
+      // collecting the EAGAIN
+      if ((size_t)bytesRead < sb->totalSize)
+        return aosPending;
     }
 
     return aosSuccess;

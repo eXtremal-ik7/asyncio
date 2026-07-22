@@ -776,6 +776,11 @@ asyncOpRoot *implRead(aioObject *object,
 
   if (copyFromBuffer(buffer, bytesTransferred, sb, size))
     return 0;
+  // A partial hit from the read-ahead buffer completes a non-afWaitAll read
+  // (the reactor executors and iocp share this contract): one more syscall
+  // could hit EAGAIN and park the already delivered bytes behind the timeout
+  if (*bytesTransferred != 0 && !(flags & afWaitAll))
+    return 0;
 
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.read, rwFinish, buffer, size);
@@ -788,11 +793,14 @@ asyncOpRoot *implRead(aioObject *object,
         sb->dataSize = bytes;
         if (copyFromBuffer(buffer, bytesTransferred, sb, size) || !(flags & afWaitAll))
           break;
-      } else {
-        asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afSyncStarted, usTimeout, (void*)callback, arg, actRead, &context);
-        op->bytesTransferred = *bytesTransferred;
-        return &op->root;
+        // A short refill means the queue is drained right now: park without
+        // paying for the guaranteed-EAGAIN syscall
+        if (bytes == sb->totalSize)
+          continue;
       }
+      asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afSyncStarted, usTimeout, (void*)callback, arg, actRead, &context);
+      op->bytesTransferred = *bytesTransferred;
+      return &op->root;
     }
 
     return 0;
