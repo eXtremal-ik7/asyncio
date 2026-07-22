@@ -130,6 +130,10 @@ aioObject *rlpxGetPlainSocket(rlpxSocket *socket)
   return socket->plainSocket;
 }
 
+// RLPx is currently an unfinished API stub, not a supported transport path.
+// The operation entry points below only reserve the intended API/state-machine
+// shape; missing submission and wire processing are deliberate until the
+// protocol implementation is added.
 static AsyncOpStatus startRlpxAccept(asyncOpRoot *opptr)
 {
   __UNUSED(opptr);

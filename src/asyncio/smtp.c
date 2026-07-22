@@ -392,12 +392,11 @@ static AsyncOpStatus smtpWriteCommand(SMTPClient *client, SMTPOp *op, const void
     return (AsyncOpStatus)smtpInvalidFormat;
 
   asyncOpRoot *writeOp;
-  if (client->TlsSocket) {
-    writeOp = implSslWrite(client->TlsSocket, data, size, afWaitAll, 0, smtpSslWriteCb, op);
-  } else {
-    size_t bytesTransferred = 0;
+  size_t bytesTransferred = 0;
+  if (client->TlsSocket)
+    writeOp = implSslWrite(client->TlsSocket, data, size, afWaitAll, 0, smtpSslWriteCb, op, &bytesTransferred);
+  else
     writeOp = implWrite(client->PlainSocket, data, size, afWaitAll, 0, smtpWriteCb, op, &bytesTransferred);
-  }
   if (writeOp) {
     combinerPushOperation(writeOp);
     return aosPending;

@@ -63,8 +63,14 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
                           AsyncFlags flags,
                           uint64_t usTimeout,
                           sslCb callback,
-                          void *arg);
+                          void *arg,
+                          size_t *bytesTransferred);
 
+// Operations on one SSLSocket use a single serialized TLS lane. A pending
+// read may delay a later write; full-duplex application progress is not
+// supported.
+// address == NULL: the transport socket is already connected, only the TLS
+// handshake is performed (both flavors)
 void aioSslConnect(SSLSocket *socket,
                    const HostAddress *address,
                    const char *tlsextHostName,

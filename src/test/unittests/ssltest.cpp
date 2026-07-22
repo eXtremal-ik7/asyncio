@@ -1,14 +1,88 @@
 #include "unittest.h"
 
+#include "asyncio/coroutine.h"
 #include "asyncio/socket.h"
 #include "asyncio/socketSSL.h"
+
+#ifdef OS_WINDOWS
+#include "asyncio/device.h"
+#else
+#include <fcntl.h>
+#include <sys/socket.h>
+#endif
 
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
+#include <vector>
+
+// Server SSL_CTX with a fresh self-signed certificate for helper-thread
+// servers. Returns nullptr on failure; the certificate and key stay
+// referenced by the context only.
+static SSL_CTX *sslTestMakeServerContext()
+{
+  EVP_PKEY *key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256");
+  if (!key)
+    return nullptr;
+  X509 *cert = X509_new();
+  ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+  X509_gmtime_adj(X509_getm_notBefore(cert), -60);
+  X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
+  X509_set_pubkey(cert, key);
+  X509_NAME *subject = X509_get_subject_name(cert);
+  X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, (const unsigned char*)"localhost", -1, -1, 0);
+  X509_set_issuer_name(cert, subject);
+
+  SSL_CTX *serverContext = nullptr;
+  if (X509_sign(cert, key, EVP_sha256()) != 0) {
+    serverContext = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_use_certificate(serverContext, cert);
+    SSL_CTX_use_PrivateKey(serverContext, key);
+  }
+  X509_free(cert);
+  EVP_PKEY_free(key);
+  return serverContext;
+}
+
+// Blocking server side of a genuine TLS handshake, for helper threads.
+// Returns the connected SSL (the caller frees it and closes *acceptedFd) or
+// nullptr; *acceptedFd is valid whenever accept() succeeded. A receive
+// timeout is armed before the handshake so a wedged peer fails the helper
+// instead of blocking it forever.
+static SSL *sslTestServerHandshake(socketTy listenSocket, socketTy *acceptedFd)
+{
+  *acceptedFd = (socketTy)(-1);
+  socketTy fd = accept(listenSocket, nullptr, nullptr);
+  if (fd == (socketTy)(-1))
+    return nullptr;
+  *acceptedFd = fd;
+
+#ifdef OS_WINDOWS
+  DWORD readTimeout = 5000;
+#else
+  timeval readTimeout;
+  readTimeout.tv_sec = 5;
+  readTimeout.tv_usec = 0;
+#endif
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&readTimeout, sizeof(readTimeout));
+
+  SSL_CTX *serverContext = sslTestMakeServerContext();
+  if (!serverContext)
+    return nullptr;
+  SSL *ssl = SSL_new(serverContext);
+  SSL_CTX_free(serverContext);  // the SSL keeps its own reference
+  SSL_set_fd(ssl, (int)fd);
+  if (SSL_accept(ssl) != 1) {
+    SSL_free(ssl);
+    ssl = nullptr;
+  }
+  return ssl;
+}
 
 #if GTEST_HAS_DEATH_TEST
 
@@ -162,36 +236,16 @@ TEST(SslDeathTest, connect_peer_disconnect_during_handshake)
 // cycles forever.
 static void sslTlsThenGarbageServer(socketTy listenSocket, int flood)
 {
-  socketTy fd = accept(listenSocket, nullptr, nullptr);
-  if (fd == (socketTy)(-1))
-    _Exit(4);
-
-  EVP_PKEY *key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256");
-  if (!key)
-    _Exit(4);
-  X509 *cert = X509_new();
-  ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
-  X509_gmtime_adj(X509_getm_notBefore(cert), -60);
-  X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
-  X509_set_pubkey(cert, key);
-  X509_NAME *subject = X509_get_subject_name(cert);
-  X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, (const unsigned char*)"localhost", -1, -1, 0);
-  X509_set_issuer_name(cert, subject);
-  if (X509_sign(cert, key, EVP_sha256()) == 0)
-    _Exit(4);
-
-  SSL_CTX *serverContext = SSL_CTX_new(TLS_server_method());
-  SSL_CTX_use_certificate(serverContext, cert);
-  SSL_CTX_use_PrivateKey(serverContext, key);
-  SSL *ssl = SSL_new(serverContext);
-  SSL_set_fd(ssl, (int)fd);
-  if (SSL_accept(ssl) != 1)
+  socketTy fd;
+  SSL *ssl = sslTestServerHandshake(listenSocket, &fd);
+  if (!ssl)
     _Exit(4);
 
   do {
     if (send(fd, (const char*)gSslGarbage, (int)(sizeof(gSslGarbage)-1), 0) <= 0)
       break;
   } while (flood);
+  SSL_free(ssl);
 }
 
 static void sslGarbageReadCb(AsyncOpStatus status, SSLSocket*, size_t, void *arg)
@@ -432,4 +486,504 @@ TEST(ssl, shared_user_context)
   SSL_CTX_free(userContext);  // the sockets keep the context alive on their own
   sslSocketDelete(first);
   sslSocketDelete(second);
+}
+
+// SSL_MODE_ENABLE_PARTIAL_WRITE in a caller-supplied SSL_CTX makes SSL_write
+// accept as little as one TLS record (16K) per call. A positive result is
+// not "the whole plaintext was taken": the write path must keep feeding the
+// remainder, or the tail of the payload silently vanishes while the
+// operation still reports the full size as sent. A real TLS server receives
+// into a sink and the test compares byte counts on both sides; a receive
+// timeout on the sink turns the lost tail into a countable shortfall
+// instead of a hang. Two flavors: the write submitted after the handshake
+// (synchronous fast path) and pipelined right behind the connect (queued
+// operation path).
+struct SslPartialWriteContext {
+  asyncBase *base;
+  std::vector<uint8_t> payload;
+  bool writeFromConnectCb;
+  AsyncOpStatus connectStatus;
+  AsyncOpStatus writeStatus;
+  size_t writeTransferred;
+  bool writeFinished;
+  ssize_t serverReceived;
+  bool serverMismatch;
+  SslPartialWriteContext(asyncBase *baseArg) :
+    base(baseArg), writeFromConnectCb(false),
+    connectStatus(aosUnknown), writeStatus(aosUnknown),
+    writeTransferred(0), writeFinished(false),
+    serverReceived(0), serverMismatch(false) {}
+};
+
+static void sslPartialWriteSink(socketTy listenSocket, SslPartialWriteContext *ctx)
+{
+  socketTy fd;
+  SSL *ssl = sslTestServerHandshake(listenSocket, &fd);
+  if (!ssl) {
+    if (fd != (socketTy)(-1))
+      socketClose(fd);
+    ctx->serverReceived = -1;
+    return;
+  }
+
+  size_t received = 0;
+  uint8_t chunk[16384];
+  while (received < ctx->payload.size()) {
+    int R = SSL_read(ssl, chunk, (int)sizeof(chunk));
+    if (R <= 0)
+      break;
+    if (received + (size_t)R > ctx->payload.size() ||
+        memcmp(chunk, ctx->payload.data() + received, (size_t)R) != 0) {
+      ctx->serverMismatch = true;
+      break;
+    }
+    received += (size_t)R;
+  }
+  ctx->serverReceived = (ssize_t)received;
+  SSL_free(ssl);
+  socketClose(fd);
+}
+
+static void sslPartialWriteWriteCb(AsyncOpStatus status, SSLSocket*, size_t transferred, void *arg)
+{
+  SslPartialWriteContext *ctx = static_cast<SslPartialWriteContext*>(arg);
+  ctx->writeStatus = status;
+  ctx->writeTransferred = transferred;
+  ctx->writeFinished = true;
+  postQuitOperation(ctx->base);
+}
+
+static void sslPartialWriteConnectCb(AsyncOpStatus status, SSLSocket *socket, void *arg)
+{
+  SslPartialWriteContext *ctx = static_cast<SslPartialWriteContext*>(arg);
+  ctx->connectStatus = status;
+  if (status != aosSuccess) {
+    postQuitOperation(ctx->base);
+    return;
+  }
+  if (ctx->writeFromConnectCb)
+    aioSslWrite(socket, ctx->payload.data(), ctx->payload.size(), afNone, 10000000, sslPartialWriteWriteCb, ctx);
+}
+
+static void sslPartialWriteScenario(bool writeFromConnectCb)
+{
+  SslPartialWriteContext ctx(gBase);
+  ctx.writeFromConnectCb = writeFromConnectCb;
+  // several records plus a partial one: a single SSL_write in partial-write
+  // mode cannot take it whole
+  ctx.payload.resize(100000);
+  for (size_t i = 0; i < ctx.payload.size(); i++)
+    ctx.payload[i] = (uint8_t)(i ^ (i >> 8) ^ (i >> 16));
+
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+
+  SSL_CTX *userContext = SSL_CTX_new(TLS_client_method());
+  ASSERT_NE(userContext, nullptr);
+  SSL_CTX_set_verify(userContext, SSL_VERIFY_NONE, nullptr);
+  SSL_CTX_set_mode(userContext, SSL_MODE_ENABLE_PARTIAL_WRITE);
+  SSLSocket *client = sslSocketNew(gBase, clientIo, userContext);
+  SSL_CTX_free(userContext);
+  ASSERT_NE(client, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread sink(sslPartialWriteSink, listenSocket, &ctx);
+
+  address.ipv4 = inet_addr("127.0.0.1");
+  aioSslConnect(client, &address, nullptr, 5000000, sslPartialWriteConnectCb, &ctx);
+  if (!writeFromConnectCb)
+    aioSslWrite(client, ctx.payload.data(), ctx.payload.size(), afNone, 10000000, sslPartialWriteWriteCb, &ctx);
+
+  asyncLoop(gBase);
+  sink.join();
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_TRUE(ctx.writeFinished);
+  EXPECT_EQ(ctx.writeStatus, aosSuccess);
+  EXPECT_EQ(ctx.writeTransferred, ctx.payload.size());
+  EXPECT_EQ(ctx.serverReceived, (ssize_t)ctx.payload.size())
+    << "the plaintext tail never entered the TLS stream";
+  EXPECT_FALSE(ctx.serverMismatch);
+
+  sslSocketDelete(client);
+  socketClose(listenSocket);
+}
+
+TEST(ssl, partial_write_mode)
+{
+  sslPartialWriteScenario(true);
+}
+
+TEST(ssl, partial_write_mode_pipelined)
+{
+  sslPartialWriteScenario(false);
+}
+
+// address == NULL means "the transport is already connected, run only the
+// TLS handshake" - the async flavor honors that, and the coroutine flavor
+// must not dereference the null address instead. The transport is connected
+// with ioConnect() first, then ioSslConnect(NULL) drives the handshake over
+// it; a verified write proves the stream is genuinely established.
+struct SslIoPreconnectedContext {
+  SslPartialWriteContext *sink;
+  aioObject *transport;
+  SSLSocket *client;
+  int tcpResult;
+  int sslResult;
+  ssize_t writeResult;
+  bool finished;
+  SslIoPreconnectedContext() :
+    sink(nullptr), transport(nullptr), client(nullptr),
+    tcpResult(-1), sslResult(-1), writeResult(-1), finished(false) {}
+};
+
+static void sslIoPreconnectedProc(void *arg)
+{
+  SslIoPreconnectedContext *ctx = static_cast<SslIoPreconnectedContext*>(arg);
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  ctx->tcpResult = ioConnect(ctx->transport, &address, 5000000);
+  if (ctx->tcpResult == 0) {
+    ctx->sslResult = ioSslConnect(ctx->client, nullptr, nullptr, 5000000);
+    if (ctx->sslResult == 0)
+      ctx->writeResult = ioSslWrite(ctx->client, ctx->sink->payload.data(), ctx->sink->payload.size(), afWaitAll, 5000000);
+  }
+  ctx->finished = true;
+  postQuitOperation(gBase);
+}
+
+// The client-side TLS 1.3 handshake ends with SSL_connect() == 1 while the
+// final flight (Finished) is still only queued to bioOut: the flush is a
+// real transport write and the connect must not report success before it
+// lands. Making that write fail deterministically needs no TCP timing (an
+// RST races the data it discards, and IOCP accepts whole overlapped sends
+// long before any reset): the transport is a duplex local channel with FIFO
+// close semantics - everything written before the peer end closes is still
+// delivered, anything the client writes afterwards dies with a broken-pipe
+// error. The transport write queue is wedged with a parked bulk write, and
+// the peer holds the server flight until it has SEEN bulk bytes arrive, so
+// the Finished provably queues behind the wedge; then the peer closes.
+// Both writes die and the connect must fail instead of reporting a session
+// whose Finished never left the machine.
+#ifdef OS_WINDOWS
+struct SslPeerChannel {
+  iodevTy transportEnd;
+  iodevTy peerEnd;
+};
+
+static bool sslPeerChannelCreate(SslPeerChannel *channel)
+{
+  pipeTy pipe;
+  if (pipeCreate(&pipe, 1) != 0)
+    return false;
+  // pipeCreate builds a duplex named pipe: both ends carry both directions
+  channel->transportEnd = pipe.read;
+  channel->peerEnd = pipe.write;
+  return true;
+}
+
+static aioObject *sslPeerChannelOpen(SslPeerChannel *channel)
+{
+  return newDeviceIo(gBase, channel->transportEnd);
+}
+
+// event-based synchronous I/O on the overlapped peer end, bounded so a
+// broken scenario fails the test instead of hanging it
+static bool sslPeerIo(bool isRead, iodevTy handle, void *buffer, size_t size, size_t *transferred)
+{
+  OVERLAPPED overlapped;
+  memset(&overlapped, 0, sizeof(overlapped));
+  overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+  BOOL started = isRead ? ReadFile(handle, buffer, (DWORD)size, nullptr, &overlapped)
+                        : WriteFile(handle, buffer, (DWORD)size, nullptr, &overlapped);
+  bool ok = false;
+  if (started || GetLastError() == ERROR_IO_PENDING) {
+    DWORD bytes = 0;
+    if (WaitForSingleObject(overlapped.hEvent, 5000) == WAIT_OBJECT_0) {
+      ok = GetOverlappedResult(handle, &overlapped, &bytes, FALSE) && bytes > 0;
+      if (ok && transferred)
+        *transferred = bytes;
+    } else {
+      CancelIoEx(handle, &overlapped);
+      GetOverlappedResult(handle, &overlapped, &bytes, TRUE);
+    }
+  }
+  CloseHandle(overlapped.hEvent);
+  return ok;
+}
+
+static bool sslPeerRead(SslPeerChannel *channel, void *buffer, size_t size, size_t *transferred)
+{
+  return sslPeerIo(true, channel->peerEnd, buffer, size, transferred);
+}
+
+static bool sslPeerWrite(SslPeerChannel *channel, const void *buffer, size_t size)
+{
+  size_t sent = 0;
+  while (sent < size) {
+    size_t chunk = 0;
+    if (!sslPeerIo(false, channel->peerEnd, (uint8_t*)(uintptr_t)buffer + sent, size - sent, &chunk))
+      return false;
+    sent += chunk;
+  }
+  return true;
+}
+
+static void sslPeerClose(SslPeerChannel *channel)
+{
+  CloseHandle(channel->peerEnd);
+}
+#else
+struct SslPeerChannel {
+  socketTy transportFd;
+  socketTy peerFd;
+};
+
+static bool sslPeerChannelCreate(SslPeerChannel *channel)
+{
+  int fds[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+    return false;
+  // newSocketIo expects what socketCreate produces: a non-blocking socket
+  // with SIGPIPE suppressed per-descriptor where send() has no MSG_NOSIGNAL
+  fcntl(fds[0], F_SETFL, O_NONBLOCK | fcntl(fds[0], F_GETFL));
+#ifdef SO_NOSIGPIPE
+  int optval = 1;
+  setsockopt(fds[0], SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
+  setsockopt(fds[1], SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
+#endif
+  // bound the peer reads so a broken scenario fails the test, not hangs it
+  timeval readTimeout;
+  readTimeout.tv_sec = 5;
+  readTimeout.tv_usec = 0;
+  setsockopt(fds[1], SOL_SOCKET, SO_RCVTIMEO, (const char*)&readTimeout, sizeof(readTimeout));
+  channel->transportFd = fds[0];
+  channel->peerFd = fds[1];
+  return true;
+}
+
+static aioObject *sslPeerChannelOpen(SslPeerChannel *channel)
+{
+  return newSocketIo(gBase, channel->transportFd);
+}
+
+static bool sslPeerRead(SslPeerChannel *channel, void *buffer, size_t size, size_t *transferred)
+{
+  ssize_t result = recv(channel->peerFd, buffer, size, 0);
+  if (result <= 0)
+    return false;
+  *transferred = (size_t)result;
+  return true;
+}
+
+static bool sslPeerWrite(SslPeerChannel *channel, const void *buffer, size_t size)
+{
+  size_t sent = 0;
+  while (sent < size) {
+    ssize_t result = send(channel->peerFd, (const uint8_t*)buffer + sent, size - sent, 0);
+    if (result <= 0)
+      return false;
+    sent += (size_t)result;
+  }
+  return true;
+}
+
+static void sslPeerClose(SslPeerChannel *channel)
+{
+  socketClose(channel->peerFd);
+}
+#endif
+
+struct SslFinalFlightContext {
+  asyncBase *base;
+  aioObject *transport;
+  SSLSocket *client;
+  std::vector<uint8_t> bulk;
+  aioUserEvent *bulkTrigger;
+  AsyncOpStatus connectStatus;
+  AsyncOpStatus bulkStatus;
+  int events;
+  bool serverFlightSent;
+  SslFinalFlightContext(asyncBase *baseArg) :
+    base(baseArg), transport(nullptr), client(nullptr), bulkTrigger(nullptr),
+    connectStatus(aosUnknown), bulkStatus(aosUnknown),
+    events(0), serverFlightSent(false) {}
+};
+
+// Server side of the handshake over memory BIOs: pump channel bytes into
+// SSL_accept until the server flight is ready, prove the wedge is in place,
+// deliver the flight, break the channel. No sleeps anywhere: every step
+// waits for an observable state of the client.
+static void sslFinalFlightPeerProc(SslPeerChannel *channel, SslFinalFlightContext *ctx)
+{
+  SSL_CTX *serverContext = sslTestMakeServerContext();
+  if (!serverContext) {
+    sslPeerClose(channel);
+    return;
+  }
+  SSL *ssl = SSL_new(serverContext);
+  SSL_CTX_free(serverContext);
+  // the final-flight-after-SSL_connect()==1 shape exists only in TLS 1.3;
+  // pin the version instead of trusting library/config defaults
+  SSL_set_min_proto_version(ssl, TLS1_3_VERSION);
+  BIO *bioIn = BIO_new(BIO_s_mem());
+  BIO *bioOut = BIO_new(BIO_s_mem());
+  SSL_set_bio(ssl, bioIn, bioOut);
+  SSL_set_accept_state(ssl);
+
+  uint8_t buffer[4096];
+  bool flightReady = false;
+  for (;;) {
+    int acceptResult = SSL_accept(ssl);
+    if (acceptResult == 1)
+      break;  // cannot happen before the flight went out; tolerated by the pump
+    if (BIO_ctrl_pending(bioOut) > 0) {
+      flightReady = true;
+      break;
+    }
+    if (SSL_get_error(ssl, acceptResult) != SSL_ERROR_WANT_READ)
+      break;
+    size_t got = 0;
+    if (!sslPeerRead(channel, buffer, sizeof(buffer), &got))
+      break;
+    BIO_write(bioIn, buffer, (int)got);
+  }
+
+  if (flightReady) {
+    // the bytes after the ClientHello are the client's bulk write: seeing
+    // them proves the transport write queue is wedged, so the Finished that
+    // follows the flight below cannot overtake it
+    size_t got = 0;
+    if (sslPeerRead(channel, buffer, sizeof(buffer), &got)) {
+      size_t flightSize = BIO_ctrl_pending(bioOut);
+      std::vector<uint8_t> flight(flightSize);
+      BIO_read(bioOut, flight.data(), (int)flightSize);
+      ctx->serverFlightSent = sslPeerWrite(channel, flight.data(), flight.size());
+    }
+  }
+  // FIFO close: the flight above still reaches the client, while the parked
+  // bulk write and the queued Finished die with a broken-pipe error
+  sslPeerClose(channel);
+  SSL_free(ssl);
+}
+
+static void sslFinalFlightQuitIfDone(SslFinalFlightContext *ctx)
+{
+  if (++ctx->events == 2)
+    postQuitOperation(ctx->base);
+}
+
+static void sslFinalFlightConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  SslFinalFlightContext *ctx = static_cast<SslFinalFlightContext*>(arg);
+  ctx->connectStatus = status;
+  sslFinalFlightQuitIfDone(ctx);
+}
+
+static void sslFinalFlightBulkCb(AsyncOpStatus status, aioObject*, size_t, void *arg)
+{
+  SslFinalFlightContext *ctx = static_cast<SslFinalFlightContext*>(arg);
+  ctx->bulkStatus = status;
+  sslFinalFlightQuitIfDone(ctx);
+}
+
+static void sslFinalFlightTriggerCb(aioUserEvent*, void *arg)
+{
+  // fires after the ClientHello went out (the connect was submitted first on
+  // this same thread); the peer will not release the server flight until
+  // these bytes are seen on its side
+  SslFinalFlightContext *ctx = static_cast<SslFinalFlightContext*>(arg);
+  aioWrite(ctx->transport, ctx->bulk.data(), ctx->bulk.size(), afWaitAll, 10000000, sslFinalFlightBulkCb, ctx);
+}
+
+TEST(ssl, connect_fails_when_final_flight_write_fails)
+{
+  SslFinalFlightContext ctx(gBase);
+  ctx.bulk.assign(1 << 20, 0x41);  // far beyond any channel buffering: parks and stays parked
+
+  SslPeerChannel channel;
+  ASSERT_TRUE(sslPeerChannelCreate(&channel));
+  ctx.transport = sslPeerChannelOpen(&channel);
+  ASSERT_NE(ctx.transport, nullptr);
+  // both sides pin TLS 1.3: the scenario is built around its final-flight
+  // handshake shape
+  SSL_CTX *userContext = SSL_CTX_new(TLS_client_method());
+  ASSERT_NE(userContext, nullptr);
+  SSL_CTX_set_verify(userContext, SSL_VERIFY_NONE, nullptr);
+  SSL_CTX_set_min_proto_version(userContext, TLS1_3_VERSION);
+  ctx.client = sslSocketNew(gBase, ctx.transport, userContext);
+  SSL_CTX_free(userContext);
+  ASSERT_NE(ctx.client, nullptr);
+
+  std::thread peer(sslFinalFlightPeerProc, &channel, &ctx);
+
+  // preconnected transport: the channel needs no TCP connect stage
+  aioSslConnect(ctx.client, nullptr, nullptr, 10000000, sslFinalFlightConnectCb, &ctx);
+  ctx.bulkTrigger = newUserEvent(gBase, 0, sslFinalFlightTriggerCb, &ctx);
+  ASSERT_NE(ctx.bulkTrigger, nullptr);
+  userEventStartTimer(ctx.bulkTrigger, 100000, 1);
+
+  asyncLoop(gBase);
+  peer.join();
+
+  EXPECT_TRUE(ctx.serverFlightSent);
+  EXPECT_NE(ctx.bulkStatus, aosSuccess);
+  EXPECT_NE(ctx.connectStatus, aosSuccess)
+    << "connect reported success although the final handshake flight never reached the transport";
+
+  deleteUserEvent(ctx.bulkTrigger);
+  sslSocketDelete(ctx.client);
+}
+
+TEST(ssl, io_connect_preconnected_transport)
+{
+  SslPartialWriteContext sinkCtx(gBase);
+  sinkCtx.payload.resize(1000);
+  for (size_t i = 0; i < sinkCtx.payload.size(); i++)
+    sinkCtx.payload[i] = (uint8_t)(i ^ (i >> 8));
+
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+  SSLSocket *client = sslSocketNew(gBase, clientIo, nullptr);
+  ASSERT_NE(client, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread sink(sslPartialWriteSink, listenSocket, &sinkCtx);
+
+  SslIoPreconnectedContext ctx;
+  ctx.sink = &sinkCtx;
+  ctx.transport = clientIo;
+  ctx.client = client;
+  coroutineTy *coroutine = coroutineNew(sslIoPreconnectedProc, &ctx, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  coroutineCall(coroutine);
+
+  asyncLoop(gBase);
+  sink.join();
+
+  EXPECT_TRUE(ctx.finished);
+  EXPECT_EQ(ctx.tcpResult, 0);
+  EXPECT_EQ(ctx.sslResult, 0);
+  EXPECT_EQ(ctx.writeResult, (ssize_t)sinkCtx.payload.size());
+  EXPECT_EQ(sinkCtx.serverReceived, (ssize_t)sinkCtx.payload.size());
+  EXPECT_FALSE(sinkCtx.serverMismatch);
+
+  sslSocketDelete(client);
+  socketClose(listenSocket);
 }

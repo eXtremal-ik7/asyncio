@@ -112,7 +112,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
     size_t bytesTransferred = 0;
     op->state = 1;
     asyncOpRoot *childOp = client->isHttps ?
-      implSslWrite(client->sslSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpsResumeProc, op) :
+      implSslWrite(client->sslSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpsResumeProc, op, &bytesTransferred) :
       implWrite(client->plainSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpResumeProc, op, &bytesTransferred);
     if (childOp) {
       combinerPushOperation(childOp);
