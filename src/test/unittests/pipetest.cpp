@@ -55,6 +55,55 @@ TEST(pipe, test_pipe)
     deleteAioObject(context.pipeWrite);
   }
 }
+
+// The read half of the device sync fast path: bytes already buffered in the
+// pipe complete aioRead right on the calling thread - the loop never runs in
+// this test, and the fire-and-forget return value is the only completion
+// channel, deliberately independent of the callback budget (api.h). POSIX
+// devices have always taken this path; on Windows it pins deviceSyncRead
+// probing the pipe instead of unconditionally deferring to the IOCP.
+TEST(pipe, test_pipe_buffered_data_completes_read_inline)
+{
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+
+  const char payload[] = {'p', 'i', 'n', 'g'};
+#ifdef OS_WINDOWS
+  // the write end stays a bare handle (no aioObject, no IOCP association),
+  // so a plain event-driven overlapped write lands the bytes deterministically
+  OVERLAPPED overlapped;
+  memset(&overlapped, 0, sizeof(overlapped));
+  overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+  ASSERT_NE(overlapped.hEvent, (HANDLE)NULL);
+  DWORD bytesWritten = 0;
+  if (!WriteFile(unnamedPipe.write, payload, sizeof(payload), &bytesWritten, &overlapped)) {
+    ASSERT_EQ(GetLastError(), (DWORD)ERROR_IO_PENDING);
+    ASSERT_EQ(WaitForSingleObject(overlapped.hEvent, 5000), WAIT_OBJECT_0);
+    ASSERT_TRUE(GetOverlappedResult(unnamedPipe.write, &overlapped, &bytesWritten, FALSE));
+  }
+  ASSERT_EQ(bytesWritten, sizeof(payload));
+  CloseHandle(overlapped.hEvent);
+#else
+  ASSERT_EQ(write(unnamedPipe.write, payload, sizeof(payload)),
+            (ssize_t)sizeof(payload));
+#endif
+
+  aioObject *pipeRead = newDeviceIo(gBase, unnamedPipe.read);
+  char buffer[8] = {};
+  ssize_t result = aioRead(pipeRead, buffer, sizeof(payload), afNone, 1000000,
+                           nullptr, nullptr);
+
+  EXPECT_EQ(result, (ssize_t)sizeof(payload))
+    << "buffered pipe data must complete the read synchronously";
+  EXPECT_EQ(memcmp(buffer, payload, sizeof(payload)), 0);
+
+  deleteAioObject(pipeRead);
+#ifdef OS_WINDOWS
+  CloseHandle(unnamedPipe.write);
+#else
+  close(unnamedPipe.write);
+#endif
+}
 #ifdef OS_COMMONUNIX
 // Same contract for the device path: writing to a pipe whose reader is gone
 // must not kill the process. write() has no MSG_NOSIGNAL equivalent, so the

@@ -1,5 +1,7 @@
 #include "asyncio/device.h"
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 iodevTy serialPortOpen(const char *name)
 {
@@ -139,14 +141,97 @@ void pipeClose(struct pipeTy pipePtr)
   CloseHandle(pipePtr.read);
 }
 
+// How much input is buffered on the handle right now. Only handle types with
+// a non-destructive probe take the sync fast path; everything else defers to
+// the overlapped path.
+static int deviceReadAvailable(iodevTy hDevice, DWORD *available)
+{
+  *available = 0;
+  switch (GetFileType(hDevice)) {
+    case FILE_TYPE_PIPE:
+      return PeekNamedPipe(hDevice, NULL, 0, NULL, available, NULL) != 0;
+    case FILE_TYPE_CHAR: {
+      DWORD errors;
+      COMSTAT commStat;
+      if (!ClearCommError(hDevice, &errors, &commStat))
+        return 0;
+      *available = commStat.cbInQue;
+      return 1;
+    }
+    default:
+      return 0;
+  }
+}
+
+// Read of a chunk the probe just proved available. The device handle is
+// associated with the IOCP, so a bare completion would land in the loop as a
+// phantom packet pointing at this stack frame - the set low bit of hEvent
+// suppresses posting for both the immediate and the pending outcome. Pending
+// here means another reader stole the bytes between probe and read: cancel
+// instead of waiting for future data, and reap the IRP either way before the
+// OVERLAPPED goes out of scope.
+static int deviceReadBuffered(iodevTy hDevice, void *buffer, DWORD size, DWORD *bytesNum)
+{
+  HANDLE event = CreateEvent(NULL, TRUE, FALSE, NULL);
+  if (!event)
+    return 0;
+
+  OVERLAPPED overlapped;
+  memset(&overlapped, 0, sizeof(overlapped));
+  overlapped.hEvent = (HANDLE)((uintptr_t)event | 1);
+
+  int result;
+  *bytesNum = 0;
+  if (ReadFile(hDevice, buffer, size, bytesNum, &overlapped)) {
+    result = 1;
+  } else {
+    DWORD error = GetLastError();
+    if (error == ERROR_IO_PENDING) {
+      CancelIoEx(hDevice, &overlapped);
+      result = GetOverlappedResult(hDevice, &overlapped, bytesNum, TRUE) ||
+               GetLastError() == ERROR_MORE_DATA;
+    } else if (error == ERROR_MORE_DATA) {
+      // message-mode pipe handed over a truncated chunk; the request is
+      // already complete, only the count has to be fetched
+      GetOverlappedResult(hDevice, &overlapped, bytesNum, FALSE);
+      result = 1;
+    } else {
+      result = 0;
+    }
+  }
+
+  CloseHandle(event);
+  return result;
+}
+
 int deviceSyncRead(iodevTy hDevice, void *buffer, size_t size, int waitAll, size_t *bytesTransferred)
 {
-  *bytesTransferred = 0;
-  return 0;
+  size_t transferred = 0;
+  while (transferred != size) {
+    DWORD available;
+    if (!deviceReadAvailable(hDevice, &available) || available == 0)
+      break;
+
+    size_t remaining = size - transferred;
+    DWORD chunk = remaining < available ? (DWORD)remaining : available;
+    DWORD bytesNum;
+    if (!deviceReadBuffered(hDevice, (uint8_t*)buffer + transferred, chunk, &bytesNum) || bytesNum == 0)
+      break;
+
+    transferred += bytesNum;
+    if (!waitAll)
+      break;
+  }
+
+  *bytesTransferred = transferred;
+  return waitAll ? transferred == size : transferred != 0;
 }
 
 int deviceSyncWrite(iodevTy hDevice, const void *buffer, size_t size, int waitAll, size_t *bytesTransferred)
 {
+  // No synchronous attempt for device writes: an overlapped handle has no
+  // would-block probe, and a WriteFile that goes pending owns the caller's
+  // buffer - every write takes the async path (see device.h)
   *bytesTransferred = 0;
   return 0;
 }
