@@ -331,7 +331,8 @@ void iocpNextFinishedOperation(asyncBase *base)
   OVERLAPPED_ENTRY entries[128];
   const int maxEntriesNum = sizeof(entries) / sizeof(OVERLAPPED_ENTRY);
   iocpBase *localBase = (iocpBase*)base;
-  if (!loopThreadEnter(base))
+  TimerLoopState *timerState = loopThreadEnter(base);
+  if (!timerState)
     return;
 
   int quitting = 0;
@@ -354,24 +355,23 @@ void iocpNextFinishedOperation(asyncBase *base)
         return;
       }
     } else {
-      // An idle base gets UINT32_MAX from timerLoopPrepareSleep, which is
-      // exactly INFINITE: the port then blocks until a completion or a
-      // posted kick.
+      // An idle base plans UINT64_MAX; the last-moment conversion below turns
+      // that into UINT32_MAX, exactly INFINITE for the completion port.
       uint64_t sleepFrom = getMonotonicTicks();
-      uint32_t sleepMs = timerSleepShrinkElapsed(sleepFrom,
-        timerLoopPrepareSleep(base, messageLoopThreadId, sleepFrom, 500));
+      uint64_t wakeTick = timerLoopPrepareSleep(base, timerState, sleepFrom);
+      uint32_t sleepMs = timerSleepMilliseconds(wakeTick);
       status = GetQueuedCompletionStatusEx(localBase->completionPort,
                                            entries,
                                            maxEntriesNum,
                                            &N,
                                            sleepMs,
                                            FALSE);
-      timerLoopCancelSleep(base, messageLoopThreadId);
+      timerLoopCancelSleep(timerState);
 
       // Unconditional sweep (the modulo election is gone): an idle pass
       // costs one relaxed load, and the wakeup handshake relies on whichever
       // thread the kick lands on doing the sweep itself
-      processTimeoutQueue(base, getMonotonicTicks());
+      processTimeoutQueue(base, timerState, getMonotonicTicks());
 
       // ignore false status
       if (status == FALSE)

@@ -393,11 +393,19 @@ static void opArmTimer(asyncOpRoot *op)
       // start timer for this operation
       base->methodImpl.startTimer(op);
     } else {
-      // Saturating add: a huge timeout must not wrap into the past
-      uint64_t nowUs = getMonotonicTicks() * TIMER_TICK_MICROSECONDS;
-      op->endTime = nowUs + op->timeout;
-      if (op->endTime < nowUs)
-        op->endTime = UINT64_MAX;
+      // Keep the grid path in ticks throughout. Match the former
+      // saturating-microsecond semantics: UINT64_MAX us rounded up is the
+      // largest representable deadline, not UINT64_MAX grid ticks.
+      uint64_t nowTick = getMonotonicTicks();
+      uint64_t timeout = op->timeout;
+      uint64_t deltaTick = timeout / TIMER_TICK_MICROSECONDS +
+                           (timeout % TIMER_TICK_MICROSECONDS != 0);
+      const uint64_t deadlineLimit =
+        UINT64_MAX / TIMER_TICK_MICROSECONDS +
+        (UINT64_MAX % TIMER_TICK_MICROSECONDS != 0);
+      op->deadlineTick = nowTick >= deadlineLimit ||
+                         deltaTick > deadlineLimit - nowTick
+                           ? deadlineLimit : nowTick + deltaTick;
       addToTimeoutQueue(base, op);
     }
   }
@@ -818,7 +826,7 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
   }
 }
 
-int loopThreadEnter(asyncBase *base)
+TimerLoopState *loopThreadEnter(asyncBase *base)
 {
   assert(!loopThreadSlotOwned && "one thread cannot nest asyncLoop invocations");
   if (loopThreadSlotOwned)
@@ -839,7 +847,7 @@ int loopThreadEnter(asyncBase *base)
       loopThreadSlotOwned = 1;
       loopThreadBase = base;
       __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, 1, amoSeqCst);
-      return 1;
+      return &base->timerLoopStates[id];
     }
   }
 
@@ -859,7 +867,8 @@ unsigned loopThreadExit(asyncBase *base)
   // Publish awake before making the index reusable. The active counter drops
   // while the bit is still owned, so a new entrant cannot be included in the
   // returned quit-propagation count by racing reuse of this exact slot.
-  __uintptr_atomic_store(&base->timerSleep[id].wakeTick, UINTPTR_MAX, amoRelaxed);
+  __uintptr_atomic_store(&base->timerLoopStates[id].wakeTick, UINTPTR_MAX,
+                         amoRelaxed);
   unsigned remaining = __uint_atomic_fetch_and_add(&base->messageLoopThreadCounter, (unsigned)-1, amoSeqCst) - 1;
   __uintptr_atomic_fetch_and(&base->loopThreadSlots[word], ~bit, amoRelease);
   loopThreadSlotOwned = 0;

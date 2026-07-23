@@ -220,7 +220,8 @@ void epollNextFinishedOperation(asyncBase *base)
   int nfds, n;
   struct epoll_event events[MAX_EVENTS];
   epollBase *localBase = (epollBase*)base;
-  if (!loopThreadEnter(base))
+  TimerLoopState *timerState = loopThreadEnter(base);
+  if (!timerState)
     return;
 
   while (1) {
@@ -239,14 +240,14 @@ void epollNextFinishedOperation(asyncBase *base)
       // UINT32_MAX = wait with no timeout: an idle base blocks until queue
       // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
       uint64_t sleepFrom = getMonotonicTicks();
-      uint32_t sleepMs = timerSleepShrinkElapsed(sleepFrom,
-        timerLoopPrepareSleep(base, messageLoopThreadId, sleepFrom, 500));
+      uint64_t wakeTick = timerLoopPrepareSleep(base, timerState, sleepFrom);
+      uint32_t sleepMs = timerSleepMilliseconds(wakeTick);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
-      timerLoopCancelSleep(base, messageLoopThreadId);
+      timerLoopCancelSleep(timerState);
       // Unconditional sweep (the modulo election is gone): an idle pass costs
       // one relaxed load, and the wakeup handshake relies on whichever thread
       // the kick lands on doing the sweep itself
-      processTimeoutQueue(base, getMonotonicTicks());
+      processTimeoutQueue(base, timerState, getMonotonicTicks());
     } while (nfds <= 0 && errno == EINTR);
 
     for (n = 0; n < nfds; n++) {

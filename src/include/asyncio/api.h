@@ -447,6 +447,10 @@ struct asyncOpRoot {
   void *timerId;
   union {
     uint64_t timeout;
+    // Absolute timeout-grid tick for non-realtime operations. This shares
+    // storage with the relative timeout after the operation is armed.
+    uint64_t deadlineTick;
+    // Kept as an ABI/source-compatible alias for older internal users.
     uint64_t endTime;
   };
   AsyncOpRunningTy running;

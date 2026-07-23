@@ -52,16 +52,17 @@ typedef struct timerWheel {
   // seq-cst loads, and the producer reads those horizons seq-cst after the
   // bit set. The resulting store/load order closes the lost-wakeup race
   // without a locked fetch-add(0) for every scanned bitmap word. A
-  // visitor clears the bit right before its drain CAS, so a publication into
-  // the reopened incarnation is ordered after the clear and its set wins, and
-  // an idempotent visitor that lost the drain race re-sets the bit when it
+  // visitor with an observed bit clears it right before its drain CAS, so a
+  // publication into the reopened incarnation is ordered after the clear and
+  // its set wins. A bitless visitor performs only the drain/reopen DWCAS. An
+  // idempotent visitor that lost either drain race re-sets the bit when it
   // still observes a chain. Invariant: a slot holding a chain published by a
   // returned insert has its bit set - a producer still inside the insert has
   // completed nothing anyone waits on, and its own set runs before it
   // returns - EXCEPT while some visit sits between its bit clear and its
   // drain CAS. The bit carries no incarnation number, so a stale visitor can
   // clear the bit of the chain living in the slot now; each visitor keeps a
-  // pre-clear bracket open for that window (TimerSleepSlot.preclearSequence
+  // pre-clear bracket open for that window (TimerLoopState.preclearSequence
   // odd / overflow word active) and timerLoopPrepareSleep validates its scan
   // against the brackets. A set bit over an empty slot is legal and only
   // costs a spurious wakeup - the next visit clears it.
@@ -77,7 +78,7 @@ typedef struct timerWheel {
 // eternal sentinel is farther than any real tick, so any published deadline
 // finds it late and kicks. Cache-line padding prevents neighbouring loop
 // threads from false-sharing their per-wait publications.
-typedef struct TimerSleepSlot {
+typedef struct TimerLoopState {
   volatile uintptr_t wakeTick;
   // Pre-clear bracket of this loop thread's window visits: odd between the
   // occupancy pre-clear and the drain CAS resolution, +2 per visit.
@@ -85,11 +86,11 @@ typedef struct TimerSleepSlot {
   // follows it, the close is a release over the bit repair.
   volatile uintptr_t preclearSequence;
   uint8_t pad[CACHE_LINE_SIZE - 2 * sizeof(uintptr_t)];
-} TimerSleepSlot;
+} TimerLoopState;
 
 static const uintptr_t timerSleepEternal = UINTPTR_MAX - 1;
 
-// Pre-clear bracket word for visitors without an own TimerSleepSlot: low
+// Pre-clear bracket word for visitors without an own TimerLoopState: low
 // half = visitors inside a bracket, high half = brackets ever entered.
 static const uintptr_t timerPreclearOverflowEntry = ((uintptr_t)1 << 32) + 1;
 static const uintptr_t timerPreclearOverflowActiveMask = ((uintptr_t)1 << 32) - 1;
@@ -183,12 +184,12 @@ struct asyncBase {
   // same index space and hands every concurrent asyncLoop invocation a unique
   // slot with one fetch-or at entry and one fetch-and at exit. Entry is
   // rejected before either array is indexed when the declared limit is full.
-  TimerSleepSlot *timerSleep;
+  TimerLoopState *timerLoopStates;
   uintptr_t *loopThreadSlots;
   unsigned loopThreadSlotWords;
   unsigned loopThreadLimit;
   volatile unsigned messageLoopThreadCounter;
-  // Shared pre-clear bracket for visitors without an own TimerSleepSlot
+  // Shared pre-clear bracket for visitors without an own TimerLoopState
   // (layout at timerPreclearOverflowEntry)
   volatile uintptr_t timerPreclearOverflow;
   // Sticky level-triggered quit (postQuitOperation sets, resetQuitOperation
@@ -565,7 +566,9 @@ int eventTimerTryClaimReference(aioUserEvent *event, uint64_t eventGeneration);
 // Single-threaded wheel lifecycle. Init may run on zeroed or reused storage
 // and seeds every slot's baseTick for the given cursor; teardown recycles
 // whatever links are still parked in the slots into the global link pool
-// without delivering them - the loop threads must already be stopped.
+// without delivering them. Teardown requires full quiescence: not only
+// stopped loop threads but no in-flight armers and no sweeper still owning
+// a detached chain.
 void timerWheelInit(asyncBase *base, uint64_t currentTick);
 void timerWheelTeardown(asyncBase *base);
 
@@ -585,12 +588,16 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor);
 // timerWheelProcessDetached. timerWheelSweepTick composes the level visits of
 // one tick in the required order and confirms the cursor with the exact
 // tick->tick+1 CAS - any thread sweeping the same tick helps a stalled one.
-asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t windowStart);
+// A registered loop passes its uniquely owned state; foreign/test sweepers
+// pass NULL and use the shared overflow bracket when a destructive clear is
+// required.
+asyncOpListLink *timerWheelDetach(asyncBase *base, TimerLoopState *state,
+                                  unsigned level, uint64_t windowStart);
 void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t windowStart);
-void timerWheelSweepTick(asyncBase *base, uint64_t tick);
+void timerWheelSweepTick(asyncBase *base, TimerLoopState *state, uint64_t tick);
 
 void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op);
-void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
+void processTimeoutQueue(asyncBase *base, TimerLoopState *state, uint64_t currentTick);
 
 // Sleep handshake of the message loops with the timeout grid. Before
 // blocking, a loop publishes the eternal-sleep sentinel (the worst case the
@@ -603,46 +610,56 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick);
 // horizon and wakes one loop through methodImpl.wakeupLoop. The scan runs
 // between pre-clear snapshots: an open visitor bracket caps the wait at one
 // grid tick, a bracket closed mid-scan repeats the scan; only a clean empty
-// scan makes the wait unbounded - UINT32_MAX, which the backends pass to the
-// kernel as "no timeout".
+// scan makes the wait unbounded - UINT64_MAX. The backends convert the
+// returned absolute tick immediately before their kernel wait.
 // After the wait returns, the slot is parked at UINTPTR_MAX (awake threads
-// sweep on their own and must not attract kicks). Returns the wait bound in
-// milliseconds; currentTick is the caller's getMonotonicTicks() reading.
-uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t currentTick, uint32_t fallbackMs);
-void timerLoopCancelSleep(asyncBase *base, unsigned threadId);
+// sweep on their own and must not attract kicks). Returns the absolute wake
+// tick; currentTick is the caller's getMonotonicTicks() reading.
+// state is the unique state returned to this loop by loopThreadEnter.
+uint64_t timerLoopPrepareSleep(asyncBase *base, TimerLoopState *state,
+                               uint64_t currentTick);
+void timerLoopCancelSleep(TimerLoopState *state);
 
 // Monotonic (wall-clock-independent) 125 ms ticks for the timeout grid; see
-// the definition in asyncioImpl.c for why the grid must not use time(0).
+// the definition in timerWheel.c for why the grid must not use time(0) and
+// why it counts only active (non-suspend) time on every platform.
 // Returns an unsigned 64-bit tick count, not calendar time, so it is
 // intentionally not a time_t (whose width is platform-dependent and which
 // connotes wall time).
 uint64_t getMonotonicTicks(void);
 
-// Deadline in grid ticks: rounds the microsecond endTime up so a timeout
-// never fires before its deadline.
+// Deadline in grid ticks. The legacy microsecond conversion remains useful
+// to white-box callers that provide an absolute time directly.
 __NO_UNUSED_FUNCTION_BEGIN
-static inline uint64_t timerDeadlineTick(uint64_t endTime)
+static inline uint64_t timerDeadlineTick(uint64_t absoluteMicroseconds)
 {
-  return endTime / TIMER_TICK_MICROSECONDS + (endTime % TIMER_TICK_MICROSECONDS != 0);
+  return absoluteMicroseconds / TIMER_TICK_MICROSECONDS +
+         (absoluteMicroseconds % TIMER_TICK_MICROSECONDS != 0);
 }
 
-// Shrinks a planned kernel-wait by the time elapsed since sleepFromTick: a
-// preemption between planning and syscall must not extend the sleep past the
-// wake. UINT32_MAX passes through. The instructions up to the syscall stay
-// unguarded - closing that needs absolute kernel timers.
-static inline uint32_t timerSleepShrinkElapsed(uint64_t sleepFromTick, uint32_t sleepMs)
+// Convert an absolute wheel wake tick immediately before entering the kernel.
+// The fresh clock read accounts for time lost after sleep planning; far waits
+// are kept inside epoll's signed-int millisecond range.
+static inline uint32_t timerSleepMilliseconds(uint64_t wakeTick)
 {
-  if (sleepMs == UINT32_MAX)
-    return sleepMs;
-  uint64_t elapsedMs = (getMonotonicTicks() - sleepFromTick) * (TIMER_TICK_MICROSECONDS / 1000);
-  return elapsedMs < sleepMs ? sleepMs - (uint32_t)elapsedMs : 0;
+  if (wakeTick == UINT64_MAX)
+    return UINT32_MAX;
+  uint64_t currentTick = getMonotonicTicks();
+  if (wakeTick <= currentTick)
+    return 0;
+  const uint32_t tickMs = TIMER_TICK_MICROSECONDS / 1000;
+  const uint64_t tickLimit = 0x7FFFFFFFu / tickMs;
+  uint64_t sleepTicks = wakeTick - currentTick;
+  if (sleepTicks > tickLimit)
+    sleepTicks = tickLimit;
+  return (uint32_t)(sleepTicks * tickMs);
 }
 __NO_UNUSED_FUNCTION_END
 
-// Claims/releases the unique timerSleep slot for one asyncLoop invocation.
+// Claims/releases the unique timer-loop state for one asyncLoop invocation.
 // Enter returns zero when callers exceed createAsyncBase(loopThreads);
 // release returns the number of loop invocations still active after exit.
-int loopThreadEnter(asyncBase *base);
+TimerLoopState *loopThreadEnter(asyncBase *base);
 unsigned loopThreadExit(asyncBase *base);
 
 // The base whose message loop this thread is currently running (set between

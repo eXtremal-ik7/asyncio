@@ -11,9 +11,9 @@
 // signal and atexit. Elapsed time is measured with a monotonic steady_clock,
 // which our stepping does not perturb.
 //
-// Coverage: the grid path (afNone I/O timeout, endTime = time(0) + timeout in
-// asyncioImpl.c) and the realtime-timer path (userEventStartTimer -> startTimer,
-// timerfd_create(CLOCK_REALTIME) on epoll).
+// Coverage: the grid path (afNone I/O timeout, an absolute CLOCK_MONOTONIC
+// deadline tick in asyncioImpl.c) and the realtime-timer path
+// (userEventStartTimer -> startTimer, timerfd_create(CLOCK_REALTIME) on epoll).
 //
 // Expected verdicts:
 //   grid_* (all backends) and realtime_* on epoll (Linux): RED before the

@@ -116,11 +116,13 @@ static inline int __uint128_atomic_compare_and_swap_relaxed(volatile uint128 *pt
 }
 
 // Two independent acquire loads, NOT a CAS(0,0) full-width read: the result
-// may be torn by a concurrent CAS. Deliberate: every routing decision made
-// from this read is re-validated by the caller's subsequent CAS on the same
-// pair, and payload publication is synchronized exclusively through CAS —
-// never through this load. Readers stay write-free (no cache-line ownership
-// transfer, works on read-only mappings).
+// may be torn by a concurrent CAS. Deliberate: a routing decision made from
+// this read is either re-validated by the caller's subsequent CAS on the
+// same pair, or - when a path acts on a mismatch without CASing - the caller
+// owes its own acquire (this load's ordering, or a fence after the relaxed
+// form) before trusting the observation. Payload publication is synchronized
+// exclusively through CAS — never through this load. Readers stay write-free
+// (no cache-line ownership transfer, works on read-only mappings).
 static inline uint128 __uint128_atomic_load(const volatile uint128 *ptr)
 {
   uint128 result;
@@ -134,8 +136,10 @@ static inline uint128 __uint128_atomic_load(const volatile uint128 *ptr)
   return result;
 }
 
-// Like the ordinary routing load this may be torn; the following CAS validates
-// every decision. It is intended for numeric/token pairs only.
+// Like the ordinary routing load this may be torn and carries no ordering;
+// the following CAS validates and orders every decision, and a path that
+// acts on the value without CASing owes its own acquire fence (see the
+// timer-wheel descend). Intended for numeric/token pairs only.
 static inline uint128 __uint128_atomic_load_relaxed(const volatile uint128 *ptr)
 {
   uint128 result;

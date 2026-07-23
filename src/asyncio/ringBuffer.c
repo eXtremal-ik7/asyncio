@@ -27,6 +27,10 @@ static ConcurrentQueueElement *partitionInit(ConcurrentQueuePartition *buffer, s
   ConcurrentQueueElement *queue = (ConcurrentQueueElement*)__pointer_atomic_load((void *volatile*)&buffer->queue, amoAcquire);
   if (!queue) {
     queue = (ConcurrentQueueElement*)malloc(size*sizeof(ConcurrentQueueElement));
+    // No recovery path: pushers already own payloads that must not vanish -
+    // fail stop deterministically instead of faulting on the first store
+    if (!queue)
+      abort();
     for (size_t i = 0; i < size; i++)
       queue[i].sequence = i;
     // Release is all the publication needs: the winner's sequence stores must

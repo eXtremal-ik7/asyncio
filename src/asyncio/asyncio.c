@@ -224,10 +224,11 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   unsigned loopThreadLimit = loopThreads ? loopThreads : 1;
   const size_t wordBits = sizeof(uintptr_t) * 8;
   size_t loopThreadSlotWords = ((size_t)loopThreadLimit + wordBits - 1) / wordBits;
-  TimerSleepSlot *timerSleep = (TimerSleepSlot*)alignedMalloc(sizeof(TimerSleepSlot) * (size_t)loopThreadLimit, CACHE_LINE_SIZE);
+  TimerLoopState *timerLoopStates = (TimerLoopState*)alignedMalloc(
+    sizeof(TimerLoopState) * (size_t)loopThreadLimit, CACHE_LINE_SIZE);
   uintptr_t *loopThreadSlots = (uintptr_t*)calloc(loopThreadSlotWords, sizeof(uintptr_t));
-  if (!timerSleep || !loopThreadSlots) {
-    alignedFree(timerSleep);
+  if (!timerLoopStates || !loopThreadSlots) {
+    alignedFree(timerLoopStates);
     free(loopThreadSlots);
     return 0;
   }
@@ -247,7 +248,7 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
 #endif
 
   if (!base) {
-    alignedFree(timerSleep);
+    alignedFree(timerLoopStates);
     free(loopThreadSlots);
     return 0;
   }
@@ -260,14 +261,14 @@ asyncBase *createAsyncBase(AsyncMethod method, unsigned loopThreads)
   memset(&base->eventPool, 0, sizeof(base->eventPool));
   base->messageLoopThreadCounter = 0;
   base->quitRequested = 0;
-  base->timerSleep = timerSleep;
+  base->timerLoopStates = timerLoopStates;
   base->loopThreadSlots = loopThreadSlots;
   base->loopThreadSlotWords = (unsigned)loopThreadSlotWords;
   base->loopThreadLimit = loopThreadLimit;
   base->timerPreclearOverflow = 0;
   for (unsigned i = 0; i < loopThreadLimit; i++) {
-    base->timerSleep[i].wakeTick = UINTPTR_MAX;
-    base->timerSleep[i].preclearSequence = 0;
+    base->timerLoopStates[i].wakeTick = UINTPTR_MAX;
+    base->timerLoopStates[i].preclearSequence = 0;
   }
   return base;
 }

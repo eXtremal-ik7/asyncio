@@ -220,7 +220,8 @@ int main(int argc, char **argv)
         for (uint64_t step = 0; step < windowsPerRound; ++step) {
           uint64_t window = (offset + step) % windowsPerRound;
           asyncOpListLink *chain =
-            timerWheelDetach(ownershipBase.get(), 0, roundBase + window);
+            timerWheelDetach(ownershipBase.get(), nullptr, 0,
+                             roundBase + window);
           if (!chain)
             continue;
           nonEmptyDetaches[static_cast<size_t>(window)].fetch_add(1, std::memory_order_relaxed);
@@ -313,7 +314,7 @@ int main(int argc, char **argv)
         for (uint64_t item = 0; item < itemsPerThread; ++item) {
           asyncOpRoot &op = myOps[static_cast<size_t>(item)];
           uint64_t deadline = blockStart + 1 + random.next() % (blockTicks + 1024);
-          op.endTime = deadline * TIMER_TICK_MICROSECONDS;
+          op.deadlineTick = deadline;
           addToTimeoutQueue(sweepBase.get(), &op);
         }
         for (uint64_t item = 0; item < itemsPerThread; ++item)
@@ -331,7 +332,8 @@ int main(int argc, char **argv)
         while ((tick = static_cast<uint64_t>(__uintptr_atomic_load(
                   &sweepBase->timerCloseCursor, amoAcquire))) < blockEnd) {
           if (random.next() % 8 == 0) {
-            asyncOpListLink *chain = timerWheelDetach(sweepBase.get(), 0, tick);
+            asyncOpListLink *chain =
+              timerWheelDetach(sweepBase.get(), nullptr, 0, tick);
             for (asyncOpListLink *link = chain; link; link = link->next) {
               if (link->deadlineTick != tick)
                 corrupt.fetch_add(1, std::memory_order_relaxed);
@@ -344,11 +346,11 @@ int main(int argc, char **argv)
             // The production entry point is the same helper loop; a partial
             // horizon keeps it interleaved with the manual sweeps and stalls
             // instead of eating the whole block in one call
-            processTimeoutQueue(sweepBase.get(),
+            processTimeoutQueue(sweepBase.get(), nullptr,
                                 std::min<uint64_t>(blockEnd, tick + 1 + random.next() % 8));
             continue;
           }
-          timerWheelSweepTick(sweepBase.get(), tick);
+          timerWheelSweepTick(sweepBase.get(), nullptr, tick);
         }
         // Atomic re-read: a straggler may still be confirming the last tick
         if (static_cast<uint64_t>(__uintptr_atomic_load(&sweepBase->timerCloseCursor, amoAcquire)) > blockEnd)
@@ -456,7 +458,8 @@ int main(int argc, char **argv)
     // cursor order. In production the checkpoint is published after these
     // visits, before the delayed producers resume.
     for (uint64_t s = 0; s < itemsPerRound; ++s) {
-      for (asyncOpListLink *link = timerWheelDetach(lateBase.get(), 0, roundBase + s); link;
+      for (asyncOpListLink *link = timerWheelDetach(
+             lateBase.get(), nullptr, 0, roundBase + s); link;
            link = link->next)
         unexpectedlyPresentBeforeAdd++;
     }

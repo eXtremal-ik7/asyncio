@@ -1160,7 +1160,7 @@ TEST(core_loop_slots, concurrent_loops_receive_distinct_indices)
   TestBackend backend;
   constexpr unsigned count = 8;
   std::array<unsigned, count> ids{};
-  std::array<int, count> entered{};
+  std::array<bool, count> entered{};
   std::atomic<unsigned> ready{0};
   std::atomic<bool> release{false};
   std::array<std::thread, count> threads;

@@ -19,8 +19,35 @@
 #include "atomic.h"
 #include <stdlib.h>
 #include <time.h>
+#if defined(OS_WINDOWS)
+#include <realtimeapiset.h>
+#endif
+
+// Build-time guards for the retunable grid constants: the clock formulas
+// divide by TICK/1000 and 1000000/TICK exactly, the nanosecond divisor must
+// fit an int, the occupancy bitmap packs whole 64-bit words per level and
+// the range shift must stay inside 64 bits.
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC C mode runs without /std:c11 and lacks _Static_assert; a negative
+// array size fails the build the same way
+typedef char timerTickAtLeastOneMillisecond[TIMER_TICK_MICROSECONDS >= 1000 ? 1 : -1];
+typedef char timerTickWholeMilliseconds[TIMER_TICK_MICROSECONDS % 1000 == 0 ? 1 : -1];
+typedef char timerTickDividesOneSecond[1000000 % TIMER_TICK_MICROSECONDS == 0 ? 1 : -1];
+typedef char timerTickNanosecondDivisorFitsInt[TIMER_TICK_MICROSECONDS <= 2147483 ? 1 : -1];
+typedef char timerWheelOccupancyWholeWords[TIMER_WHEEL_SLOTS % 64 == 0 ? 1 : -1];
+typedef char timerWheelRangeShiftBelow64[TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS < 64 ? 1 : -1];
+#else
+_Static_assert(TIMER_TICK_MICROSECONDS >= 1000, "millisecond conversions divide by TICK/1000");
+_Static_assert(TIMER_TICK_MICROSECONDS % 1000 == 0, "kernel timeouts are whole milliseconds");
+_Static_assert(1000000 % TIMER_TICK_MICROSECONDS == 0, "seconds must convert to whole ticks");
+_Static_assert(TIMER_TICK_MICROSECONDS <= 2147483, "TICK * 1000 (ns per tick) must fit in int");
+_Static_assert(TIMER_WHEEL_SLOTS % 64 == 0, "occupancy bitmap packs whole 64-bit words");
+_Static_assert(TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS < 64, "wheel range shift must stay below 64");
+#endif
 
 static ConcurrentQueue asyncOpLinkListPool;
+
+static void timerKickUncoveredSleepers(asyncBase *base, uint64_t deadline);
 
 static inline unsigned highestBitIndex64(uint64_t value)
 {
@@ -62,6 +89,14 @@ static inline void timerWheelClearOccupied(asyncBase *base, unsigned level, unsi
                              amoSeqCst);
 }
 
+static inline int timerWheelIsOccupied(asyncBase *base, unsigned level,
+                                       unsigned index)
+{
+  uintptr_t bits = __uintptr_atomic_load(
+    &base->timerWheel.occupancy[level][index >> 6], amoSeqCst);
+  return (bits & ((uintptr_t)1 << (index & 63))) != 0;
+}
+
 // Window width of a level, in ticks
 static inline uint64_t timerWheelWidth(unsigned level)
 {
@@ -77,16 +112,26 @@ static inline uint64_t timerWheelPeriod(unsigned level)
 // Monotonic ticks for the timeout grid. Deliberately not derived from the
 // wall clock (time(0)): a backward NTP/manual step would stall the grid (the
 // checkpoint would sit ahead of "now" and the sweep would early-return), and
-// a forward step would fire pending timeouts early. A monotonic source
-// advances with true elapsed time regardless of any system-date change. All
-// grid sites (arm, sweep, checkpoint init) must share this one clock.
+// a forward step would fire pending timeouts early. Active-time semantics on
+// every platform: CLOCK_MONOTONIC (Linux, macOS) and unbiased interrupt time
+// exclude suspend/hibernation, matching the kernel waits the backends sleep
+// in - a relative GetQueuedCompletionStatusEx timeout does not run in
+// low-power states either (Windows 8+), so a suspend-counting clock would
+// declare deadlines overdue while the wait still had its full active
+// remainder to serve. All grid sites (arm, sweep, checkpoint init) must
+// share this one clock. The sources cannot fail on supported targets; fail
+// stop beats reading an undefined time.
 uint64_t getMonotonicTicks(void)
 {
 #if defined(OS_WINDOWS)
-  return GetTickCount64() / (TIMER_TICK_MICROSECONDS / 1000);
+  ULONGLONG interruptTime100ns;
+  if (!QueryUnbiasedInterruptTime(&interruptTime100ns))
+    abort();
+  return interruptTime100ns / (TIMER_TICK_MICROSECONDS * 10u);
 #else
   struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    abort();
   return (uint64_t)ts.tv_sec * (1000000 / TIMER_TICK_MICROSECONDS) +
          (uint64_t)ts.tv_nsec / (TIMER_TICK_MICROSECONDS * 1000);
 #endif
@@ -113,7 +158,9 @@ void timerWheelInit(asyncBase *base, uint64_t currentTick)
 
 void timerWheelTeardown(asyncBase *base)
 {
-  // Loop threads are already stopped: links are recycled without delivery,
+  // Full-quiescence contract: no loop threads, no in-flight armers and no
+  // sweeper still owning a detached chain - a concurrent publish or drain
+  // would race these plain stores. Links are recycled without delivery,
   // their operations are dead or dying with the base
   for (unsigned level = 0; level < TIMER_WHEEL_LEVELS; level++) {
     for (unsigned i = 0; i < TIMER_WHEEL_SLOTS; i++) {
@@ -162,50 +209,34 @@ static int timerWheelTryPublish(asyncBase *base, unsigned level, unsigned index,
 int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
 {
   uint64_t deadline = link->deadlineTick;
+  const uint64_t range =
+    (uint64_t)1 << (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS);
 
   for (;;) {
     // The deadline's tick is already confirmed swept: its window was visited,
     // the arm is late. Strictly "<": tick == cursor is the first unconfirmed
     // tick, its window may not have been visited yet and the deadline is not
     // due before that visit anyway - expiring it here would fire early.
-    // Re-checked after each far-branch cursor refresh
+    // Live only for the caller's cursor: every refresh assigns
+    // expectedBase <= deadline, so re-entry cannot trip it (kept as a cheap
+    // invariant guard)
     if (deadline < cursor)
       return 0;
 
-    if ((deadline - cursor) >> (TIMER_WHEEL_LEVEL_BITS * TIMER_WHEEL_LEVELS)) {
-      // Far by numeric distance - the XOR image mistakes a near deadline
-      // across a range binary boundary for far. The farthest top-level
-      // slot's visit precedes the deadline and re-cascades the exact tick;
-      // an incarnation mismatch means a stale hint - reroute from the
-      // authoritative cursor
-      unsigned level = TIMER_WHEEL_LEVELS - 1;
-      unsigned index = ((unsigned)(cursor >> (TIMER_WHEEL_LEVEL_BITS * level)) + TIMER_WHEEL_SLOTS - 1) %
-                       TIMER_WHEEL_SLOTS;
-      uint64_t windowStart = (cursor & ~(timerWheelPeriod(level) - 1)) +
-                             (uint64_t)index * timerWheelWidth(level);
-      uint64_t expectedBase = windowStart > cursor ? windowStart
-                                                   : windowStart + timerWheelPeriod(level);
-      volatile uint128 *slot = &base->timerWheel.slots[level][index];
-      // Routing snapshot only; the successful DWCAS inside the publish helper
-      // is the publication acquire and validates both possibly torn words.
-      uint128 observed = __uint128_atomic_load_relaxed(slot);
-      while (observed.high == expectedBase) {
-        if (timerWheelTryPublish(base, level, index, &observed, link))
-          return 1;
-      }
-      cursor = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire);
-      continue;
-    }
-
-    // XOR picks the level; across a range binary boundary it overshoots the
-    // top level for an in-range distance - clamp, expectedBase still targets
-    // the deadline's own window
-    uint64_t diff = deadline ^ cursor;
-    unsigned level = diff ? highestBitIndex64(diff) / TIMER_WHEEL_LEVEL_BITS : 0;
-    if (level >= TIMER_WHEEL_LEVELS)
-      level = TIMER_WHEEL_LEVELS - 1;
-    unsigned index = (unsigned)(deadline >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
-    uint64_t expectedBase = deadline & ~(timerWheelWidth(level) - 1);
+    // Route by numeric distance, not by the differing radix prefix. Near
+    // deadlines stay near even when cursor and deadline straddle a power-of-
+    // two boundary. A far deadline is represented by the last point inside
+    // the wheel's current numeric range; using the deadline itself after
+    // merely clamping the level could target an incarnation not open yet.
+    uint64_t distance = deadline - cursor;
+    uint64_t routeDistance = distance < range ? distance : range - 1;
+    uint64_t routeTick = cursor + routeDistance;
+    unsigned level = routeDistance
+      ? highestBitIndex64(routeDistance) / TIMER_WHEEL_LEVEL_BITS : 0;
+    uint64_t width = timerWheelWidth(level);
+    uint64_t expectedBase = routeTick & ~(width - 1);
+    unsigned index = (unsigned)(routeTick >>
+      (TIMER_WHEEL_LEVEL_BITS * level)) & (TIMER_WHEEL_SLOTS - 1);
 
     // Publish only into the incarnation that covers the deadline: the pair
     // CAS validates head and baseTick together, so "published into a foreign
@@ -215,19 +246,33 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
     volatile uint128 *slot = &base->timerWheel.slots[level][index];
     uint128 observed = __uint128_atomic_load_relaxed(slot);
     while (observed.high == expectedBase) {
-      if (timerWheelTryPublish(base, level, index, &observed, link))
+      if (timerWheelTryPublish(base, level, index, &observed, link)) {
+        // The insert owns activation duty as well as bitmap publication. This
+        // is deliberately per link: a sleeper can scan between two links of
+        // the same detached chain being re-published.
+        timerKickUncoveredSleepers(base, deadline);
         return 1;
+      }
     }
 
     // The window's incarnation is gone - its visit already ran (baseTick
     // moves only forward, in whole rotations). At level 0 the window IS the
-    // deadline tick: the timeout is due, refuse the publication. Higher up
-    // the deadline may still lie ahead inside the drained window - descend,
-    // taking the drained window's start as a proven sweep position; the
-    // deadline shares that prefix, so the level strictly decreases and the
-    // loop is bounded by the number of levels
+    // routed tick: the deadline is due, refuse the publication. Higher up the
+    // deadline may still lie ahead; take the drained window's start as a
+    // proven sweep position and route again. Normal in-range routing strictly
+    // descends a level; a far route may first advance its stale range hint.
     if (level == 0)
       return 0;
+    // The mismatch itself was observed by a relaxed load. A pinned iteration
+    // can only observe drain-written values (the incoming pin forbids older
+    // ones), so this acquire fence makes that drain synchronize-with us and,
+    // through the drainer's own acquire cursor read, pins every visit below
+    // expectedBase for the next iteration - the same induction as the first
+    // route (see the cursor comment in addToTimeoutQueue). Without it a
+    // weakly-ordered CPU may satisfy the next iteration's slot load early,
+    // see a pre-reopen baseTick and falsely refuse at level 0 - an early
+    // timeout up to a full lower-level rotation ahead of the deadline.
+    __atomic_fence(amoAcquire);
     cursor = expectedBase;
   }
 }
@@ -257,23 +302,27 @@ int timerWheelInsert(asyncBase *base, asyncOpListLink *link, uint64_t cursor)
 // and runs this check itself, so the litmus binds each publication
 // independently; visibility never waits on another thread resuming. Every
 // stale reading errs toward a spurious kick, never toward a lost wakeup.
+// Coverage itself is a cooperative promise, not a transferable token: a loop
+// that wakes early withdraws its horizon and re-establishes coverage only at
+// its next prepareSleep, after finishing the in-flight dispatch batch (user
+// callbacks included), so a covered deadline may trail that work. Timer
+// progress deliberately rests on every loop thread continuing its loop;
+// pause-tolerance across a stalled loop thread is out of contract.
 static void timerKickUncoveredSleepers(asyncBase *base, uint64_t deadline)
 {
-  if (!base->timerSleep)
+  TimerLoopState *states = base->timerLoopStates;
+  if (!states)
     return;
-  uintptr_t earliest = UINTPTR_MAX;
-  for (unsigned i = 0; i < base->loopThreadLimit; i++) {
+  unsigned limit = base->loopThreadLimit;
+  int hasSleeper = 0;
+  for (unsigned i = 0; i < limit; i++) {
     uintptr_t wakeTick =
-      __uintptr_atomic_load(&base->timerSleep[i].wakeTick, amoSeqCst);
-    if (wakeTick < earliest)
-      earliest = wakeTick;
-    // A covering sleeper fixes the decision as "no kick"; later slots can
-    // only lower the minimum further. No such exit for UINTPTR_MAX: an
-    // awake slot covers nothing, a later slot may still demand the kick
-    if (earliest <= (uintptr_t)(deadline + 1))
-      break;
+      __uintptr_atomic_load(&states[i].wakeTick, amoSeqCst);
+    if (wakeTick <= (uintptr_t)(deadline + 1))
+      return;
+    hasSleeper |= wakeTick != UINTPTR_MAX;
   }
-  if (earliest != UINTPTR_MAX && earliest > (uintptr_t)(deadline + 1))
+  if (hasSleeper)
     base->methodImpl.wakeupLoop(base);
 }
 
@@ -298,10 +347,7 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   timerLink->object = op->object;
   timerLink->objectGeneration =
     objectHeaderGeneration(&op->object->header);
-  timerLink->deadlineTick = timerDeadlineTick(op->endTime);
-  // The deadline is read back after the publication for the wakeup check, and
-  // a published link belongs to the wheel - keep a local copy
-  uint64_t deadline = timerLink->deadlineTick;
+  timerLink->deadlineTick = op->deadlineTick;
   // timerId strictly before publication: the moment the link is in the slot a
   // concurrent sweep may deliver the timeout and recycle the operation, and a
   // late store would corrupt the next incarnation's field
@@ -314,7 +360,9 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
   // window was drained. With a relaxed read the pair load may be satisfied
   // ahead of the cursor load, and a visit landing between the two would make
   // a still-open level-0 window look drained - the arm would be refused and
-  // the timeout delivered up to a full level-0 rotation early
+  // the timeout delivered up to a full level-0 rotation early. The descend
+  // path re-establishes this pin per mismatch with an acquire fence inside
+  // the insert
   if (!timerWheelInsert(base,
                         timerLink,
                         __uintptr_atomic_load(&base->timerCloseCursor,
@@ -337,9 +385,6 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
     return;
   }
 
-  // A published link belongs to the wheel; the kick decision reads the local
-  // deadline copy
-  timerKickUncoveredSleepers(base, deadline);
 }
 
 // Drain the slot owning the window that starts at windowStart and reopen it
@@ -348,15 +393,11 @@ void addToTimeoutQueue(asyncBase *base, asyncOpRoot *op)
 // the new one - a link cannot be lost in between. Exactly one caller gets the
 // chain of an incarnation: every other visitor of the same window observes
 // the advanced baseTick and returns 0 (the visit is idempotent).
-asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t windowStart)
+asyncOpListLink *timerWheelDetach(asyncBase *base, TimerLoopState *state,
+                                  unsigned level, uint64_t windowStart)
 {
   unsigned index = (unsigned)(windowStart >> (TIMER_WHEEL_LEVEL_BITS * level)) % TIMER_WHEEL_SLOTS;
   volatile uint128 *slot = &base->timerWheel.slots[level][index];
-  // Bracket identity: a loop thread of this base owns a TimerSleepSlot,
-  // anyone else shares the overflow word
-  TimerSleepSlot *visitor =
-    loopThreadBase == base && base->timerSleep && messageLoopThreadId < base->loopThreadLimit
-      ? &base->timerSleep[messageLoopThreadId] : 0;
   uintptr_t sequence = 0;
   int opened = 0;
   asyncOpListLink *chain = 0;
@@ -375,13 +416,30 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
       break;
     }
     if (!opened) {
+      // Empty/bitless windows need no destructive bitmap clear and therefore
+      // no pre-clear bracket. The strong DWCAS is still mandatory: it moves
+      // the incarnation even when the head is null and acquires a bitless
+      // chain from a publisher stalled before its occupancy set. A failed
+      // CAS refreshes the pair; reload the bit before deciding again.
+      if (!timerWheelIsOccupied(base, level, index)) {
+        uint128 desired;
+        desired.low = 0;
+        desired.high = windowStart + timerWheelPeriod(level);
+        if (__uint128_atomic_compare_and_swap(slot, &observed, desired)) {
+          chain = (asyncOpListLink*)(uintptr_t)observed.low;
+          break;
+        }
+        continue;
+      }
+
       // Open the pre-clear bracket before the first destructive clear. The
       // odd value need only reach threads that observed the clear itself:
       // the plain store rides on the seq-cst clear RMW that follows it
       opened = 1;
-      if (visitor) {
-        sequence = __uintptr_atomic_load(&visitor->preclearSequence, amoRelaxed);
-        __uintptr_atomic_store(&visitor->preclearSequence, sequence + 1, amoRelaxed);
+      if (state) {
+        sequence = __uintptr_atomic_load(&state->preclearSequence, amoRelaxed);
+        __uintptr_atomic_store(&state->preclearSequence, sequence + 1,
+                               amoRelaxed);
       } else {
         __uintptr_atomic_fetch_and_add(&base->timerPreclearOverflow,
                                        timerPreclearOverflowEntry,
@@ -406,8 +464,9 @@ asyncOpListLink *timerWheelDetach(asyncBase *base, unsigned level, uint64_t wind
   if (opened) {
     // Release order: a sleeper reading the even value must also see the bit
     // repair / drain resolution ordered before it
-    if (visitor)
-      __uintptr_atomic_store(&visitor->preclearSequence, sequence + 2, amoRelease);
+    if (state)
+      __uintptr_atomic_store(&state->preclearSequence, sequence + 2,
+                             amoRelease);
     else
       __uintptr_atomic_fetch_and_add(&base->timerPreclearOverflow, ~(uintptr_t)0, amoRelease);
   }
@@ -425,29 +484,24 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
     // Local copy: past a successful re-insert the link belongs to the wheel
     // again and may be delivered and recycled concurrently
     uint64_t deadlineTick = link->deadlineTick;
-    if (opGetGeneration(link->op) != link->generation) {
-      // The operation completed and moved on long ago; lazy cancellation ends
-      // here without touching anything beyond the atomic tag
+    uintptr_t expectedTag =
+      (link->generation << TAG_STATUS_SIZE) | aosPending;
+    uintptr_t currentTag =
+      __uintptr_atomic_load(&link->op->tag, amoRelaxed);
+    if (currentTag != expectedTag) {
+      // A terminal operation in the same generation is just as dead as a
+      // recycled one. The tag is the only operation storage a stale link may
+      // inspect; a stale pending read merely preserves the old lazy path.
       objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
-    } else if (deadlineTick <= windowStart) {
-      (void)opCancel(link->op,
-                     link->generation,
-                     aosTimeout,
-                     link->object,
-                     link->objectGeneration);
-      objectPoolPut(&asyncOpLinkListPool, link, sizeof(asyncOpListLink));
-    } else if (timerWheelInsert(base, link, windowStart)) {
+    } else if (deadlineTick > windowStart &&
+               timerWheelInsert(base, link, windowStart)) {
       // Cascade: the deadline is inside a narrower window; re-route from the
       // tick being processed (the target level only shrinks for an in-window
-      // deadline). The re-parking sweeper is this link's publisher now, with
-      // a fresh arm's full activation duty: the bit set ran inside the
-      // insert, the uncovered-sleeper check runs here - a sleeper that
-      // scanned between the upper window's drain and this lower publication
-      // has no other way to learn of the migrated deadline
-      timerKickUncoveredSleepers(base, deadlineTick);
+      // deadline). timerWheelInsert performs this re-publication's activation
+      // duty before returning.
     } else {
-      // A refused publication means the lower window is already terminal - a
-      // stalled owner resuming an old chain - so the timeout is due right now
+      // Due links and refused lower-window publications have the same
+      // terminal action. The latter is a stalled owner resuming an old chain.
       (void)opCancel(link->op,
                      link->generation,
                      aosTimeout,
@@ -459,21 +513,24 @@ void timerWheelProcessDetached(asyncBase *base, asyncOpListLink *link, uint64_t 
   }
 }
 
-static void timerWheelVisit(asyncBase *base, unsigned level, uint64_t windowStart)
+static void timerWheelVisit(asyncBase *base, TimerLoopState *state,
+                            unsigned level, uint64_t windowStart)
 {
-  timerWheelProcessDetached(base, timerWheelDetach(base, level, windowStart), windowStart);
+  asyncOpListLink *chain = timerWheelDetach(base, state, level, windowStart);
+  if (chain)
+    timerWheelProcessDetached(base, chain, windowStart);
 }
 
-void timerWheelSweepTick(asyncBase *base, uint64_t tick)
+void timerWheelSweepTick(asyncBase *base, TimerLoopState *state, uint64_t tick)
 {
   // Visit order inside one tick: upper levels first, then level 0 - a link
   // whose deadline sits exactly on a window boundary must migrate down and
   // fire in this very tick, not one rotation later
   for (unsigned level = TIMER_WHEEL_LEVELS - 1; level >= 1; level--) {
     if ((tick & (timerWheelWidth(level) - 1)) == 0)
-      timerWheelVisit(base, level, tick);
+      timerWheelVisit(base, state, level, tick);
   }
-  timerWheelVisit(base, 0, tick);
+  timerWheelVisit(base, state, 0, tick);
 
   // Confirm the tick. The cursor only ever moves forward by 1 from the exact
   // tick just swept, so a sweeper resurfacing with a long-confirmed tick
@@ -492,7 +549,8 @@ void timerWheelSweepTick(asyncBase *base, uint64_t tick)
                                     amoRelease);
 }
 
-void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
+void processTimeoutQueue(asyncBase *base, TimerLoopState *state,
+                         uint64_t currentTick)
 {
   // Relaxed fast check keeps the per-iteration cost of an idle grid to one
   // load; it races with the confirm CAS only formally - a stale (smaller)
@@ -507,7 +565,7 @@ void processTimeoutQueue(asyncBase *base, uint64_t currentTick)
   // concurrent callers finish the tick of a stalled one instead of waiting
   uint64_t tick;
   while ((tick = (uint64_t)__uintptr_atomic_load(&base->timerCloseCursor, amoAcquire)) < currentTick)
-    timerWheelSweepTick(base, tick);
+    timerWheelSweepTick(base, state, tick);
 }
 
 // Earliest tick a sleeping loop must wake at to serve the parked timers, or
@@ -577,39 +635,45 @@ static uint64_t timerWheelNearestWake(asyncBase *base, uint64_t from)
   return best;
 }
 
-// Sum and parity of every pre-clear bracket (per-slot sequences plus the
-// overflow word). Components only grow, so equal sums mean no bracket
-// turnover between two snapshots.
+// Version and activity of every relevant pre-clear bracket. Per-loop
+// sequences only grow. The overflow high half is its monotonic entry epoch;
+// the low half is the active count and deliberately does not participate in
+// the version, so closes can no longer cancel a per-loop increment.
 typedef struct TimerPreclearSnapshot {
-  uintptr_t sum;
+  uintptr_t version;
   int active;
 } TimerPreclearSnapshot;
 
-static TimerPreclearSnapshot timerPreclearSnapshot(asyncBase *base)
+static TimerPreclearSnapshot timerPreclearSnapshot(
+  asyncBase *base, TimerLoopState *ownState,
+  TimerLoopState *states, unsigned limit)
 {
   TimerPreclearSnapshot snapshot = {0, 0};
-  for (unsigned i = 0; i < base->loopThreadLimit; i++) {
-    uintptr_t sequence = __uintptr_atomic_load(&base->timerSleep[i].preclearSequence, amoAcquire);
-    snapshot.sum += sequence;
-    snapshot.active |= (int)(sequence & 1);
+  for (unsigned i = 0; i < limit; i++) {
+    if (&states[i] == ownState)
+      continue;
+    uintptr_t sequence =
+      __uintptr_atomic_load(&states[i].preclearSequence, amoAcquire);
+    if (sequence & 1) {
+      snapshot.active = 1;
+      return snapshot;
+    }
+    snapshot.version += sequence;
   }
   uintptr_t overflow = __uintptr_atomic_load(&base->timerPreclearOverflow, amoAcquire);
-  snapshot.sum += overflow;
-  snapshot.active |= (overflow & timerPreclearOverflowActiveMask) != 0;
+  snapshot.version += overflow >> 32;
+  snapshot.active =
+    (overflow & timerPreclearOverflowActiveMask) != 0;
   return snapshot;
 }
 
-uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t currentTick, uint32_t fallbackMs)
+uint64_t timerLoopPrepareSleep(asyncBase *base, TimerLoopState *state,
+                               uint64_t currentTick)
 {
-  const uint32_t tickMs = TIMER_TICK_MICROSECONDS / 1000;
-  TimerSleepSlot *slot =
-    base->timerSleep && threadId < base->loopThreadLimit ? &base->timerSleep[threadId] : 0;
-  // A thread beyond the horizon array has no channel for the wakeup kick:
-  // cap its wait at one grid tick so a deadline it cannot be told about is
-  // late by at most the tick (an out-of-contract configuration; delivery is
-  // otherwise carried by the slotted threads)
-  if (!slot)
-    return tickMs < fallbackMs ? tickMs : fallbackMs;
+  assert(state && "timer sleep requires the loop's owned state");
+  TimerLoopState *states = base->timerLoopStates;
+  unsigned limit = base->loopThreadLimit;
+  assert(states && "timer loop states must exist while a loop is active");
 
   // The worst case this call may commit to goes out first: the scan below
   // must run with a published wakeTick no earlier than the final decision,
@@ -617,7 +681,7 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
   // kick while the scan misses its fresh bit. Every later store only
   // shrinks the horizon - a producer reading a stale larger value kicks
   // spuriously at worst
-  __uintptr_atomic_store(&slot->wakeTick, timerSleepEternal, amoSeqCst);
+  __uintptr_atomic_store(&state->wakeTick, timerSleepEternal, amoSeqCst);
 
   // Scan from the confirmed sweep position when it lags the clock (a
   // concurrent sweeper mid-tick): due backlog then wakes immediately instead
@@ -629,52 +693,57 @@ uint32_t timerLoopPrepareSleep(asyncBase *base, unsigned threadId, uint64_t curr
   // bitless anywhere in the wheel (the bit has no incarnation), invisible to
   // the scan. Trust the scan only when no bracket was open at either
   // snapshot and none turned over in between: reading a cleared bit orders
-  // the bracket open before the closing snapshot, a close mid-scan changes
-  // the sum - one re-scan then sees the repaired bit. Both parity checks are
-  // load-bearing: an overflow exit is the one negative sum term and can
-  // cancel a slot close, but it presupposes a bracket already open at the
-  // opening snapshot. Otherwise cap at one tick behind the scan origin: due
-  // backlog drains immediately, the pair-driven sweep delivers without the
-  // bitmap
-  uint64_t wake;
-  TimerPreclearSnapshot before = timerPreclearSnapshot(base);
-  for (unsigned attempt = 0;;) {
-    wake = timerWheelNearestWake(base, from);
-    TimerPreclearSnapshot after = timerPreclearSnapshot(base);
-    if (!before.active && !after.active && after.sum == before.sum)
-      break;
-    if (before.active || after.active || ++attempt == 2) {
-      if (wake > from + 1)
-        wake = from + 1;
-      break;
+  // the bracket open before the closing snapshot, while a completed bracket
+  // advances a monotonic component version. An active opening snapshot skips
+  // the futile bitmap scan entirely. Otherwise cap at one tick behind the
+  // scan origin: due backlog drains immediately, the pair-driven sweep
+  // delivers without the bitmap.
+  uint64_t wake = from + 1;
+  TimerPreclearSnapshot before =
+    timerPreclearSnapshot(base, state, states, limit);
+  if (!before.active) {
+    for (unsigned attempt = 0;;) {
+      wake = timerWheelNearestWake(base, from);
+      // No validation result can shorten the already-minimal horizon.
+      if (wake == from + 1)
+        break;
+      TimerPreclearSnapshot after =
+        timerPreclearSnapshot(base, state, states, limit);
+      if (!after.active && after.version == before.version)
+        break;
+      if (after.active || ++attempt == 2) {
+        if (wake > from + 1)
+          wake = from + 1;
+        break;
+      }
+      before = after;
     }
-    before = after;
   }
 
   if (wake == UINT64_MAX) {
     // Nothing parked anywhere: wait with no timeout. The eternal sentinel
     // stays published - a later arm kicks through methodImpl.wakeupLoop,
     // while queue traffic carries its own doorbell.
-    return UINT32_MAX;
+    return UINT64_MAX;
   }
 
   // Far wakes are clamped to the kernel timeout range (epoll takes int
   // milliseconds); waking early is harmless, the loop re-scans and sleeps on
   uint64_t sleepTicks = wake > currentTick ? wake - currentTick : 0;
-  const uint64_t sleepTicksLimit = 0x7FFFFFFFu / tickMs;
+  const uint64_t sleepTicksLimit =
+    0x7FFFFFFFu / (TIMER_TICK_MICROSECONDS / 1000);
   if (sleepTicks > sleepTicksLimit) {
     sleepTicks = sleepTicksLimit;
     wake = currentTick + sleepTicks;
   }
-  __uintptr_atomic_store(&slot->wakeTick, (uintptr_t)wake, amoRelease);
-  return (uint32_t)(sleepTicks * tickMs);
+  __uintptr_atomic_store(&state->wakeTick, (uintptr_t)wake, amoRelease);
+  return wake;
 }
 
-void timerLoopCancelSleep(asyncBase *base, unsigned threadId)
+void timerLoopCancelSleep(TimerLoopState *state)
 {
   // Awake: the thread sweeps on its own before its next sleep, kicking it
   // would be a wasted syscall. A producer racing this store at worst reads
   // the stale horizon and issues one spurious wakeup
-  if (base->timerSleep && threadId < base->loopThreadLimit)
-    __uintptr_atomic_store(&base->timerSleep[threadId].wakeTick, UINTPTR_MAX, amoRelaxed);
+  __uintptr_atomic_store(&state->wakeTick, UINTPTR_MAX, amoRelaxed);
 }

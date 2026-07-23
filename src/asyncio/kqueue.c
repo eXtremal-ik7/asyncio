@@ -181,7 +181,8 @@ void kqueueNextFinishedOperation(asyncBase *base)
   int nfds, n;
   struct kevent events[MAX_EVENTS];
   kqueueBase *localBase = (kqueueBase*)base;
-  if (!loopThreadEnter(base))
+  TimerLoopState *timerState = loopThreadEnter(base);
+  if (!timerState)
     return;
 
   while (1) {
@@ -200,18 +201,18 @@ void kqueueNextFinishedOperation(asyncBase *base)
       // UINT32_MAX = wait with no timeout: an idle base blocks until queue
       // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
       uint64_t sleepFrom = getMonotonicTicks();
-      uint32_t sleepMs = timerSleepShrinkElapsed(sleepFrom,
-        timerLoopPrepareSleep(base, messageLoopThreadId, sleepFrom, 1000));
+      uint64_t wakeTick = timerLoopPrepareSleep(base, timerState, sleepFrom);
+      uint32_t sleepMs = timerSleepMilliseconds(wakeTick);
       struct timespec timeout;
       timeout.tv_sec = sleepMs / 1000;
       timeout.tv_nsec = (long)(sleepMs % 1000) * 1000000;
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, sleepMs == UINT32_MAX ? 0 : &timeout);
-      timerLoopCancelSleep(base, messageLoopThreadId);
+      timerLoopCancelSleep(timerState);
 
       // Unconditional sweep (the modulo election is gone): an idle pass costs
       // one relaxed load, and the wakeup handshake relies on whichever thread
       // the kick lands on doing the sweep itself
-      processTimeoutQueue(base, getMonotonicTicks());
+      processTimeoutQueue(base, timerState, getMonotonicTicks());
     } while (nfds <= 0 && errno == EINTR);
 
     for (n = 0; n < nfds; n++) {

@@ -94,10 +94,10 @@ struct TestBackend: asyncBase {
   uint64_t lastEventTimerPeriod = 0;
   std::function<int(aioUserEvent*, EventTimerUpdate, uint32_t, uint64_t)> eventTimerHook;
   std::function<uint64_t(aioUserEvent*, uint64_t, uint32_t, uint64_t)> eventTimerConsumeHook;
-  // Backs the loop-slot bitmap and timerSleep array that createAsyncBase
+  // Backs the loop-slot bitmap and timer-loop state array that createAsyncBase
   // allocates for production bases.
   std::array<uintptr_t, 1> loopSlots{};
-  alignas(CACHE_LINE_SIZE) std::array<TimerSleepSlot, 8> sleepSlots{};
+  alignas(CACHE_LINE_SIZE) std::array<TimerLoopState, 8> loopStates{};
 
   TestBackend() :
     asyncBase{},
@@ -116,11 +116,11 @@ struct TestBackend: asyncBase {
     base.methodImpl.updateEventTimer = updateEventTimer;
     base.methodImpl.consumeEventTimerTick = consumeEventTimerTick;
     base.methodImpl.releaseUserEvent = releaseUserEvent;
-    base.timerSleep = sleepSlots.data();
+    base.timerLoopStates = loopStates.data();
     base.loopThreadSlots = loopSlots.data();
     base.loopThreadSlotWords = static_cast<unsigned>(loopSlots.size());
-    base.loopThreadLimit = static_cast<unsigned>(sleepSlots.size());
-    for (TimerSleepSlot &slot: sleepSlots)
+    base.loopThreadLimit = static_cast<unsigned>(loopStates.size());
+    for (TimerLoopState &slot: loopStates)
       slot.wakeTick = UINTPTR_MAX;
     currentFinishedSync = 0;
     messageLoopThreadId = 0;

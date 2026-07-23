@@ -22,6 +22,11 @@ typedef enum AtomicMemoryOrder {
 #endif
 } AtomicMemoryOrder;
 
+// MSVC mapping invariant: seq-cst loads lower to acquire loads
+// (ReadAcquire*), sound only while every seq-cst store and RMW in this
+// header lowers to a locked Interlocked* operation - the complementary
+// x64/ARM64 split. Adding a plain seq-cst store path would silently break
+// every seq-cst litmus built on these helpers.
 __NO_UNUSED_FUNCTION_BEGIN
 static inline void __atomic_fence(AtomicMemoryOrder order)
 {
