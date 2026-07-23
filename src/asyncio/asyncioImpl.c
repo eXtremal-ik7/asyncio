@@ -590,7 +590,12 @@ void startOperation(asyncOpRoot *op, uint32_t *needStart)
   }
 
   opRun(op, list);
-  *needStart |= (list->head && list->head->running == arWaiting) ? tag : 0;
+  if (opGetStatus(op) != aosPending) {
+    reapObject(object, COMBINER_TAG_CANCEL, needStart);
+    return;
+  }
+  if (list->head && list->head->running == arWaiting)
+    *needStart |= tag;
 }
 
 // Survivor accumulator shared by the positional sweeps (reapQueue and
@@ -959,6 +964,12 @@ static inline int combinerDispatch(aioObjectRoot *object,
 {
   if (combinerTaskHandlerCommon(object, tag))
     return 1;
+  // Pair a child/kernel completion with the sticky delete sweep before the
+  // backend consumes its sole progress signal. A retained cancelling head is
+  // then released by that same pass instead of waiting for a wake already used.
+  if ((tag & COMBINER_TAG_PROGRESS_MASK) &&
+      __uint_atomic_load(&object->DeletePending, amoRelaxed))
+    cancelAllObjectOperations(object);
   taskHandler(object, op, tag);
   return 0;
 }

@@ -393,16 +393,20 @@ static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
   }
 
   if (*p == ':') {
-    p++;
-    int32_t i32 = 0;
+    const char *digits = ++p;
+    uint32_t port = 0;
     while (isDigit(*p)) {
-      i32 = i32*10 + (*p - '0');
+      port = port*10u + static_cast<uint32_t>(*p - '0');
       p++;
+      if (port > 65535)
+        return 0;
     }
-    URIComponent component;
-    component.type = uriCtPort;
-    component.i32 = i32;
-    callback(&component, arg);
+    if (p != digits) {
+      URIComponent component;
+      component.type = uriCtPort;
+      component.i32 = static_cast<int32_t>(port);
+      callback(&component, arg);
+    }
   }
 
   *ptr = p;

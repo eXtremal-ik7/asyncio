@@ -164,7 +164,7 @@ static void recvFinish(asyncOpRoot *opptr)
   btcOp *op = reinterpret_cast<btcOp*>(opptr);
   reinterpret_cast<btcRecvCb*>(opptr->callback)(opGetStatus(opptr),
                                                       reinterpret_cast<BTCSocket*>(opptr->object),
-                                                      op->command,
+                                                      op->commandPtr,
                                                       op->stream,
                                                       opptr->arg);
 }
