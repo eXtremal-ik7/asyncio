@@ -1,6 +1,8 @@
 #include "unittest.h"
 
 #include "asyncio/coroutine.h"
+#include "asyncio/http.h"
+#include "asyncio/smtp.h"
 #include "asyncio/socket.h"
 #include "asyncio/socketSSL.h"
 
@@ -19,6 +21,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -626,16 +629,11 @@ TEST(ssl, partial_write_mode_pipelined)
   sslPartialWriteScenario(false);
 }
 
-// implSslRead/implSslWrite hand a continuation operation back to the caller
-// while the transport child was already pushed to the plain socket's combiner
-// inside the impl call. This is the calling pattern of the HTTP/SMTP clients:
-// they run under their own client-object combiner (not the SSL object's one)
-// and push the returned continuation afterwards. The child's completion
-// signal must wake the continuation even when the continuation is queued
-// after that completion already happened: here a TLS read parks its transport
-// child, the loop consumes the child's completion while the continuation is
-// still unqueued, and only then is the continuation pushed - it must still
-// complete with the decrypted payload instead of parking forever.
+// The active-once entry point owns the SSL combiner across its synchronous
+// attempt and publication of a returned continuation. A pending return means
+// exactly one callback will finish the read; an inline return means no
+// callback. Keep the server silent until the call has returned so this
+// exercises the pending half of that contract.
 struct SslContinuationWakeupContext {
   asyncBase *base = nullptr;
   AsyncOpStatus connectStatus = aosUnknown;
@@ -696,7 +694,7 @@ static void sslContinuationWakeupQuitCb(aioUserEvent*, void *arg)
   postQuitOperation(static_cast<asyncBase*>(arg));
 }
 
-TEST(ssl, read_continuation_pushed_after_child_completion)
+TEST(ssl, active_once_read_publishes_continuation)
 {
   SslContinuationWakeupContext ctx;
   ctx.base = gBase;
@@ -735,59 +733,344 @@ TEST(ssl, read_continuation_pushed_after_child_completion)
   ASSERT_TRUE(ctx.serverReady.load());
   ASSERT_FALSE(ctx.serverFailed.load());
 
-  // the caller's half of the client pattern: park a TLS read. The transport
-  // child is pushed inside implSslRead; the continuation op is returned and
-  // deliberately not pushed yet
-  size_t bytes = 0;
-  asyncOpRoot *continuationOp = implSslRead(client, ctx.buffer, sizeof(ctx.buffer), afNone, 0,
-                                            sslContinuationWakeupReadCb, &ctx, &bytes);
-  ASSERT_NE(continuationOp, nullptr);  // no transport data buffered: the read must park
-
-  // let the transport child run to completion while the continuation stays
-  // unqueued: the server sends one TLS record, the loop consumes the child's
-  // completion (and with it the continuation's wakeup signal), the watchdog
-  // then stops the loop
   resetQuitOperation(gBase);
+  ssize_t result = aioSslRead(client,
+                              ctx.buffer,
+                              sizeof(ctx.buffer),
+                              afActiveOnce,
+                              2500000,
+                              sslContinuationWakeupReadCb,
+                              &ctx);
+  ASSERT_EQ(result, -(ssize_t)aosPending);
+
   ctx.serverSend = true;
-  userEventStartTimer(watchdog, 700000, 1);
+  userEventStartTimer(watchdog, 4000000, 1);
   asyncLoop(gBase);
   userEventStopTimer(watchdog);
+
   ASSERT_FALSE(ctx.serverFailed.load());
-  // the loop is stopped, no concurrent BIO access: ciphertext in the client
-  // input BIO proves the transport child completed and signalled the (not yet
-  // queued) continuation
-  ASSERT_GT(BIO_ctrl_pending(client->bioIn), 0u);
-  ASSERT_FALSE(ctx.readDone.load());
-
-  // push the continuation exactly as the HTTP/SMTP clients do, then wait for
-  // its completion with a rescue deadline
-  resetQuitOperation(gBase);
-  combinerPushOperation(continuationOp);
-  userEventStartTimer(watchdog, 2500000, 1);
-  asyncLoop(gBase);
-  userEventStopTimer(watchdog);
-
-  bool wedged = !ctx.readDone.load();
-  EXPECT_FALSE(wedged) << "continuation op never completed: its child's wakeup was consumed before the op was queued";
-  if (!wedged) {
+  EXPECT_TRUE(ctx.readDone.load());
+  if (ctx.readDone.load()) {
     EXPECT_EQ(ctx.readStatus, aosSuccess);
     EXPECT_EQ(ctx.readTransferred, strlen(gSslContinuationPayload));
     EXPECT_EQ(memcmp(ctx.buffer, gSslContinuationPayload, strlen(gSslContinuationPayload)), 0);
   }
 
-  // teardown: deleting the socket sweeps a wedged continuation; the cancel
-  // callback both proves the op was parked in the queue and lets the object
-  // release cleanly
-  resetQuitOperation(gBase);
   sslSocketDelete(client);
-  if (wedged) {
-    userEventStartTimer(watchdog, 2000000, 1);
-    asyncLoop(gBase);
-    userEventStopTimer(watchdog);
-    EXPECT_TRUE(ctx.readDone.load());
-    EXPECT_EQ(ctx.readStatus, aosCanceled);
-  }
   deleteUserEvent(watchdog);
+  socketClose(listenSocket);
+}
+
+static const char gHttpsActiveOnceRequest[] =
+  "GET / HTTP/1.1\r\n"
+  "Host: localhost\r\n"
+  "\r\n";
+
+static const char gHttpsActiveOnceResponse[] =
+  "HTTP/1.1 200 OK\r\n"
+  "Content-Length: 6\r\n"
+  "\r\n"
+  "wakeup";
+
+static const unsigned gHttpsActiveOnceRounds = 64;
+
+struct HttpsActiveOnceContext {
+  asyncBase *base = nullptr;
+  HTTPClient *client = nullptr;
+  HTTPParseDefaultContext parseContext;
+  AsyncOpStatus connectStatus = aosUnknown;
+  std::atomic<AsyncOpStatus> requestStatus{aosUnknown};
+  std::atomic<unsigned> completed{0};
+  std::atomic<bool> responseMismatch{false};
+  std::atomic<bool> serverFailed{false};
+};
+
+static int sslBlockingWriteAll(SSL *ssl, const char *data, size_t size)
+{
+  size_t offset = 0;
+  while (offset < size) {
+    int result = SSL_write(ssl, data + offset, (int)(size - offset));
+    if (result <= 0)
+      return 0;
+    offset += (size_t)result;
+  }
+  return 1;
+}
+
+static void httpsActiveOnceSink(socketTy listenSocket, HttpsActiveOnceContext *ctx)
+{
+  socketTy fd;
+  SSL *ssl = sslTestServerHandshake(listenSocket, &fd);
+  if (!ssl) {
+    ctx->serverFailed = true;
+    if (fd != (socketTy)(-1))
+      socketClose(fd);
+    return;
+  }
+
+  for (unsigned round = 0; round < gHttpsActiveOnceRounds; round++) {
+    std::string request;
+    while (request.find("\r\n\r\n") == std::string::npos) {
+      char buffer[512];
+      int result = SSL_read(ssl, buffer, (int)sizeof(buffer));
+      if (result <= 0) {
+        ctx->serverFailed = true;
+        break;
+      }
+      request.append(buffer, (size_t)result);
+    }
+    if (ctx->serverFailed ||
+        request != std::string(gHttpsActiveOnceRequest,
+                               sizeof(gHttpsActiveOnceRequest)-1) ||
+        !sslBlockingWriteAll(ssl,
+                             gHttpsActiveOnceResponse,
+                             sizeof(gHttpsActiveOnceResponse)-1)) {
+      ctx->serverFailed = true;
+      break;
+    }
+  }
+
+  SSL_free(ssl);
+  socketClose(fd);
+}
+
+static void httpsActiveOnceSubmit(HttpsActiveOnceContext *ctx);
+
+static void httpsActiveOnceRequestCb(AsyncOpStatus status, HTTPClient*, void *arg)
+{
+  HttpsActiveOnceContext *ctx = static_cast<HttpsActiveOnceContext*>(arg);
+  ctx->requestStatus = status;
+  if (status != aosSuccess) {
+    postQuitOperation(ctx->base);
+    return;
+  }
+
+  if (ctx->parseContext.resultCode != 200 ||
+      ctx->parseContext.body.size != strlen(gSslContinuationPayload) ||
+      memcmp(ctx->parseContext.body.data,
+             gSslContinuationPayload,
+             strlen(gSslContinuationPayload)) != 0)
+    ctx->responseMismatch = true;
+
+  if (ctx->completed.fetch_add(1) + 1 == gHttpsActiveOnceRounds)
+    postQuitOperation(ctx->base);
+  else
+    httpsActiveOnceSubmit(ctx);
+}
+
+static void httpsActiveOnceSubmit(HttpsActiveOnceContext *ctx)
+{
+  aioHttpRequest(ctx->client,
+                 gHttpsActiveOnceRequest,
+                 sizeof(gHttpsActiveOnceRequest)-1,
+                 5000000,
+                 httpParseDefault,
+                 &ctx->parseContext,
+                 httpsActiveOnceRequestCb,
+                 ctx);
+}
+
+static void httpsActiveOnceConnectCb(AsyncOpStatus status, HTTPClient*, void *arg)
+{
+  HttpsActiveOnceContext *ctx = static_cast<HttpsActiveOnceContext*>(arg);
+  ctx->connectStatus = status;
+  if (status == aosSuccess)
+    httpsActiveOnceSubmit(ctx);
+  else
+    postQuitOperation(ctx->base);
+}
+
+// HTTPS is the in-tree three-level ownership chain: client -> SSL ->
+// transport. Exercise both request writes and response reads repeatedly with
+// two loop threads so child completions may race the caller, while the public
+// SSL entry points keep continuation publication inside their combiner.
+TEST(ssl, https_client_nested_active_once_io)
+{
+  HttpsActiveOnceContext ctx;
+  ctx.base = gBase;
+
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+  SSLSocket *sslClient = sslSocketNew(gBase, clientIo, nullptr);
+  ASSERT_NE(sslClient, nullptr);
+  ctx.client = httpsClientNew(gBase, sslClient);
+  ASSERT_NE(ctx.client, nullptr);
+  httpParseDefaultInit(&ctx.parseContext, ctx.client);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread sink(httpsActiveOnceSink, listenSocket, &ctx);
+
+  address.ipv4 = inet_addr("127.0.0.1");
+  aioHttpConnect(ctx.client,
+                 &address,
+                 nullptr,
+                 5000000,
+                 httpsActiveOnceConnectCb,
+                 &ctx);
+
+  std::thread secondLoop([] { asyncLoop(gBase); });
+  asyncLoop(gBase);
+  secondLoop.join();
+  sink.join();
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.requestStatus.load(), aosSuccess);
+  EXPECT_EQ(ctx.completed.load(), gHttpsActiveOnceRounds);
+  EXPECT_FALSE(ctx.responseMismatch.load());
+  EXPECT_FALSE(ctx.serverFailed.load());
+
+  httpClientDelete(ctx.client);
+  dynamicBufferFree(&ctx.parseContext.buffer);
+  socketClose(listenSocket);
+}
+
+static const char gSmtpsActiveOnceGreeting[] = "220 localhost ready\r\n";
+static const char gSmtpsActiveOnceCommand[] = "NOOP\r\n";
+static const char gSmtpsActiveOnceResponse[] = "250 ok\r\n";
+static const unsigned gSmtpsActiveOnceRounds = 64;
+
+struct SmtpsActiveOnceContext {
+  asyncBase *base = nullptr;
+  SMTPClient *client = nullptr;
+  AsyncOpStatus connectStatus = aosUnknown;
+  std::atomic<AsyncOpStatus> commandStatus{aosUnknown};
+  std::atomic<unsigned> completed{0};
+  std::atomic<bool> responseMismatch{false};
+  std::atomic<bool> serverFailed{false};
+};
+
+static void smtpsActiveOnceSink(socketTy listenSocket, SmtpsActiveOnceContext *ctx)
+{
+  socketTy fd;
+  SSL *ssl = sslTestServerHandshake(listenSocket, &fd);
+  if (!ssl) {
+    ctx->serverFailed = true;
+    if (fd != (socketTy)(-1))
+      socketClose(fd);
+    return;
+  }
+
+  if (!sslBlockingWriteAll(ssl,
+                           gSmtpsActiveOnceGreeting,
+                           sizeof(gSmtpsActiveOnceGreeting)-1))
+    ctx->serverFailed = true;
+
+  for (unsigned round = 0;
+       !ctx->serverFailed && round < gSmtpsActiveOnceRounds;
+       round++) {
+    std::string command;
+    while (command.find("\r\n") == std::string::npos) {
+      char buffer[128];
+      int result = SSL_read(ssl, buffer, (int)sizeof(buffer));
+      if (result <= 0) {
+        ctx->serverFailed = true;
+        break;
+      }
+      command.append(buffer, (size_t)result);
+    }
+    if (ctx->serverFailed ||
+        command != std::string(gSmtpsActiveOnceCommand,
+                               sizeof(gSmtpsActiveOnceCommand)-1) ||
+        !sslBlockingWriteAll(ssl,
+                             gSmtpsActiveOnceResponse,
+                             sizeof(gSmtpsActiveOnceResponse)-1))
+      ctx->serverFailed = true;
+  }
+
+  SSL_free(ssl);
+  socketClose(fd);
+}
+
+static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx);
+
+static void smtpsActiveOnceCommandCb(AsyncOpStatus status,
+                                     unsigned code,
+                                     SMTPClient*,
+                                     void *arg)
+{
+  SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
+  ctx->commandStatus = status;
+  if (status != aosSuccess) {
+    postQuitOperation(ctx->base);
+    return;
+  }
+  if (code != 250)
+    ctx->responseMismatch = true;
+
+  if (ctx->completed.fetch_add(1) + 1 == gSmtpsActiveOnceRounds)
+    postQuitOperation(ctx->base);
+  else
+    smtpsActiveOnceSubmit(ctx);
+}
+
+static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx)
+{
+  aioSmtpCommand(ctx->client,
+                 "NOOP",
+                 afNone,
+                 5000000,
+                 smtpsActiveOnceCommandCb,
+                 ctx);
+}
+
+static void smtpsActiveOnceConnectCb(AsyncOpStatus status, SMTPClient*, void *arg)
+{
+  SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
+  ctx->connectStatus = status;
+  if (status == aosSuccess)
+    smtpsActiveOnceSubmit(ctx);
+  else
+    postQuitOperation(ctx->base);
+}
+
+TEST(ssl, smtps_client_nested_active_once_io)
+{
+  SmtpsActiveOnceContext ctx;
+  ctx.base = gBase;
+
+  HostAddress localAddress = {};
+  localAddress.family = AF_INET;
+  localAddress.ipv4 = INADDR_ANY;
+  localAddress.port = 0;
+  ctx.client = smtpClientNew(gBase, localAddress, smtpServerSmtps);
+  ASSERT_NE(ctx.client, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread sink(smtpsActiveOnceSink, listenSocket, &ctx);
+
+  address.ipv4 = inet_addr("127.0.0.1");
+  aioSmtpConnect(ctx.client,
+                 address,
+                 5000000,
+                 smtpsActiveOnceConnectCb,
+                 &ctx);
+
+  std::thread secondLoop([] { asyncLoop(gBase); });
+  asyncLoop(gBase);
+  secondLoop.join();
+  sink.join();
+
+  EXPECT_EQ(ctx.connectStatus, aosSuccess);
+  EXPECT_EQ(ctx.commandStatus.load(), aosSuccess);
+  EXPECT_EQ(ctx.completed.load(), gSmtpsActiveOnceRounds);
+  EXPECT_FALSE(ctx.responseMismatch.load());
+  EXPECT_FALSE(ctx.serverFailed.load());
+
+  smtpClientDelete(ctx.client);
   socketClose(listenSocket);
 }
 

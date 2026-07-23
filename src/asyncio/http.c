@@ -111,15 +111,33 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
 
     size_t bytesTransferred = 0;
     op->state = 1;
-    asyncOpRoot *childOp = client->isHttps ?
-      implSslWrite(client->sslSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpsResumeProc, op, &bytesTransferred) :
-      implWrite(client->plainSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpResumeProc, op, &bytesTransferred);
-    if (childOp) {
-      combinerPushOperation(childOp);
-      return aosPending;
+    if (client->isHttps) {
+      ssize_t result = aioSslWrite(client->sslSocket,
+                                   op->internalBuffer,
+                                   op->dataSize,
+                                   afWaitAll | afActiveOnce,
+                                   0,
+                                   httpsResumeProc,
+                                   op);
+      if (result < 0)
+        return (AsyncOpStatus)-result;
+      bytesTransferred = (size_t)result;
+    } else {
+      asyncOpRoot *childOp = implWrite(client->plainSocket,
+                                       op->internalBuffer,
+                                       op->dataSize,
+                                       afWaitAll,
+                                       0,
+                                       httpResumeProc,
+                                       op,
+                                       &bytesTransferred);
+      if (childOp) {
+        combinerPushOperation(childOp);
+        return aosPending;
+      }
     }
-    // sync completion — callback not invoked, all bytes sent (afWaitAll)
-    client->requestBytesSent = op->dataSize;
+    // Active-once/impl sync completion: the callback is not invoked.
+    client->requestBytesSent = bytesTransferred;
   }
 
   for (;;) {
@@ -143,34 +161,34 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
         if (offset)
           memmove(client->inBuffer, httpDataPtr(&client->state), offset);
 
-        asyncOpRoot *readOp;
         size_t bytesTransferred = 0;
-        if (client->isHttps)
-          readOp = implSslRead(client->sslSocket,
-                               client->inBuffer+offset,
-                               client->inBufferSize-offset,
-                               afNone,
-                               0,
-                               httpsRequestProc,
-                               op,
-                               &bytesTransferred);
-        else
-          readOp = implRead(client->plainSocket,
-                            client->inBuffer+offset,
-                            client->inBufferSize-offset,
-                            afNone,
-                            0,
-                            httpRequestProc,
-                            op,
-                            &bytesTransferred);
-
         client->inBufferOffset = offset;
-        if (readOp) {
-          combinerPushOperation(readOp);
-          return aosPending;
+        if (client->isHttps) {
+          ssize_t result = aioSslRead(client->sslSocket,
+                                      client->inBuffer+offset,
+                                      client->inBufferSize-offset,
+                                      afActiveOnce,
+                                      0,
+                                      httpsRequestProc,
+                                      op);
+          if (result < 0)
+            return (AsyncOpStatus)-result;
+          bytesTransferred = (size_t)result;
         } else {
-          httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset+bytesTransferred);
+          asyncOpRoot *readOp = implRead(client->plainSocket,
+                                         client->inBuffer+offset,
+                                         client->inBufferSize-offset,
+                                         afNone,
+                                         0,
+                                         httpRequestProc,
+                                         op,
+                                         &bytesTransferred);
+          if (readOp) {
+            combinerPushOperation(readOp);
+            return aosPending;
+          }
         }
+        httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset+bytesTransferred);
         break;
       }
 

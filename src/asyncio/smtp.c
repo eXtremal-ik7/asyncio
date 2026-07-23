@@ -355,14 +355,30 @@ static AsyncOpStatus smtpReadResponse(SMTPClient *client, SMTPOp *op, unsigned e
     client->Response = 0;
 
     size_t bytesTransferred = 0;
-    asyncOpRoot *readOp;
-    if (client->TlsSocket)
-      readOp = implSslRead(client->TlsSocket, client->end, sizeof(client->buffer) - remaining, afNone, 0, smtpSslReadCb, op, &bytesTransferred);
-    else
-      readOp = implRead(client->PlainSocket, client->end, sizeof(client->buffer) - remaining, afNone, 0, smtpReadCb, op, &bytesTransferred);
-    if (readOp) {
-      combinerPushOperation(readOp);
-      return aosPending;
+    if (client->TlsSocket) {
+      ssize_t result = aioSslRead(client->TlsSocket,
+                                  client->end,
+                                  sizeof(client->buffer) - remaining,
+                                  afActiveOnce,
+                                  0,
+                                  smtpSslReadCb,
+                                  op);
+      if (result < 0)
+        return (AsyncOpStatus)-result;
+      bytesTransferred = (size_t)result;
+    } else {
+      asyncOpRoot *readOp = implRead(client->PlainSocket,
+                                     client->end,
+                                     sizeof(client->buffer) - remaining,
+                                     afNone,
+                                     0,
+                                     smtpReadCb,
+                                     op,
+                                     &bytesTransferred);
+      if (readOp) {
+        combinerPushOperation(readOp);
+        return aosPending;
+      }
     }
     client->end += bytesTransferred;
   }
@@ -391,16 +407,31 @@ static AsyncOpStatus smtpWriteCommand(SMTPClient *client, SMTPOp *op, const void
   if (client->ptr != client->end)
     return (AsyncOpStatus)smtpInvalidFormat;
 
-  asyncOpRoot *writeOp;
+  if (client->TlsSocket) {
+    ssize_t result = aioSslWrite(client->TlsSocket,
+                                 data,
+                                 size,
+                                 afWaitAll | afActiveOnce,
+                                 0,
+                                 smtpSslWriteCb,
+                                 op);
+    return result < 0 ? (AsyncOpStatus)-result : aosSuccess;
+  }
+
   size_t bytesTransferred = 0;
-  if (client->TlsSocket)
-    writeOp = implSslWrite(client->TlsSocket, data, size, afWaitAll, 0, smtpSslWriteCb, op, &bytesTransferred);
-  else
-    writeOp = implWrite(client->PlainSocket, data, size, afWaitAll, 0, smtpWriteCb, op, &bytesTransferred);
+  asyncOpRoot *writeOp = implWrite(client->PlainSocket,
+                                   data,
+                                   size,
+                                   afWaitAll,
+                                   0,
+                                   smtpWriteCb,
+                                   op,
+                                   &bytesTransferred);
   if (writeOp) {
     combinerPushOperation(writeOp);
     return aosPending;
   }
+
   return aosSuccess;
 }
 
