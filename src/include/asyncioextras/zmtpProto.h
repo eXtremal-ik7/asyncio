@@ -36,13 +36,13 @@ private:
     return true;
   }
   
-  void writeKeyValue(const char *key, const char *value) {
+  bool writeKeyValue(const char *key, const char *value) {
     size_t keyLength = strlen(key);
     size_t valueLength = strlen(value);
-    write<uint8_t>(static_cast<uint8_t>(keyLength));
-    write(key, keyLength);
-    writebe<uint32_t>(static_cast<uint32_t>(valueLength));
-    write(value, valueLength);
+    return write<uint8_t>(static_cast<uint8_t>(keyLength))
+           && write(key, keyLength)
+           && writebe<uint32_t>(static_cast<uint32_t>(valueLength))
+           && write(value, valueLength);
   }
   
 public:
@@ -61,10 +61,10 @@ public:
     return false;
   }
   
-  void writeCommandName(const char *name) {
+  bool writeCommandName(const char *name) {
     size_t length = strlen(name);
-    write<uint8_t>(static_cast<uint8_t>(length));
-    write(name, length);
+    return write<uint8_t>(static_cast<uint8_t>(length))
+           && write(name, length);
   }
   
   bool readReadyCmd(RawData *socketType, RawData *identity) {
@@ -93,10 +93,9 @@ public:
     return socketType->data != nullptr;
   }
   
-  void writeReadyCmd(const char *socketType, const char *identity) {
-    writeCommandName("READY");
-    writeKeyValue("Socket-Type", socketType);
-    if (identity)
-      writeKeyValue("Identity", identity);
+  bool writeReadyCmd(const char *socketType, const char *identity) {
+    return writeCommandName("READY")
+           && writeKeyValue("Socket-Type", socketType)
+           && (!identity || writeKeyValue("Identity", identity));
   }
 };

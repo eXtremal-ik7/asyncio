@@ -2,6 +2,7 @@
 #define __XMSTREAM_H_
 
 #include "p2putils/strExtras.h"
+#include <new>
 #include <stdint.h>
 #include <string.h>
 #if defined(_MSC_VER)
@@ -22,7 +23,11 @@ private:
 public:
   xmstream(void *data, size_t size) : _m((uint8_t*)data), _p((uint8_t*)data), _size(size), _msize(size), _eof(0), _own(0) {}
   xmstream(size_t size = 64) : _size(0), _msize(size), _eof(0), _own(1) {
-    _m = static_cast<uint8_t*>(operator new(size));
+    _m = size <= static_cast<size_t>(PTRDIFF_MAX)
+           ? static_cast<uint8_t*>(operator new(size, std::nothrow))
+           : nullptr;
+    if (!_m)
+      _msize = 0;
     _p = _m;
   }
   
@@ -32,18 +37,26 @@ public:
   }
 
   xmstream(const xmstream &s) {
+    size_t sourceOffset = s.offsetOf();
     _size = s._size;
     _msize = s._msize;
     _own = s._own;
     _eof = s._eof;
     if (_own) {
-      _m = static_cast<uint8_t*>(operator new(_msize));
-      memcpy(_m, s._m, _size);
+      _m = static_cast<uint8_t*>(operator new(_msize, std::nothrow));
+      if (_m) {
+        if (_size)
+          memcpy(_m, s._m, _size);
+      } else {
+        _size = 0;
+        _msize = 0;
+        _eof = 1;
+      }
     } else {
       _m = s._m;
     }
 
-    _p = _m + (s._p - s._m);
+    _p = _m ? _m + sourceOffset : nullptr;
   }
 
   xmstream(xmstream &&s) :
@@ -56,7 +69,7 @@ public:
     s._m = nullptr;
   }
   
-  size_t offsetOf() const { return _p - _m; }
+  size_t offsetOf() const { return _m ? static_cast<size_t>(_p - _m) : 0; }
   size_t sizeOf() const { return _size; }
   size_t capacity() const { return _msize; }
   bool own() const { return _own; }
@@ -78,20 +91,29 @@ public:
   void *reserve(size_t size) {
     _eof = 0;
     size_t offset = offsetOf();
+    const size_t maxSize = static_cast<size_t>(PTRDIFF_MAX);
+    if (offset > maxSize || size > maxSize - offset)
+      return nullptr;
+
     size_t required = offset + size;
     if (required > _msize) {
-      size_t newSize = _msize ? _msize : required;
-      do {
-        newSize *= 2;
-      } while (newSize < required);
-      
-      _msize = newSize;
-      uint8_t *newData = static_cast<uint8_t*>(operator new(_msize));
-      memcpy(newData, _m, _size);
+      size_t newSize = required;
+      if (_msize && _msize <= maxSize / 2) {
+        size_t doubledSize = _msize * 2;
+        if (doubledSize > newSize)
+          newSize = doubledSize;
+      }
+
+      uint8_t *newData = static_cast<uint8_t*>(operator new(newSize, std::nothrow));
+      if (!newData)
+        return nullptr;
+
+      if (_size)
+        memcpy(newData, _m, _size);
       if (_own)
         operator delete(_m);
       _m = newData;
-      
+      _msize = newSize;
       _size = required;
       uint8_t *p = _m + offset;
       _p = p + size;
@@ -105,7 +127,11 @@ public:
     }
   }
   
-  template<typename T> T *reserve(size_t num) { return static_cast<T*>(reserve(num*sizeof(T))); }
+  template<typename T> T *reserve(size_t num) {
+    if (num > SIZE_MAX / sizeof(T))
+      return nullptr;
+    return static_cast<T*>(reserve(num*sizeof(T)));
+  }
   
   // pointer move functions
   void reset() {
@@ -168,13 +194,19 @@ public:
   }
 
   // write functions
-  void write(const void *data, size_t size) { memcpy(reserve(size), data, size); }
-  template<typename T> void write(const T& data) { memcpy(reserve<T>(1), &data, sizeof(T)); }
-  template<typename T> void writele(T data) { T value = xhtole(data); memcpy(reserve<T>(1), &value, sizeof(T)); }
-  template<typename T> void writebe(T data) { T value = xhtobe(data); memcpy(reserve<T>(1), &value, sizeof(T)); }
+  bool write(const void *data, size_t size) {
+    void *target = reserve(size);
+    if (!target)
+      return false;
+    memcpy(target, data, size);
+    return true;
+  }
+  template<typename T> bool write(const T& data) { return write(&data, sizeof(T)); }
+  template<typename T> bool writele(T data) { T value = xhtole(data); return write(&value, sizeof(T)); }
+  template<typename T> bool writebe(T data) { T value = xhtobe(data); return write(&value, sizeof(T)); }
 
-  void write(const char *data) {
-    write(data, strlen(data));
+  bool write(const char *data) {
+    return write(data, strlen(data));
   }
 
   void truncate() {

@@ -386,8 +386,9 @@ static AsyncOpStatus startZmtpAccept(asyncOpRoot *opptr)
 
         op->state = stAcceptWriteReadyMsg;
         stream.reset();
-        stream.write<uint16_t>(0);
-        stream.writeReadyCmd(socketTypeNames[socket->type], nullptr);
+        if (!stream.write<uint16_t>(0)
+            || !stream.writeReadyCmd(socketTypeNames[socket->type], nullptr))
+          return aosUnknownError;
         stream.data<uint8_t>()[0] = zmtpMsgFlagCommand;
         stream.data<uint8_t>()[1] = static_cast<uint8_t>(stream.offsetOf() - 2);
         childOp = implWrite(socket->plainSocket, stream.data(), stream.offsetOf(), afWaitAll, 0, resumeRwCb, opptr, &bytes);
@@ -460,8 +461,9 @@ static AsyncOpStatus startZmtpConnect(asyncOpRoot *opptr)
         op->state = stConnectReadReadyMsg;
         zmtpStream stream(socket->recvBuffer, sizeof(socket->recvBuffer));
         stream.reset();
-        stream.write<uint16_t>(0);
-        stream.writeReadyCmd(socketTypeNames[socket->type], "");
+        if (!stream.write<uint16_t>(0)
+            || !stream.writeReadyCmd(socketTypeNames[socket->type], ""))
+          return aosUnknownError;
         stream.data<uint8_t>()[0] = zmtpMsgFlagCommand;
         stream.data<uint8_t>()[1] = static_cast<uint8_t>(stream.offsetOf() - 2);
         childOp = implWrite(socket->plainSocket, stream.data(), stream.offsetOf(), afWaitAll, 0, resumeRwCb, opptr, &bytes);
@@ -557,12 +559,17 @@ static AsyncOpStatus startZmtpRecv(asyncOpRoot *opptr)
 
         // the limit caps the whole message, so every frame draws from the
         // budget left by the previous ones; transferred accumulates the total
-        if (frameSize <= op->size - op->transferred)
-          childOp = implRead(socket->plainSocket,
-                             op->stream ? op->stream->reserve(frameSize) : static_cast<uint8_t*>(op->data) + op->transferred,
-                             frameSize, afWaitAll, 0, resumeRwCb, opptr, &bytes);
-        else
+        if (frameSize > op->size - op->transferred)
           return aosBufferTooSmall;
+
+        void *frameData = op->stream
+                            ? op->stream->reserve(frameSize)
+                            : static_cast<uint8_t*>(op->data) + op->transferred;
+        if (!frameData)
+          return aosBufferTooSmall;
+
+        childOp = implRead(socket->plainSocket, frameData, frameSize, afWaitAll,
+                           0, resumeRwCb, opptr, &bytes);
         op->transferred += frameSize;
         break;
       }
@@ -613,8 +620,16 @@ static asyncOpRoot *implZmtpRecvStream(zmtpSocket *socket, zmtpStream &msg, size
     size_t frameSize = zmtpFrameLength(socket, type);
 
     if (frameSize <= limit - transferred) {
+      void *frameData = msg.reserve(frameSize);
+      if (!frameData) {
+        Context context(startZmtpRecv, recvFinish, &msg, nullptr, limit, zmtpUnknown);
+        asyncOpRoot *op = newReadAsyncOp(&socket->root, flags, 0, reinterpret_cast<void*>(callback), arg, zmtpOpRecv, &context);
+        opForceStatus(op, aosBufferTooSmall);
+        return op;
+      }
+
       transferred += frameSize;
-      if ( (childOp = implRead(socket->plainSocket, msg.reserve(frameSize), frameSize, afWaitAll, 0, resumeRwCb, nullptr, &bytes)) ) {
+      if ( (childOp = implRead(socket->plainSocket, frameData, frameSize, afWaitAll, 0, resumeRwCb, nullptr, &bytes)) ) {
         state = (type & zmtpMsgFlagMore) ? stRecvReadType : stFinished;
         break;
       }

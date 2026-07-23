@@ -596,13 +596,15 @@ void iocpStartTimer(asyncOpRoot *op)
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
   }
+  // The timer cell survives pooled operation reuse. Finish any old callback
+  // rendezvous before replacing the payload that callback may still read.
+  if (__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != IOCP_TIMER_STOPPED)
+    iocpDisarmWaitableTimer(timer);
   timer->target = op;
   timer->object = op->object;
   timer->header.base = op->object->header.base;
   timer->objectGeneration = objectHeaderGeneration(&op->object->header);
   __uint64_atomic_store(&timer->header.tag.high, opGetGeneration(op), amoRelaxed);
-  if (__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != IOCP_TIMER_STOPPED)
-    iocpDisarmWaitableTimer(timer);
   __uint64_atomic_store(&timer->header.tag.low, IOCP_TIMER_ARMED, amoRelease);
   if (!iocpArmWaitableTimer(timer, op->timeout)) {
     __uint64_atomic_store(&timer->header.tag.low, IOCP_TIMER_STOPPED, amoRelaxed);

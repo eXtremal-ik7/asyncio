@@ -316,7 +316,7 @@ static inline AsyncOpStatus writeMsgSyscall(asyncOpRoot *opptr)
 
   struct sockaddr_storage remoteAddress;
   socklen_t addrLen = hostAddressToSockaddr(&op->host, &remoteAddress);
-  ssize_t result = sendto(fd, op->buffer, op->transactionSize, 0, (struct sockaddr*)&remoteAddress, addrLen);
+  ssize_t result = sendto(fd, op->buffer, op->transactionSize, ASYNCIO_MSG_NOSIGNAL, (struct sockaddr*)&remoteAddress, addrLen);
   if (result != -1) {
     return aosSuccess;
   }

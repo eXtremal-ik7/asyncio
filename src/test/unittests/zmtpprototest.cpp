@@ -10,7 +10,7 @@ TEST(zmtpProto, ready_with_socket_type)
 {
   zmtpStream w;
   w.reset();
-  w.writeReadyCmd("PUSH", "peer");
+  ASSERT_TRUE(w.writeReadyCmd("PUSH", "peer"));
 
   zmtpStream rd(w.data(), w.offsetOf());
   RawData socketType;
@@ -27,11 +27,11 @@ TEST(zmtpProto, ready_metadata_keys_case_insensitive)
 {
   zmtpStream w;
   w.reset();
-  w.writeCommandName("READY");
-  w.write<uint8_t>(11);
-  w.write("SOCKET-TYPE", 11);
-  w.writebe<uint32_t>(4);
-  w.write("PUSH", 4);
+  ASSERT_TRUE(w.writeCommandName("READY"));
+  ASSERT_TRUE(w.write<uint8_t>(11));
+  ASSERT_TRUE(w.write("SOCKET-TYPE", 11));
+  ASSERT_TRUE(w.writebe<uint32_t>(4));
+  ASSERT_TRUE(w.write("PUSH", 4));
 
   zmtpStream rd(w.data(), w.offsetOf());
   RawData socketType;
@@ -45,11 +45,11 @@ TEST(zmtpProto, ready_requires_socket_type)
 {
   zmtpStream w;
   w.reset();
-  w.writeCommandName("READY");
-  w.write<uint8_t>(8);
-  w.write("Identity", 8);
-  w.writebe<uint32_t>(4);
-  w.write("peer", 4);
+  ASSERT_TRUE(w.writeCommandName("READY"));
+  ASSERT_TRUE(w.write<uint8_t>(8));
+  ASSERT_TRUE(w.write("Identity", 8));
+  ASSERT_TRUE(w.writebe<uint32_t>(4));
+  ASSERT_TRUE(w.write("peer", 4));
 
   zmtpStream rd(w.data(), w.offsetOf());
   RawData socketType;

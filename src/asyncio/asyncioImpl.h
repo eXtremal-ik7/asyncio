@@ -14,6 +14,12 @@ extern "C" {
 #include <signal.h>
 #endif
 
+#ifdef MSG_NOSIGNAL
+#define ASYNCIO_MSG_NOSIGNAL MSG_NOSIGNAL
+#else
+#define ASYNCIO_MSG_NOSIGNAL 0
+#endif
+
 #define TAGGED_POINTER_DATA_SIZE 6
 #define TAGGED_POINTER_ALIGNMENT (((intptr_t)1) << TAGGED_POINTER_DATA_SIZE)
 #define TAGGED_POINTER_DATA_MASK (TAGGED_POINTER_ALIGNMENT - 1)

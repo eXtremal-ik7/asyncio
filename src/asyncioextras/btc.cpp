@@ -286,7 +286,11 @@ static AsyncOpStatus startBtcRecv(asyncOpRoot *opptr)
           return aosBufferTooSmall;
 
         op->stream->reset();
-        childOp = implRead(socket->plainSocket, op->stream->reserve(header->length), header->length, afWaitAll, 0, resumeRwCb, opptr, &bytes);
+        void *payload = op->stream->reserve(header->length);
+        if (!payload)
+          return aosBufferTooSmall;
+        childOp = implRead(socket->plainSocket, payload, header->length,
+                           afWaitAll, 0, resumeRwCb, opptr, &bytes);
         break;
       }
 
@@ -336,11 +340,17 @@ static asyncOpRoot *implBtcRecv(BTCSocket *socket,
       result = aosBufferTooSmall;
 
     stream.reset();
-    if (result == aosSuccess &&
-        ! (childOp = implRead(socket->plainSocket, stream.reserve(header->length), header->length, afWaitAll, 0, resumeRwCb, nullptr, &bytes))) {
-      uint32_t checkSum = calculateCheckSum(stream.data(), header->length);
-      if (header->checksum != checkSum)
-        result = btcMakeStatus(btcInvalidChecksum);
+    if (result == aosSuccess) {
+      void *payload = stream.reserve(header->length);
+      if (!payload) {
+        result = aosBufferTooSmall;
+      } else if (! (childOp = implRead(socket->plainSocket, payload,
+                                      header->length, afWaitAll, 0,
+                                      resumeRwCb, nullptr, &bytes))) {
+        uint32_t checkSum = calculateCheckSum(stream.data(), header->length);
+        if (header->checksum != checkSum)
+          result = btcMakeStatus(btcInvalidChecksum);
+      }
     }
   }
 

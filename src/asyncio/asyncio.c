@@ -1047,7 +1047,7 @@ static ssize_t writeMsgSyscall(aioObject *object, const HostAddress *address, co
 #ifdef OS_WINDOWS
   return sendto(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)&remoteAddress, addrlen);
 #else
-  return sendto(object->hSocket, buffer, size, 0, (struct sockaddr*)&remoteAddress, addrlen);
+  return sendto(object->hSocket, buffer, size, ASYNCIO_MSG_NOSIGNAL, (struct sockaddr*)&remoteAddress, addrlen);
 #endif
 }
 
