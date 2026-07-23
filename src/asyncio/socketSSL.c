@@ -53,9 +53,9 @@ typedef enum {
 // SSL_write may need input and SSL_read may produce output, so that would
 // require one coordinated TLS/BIO pump.
 typedef enum {
-  sslOpConnect = 0,
-  sslOpRead,
-  sslOpWrite
+  sslOpConnect = OPCODE_INIT,
+  sslOpRead = 1,
+  sslOpWrite = 2
 } SSLOpTy;
 
 __NO_PADDING_BEGIN
@@ -205,6 +205,16 @@ static AsyncOpStatus connectProc(asyncOpRoot *opptr)
 {
   SSLOp *op = (SSLOp*)opptr;
   SSLSocket *socket = (SSLSocket*)op->root.object;
+
+  // The start node reaches this callback only after the combiner has stored
+  // this operation in initializationOp. Configure the shared SSL state once;
+  // subsequent child completions re-enter with arRunning.
+  if (opptr->running == arWaiting) {
+    SSL_set_connect_state(socket->ssl);
+    if (op->transactionSize &&
+        !SSL_set_tlsext_host_name(socket->ssl, op->buffer))
+      return aosUnknownError;
+  }
 
   if (op->state == sslStInitalize) {
     op->state = sslStProcessing;
@@ -374,29 +384,6 @@ socketTy sslGetSocket(const SSLSocket *socket)
   return aioObjectSocket(socket->object);
 }
 
-// One-shot claim of the transport-initialization slot shared by both connect
-// entry points. The SSL state machine belongs to the initialization owner:
-// after a lost CAS a handshake may be running on it right now, so it is
-// configured only between a won CAS and the push.
-static void sslConnectSubmit(SSLSocket *socket, SSLOp *op, const char *tlsextHostName)
-{
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         (uintptr_t)&op->root,
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-    return;
-  }
-
-  SSL_set_connect_state(socket->ssl);
-  if (tlsextHostName)
-    SSL_set_tlsext_host_name(socket->ssl, op->buffer);
-
-  combinerPushOperation(&op->root);
-}
-
 void aioSslConnect(SSLSocket *socket,
                    const HostAddress *address,
                    const char *tlsextHostName,
@@ -413,7 +400,7 @@ void aioSslConnect(SSLSocket *socket,
   else
     op->state = sslStProcessing;
 
-  sslConnectSubmit(socket, op, tlsextHostName);
+  combinerPushOperation(&op->root);
 }
 
 asyncOpRoot *implSslRead(SSLSocket *socket,
@@ -631,7 +618,7 @@ int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlse
     op->address = *address;
   else
     op->state = sslStProcessing;
-  sslConnectSubmit(socket, op, tlsextHostName);
+  combinerPushOperation(&op->root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);

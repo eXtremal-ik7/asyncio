@@ -246,6 +246,8 @@ typedef struct AsyncOpTaggedPtr {
 #define OPCODE_READ 0
 #define OPCODE_WRITE 0x01000000
 #define OPCODE_OTHER 0x02000000
+// Library-owned marker for operations routed through initializationOp.
+#define OPCODE_INIT 0x04000000
 
 // Public intrusive ownership hooks. Retain/release are thread-safe; a caller
 // may retain only through a reference it already owns. Destructor callbacks
@@ -408,8 +410,9 @@ struct aioObjectRoot {
   // handshake). It must be submitted before ordinary I/O; operations submitted
   // afterwards may wait in the read/write queues until initialization ends.
   // Objects already ready for I/O (accepted/UDP sockets, devices) never use it.
-  // Claimed once by CAS at submission and cleared by the object's combiner.
-  volatile uintptr_t initializationOp;
+  // Only the combiner assigns and clears this slot. Head ownership serializes
+  // its plain accesses just like the read/write queue links.
+  asyncOpRoot *initializationOp;
 
   aioObjectDestructor *destructor;
   aioObjectDestructorCb *destructorCb;
@@ -612,7 +615,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
   if (!head.data) {
     // This thread entered a combiner
     if (queue->head ||
-        __uintptr_atomic_load(&object->initializationOp, amoRelaxed) ||
+        object->initializationOp ||
         __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
       // Object has operations in queue, initialization in flight, or is
       // closing. A closing object must not reach syncImpl: route the

@@ -56,14 +56,14 @@ static void drainOrDie(std::vector<std::deque<Ctx>> &arenas,
           aioObjectRoot *o = ctx.handle;
           fprintf(stderr,
                   "  %s %p: refs=%" PRIuPTR " head=%" PRIx64 " readQ=%p writeQ=%p"
-                  " deletePending=%u initialization=%" PRIxPTR " missing=%u\n",
+                  " deletePending=%u missing=%u\n",
                   dumpTag,
                   (void*)o,
                   o->refs,
                   __uint64_atomic_load(&o->header.tag.low, amoRelaxed),
                   (void*)o->readQueue.head,
                   (void*)o->writeQueue.head,
-                  o->DeletePending, o->initializationOp,
+                  o->DeletePending,
                   ctx.expected.load() - ctx.callbacks.load());
           if (++dumped == 16)
             break;

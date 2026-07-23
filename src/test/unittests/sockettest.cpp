@@ -486,10 +486,10 @@ TEST(socket, test_tcp_read_pipelined_with_connect)
     << ") while the connect was still in flight";
 }
 
-// Connect is the object's one-shot initialization: it occupies the single
-// aioObjectRoot::initializationOp slot. A second connect submitted while the
-// first is still in flight must be rejected immediately instead of queueing
-// or corrupting the slot.
+// Connect is the object's one-shot initialization: the combiner places it in
+// aioObjectRoot::initializationOp. A second connect submitted while the
+// first is still in flight must complete as an error without corrupting the
+// slot.
 TEST(socket, double_connect_rejected)
 {
   DoubleConnectRecorder ctx(gBase);

@@ -276,8 +276,8 @@ TEST(uriparse, pct_decode_compacts_adjacent_escapes_and_embedded_nul)
   EXPECT_EQ(uri.fragment, "GH");
 }
 
-// B2: regname after userinfo ("user@host") never leaves the StWaitRegname
-// loop; until the fix these calls hang the test run.
+// A regname after userinfo ("user@host") must leave the StWaitRegname loop;
+// otherwise these calls hang the test run.
 TEST(uriparse, test_dns_host_with_userinfo)
 {
   URI uri;
@@ -461,6 +461,24 @@ TEST(uriparse, test_hostport_port_rules)
   EXPECT_EQ(uriParseHostPort("example.com:65536", &uri, 0), 0);
   EXPECT_EQ(uriParseHostPort("example.com:99999999", &uri, 0), 0);
   EXPECT_EQ(uriParseHostPort("example.com:", &uri, 0), 0);
+}
+
+// The authority port of the full uriParse must follow the same rules as the
+// uriParseHostPort pair: values beyond 65535 are rejected (never accumulated
+// into signed overflow), and an empty port keeps the "-1 = no explicit port"
+// sentinel so build() cannot turn "host:/" into "host:0/". An explicit ":0"
+// stays a real port, matching the hostport parser.
+TEST(uriparse, test_authority_port_rules)
+{
+  URI uri;
+  EXPECT_EQ(uriParse("http://example.com:65536/", &uri), 0);
+  EXPECT_EQ(uriParse("http://example.com:9999999999/", &uri), 0);
+
+  ASSERT_EQ(uriParse("http://example.com:/", &uri), 1);
+  EXPECT_EQ(uri.port, -1);
+
+  ASSERT_EQ(uriParse("http://example.com:0/", &uri), 1);
+  EXPECT_EQ(uri.port, 0);
 }
 
 TEST(uriparse, test_hostport_must_reject)

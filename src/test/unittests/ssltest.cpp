@@ -15,6 +15,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -433,10 +434,9 @@ TEST(ssl, write_without_connect)
   sslSocketDelete(client);
 }
 
-// The SSL connect claims its object's initialization slot the same way the plain
-// TCP connect does: a second handshake submitted while the first is still in
-// flight must be rejected immediately, without touching the shared SSL state
-// machine.
+// The combiner installs the SSL initialization operation just as for plain TCP.
+// A second handshake submitted while the first is still in flight must fail
+// without touching the shared SSL state machine.
 TEST(ssl, double_connect_rejected)
 {
   DoubleConnectRecorder ctx(gBase);
@@ -624,6 +624,171 @@ TEST(ssl, partial_write_mode)
 TEST(ssl, partial_write_mode_pipelined)
 {
   sslPartialWriteScenario(false);
+}
+
+// implSslRead/implSslWrite hand a continuation operation back to the caller
+// while the transport child was already pushed to the plain socket's combiner
+// inside the impl call. This is the calling pattern of the HTTP/SMTP clients:
+// they run under their own client-object combiner (not the SSL object's one)
+// and push the returned continuation afterwards. The child's completion
+// signal must wake the continuation even when the continuation is queued
+// after that completion already happened: here a TLS read parks its transport
+// child, the loop consumes the child's completion while the continuation is
+// still unqueued, and only then is the continuation pushed - it must still
+// complete with the decrypted payload instead of parking forever.
+struct SslContinuationWakeupContext {
+  asyncBase *base = nullptr;
+  AsyncOpStatus connectStatus = aosUnknown;
+  std::atomic<bool> readDone{false};
+  AsyncOpStatus readStatus = aosUnknown;
+  size_t readTransferred = 0;
+  std::atomic<bool> serverReady{false};
+  std::atomic<bool> serverSend{false};
+  std::atomic<bool> serverExit{false};
+  std::atomic<bool> serverFailed{false};
+  uint8_t buffer[64] = {};
+};
+
+static const char gSslContinuationPayload[] = "wakeup";
+
+static void sslContinuationWakeupSink(socketTy listenSocket, SslContinuationWakeupContext *ctx)
+{
+  socketTy fd;
+  SSL *ssl = sslTestServerHandshake(listenSocket, &fd);
+  if (!ssl) {
+    ctx->serverFailed = true;
+    ctx->serverReady = true;
+    if (fd != (socketTy)(-1))
+      socketClose(fd);
+    return;
+  }
+  ctx->serverReady = true;
+  while (!ctx->serverSend)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  if (SSL_write(ssl, gSslContinuationPayload, (int)strlen(gSslContinuationPayload)) <= 0)
+    ctx->serverFailed = true;
+  // keep the connection open: an EOF-driven read-queue sweep must not stand in
+  // for the wakeup under test
+  while (!ctx->serverExit)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  SSL_free(ssl);
+  socketClose(fd);
+}
+
+static void sslContinuationWakeupConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
+{
+  SslContinuationWakeupContext *ctx = static_cast<SslContinuationWakeupContext*>(arg);
+  ctx->connectStatus = status;
+  postQuitOperation(ctx->base);
+}
+
+static void sslContinuationWakeupReadCb(AsyncOpStatus status, SSLSocket*, size_t transferred, void *arg)
+{
+  SslContinuationWakeupContext *ctx = static_cast<SslContinuationWakeupContext*>(arg);
+  ctx->readStatus = status;
+  ctx->readTransferred = transferred;
+  ctx->readDone = true;
+  postQuitOperation(ctx->base);
+}
+
+static void sslContinuationWakeupQuitCb(aioUserEvent*, void *arg)
+{
+  postQuitOperation(static_cast<asyncBase*>(arg));
+}
+
+TEST(ssl, read_continuation_pushed_after_child_completion)
+{
+  SslContinuationWakeupContext ctx;
+  ctx.base = gBase;
+
+  aioObject *clientIo = initializeTCPClient(gBase, nullptr, nullptr, 0);
+  ASSERT_NE(clientIo, nullptr);
+  SSLSocket *client = sslSocketNew(gBase, clientIo, nullptr);
+  ASSERT_NE(client, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread sink(sslContinuationWakeupSink, listenSocket, &ctx);
+  // an early ASSERT return must release the helper, or its thread destructor
+  // terminates the whole binary
+  struct SinkGuard {
+    SslContinuationWakeupContext *ctx;
+    std::thread *sink;
+    ~SinkGuard() { ctx->serverSend = true; ctx->serverExit = true; sink->join(); }
+  } sinkGuard{&ctx, &sink};
+
+  aioUserEvent *watchdog = newUserEvent(gBase, 0, sslContinuationWakeupQuitCb, gBase);
+
+  address.ipv4 = inet_addr("127.0.0.1");
+  aioSslConnect(client, &address, nullptr, 5000000, sslContinuationWakeupConnectCb, &ctx);
+  asyncLoop(gBase);
+  ASSERT_EQ(ctx.connectStatus, aosSuccess);
+  auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!ctx.serverReady && std::chrono::steady_clock::now() < readyDeadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_TRUE(ctx.serverReady.load());
+  ASSERT_FALSE(ctx.serverFailed.load());
+
+  // the caller's half of the client pattern: park a TLS read. The transport
+  // child is pushed inside implSslRead; the continuation op is returned and
+  // deliberately not pushed yet
+  size_t bytes = 0;
+  asyncOpRoot *continuationOp = implSslRead(client, ctx.buffer, sizeof(ctx.buffer), afNone, 0,
+                                            sslContinuationWakeupReadCb, &ctx, &bytes);
+  ASSERT_NE(continuationOp, nullptr);  // no transport data buffered: the read must park
+
+  // let the transport child run to completion while the continuation stays
+  // unqueued: the server sends one TLS record, the loop consumes the child's
+  // completion (and with it the continuation's wakeup signal), the watchdog
+  // then stops the loop
+  resetQuitOperation(gBase);
+  ctx.serverSend = true;
+  userEventStartTimer(watchdog, 700000, 1);
+  asyncLoop(gBase);
+  userEventStopTimer(watchdog);
+  ASSERT_FALSE(ctx.serverFailed.load());
+  // the loop is stopped, no concurrent BIO access: ciphertext in the client
+  // input BIO proves the transport child completed and signalled the (not yet
+  // queued) continuation
+  ASSERT_GT(BIO_ctrl_pending(client->bioIn), 0u);
+  ASSERT_FALSE(ctx.readDone.load());
+
+  // push the continuation exactly as the HTTP/SMTP clients do, then wait for
+  // its completion with a rescue deadline
+  resetQuitOperation(gBase);
+  combinerPushOperation(continuationOp);
+  userEventStartTimer(watchdog, 2500000, 1);
+  asyncLoop(gBase);
+  userEventStopTimer(watchdog);
+
+  bool wedged = !ctx.readDone.load();
+  EXPECT_FALSE(wedged) << "continuation op never completed: its child's wakeup was consumed before the op was queued";
+  if (!wedged) {
+    EXPECT_EQ(ctx.readStatus, aosSuccess);
+    EXPECT_EQ(ctx.readTransferred, strlen(gSslContinuationPayload));
+    EXPECT_EQ(memcmp(ctx.buffer, gSslContinuationPayload, strlen(gSslContinuationPayload)), 0);
+  }
+
+  // teardown: deleting the socket sweeps a wedged continuation; the cancel
+  // callback both proves the op was parked in the queue and lets the object
+  // release cleanly
+  resetQuitOperation(gBase);
+  sslSocketDelete(client);
+  if (wedged) {
+    userEventStartTimer(watchdog, 2000000, 1);
+    asyncLoop(gBase);
+    userEventStopTimer(watchdog);
+    EXPECT_TRUE(ctx.readDone.load());
+    EXPECT_EQ(ctx.readStatus, aosCanceled);
+  }
+  deleteUserEvent(watchdog);
+  socketClose(listenSocket);
 }
 
 // address == NULL means "the transport is already connected, run only the

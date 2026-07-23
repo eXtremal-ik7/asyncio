@@ -379,6 +379,45 @@ TEST(core_user_event, stale_timer_generation_cannot_touch_restarted_schedule)
   EXPECT_EQ(context.destructors, 1u);
 }
 
+// A transient backend arm failure (timer allocation, kevent/timerfd rejection)
+// must not leave a successfully published schedule silently dead: an armed
+// generation is the only tick source, so a swallowed failure wedges an ioSleep
+// waiter forever and starves userEventStartTimer deliveries. The activation
+// doorbell (userEventActivate) already retries transient kernel failures; the
+// arm path owes its schedule the same liveness.
+TEST(core_user_event, transient_backend_arm_failure_must_not_kill_schedule)
+{
+  TestBackend backend;
+  EventContext context;
+  aioUserEvent *event = newUserEvent(&backend.base, 1, coreEventCallback, &context);
+  ASSERT_NE(event, nullptr);
+
+  int armFailures = 1;
+  backend.eventTimerHook = [&](aioUserEvent*, EventTimerUpdate update, uint32_t, uint64_t) -> int {
+    if (update == etuStart && armFailures) {
+      armFailures--;
+      return 0;
+    }
+    return 1;
+  };
+
+  userEventStartTimer(event, 100, 1);
+
+  // The single failure was consumed; the schedule must have been re-armed.
+  aioTimer *timer = eventTimerLoad(event, amoRelaxed);
+  ASSERT_NE(timer, nullptr);
+  EXPECT_EQ(armFailures, 0);
+  EXPECT_GE(backend.startTimerCalls, 2u);
+  EXPECT_NE(eventTimerState(timer)->armed, 0u);
+
+  // Delivery must be alive: a tick of the current generation reaches the
+  // callback instead of being drained by a disarmed-state gate.
+  eventTimerSignal(event, backend.lastEventTimerGeneration, eventHandleGeneration(event), 1);
+  EXPECT_EQ(context.finishes, 1u);
+
+  deleteUserEvent(event);
+}
+
 TEST(core_user_event, timerfd_count_replaces_the_provisional_tick)
 {
   TestBackend backend;

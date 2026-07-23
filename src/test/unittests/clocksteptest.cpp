@@ -15,10 +15,9 @@
 // deadline tick in asyncioImpl.c) and the realtime-timer path
 // (userEventStartTimer -> startTimer, timerfd_create(CLOCK_REALTIME) on epoll).
 //
-// Expected verdicts:
-//   grid_* (all backends) and realtime_* on epoll (Linux): RED before the
-//   CLOCK_MONOTONIC fix, GREEN after. realtime_* on kqueue (macOS/BSD) is GREEN
-//   even before the fix, because EVFILT_TIMER already runs off a monotonic base.
+// Backend coverage:
+//   grid_* on every backend and realtime_* on epoll use monotonic deadlines;
+//   realtime_* on kqueue uses EVFILT_TIMER, which also has a monotonic base.
 
 #include "unittest.h"
 

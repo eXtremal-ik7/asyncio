@@ -259,7 +259,7 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   if (op)
     startOperation(op, &needStart);
 
-  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
+  if (progress && object->initializationOp)
     processInitializationOp(object, &needStart);
   // CANCEL/CANCELIO: the CANCELIO position additionally bounds the bulk
   // cancelIo() sweep

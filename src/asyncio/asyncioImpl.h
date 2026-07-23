@@ -97,11 +97,11 @@ static const uintptr_t timerPreclearOverflowActiveMask = ((uintptr_t)1 << 32) - 
 
 typedef enum IoActionTy {
   actAccept = OPCODE_READ,
-  actRead,
-  actReadMsg,
-  actConnect = OPCODE_WRITE,
-  actWrite,
-  actWriteMsg
+  actRead = OPCODE_READ + 1,
+  actReadMsg = OPCODE_READ + 2,
+  actConnect = OPCODE_WRITE | OPCODE_INIT,
+  actWrite = OPCODE_WRITE + 1,
+  actWriteMsg = OPCODE_WRITE + 2
 } IoActionTy;
 
 // (object, startOp, sig): startOp != 0 is an op-node to start; sig is the
@@ -266,7 +266,7 @@ static inline uint32_t combinerSelectActiveIoEvents(int hasInitialization,
 
 static inline uint32_t combinerActiveIoEvents(aioObjectRoot *object)
 {
-  asyncOpRoot *initialization = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
+  asyncOpRoot *initialization = object->initializationOp;
   if (initialization)
     return combinerSelectActiveIoEvents(1, initialization->running, initialization->opCode & OPCODE_WRITE, 0, 0);
 

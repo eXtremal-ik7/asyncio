@@ -18,6 +18,7 @@ set(
   httpparsetest.cpp
   httpheadertabletest.cpp
   base64test.cpp
+  btctest.cpp
   coretest.cpp
   timertest.cpp
   eventtest.cpp

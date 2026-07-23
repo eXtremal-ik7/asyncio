@@ -581,10 +581,9 @@ TEST(core_initialization, pending_operation_freezes_ordinary_queues_until_succes
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp connect(object, OPCODE_WRITE), read(object);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT), read(object);
   connect.setResults({aosPending, aosSuccess});
   read.setResults({aosSuccess});
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
 
   combinerPushOperation(&connect.root);
   combinerPushOperation(&read.root);
@@ -594,7 +593,7 @@ TEST(core_initialization, pending_operation_freezes_ordinary_queues_until_succes
 
   combinerPushProgress(&connect.root);
 
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   EXPECT_EQ(connect.executeCalls, 2u);
   EXPECT_EQ(read.executeCalls, 1u);
   EXPECT_EQ(connect.releaseCalls, 1u);
@@ -609,10 +608,9 @@ TEST(core_initialization, read_direction_progress_drives_handshake_slot)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp handshake(object, OPCODE_READ), write(object, OPCODE_WRITE);
+  TestOp handshake(object, OPCODE_READ | OPCODE_INIT), write(object, OPCODE_WRITE);
   handshake.setResults({aosPending, aosSuccess});
   write.setResults({aosSuccess});
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&handshake.root);
 
   combinerPushOperation(&handshake.root);
   combinerPushOperation(&write.root);
@@ -623,7 +621,7 @@ TEST(core_initialization, read_direction_progress_drives_handshake_slot)
 
   EXPECT_EQ(handshake.executeCalls, 2u);
   EXPECT_EQ(write.executeCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   EXPECT_NE(std::find(backend.handledSignals.begin(),
                       backend.handledSignals.end(),
                       COMBINER_TAG_PROGRESS_READ),
@@ -636,9 +634,8 @@ TEST(core_initialization, failure_cancels_operations_queued_behind_it)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp connect(object, OPCODE_WRITE), read(object), write(object, OPCODE_WRITE);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT), read(object), write(object, OPCODE_WRITE);
   connect.setResults({aosPending, aosDisconnected});
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   combinerPushOperation(&connect.root);
   combinerPushOperation(&read.root);
   combinerPushOperation(&write.root);
@@ -660,21 +657,20 @@ TEST(core_initialization, proactor_cancel_waits_for_late_completion)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp connect(object, OPCODE_WRITE);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
   connect.cancelResult = 0;
   connect.setResults({aosPending});
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   combinerPushOperation(&connect.root);
 
   cancelIo(&object.root);
 
   EXPECT_EQ(connect.root.running, arCancelling);
   EXPECT_EQ(connect.releaseCalls, 0u);
-  EXPECT_EQ(object.root.initializationOp, reinterpret_cast<uintptr_t>(&connect.root));
+  EXPECT_EQ(object.root.initializationOp, &connect.root);
 
   combinerPushProgress(&connect.root);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   backend.drainCompletions();
   EXPECT_EQ(connect.callbackStatus, aosCanceled);
   deleteOwner(backend, object);
@@ -684,17 +680,16 @@ TEST(core_initialization, synchronous_cancel_releases_immediately)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp connect(object, OPCODE_WRITE);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
   connect.cancelResult = 1;
   connect.setResults({aosPending});
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
   combinerPushOperation(&connect.root);
 
   cancelIo(&object.root);
 
   EXPECT_EQ(connect.cancelCalls, 1u);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   backend.drainCompletions();
   EXPECT_EQ(connect.callbackStatus, aosCanceled);
   deleteOwner(backend, object);
@@ -704,8 +699,9 @@ TEST(core_initialization, direct_reap_handles_running_and_waiting_terminal_state
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp running(object, OPCODE_WRITE), waiting(object, OPCODE_WRITE);
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&running.root);
+  TestOp running(object, OPCODE_WRITE | OPCODE_INIT);
+  TestOp waiting(object, OPCODE_WRITE | OPCODE_INIT);
+  object.root.initializationOp = &running.root;
   running.root.running = arRunning;
   ASSERT_TRUE(opSetStatus(&running.root, opGetGeneration(&running.root), aosTimeout));
   uint32_t needStart = 0;
@@ -713,19 +709,74 @@ TEST(core_initialization, direct_reap_handles_running_and_waiting_terminal_state
   reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(running.cancelCalls, 1u);
   EXPECT_EQ(running.releaseCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
 
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&waiting.root);
+  object.root.initializationOp = &waiting.root;
   waiting.root.running = arWaiting;
   ASSERT_TRUE(opSetStatus(&waiting.root, opGetGeneration(&waiting.root), aosCanceled));
   reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(waiting.cancelCalls, 0u);
   EXPECT_EQ(waiting.releaseCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   EXPECT_EQ(needStart & (IO_EVENT_READ | IO_EVENT_WRITE),
             IO_EVENT_READ | IO_EVENT_WRITE);
 
   backend.drainCompletions();
+  deleteOwner(backend, object);
+}
+
+TEST(core_initialization, cancel_boundary_on_init_start_node_releases_once)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp active(object), connect(object, OPCODE_WRITE | OPCODE_INIT);
+  active.setResults({aosPending});
+  connect.setResults({aosPending});
+  active.executeHook = [&](TestOp &op) {
+    if (op.executeCalls != 1)
+      return;
+    // CANCELIO is attached to this init node. The backend must first install
+    // and start it and only then sweep it; no pre-start slot exists.
+    combinerPushOperation(&connect.root);
+    cancelIo(&object.root);
+  };
+
+  combinerPushOperation(&active.root);
+
+  EXPECT_EQ(connect.releaseCalls, 1u);
+  EXPECT_EQ(connect.executeCalls, 1u);
+  EXPECT_EQ(connect.cancelCalls, 1u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
+
+  backend.drainCompletions();
+  EXPECT_EQ(connect.finishCalls, 1u);
+  EXPECT_EQ(active.finishCalls, 1u);
+  EXPECT_EQ(connect.callbackStatus, aosCanceled);
+  deleteOwner(backend, object);
+}
+
+TEST(core_initialization, owner_rejects_second_init_while_slot_is_occupied)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp first(object, OPCODE_WRITE | OPCODE_INIT);
+  TestOp second(object, OPCODE_WRITE | OPCODE_INIT);
+  first.setResults({aosPending});
+  first.executeHook = [&](TestOp &op) {
+    if (op.executeCalls == 1)
+      combinerPushOperation(&second.root);
+  };
+
+  combinerPushOperation(&first.root);
+
+  EXPECT_EQ(object.root.initializationOp, &first.root);
+  EXPECT_EQ(second.executeCalls, 0u);
+  EXPECT_EQ(second.releaseCalls, 1u);
+  EXPECT_EQ(opGetStatus(&second.root), aosUnknownError);
+
+  cancelAndDrain(backend, object);
+  EXPECT_EQ(first.finishCalls, 1u);
+  EXPECT_EQ(second.finishCalls, 1u);
   deleteOwner(backend, object);
 }
 
@@ -737,8 +788,8 @@ TEST(core_initialization, process_is_noop_without_running_slot)
   processInitializationOp(&object.root, &needStart);
   EXPECT_EQ(needStart, 0u);
 
-  TestOp waiting(object, OPCODE_WRITE);
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&waiting.root);
+  TestOp waiting(object, OPCODE_WRITE | OPCODE_INIT);
+  object.root.initializationOp = &waiting.root;
   waiting.root.running = arWaiting;
   processInitializationOp(&object.root, &needStart);
   EXPECT_EQ(waiting.executeCalls, 0u);
@@ -753,8 +804,8 @@ TEST(core_initialization, terminal_status_from_child_releases_without_reexecutio
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp connect(object, OPCODE_WRITE);
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
+  object.root.initializationOp = &connect.root;
   connect.root.running = arRunning;
   ASSERT_TRUE(opSetStatus(&connect.root,
                           opGetGeneration(&connect.root),
@@ -765,7 +816,7 @@ TEST(core_initialization, terminal_status_from_child_releases_without_reexecutio
 
   EXPECT_EQ(connect.executeCalls, 0u);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   backend.drainCompletions();
   EXPECT_EQ(connect.callbackStatus, aosUnknownError);
   deleteOwner(backend, object);
@@ -775,16 +826,45 @@ TEST(core_initialization, operation_cancelled_before_start_is_never_executed)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp connect(object, OPCODE_WRITE);
-  object.root.initializationOp = reinterpret_cast<uintptr_t>(&connect.root);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
   ASSERT_TRUE(opSetStatus(&connect.root, opGetGeneration(&connect.root), aosCanceled));
 
   combinerPushOperation(&connect.root);
 
   EXPECT_EQ(connect.executeCalls, 0u);
   EXPECT_EQ(connect.releaseCalls, 1u);
-  EXPECT_EQ(object.root.initializationOp, 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   backend.drainCompletions();
+  deleteOwner(backend, object);
+}
+
+// Mirror of the kqueue/epoll realtime arm-failure path: the backend records
+// the terminal status on the operation and returns without emitting any
+// combiner signal.
+static void failingRealtimeStartTimer(asyncOpRoot *op)
+{
+  (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
+}
+
+TEST(core_timer_arm, realtime_arm_failure_still_delivers_completion)
+{
+  TestBackend backend;
+  backend.base.methodImpl.startTimer = failingRealtimeStartTimer;
+  TestObject object(backend);
+  // A reactor operation parked after its sync attempt: running from
+  // submission on, woken only by kernel readiness or its realtime timeout.
+  TestOp op(object, OPCODE_READ, afRealtime | afRunning, 1000000);
+  op.setResults({aosPending});
+
+  combinerPushOperation(&op.root);
+
+  EXPECT_EQ(opGetStatus(&op.root), aosUnknownError);
+  ASSERT_EQ(backend.completions.size(), 1u)
+      << "operation with a failed timer arm was stranded in its queue";
+  backend.drainCompletions();
+  EXPECT_EQ(op.finishCalls, 1u);
+  EXPECT_EQ(op.callbackStatus, aosUnknownError);
+  EXPECT_EQ(object.root.readQueue.head, nullptr);
   deleteOwner(backend, object);
 }
 
@@ -945,6 +1025,63 @@ TEST(core_delete_lifecycle, sticky_delete_sweeps_submission_captured_after_cance
   EXPECT_EQ(opGetStatus(&captured.root), aosCanceled);
   EXPECT_EQ(captured.finishCalls, 1u);
   EXPECT_EQ(object.destructorCallbacks, 1u);
+}
+
+TEST(core_delete_lifecycle, init_node_after_delete_is_rejected_before_claim)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
+  connect.setResults({aosPending});
+
+  // The operation reference keeps the object storage alive across delete.
+  // Its node is published afterwards, as can happen to a concurrent submitter.
+  objectDelete(&object.root);
+  combinerPushOperation(&connect.root);
+
+  EXPECT_EQ(connect.executeCalls, 0u);
+  EXPECT_EQ(connect.releaseCalls, 1u);
+  EXPECT_EQ(opGetStatus(&connect.root), aosCanceled);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
+
+  backend.drainCompletions();
+  EXPECT_EQ(connect.finishCalls, 1u);
+  EXPECT_EQ(connect.callbackStatus, aosCanceled);
+  EXPECT_EQ(object.destructorCallbacks, 1u);
+  EXPECT_EQ(object.resourceDestructors, 1u);
+}
+
+TEST(core_delete_lifecycle, kept_parent_with_consumed_child_wake_is_not_stranded)
+{
+  TestBackend backend;
+  TestObject object(backend);
+  TestOp parent(object);
+  // Protocol parent: cancel forwards to the transport and reports the child
+  // completion as in flight. If the parent is ever re-driven on the dying
+  // object, its fresh child is immediately cancelled by the same teardown.
+  parent.cancelResult = 0;
+  parent.setResults({aosPending, aosPending});
+  parent.executeHook = [&](TestOp &op) {
+    if (op.executeCalls >= 2)
+      resumeParent(&op.root, aosCanceled);
+  };
+  combinerPushOperation(&parent.root);
+  ASSERT_EQ(parent.root.running, arRunning);
+
+  // objectDelete split at its internal window: the deleting thread has stored
+  // the flag but not yet pushed CANCELIO when the child-success progress
+  // dispatch runs. The gate suppresses the re-drive that would have issued a
+  // new child, so the cancel sweep keeps a parent no completion can reach.
+  __uint_atomic_store(&object.root.DeletePending, 1, amoRelease);
+  combinerPushProgress(&parent.root);
+  cancelIo(&object.root);
+  objectDecrementReference(&object.root, 1);
+
+  backend.drainCompletions();
+  EXPECT_EQ(parent.releaseCalls, 1u);
+  EXPECT_EQ(parent.finishCalls, 1u);
+  EXPECT_EQ(object.destructorCallbacks, 1u);
+  EXPECT_EQ(object.resourceDestructors, 1u);
 }
 
 

@@ -968,29 +968,13 @@ static asyncOpRoot *implWriteProxy(aioObjectRoot *object, AsyncFlags flags, uint
                    &context->BytesTransferred);
 }
 
-// Transport initialization is one-shot for an object: the connect operation
-// claims the initialization slot at submission. A losing claim is a second
-// connect on the same object and completes with aosUnknownError through the
-// global queue instead of entering the combiner.
-static void connectSubmit(asyncOp *op)
-{
-  aioObjectRoot *object = op->root.object;
-  if (!__uintptr_atomic_compare_and_swap(&object->initializationOp, 0, (uintptr_t)&op->root, amoSeqCst)) {
-    opForceStatus(&op->root, aosUnknownError);
-    addToGlobalQueue(&op->root);
-    return;
-  }
-
-  combinerPushOperation(&op->root);
-}
-
 void aioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout, aioConnectCb callback, void *arg)
 {
   struct Context context;
   fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afNone, usTimeout, (void*)callback, arg, actConnect, &context);
   op->host = *address;
-  connectSubmit(op);
+  combinerPushOperation(&op->root);
 }
 
 void aioAccept(aioObject *object, uint64_t usTimeout, aioAcceptCb callback, void *arg)
@@ -1183,7 +1167,7 @@ int ioConnect(aioObject *object, const HostAddress *address, uint64_t usTimeout)
   fillContext(&context, object->root.header.base->methodImpl.connect, connectFinish, 0, 0);
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, afCoroutine, usTimeout, 0, 0, actConnect, &context);
   op->host = *address;
-  connectSubmit(op);
+  combinerPushOperation(&op->root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);

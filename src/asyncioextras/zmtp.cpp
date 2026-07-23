@@ -99,10 +99,10 @@ static inline zmtpMsgTy operator|(zmtpMsgTy a, zmtpMsgTy b) {
 }
 
 enum btcOpTy {
-  zmtpOpAccept = OPCODE_READ,
-  zmtpOpRecv,
-  zmtpOpConnect = OPCODE_WRITE,
-  zmtpOpSend
+  zmtpOpAccept = OPCODE_READ | OPCODE_INIT,
+  zmtpOpRecv = OPCODE_READ + 1,
+  zmtpOpConnect = OPCODE_WRITE | OPCODE_INIT,
+  zmtpOpSend = OPCODE_WRITE + 1
 };
 
 enum zmtpOpState {
@@ -795,28 +795,11 @@ void zmtpSocketDelete(zmtpSocket *socket)
   objectDelete(&socket->root);
 }
 
-// One-shot claim of the transport-initialization slot shared by all four
-// accept/connect entry points
-static void submitInitOp(zmtpSocket *socket, asyncOpRoot *op)
-{
-  if (!__uintptr_atomic_compare_and_swap(&socket->root.initializationOp,
-                                         0,
-                                         reinterpret_cast<uintptr_t>(op),
-                                         amoSeqCst)) {
-    // Transport initialization is one-shot for an object.
-    opForceStatus(op, aosUnknownError);
-    addToGlobalQueue(op);
-    return;
-  }
-
-  combinerPushOperation(op);
-}
-
 void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpAcceptCb callback, void *arg)
 {
   Context context(startZmtpAccept, socketOpFinish, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpAccept, &context);
-  submitInitOp(socket, op);
+  combinerPushOperation(op);
 }
 
 void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags flags, uint64_t timeout, zmtpConnectCb callback, void *arg)
@@ -825,7 +808,7 @@ void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags f
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags, timeout, reinterpret_cast<void*>(callback), arg, zmtpOpConnect, &context));
   op->address = *address;
-  submitInitOp(socket, &op->root);
+  combinerPushOperation(&op->root);
 }
 
 // Inline-completion glue shared by the aio/io entry points: publish the byte
@@ -867,7 +850,7 @@ int ioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout)
 {
   Context context(startZmtpAccept, 0, nullptr, nullptr, 0, zmtpUnknown);
   asyncOpRoot *op = newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpAccept, &context);
-  submitInitOp(socket, op);
+  combinerPushOperation(op);
   coroutineYield();
 
   AsyncOpStatus status = opGetStatus(op);
@@ -881,7 +864,7 @@ int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags fla
   zmtpOp *op =
     reinterpret_cast<zmtpOp*>(newAsyncOp(&socket->root, flags | afCoroutine, timeout, nullptr, nullptr, zmtpOpConnect, &context));
   op->address = *address;
-  submitInitOp(socket, &op->root);
+  combinerPushOperation(&op->root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->root);
   releaseAsyncOp(&op->root);

@@ -373,7 +373,7 @@ static inline CombinerPassEvents reactorCombinerCore(aioObjectRoot *object, aioO
   if (op)
     startOperation(op, &needStart);
 
-  if (progress && __uintptr_atomic_load(&object->initializationOp, amoRelaxed))
+  if (progress && object->initializationOp)
     processInitializationOp(object, &needStart);
 
   if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))

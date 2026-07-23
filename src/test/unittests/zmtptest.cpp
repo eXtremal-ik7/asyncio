@@ -1067,8 +1067,8 @@ TEST(zmtp, aio_rep_coro)
 }
 
 // The ZMTP handshake operations (connect and accept) initialize the transport:
-// they claim the object's initializationOp slot, and recv/send submitted behind them
-// stay frozen in the object queues until the handshake outcome. Without the
+// the combiner stores them in initializationOp, and recv/send submitted
+// behind them stay frozen in the object queues until the handshake outcome. Without the
 // slot the opposite lane is open: connect lives in the write queue, so a
 // pipelined recv used to take the inline fast path and read on the plain
 // socket, stealing greeting bytes from the handshake state machine (and

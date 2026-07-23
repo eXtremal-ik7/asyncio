@@ -222,9 +222,8 @@ TEST(timer_grid, late_arm_after_swept_checkpoint_expires_instead_of_being_strand
   EXPECT_EQ(statusAfterArm, aosTimeout) << "a timer armed after its window was swept was not expired immediately";
   EXPECT_EQ(stranded, nullptr) << "the late timer was published into the reopened slot and will fire a rotation late";
 
-  // Keep the known-red test hygienic on the current implementation. The
-  // diagnostic drain above recovered ownership of the physical link; it must
-  // not remain in the global link pool with a pointer to this stack operation.
+  // If the diagnostic drain recovered the physical link, it must not remain
+  // in the global link pool with a pointer to this stack operation.
   if (stranded) {
     op.root.timerId = nullptr;
     free(stranded);
@@ -472,19 +471,18 @@ TEST(timer_wheel, expired_arm_never_starts_initialization_io)
 {
   TestBackend backend;
   TestObject object(backend);
-  TestOp op(object, OPCODE_WRITE, afNone, 1);
+  TestOp op(object, OPCODE_WRITE | OPCODE_INIT, afNone, 1);
   op.setResults({aosPending});
   // A connect whose timeout elapsed before the submission reached the
   // combiner: the deadline computed from the monotonic clock lies behind the
   // confirmed sweep position
   backend.base.timerCloseCursor = static_cast<uintptr_t>(getMonotonicTicks() + 1024);
-  ASSERT_TRUE(__uintptr_atomic_compare_and_swap(&object.root.initializationOp, 0, reinterpret_cast<uintptr_t>(&op.root), amoSeqCst));
 
   combinerPushOperation(&op.root);
 
   EXPECT_EQ(op.executeCalls, 0u) << "initialization I/O was issued after its timeout had already won";
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
-  EXPECT_EQ(__uintptr_atomic_load(&object.root.initializationOp, amoRelaxed), 0u);
+  EXPECT_EQ(object.root.initializationOp, nullptr);
   backend.drainCompletions();
   EXPECT_EQ(op.callbackStatus, aosTimeout);
   objectDelete(&object.root);

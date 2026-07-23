@@ -195,7 +195,8 @@ void initObjectRoot(aioObjectRoot *object, asyncBase *base, IoObjectTy type, aio
   object->destructorCb = 0;
   object->destructorCbArg = 0;
   __uint_atomic_store(&object->DeletePending, 0, amoRelaxed);
-  __uintptr_atomic_store(&object->initializationOp, 0, amoRelaxed);
+  // initializationOp is protected by combiner ownership after publication.
+  object->initializationOp = 0;
 }
 
 void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback, void *arg)
@@ -417,18 +418,48 @@ static void opRun(asyncOpRoot *op, List *list)
   opArmTimer(op);
 }
 
+// Complete an operation whose start node has not armed a timer or issued I/O.
+// opRelease() deliberately is not used: a realtime operation owns a timer cell
+// from allocation onward, but stopTimer is only legal after that cell was
+// actually armed. The operation-specific release hook still has to run before
+// the completion is published (large captured buffers may otherwise leak).
+static void opReleaseUnstarted(asyncOpRoot *op, AsyncOpStatus status)
+{
+  opSetStatus(op, opGetGeneration(op), status);
+  assert(opGetStatus(op) != aosPending);
+  if (op->releaseMethod)
+    op->releaseMethod(op);
+  addToGlobalQueue(op);
+}
+
 // One-shot transport initialization does not live in the read/write queues.
-// Its slot is claimed before submission; ordinary operations submitted after
-// it may queue, but cannot start until initialization leaves the slot. This
-// ordering is an API contract: an object is not reinitialized, and no ordinary
-// I/O may precede its initialization. Leaving the slot kicks both queues; a
+// Its slot is assigned by the combiner while processing the init start node;
+// ordinary operations submitted afterwards may queue, but cannot start
+// until initialization leaves the slot. Leaving the slot kicks both queues; a
 // failure also cancels everything queued behind it with the same status.
 static void initializationRelease(asyncOpRoot *op, AsyncOpStatus status, uint32_t *needStart)
 {
   aioObjectRoot *object = op->object;
-  if (__uintptr_atomic_load(&object->initializationOp, amoRelaxed) == (uintptr_t)op)
-    __uintptr_atomic_store(&object->initializationOp, 0, amoRelaxed);
+  if (object->initializationOp == op)
+    object->initializationOp = 0;
   opRelease(op, status, 0);
+  if (status != aosSuccess) {
+    cancelOperationList(&object->readQueue, status);
+    cancelOperationList(&object->writeQueue, status);
+  }
+  if (needStart)
+    *needStart |= IO_EVENT_READ | IO_EVENT_WRITE;
+}
+
+// Same slot teardown before opArmTimer(): no backend timer exists to stop.
+static void initializationReleaseUnstarted(asyncOpRoot *op,
+                                           AsyncOpStatus status,
+                                           uint32_t *needStart)
+{
+  aioObjectRoot *object = op->object;
+  if (object->initializationOp == op)
+    object->initializationOp = 0;
+  opReleaseUnstarted(op, status);
   if (status != aosSuccess) {
     cancelOperationList(&object->readQueue, status);
     cancelOperationList(&object->writeQueue, status);
@@ -458,7 +489,7 @@ static void initializationTryComplete(asyncOpRoot *op, AsyncOpStatus status, uin
 // unambiguous while the slot is occupied.
 void processInitializationOp(aioObjectRoot *object, uint32_t *needStart)
 {
-  asyncOpRoot *op = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
+  asyncOpRoot *op = object->initializationOp;
   if (!op)
     return;
   AsyncOpStatus status = opGetStatus(op);
@@ -478,7 +509,7 @@ void processInitializationOp(aioObjectRoot *object, uint32_t *needStart)
 
 static void cancelInitializationOp(aioObjectRoot *object, AsyncOpStatus status)
 {
-  asyncOpRoot *op = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
+  asyncOpRoot *op = object->initializationOp;
   if (!op)
     return;
   if (opSetStatus(op, opGetGeneration(op), status)) {
@@ -486,9 +517,12 @@ static void cancelInitializationOp(aioObjectRoot *object, AsyncOpStatus status)
       op->running = arCancelling;
       if (op->cancelMethod(op))
         initializationRelease(op, status, 0);
+    } else if (op->running == arWaiting) {
+      // The slot is assigned only while its start node is being processed, so
+      // a visible waiting operation has no timer or I/O in flight and is safe
+      // to finish immediately.
+      initializationReleaseUnstarted(op, status, 0);
     }
-    // arWaiting: aaStart is still queued in the combiner; it will observe the
-    // status and release the slot
   }
 }
 
@@ -509,14 +543,27 @@ void startOperation(asyncOpRoot *op, uint32_t *needStart)
 {
   aioObjectRoot *object = op->object;
 
-  // Ownership of the initialization slot (claimed by CAS at submission, e.g.
-  // in aioConnect) routes an operation to the initialization path; there is no flag to
-  // spoof, any other operation goes to its read/write queue.
-  if (__uintptr_atomic_load(&object->initializationOp, amoRelaxed) == (uintptr_t)op) {
+  // Central rejection for a genuinely unstarted node. arRunning operations
+  // may already own child/kernel I/O and must enter their normal queue/slot so
+  // the existing cancel path can retain them until the late completion.
+  if (op->running == arWaiting &&
+      __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
+    opReleaseUnstarted(op, aosCanceled);
+    return;
+  }
+
+  if (op->opCode & OPCODE_INIT) {
+    // Only the combiner owner touches the slot. A duplicate init request is a
+    // client error, but its operation lifecycle still has to complete safely.
+    if (object->initializationOp) {
+      opReleaseUnstarted(op, aosUnknownError);
+      return;
+    }
+    object->initializationOp = op;
+
     if (opGetStatus(op) != aosPending) {
-      // Cancelled between submission and start (a cancelIo sweep): the sweep
-      // does not reach a not-yet-started operation, releasing the slot is on us
-      initializationRelease(op, opGetStatus(op), needStart);
+      // A direct operation cancellation won before its start node was handled.
+      initializationReleaseUnstarted(op, opGetStatus(op), needStart);
       return;
     }
     opArmTimer(op);
@@ -625,7 +672,7 @@ void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
   if (tag & COMBINER_TAG_CANCELIO)
     cancelAllObjectOperations(object);
 
-  asyncOpRoot *ex = (asyncOpRoot*)__uintptr_atomic_load(&object->initializationOp, amoRelaxed);
+  asyncOpRoot *ex = object->initializationOp;
   if (ex) {
     AsyncOpStatus status = opGetStatus(ex);
     switch (combinerSelectReapAction(ex->running, status)) {
@@ -635,7 +682,12 @@ void reapObject(aioObjectRoot *object, uint32_t tag, uint32_t *needStart)
           initializationRelease(ex, status, needStart);
         break;
 
-      case craRelease: initializationRelease(ex, status, needStart); break;
+      case craRelease:
+        if (ex->running == arWaiting)
+          initializationReleaseUnstarted(ex, status, needStart);
+        else
+          initializationRelease(ex, status, needStart);
+        break;
 
       case craKeep:
         // Pending, or already cancelling an in-flight operation: wait for its
@@ -664,7 +716,7 @@ void executeOperationList(List *list)
   asyncOpRoot *op = list->head;
   // Both queues are frozen while transport initialization is in flight; they
   // are kicked when it leaves the slot.
-  if (op && __uintptr_atomic_load(&op->object->initializationOp, amoRelaxed))
+  if (op && op->object->initializationOp)
     return;
 
   while (op) {
