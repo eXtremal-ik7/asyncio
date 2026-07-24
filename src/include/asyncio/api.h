@@ -267,7 +267,8 @@ void objectSetDestructorCb(aioObjectRoot *object, aioObjectDestructorCb callback
 // claims one for the current generation immediately before delivery. Coroutine
 // helpers likewise borrow the caller's reference across Yield rather than
 // retaining one internally. Delete may therefore discard readiness which has
-// not reached its claim point.
+// not reached its claim point. The sole exception is the personal doorbell
+// used to cancel a committed coroutine waiter after delete.
 void eventIncrementReference(aioUserEvent *event, uintptr_t count);
 void eventDecrementReference(aioUserEvent *event, uintptr_t count);
 // Construction-time configuration: set before publishing or deleting event.

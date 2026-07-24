@@ -75,6 +75,9 @@ static_assert(alignof(TestOp) >= kCombinerAlignment, "combiner nodes must be tag
 static_assert(offsetof(TestObject, root) == 0, "aioObjectRoot must be the first member");
 
 struct TestBackend: asyncBase {
+  static constexpr uintptr_t eventCompletionTagMask = 3;
+  static constexpr uintptr_t eventCompletionTag = 3;
+
   asyncBase &base;
   ConcurrentQueue operationPool{};
   std::vector<asyncOpRoot*> completions;
@@ -88,7 +91,6 @@ struct TestBackend: asyncBase {
   unsigned initializeTimerCalls = 0;
   unsigned wakeupCalls = 0;
   unsigned activateCalls = 0;
-  unsigned activateFailures = 0;
   uintptr_t nextTimerTag = 1;
   uint32_t lastEventTimerGeneration = 0;
   uint64_t lastEventTimerPeriod = 0;
@@ -141,15 +143,11 @@ struct TestBackend: asyncBase {
     size_t index = 0;
     while (index < completions.size()) {
       asyncOpRoot *op = completions[index++];
-      if (((uintptr_t)op & eventQueueTagMask) == eventQueueTagMask) {
-        aioUserEvent *event = (aioUserEvent*)((uintptr_t)op & ~(uintptr_t)eventQueueTagMask);
+      if (((uintptr_t)op & eventCompletionTagMask) == eventCompletionTag) {
+        aioUserEvent *event = (aioUserEvent*)((uintptr_t)op & ~(uintptr_t)eventCompletionTagMask);
         currentFinishedSync = 0;
         eventManualReady(event);
         eventDecrementReference(event, 1);
-        continue;
-      }
-      if (eventIsQueueTask(op)) {
-        eventExecuteQueuedTask(op);
         continue;
       }
       if (op->callback)
@@ -207,15 +205,12 @@ struct TestBackend: asyncBase {
   static int activateEvent(aioUserEvent *event) {
     TestBackend &backend = from(event->header.base);
     backend.activateCalls++;
-    // A rejected kernel post claims nothing: no envelope, no reference.
-    if (backend.activateFailures) {
-      backend.activateFailures--;
-      return 0;
-    }
-    // Model a kernel readiness envelope that successfully claimed the live
-    // generation. Its reference spans the queued record and delivery.
-    eventIncrementReference(event, 1);
-    enqueue(event->header.base, (asyncOpRoot*)((uintptr_t)event | eventQueueTagMask));
+    // Model the generation-checked reference claim normally performed when
+    // the kernel readiness is harvested. Deleted events remain claimable only
+    // for cancellation of a committed coroutine waiter.
+    if (!eventManualTryClaimReference(event, eventHandleGeneration(event)))
+      return 1;
+    enqueue(event->header.base, (asyncOpRoot*)((uintptr_t)event | eventCompletionTag));
     return 1;
   }
 

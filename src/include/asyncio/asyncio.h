@@ -191,6 +191,8 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
 // contract violation. A pending activation is consumed without suspending. A
 // coroutine may resume on a different OS thread after suspension; in particular
 // an IOCP timer wake resumes it directly on a Windows thread-pool worker.
+// Concurrent deletion wakes a parked helper asynchronously through the
+// event's normal manual-delivery path.
 void ioSleep(aioUserEvent *event, uint64_t usTimeout);
 
 void ioWaitUserEvent(aioUserEvent *event);

@@ -545,33 +545,39 @@ static inline int eventReferenceIsDeleting(aioUserEvent *event)
   return (__uint64_atomic_load(&event->header.tag.low, amoRelaxed) & TAG_EVENT_DELETE) != 0;
 }
 
-enum {
-  // Queue pointers are 64-byte aligned. Tag 1 requests loop-context waiter
-  // cancellation.
-  eventQueueCancellationTag = 1,
-  eventQueueTagMask = 3
-};
-
-static inline asyncOpRoot *eventCancellationNode(aioUserEvent *event)
+// Claims a kernel reference for a decoded full-generation handle. The
+// successful DWCAS pins the complete Head before any tail access. Timer
+// delivery is rejected after delete; manual delivery has one terminal
+// exception so the event's own doorbell can cancel a committed waiter.
+static inline int eventTryClaimReference(aioUserEvent *event,
+                                         uint64_t eventGeneration,
+                                         int allowDeletedWaiter)
 {
-  return (asyncOpRoot*)((uintptr_t)event | eventQueueCancellationTag);
+  uint128 expected = {__uint64_atomic_load(&event->header.tag.low, amoRelaxed), eventGeneration};
+  for (;;) {
+    if (expected.high != eventGeneration || !(expected.low & TAG_EVENT_REF_MASK))
+      return 0;
+    if ((expected.low & TAG_EVENT_DELETE) &&
+        (!allowDeletedWaiter || !(expected.low & TAG_EVENT_WAITER_COMMITTED)))
+      return 0;
+    uint128 desired = {expected.low + 1, expected.high};
+    if (__uint128_atomic_compare_and_swap(&event->header.tag, &expected, desired))
+      return 1;
+  }
 }
 
-static inline int eventIsQueueTask(asyncOpRoot *node)
+static inline int eventTimerTryClaimReference(aioUserEvent *event, uint64_t eventGeneration)
 {
-  return ((uintptr_t)node & eventQueueTagMask) == eventQueueCancellationTag;
+  return eventTryClaimReference(event, eventGeneration, 0);
 }
 
-static inline aioUserEvent *eventQueueTaskEvent(asyncOpRoot *node)
+static inline int eventManualTryClaimReference(aioUserEvent *event, uint64_t eventGeneration)
 {
-  return (aioUserEvent*)((uintptr_t)node & ~(uintptr_t)eventQueueTagMask);
+  return eventTryClaimReference(event, eventGeneration, 1);
 }
 
 void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t eventGeneration, uint64_t tickCount);
-// Executes waiter cancellation and releases its queue-owned reference.
-void eventExecuteQueuedTask(asyncOpRoot *node);
 void eventManualReady(aioUserEvent *event);
-int eventTimerTryClaimReference(aioUserEvent *event, uint64_t eventGeneration);
 
 // Single-threaded wheel lifecycle. Init may run on zeroed or reused storage
 // and seeds every slot's baseTick for the given cursor; teardown recycles

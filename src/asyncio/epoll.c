@@ -258,7 +258,7 @@ void epollNextFinishedOperation(asyncBase *base)
       switch (objectHeaderGetType(header)) {
         case ohtUserEvent: {
           aioUserEvent *event = (aioUserEvent*)header;
-          if (!eventTimerTryClaimReference(event, generation))
+          if (!eventManualTryClaimReference(event, generation))
             break;
           eventfd_t eventValue;
           int result;

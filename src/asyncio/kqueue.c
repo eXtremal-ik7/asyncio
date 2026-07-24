@@ -227,7 +227,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
       switch (objectHeaderGetType(header)) {
         case ohtUserEvent: {
           aioUserEvent *event = (aioUserEvent*)header;
-          if (!eventTimerTryClaimReference(event, envelopeGeneration))
+          if (!eventManualTryClaimReference(event, envelopeGeneration))
             break;
           eventManualReady(event);
           eventDecrementReference(event, 1);

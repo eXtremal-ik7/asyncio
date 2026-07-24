@@ -386,7 +386,7 @@ void iocpNextFinishedOperation(asyncBase *base)
           // A manually posted packet round-trips both payload fields verbatim;
           // this numeric OVERLAPPED value is never dereferenced.
           uint64_t fullGeneration = (uint64_t)(uintptr_t)entry->lpOverlapped;
-          if (!eventTimerTryClaimReference(event, fullGeneration))
+          if (!eventManualTryClaimReference(event, fullGeneration))
             continue;
           currentFinishedSync = 0;
           eventManualReady(event);
@@ -394,17 +394,13 @@ void iocpNextFinishedOperation(asyncBase *base)
           continue;
         }
         asyncOpRoot *op = (asyncOpRoot*)entry->lpCompletionKey;
-        if (eventIsQueueTask(op)) {
-          eventExecuteQueuedTask(op);
+        currentFinishedSync = 0;
+        if (op->flags & afCoroutine) {
+          coroutineCall((coroutineTy*)op->finishMethod);
         } else {
-          currentFinishedSync = 0;
-          if (op->flags & afCoroutine) {
-            coroutineCall((coroutineTy*)op->finishMethod);
-          } else {
-            if (op->callback)
-              op->finishMethod(op);
-            releaseAsyncOp(op);
-          }
+          if (op->callback)
+            op->finishMethod(op);
+          releaseAsyncOp(op);
         }
       } else if (entry->lpOverlapped) {
         iocpOp *op = (iocpOp*)(((uint8_t*)entry->lpOverlapped) - offsetof(struct iocpOp, overlapped));

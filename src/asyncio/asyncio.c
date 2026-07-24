@@ -21,7 +21,6 @@ static ConcurrentQueue opTimerPool;
 
 static void eventDeliverCallbacks(aioUserEvent *event, uintptr_t count);
 static void eventCoroutineResume(aioUserEvent *event, uintptr_t count, int manual, uint32_t generation);
-static void eventProcessCancellation(aioUserEvent *event);
 static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint32_t requiredGeneration, int terminal);
 
 #ifdef OS_WINDOWS
@@ -42,15 +41,6 @@ static const AsyncFlags afSyncStarted = afNone;
 #else
 static const AsyncFlags afSyncStarted = afRunning;
 #endif
-
-static void threadYield(void)
-{
-#ifdef OS_WINDOWS
-  SwitchToThread();
-#else
-  sched_yield();
-#endif
-}
 
 struct Context {
   aioExecuteProc *StartProc;
@@ -96,14 +86,6 @@ static void readMsgFinish(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
   ((aioReadMsgCb*)opptr->callback)(opGetStatus(opptr), (aioObject*)opptr->object, op->host, op->bytesTransferred, opptr->arg);
-}
-
-void eventExecuteQueuedTask(asyncOpRoot *node)
-{
-  aioUserEvent *event = eventQueueTaskEvent(node);
-  currentFinishedSync = 0;
-  eventProcessCancellation(event);
-  eventDecrementReference(event, 1);
 }
 
 static void releaseOp(asyncOpRoot *opptr)
@@ -514,21 +496,6 @@ static void eventTimerCancelGeneration(aioUserEvent *event, uint32_t generation)
     eventTimerPublishConfig(event, 0, 0, generation, 0);
 }
 
-// Claims a kernel reference for a decoded full-generation handle. The
-// successful DWCAS pins the complete Head before any tail access.
-int eventTimerTryClaimReference(aioUserEvent *event, uint64_t eventGeneration)
-{
-  uint128 expected = {__uint64_atomic_load(&event->header.tag.low, amoRelaxed), eventGeneration};
-  for (;;) {
-    // The handle must still name a live, non-deleting event incarnation.
-    if (expected.high != eventGeneration || !(expected.low & TAG_EVENT_REF_MASK) || (expected.low & TAG_EVENT_DELETE))
-      return 0;
-    uint128 desired = {expected.low + 1, expected.high};
-    if (__uint128_atomic_compare_and_swap(&event->header.tag, &expected, desired))
-      return 1;
-  }
-}
-
 void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t eventGeneration, uint64_t tickCount)
 {
   // A stale harvested timer may outlive logical release and may inspect only
@@ -620,6 +587,16 @@ static void eventCoroutineCancel(aioUserEvent *event)
   }
 }
 
+static void eventActivateCancellation(aioUserEvent *event)
+{
+  // DELETE makes every pending manual count irrelevant. Always post a fresh
+  // personal doorbell: a nonzero signalState may belong to a normal activation
+  // whose owner has not reached its backend call yet, so cancellation must not
+  // wait for that thread to make progress.
+  __uintptr_atomic_store(&event->signalState, 1, amoRelease);
+  (void)event->header.base->methodImpl.activate(event);
+}
+
 static int eventInstallWaiter(aioUserEvent *event, unsigned waiterKind)
 {
   uint128 expected = __uint128_atomic_load_relaxed(&event->waiter);
@@ -635,10 +612,8 @@ static int eventInstallWaiter(aioUserEvent *event, unsigned waiterKind)
         continue;
       // The second same-word RMW against Delete schedules cancellation.
       uint64_t oldTag = __uint64_atomic_fetch_and_add(&event->header.tag.low, TAG_EVENT_WAITER_COMMITTED, amoRelease);
-      if (oldTag & TAG_EVENT_DELETE) {
-        eventIncrementReference(event, 1);
-        event->header.base->methodImpl.enqueue(event->header.base, eventCancellationNode(event));
-      }
+      if (oldTag & TAG_EVENT_DELETE)
+        eventActivateCancellation(event);
       return 1;
     }
     // Credits are consumed by CAS only: a concurrent delete may replace them
@@ -677,7 +652,12 @@ void eventManualReady(aioUserEvent *event)
   if (!count)
     return;
 
-  if (event->callback)
+  // A callback readiness which claimed before delete remains accepted and
+  // must still be delivered. Callback-less events instead use the personal
+  // doorbell as the asynchronous cancellation path for a committed waiter.
+  if (!event->callback && eventReferenceIsDeleting(event))
+    eventProcessCancellation(event);
+  else if (event->callback)
     eventDeliverCallbacks(event, count);
   else
     eventCoroutineResume(event, count, 1, 0);
@@ -814,16 +794,10 @@ void userEventActivate(aioUserEvent *event)
 
   // The personal descriptor/completion is only a manual doorbell. Once one is
   // pending, signalState carries the exact count or the coalescing gate.
-  // The 0->nonzero edge owns the single doorbell: a swallowed post would
-  // wedge the gate forever, since later activations skip it. Retry transient
-  // kernel failures; teardown makes delivery moot.
-  if (old == 0) {
-    while (!event->header.base->methodImpl.activate(event)) {
-      if (eventReferenceIsDeleting(event))
-        return;
-      threadYield();
-    }
-  }
+  // The 0->nonzero edge owns the single doorbell. Interruptible syscall
+  // failures are handled inside the backend; common code never spins here.
+  if (old == 0)
+    (void)event->header.base->methodImpl.activate(event);
 }
 
 void deleteUserEvent(aioUserEvent *event)
@@ -832,10 +806,8 @@ void deleteUserEvent(aioUserEvent *event)
   uint64_t oldTag = __uint64_atomic_fetch_and_add(&event->header.tag.low, TAG_EVENT_DELETE, amoAcquire);
 
   eventTimerPublishConfig(event, 0, 0, 0, 1);
-  if (event->callback == 0 && (oldTag & TAG_EVENT_WAITER_COMMITTED)) {
-    eventIncrementReference(event, 1);
-    event->header.base->methodImpl.enqueue(event->header.base, eventCancellationNode(event));
-  }
+  if (event->callback == 0 && (oldTag & TAG_EVENT_WAITER_COMMITTED))
+    eventActivateCancellation(event);
   eventDecrementReference(event, 1);
 }
 

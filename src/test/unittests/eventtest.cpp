@@ -1740,7 +1740,12 @@ TEST(core_user_event, delete_resumes_waiter_without_timer_state)
       << "waiting must borrow the coroutine's reference, not retain another";
   EXPECT_NE(__uint64_atomic_load(&probe.event->header.tag.low, amoRelaxed) & TAG_EVENT_WAITER_COMMITTED, 0u);
 
+  // Model a normal activation paused after publishing signalState but before
+  // posting its kernel doorbell. Cancellation must make progress independently
+  // of that producer.
+  __uintptr_atomic_store(&probe.event->signalState, 1, amoRelaxed);
   deleteUserEvent(probe.event);
+  EXPECT_EQ(backend.activateCalls, 1u);
   EXPECT_EQ(lifetime.destructors, 0u);
   backend.drainCompletions();
 
@@ -2143,20 +2148,24 @@ TEST(event, recycled_compact_event_reinitializes_protocol_fields)
   deleteUserEvent(second);
 }
 
-TEST(event, manual_activation_survives_doorbell_failure)
+TEST(event, manual_activation_posts_one_doorbell_per_pending_batch)
 {
   TestBackend backend;
   EventContext context;
   aioUserEvent *event = newUserEvent(&backend.base, 1, coreEventCallback, &context);
   ASSERT_NE(event, nullptr);
 
-  // Transient kernel rejections of the 0->nonzero doorbell must be retried:
-  // the gate stays nonzero, so no later activation would re-ring it.
-  backend.activateFailures = 3;
   userEventActivate(event);
-  EXPECT_EQ(backend.activateCalls, 4u);
+  userEventActivate(event);
+  userEventActivate(event);
+  EXPECT_EQ(backend.activateCalls, 1u);
   backend.drainCompletions();
-  EXPECT_EQ(context.finishes, 1u);
+  EXPECT_EQ(context.finishes, 3u);
+
+  userEventActivate(event);
+  EXPECT_EQ(backend.activateCalls, 2u);
+  backend.drainCompletions();
+  EXPECT_EQ(context.finishes, 4u);
   deleteUserEvent(event);
 }
 

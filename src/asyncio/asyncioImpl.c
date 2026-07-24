@@ -847,11 +847,6 @@ void executeGlobalQueue(asyncBase *base)
   asyncOpRoot *op;
   while (concurrentQueuePop(&base->globalQueue, (void**)&op)) {
     assert(op && "empty node in the global queue (the quit marker is gone)");
-    if (eventIsQueueTask(op)) {
-      eventExecuteQueuedTask(op);
-      continue;
-    }
-
     assert(opGetStatus(op) != aosPending && "finishing pending operation!");
     currentFinishedSync = 0;
     if (op->flags & afCoroutine) {
