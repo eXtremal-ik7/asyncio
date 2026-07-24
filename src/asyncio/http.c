@@ -2,11 +2,38 @@
 
 #include "asyncio/asyncio.h"
 #include "asyncio/coroutine.h"
+#include "asyncioImpl.h"
 #include <string.h>
 
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
 static ConcurrentQueue objectPool;
+
+struct HTTPClient {
+  aioObjectRoot root;
+  int isHttps;
+  union {
+    aioObject *plainSocket;
+    SSLSocket *sslSocket;
+  };
+  uint8_t *inBuffer;
+  size_t inBufferSize;
+  size_t inBufferOffset;
+  size_t requestBytesSent;
+  HttpParserState state;
+  const HttpHeaderTable *headerTable;
+};
+
+struct HTTPOp {
+  asyncOpRoot root;
+  int state;
+  HostAddress address;
+  httpParseCb *parseCallback;
+  void *parseArg;
+  uint8_t *internalBuffer;
+  size_t internalBufferSize;
+  size_t dataSize;
+};
 
 // Pooled operations keep their scratch buffer up to this size (matches the
 // transport's default read-ahead buffer); larger request captures are
@@ -22,7 +49,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr);
 static int cancel(asyncOpRoot *opptr)
 {
   HTTPClient *client = (HTTPClient*)opptr->object;
-  cancelIo(client->isHttps ? (aioObjectRoot*)client->sslSocket : (aioObjectRoot*)client->plainSocket);
+  cancelIo(client->isHttps ? sslSocketHandle(client->sslSocket) : aioObjectHandle(client->plainSocket));
   return 0;
 }
 

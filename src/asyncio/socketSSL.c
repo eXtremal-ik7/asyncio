@@ -3,6 +3,7 @@
 #include "asyncio/socket.h"
 #include "asyncio/socketSSL.h"
 #include "asyncioImpl.h"
+#include "io.h"
 #include "atomic.h"
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -18,6 +19,30 @@
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
 static ConcurrentQueue objectPool;
+
+struct SSLSocket {
+  aioObjectRoot root;
+  aioObject *object;
+  SSL_CTX *sslContext;
+  SSL *ssl;
+  BIO *bioIn;
+  BIO *bioOut;
+  size_t sslReadBufferSize;
+  uint8_t *sslReadBuffer;
+  size_t sslWriteBufferSize;
+  uint8_t *sslWriteBuffer;
+};
+
+struct SSLOp {
+  asyncOpRoot root;
+  HostAddress address;
+  int state;
+  void *buffer;
+  size_t transactionSize;
+  size_t bytesTransferred;
+  void *internalBuffer;
+  size_t internalBufferSize;
+};
 
 struct Context {
   aioExecuteProc *StartProc;
@@ -69,7 +94,7 @@ __NO_PADDING_END
 static int cancel(asyncOpRoot *opptr)
 {
   SSLSocket *S = (SSLSocket*)opptr->object;
-  cancelIo((aioObjectRoot*)S->object);
+  cancelIo(aioObjectHandle(S->object));
   return 0;
 }
 
@@ -396,6 +421,11 @@ void sslSocketDelete(SSLSocket *socket)
 socketTy sslGetSocket(const SSLSocket *socket)
 {
   return aioObjectSocket(socket->object);
+}
+
+aioObjectRoot *sslSocketHandle(SSLSocket *socket)
+{
+  return &socket->root;
 }
 
 void aioSslConnect(SSLSocket *socket,

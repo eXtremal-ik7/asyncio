@@ -483,8 +483,6 @@ TEST(ssl, shared_user_context)
   SSLSocket *second = sslSocketNew(gBase, secondIo, userContext);
   ASSERT_NE(first, nullptr);
   ASSERT_NE(second, nullptr);
-  EXPECT_EQ(first->sslContext, userContext);
-  EXPECT_EQ(second->sslContext, userContext);
 
   SSL_CTX_free(userContext);  // the sockets keep the context alive on their own
   sslSocketDelete(first);

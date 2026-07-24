@@ -4,8 +4,10 @@ if (NOT WIN32)
 endif()
 
 set(Sources
-  asyncio.c
   asyncioImpl.c
+  events.c
+  io.c
+  lifetime.c
   timerWheel.c
   dynamicBuffer.c
   ringBuffer.c

@@ -1,0 +1,4 @@
+.DS_Store
+/src/.qtcreator
+/*.md
+!/README.md

@@ -14,5 +14,6 @@ target_link_libraries(timerwheelstress asyncio-0.5 ${PLATFORM_LIBRARIES})
 
 if (ASYNCIO_ENABLE_ZMTP)
   add_executable(connectstress connectstress.cpp)
+  target_include_directories(connectstress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../asyncio)
   target_link_libraries(connectstress asyncio-0.5 asyncioextras-0.5 ${PLATFORM_LIBRARIES})
 endif()

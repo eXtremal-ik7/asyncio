@@ -1,6 +1,7 @@
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
 #include "asyncio/timer.h"
+#include "macro.h"
 
 #include <getopt.h>
 #include <stdio.h>

@@ -27,6 +27,7 @@
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
 #include "asyncioextras/zmtp.h"
+#include "asyncioImpl.h"
 #include "verdict.h"
 
 #ifdef OS_WINDOWS

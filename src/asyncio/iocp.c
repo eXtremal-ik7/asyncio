@@ -3,6 +3,7 @@
 #include <mswsock.h>
 #include <windows.h>
 #include "asyncioImpl.h"
+#include "io.h"
 #include "atomic.h"
 #include <stdlib.h>
 #include <time.h>

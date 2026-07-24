@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-#include "asyncio/api.h"
+#include "asyncio/asyncio.h"
 
 typedef enum SmtpServerType {
   smtpServerPlain = 0,
@@ -29,7 +29,13 @@ const char *smtpClientGetResponse(SMTPClient *client);
 
 void aioSmtpConnect(SMTPClient *client, HostAddress address, uint64_t usTimeout, smtpConnectCb callback, void *arg);
 void aioSmtpStartTls(SMTPClient *client, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg);
-void aioSmtpLogin(SMTPClient *client, const char *login, const char *password, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg);
+void aioSmtpLogin(SMTPClient *client,
+                  const char *login,
+                  const char *password,
+                  AsyncFlags flags,
+                  uint64_t usTimeout,
+                  smtpResponseCb callback,
+                  void *arg);
 void aioSmtpCommand(SMTPClient *client, const char *command, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg);
 
 int ioSmtpConnect(SMTPClient *client, HostAddress address, uint64_t usTimeout);

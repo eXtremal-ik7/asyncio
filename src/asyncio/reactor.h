@@ -4,6 +4,7 @@
 #define __ASYNCIO_REACTOR_H_
 
 #include "asyncioImpl.h"
+#include "io.h"
 
 #ifndef OS_WINDOWS
 #include <fcntl.h>

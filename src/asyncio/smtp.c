@@ -4,6 +4,7 @@
 #include "asyncio/dynamicBuffer.h"
 #include "asyncio/socketSSL.h"
 #include "asyncio/socket.h"
+#include "asyncioImpl.h"
 #include <memory.h>
 #include <string.h>
 
@@ -131,7 +132,7 @@ static int cancel(asyncOpRoot *opptr)
   // cancel to the underlying socket themselves)
   SMTPClient *client = (SMTPClient*)opptr->object;
   if (client->TlsSocket)
-    cancelIo(&client->TlsSocket->root);
+    cancelIo(sslSocketHandle(client->TlsSocket));
   else
     cancelIo(aioObjectHandle(client->PlainSocket));
   return 0;

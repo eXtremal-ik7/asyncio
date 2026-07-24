@@ -1,6 +1,8 @@
 #include "unittest.h"
 
+#include "asyncio/coroutine.h"
 #include "asyncio/socket.h"
+#include "asyncioImpl.h"
 
 #include <atomic>
 #include <cerrno>
@@ -744,7 +746,7 @@ TEST(socket, client_reset_in_backlog_does_not_fail_accept)
   deleteAioObject(listener);
 }
 // Operations pushed while an object's combiner is held by another thread are
-// stacked LIFO (Treiber stack, api.h) and the combiner drains the captured
+// stacked LIFO (Treiber stack, asyncioImpl.h) and the combiner drains the captured
 // chain from its head, newest-first, without reversing it (asyncioImpl.c):
 // two writes submitted back-to-back by one thread land in the socket in
 // swapped order - silent TCP stream corruption. The producer (test main

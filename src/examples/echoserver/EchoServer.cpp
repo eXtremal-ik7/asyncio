@@ -1,5 +1,6 @@
 #include "asyncio/asyncio.h"
 #include "asyncio/socket.h"
+#include "macro.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

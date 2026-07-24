@@ -19,34 +19,6 @@ typedef struct HTTPOp HTTPOp;
 typedef void httpConnectCb(AsyncOpStatus, HTTPClient*, void*);
 typedef void httpRequestCb(AsyncOpStatus, HTTPClient*, void*);
 
-typedef struct HTTPClient {
-  aioObjectRoot root;
-  int isHttps;
-  union {
-    aioObject *plainSocket;
-    SSLSocket *sslSocket;
-  };
-
-  uint8_t *inBuffer;
-  size_t inBufferSize;
-  size_t inBufferOffset;
-  size_t requestBytesSent;
-  HttpParserState state;
-  const HttpHeaderTable *headerTable;
-} HTTPClient;
-
-
-typedef struct HTTPOp {
-  asyncOpRoot root;
-  int state;
-  HostAddress address;
-  httpParseCb *parseCallback;
-  void *parseArg;
-  uint8_t *internalBuffer;
-  size_t internalBufferSize;
-  size_t dataSize;
-} HTTPOp;
-
 typedef struct HTTPParseDefaultContext {
   unsigned resultCode;
   Raw contentType;
@@ -87,7 +59,6 @@ void aioHttpConnect(HTTPClient *client,
                     uint64_t usTimeout,
                     httpConnectCb callback,
                     void *arg);
-
 void aioHttpRequest(HTTPClient *client,
                     const char *request,
                     size_t requestSize,
@@ -98,7 +69,12 @@ void aioHttpRequest(HTTPClient *client,
                     void *arg);
 
 int ioHttpConnect(HTTPClient *client, const HostAddress *address, const char *tlsextHostName, uint64_t usTimeout);
-AsyncOpStatus ioHttpRequest(HTTPClient *client, const char *request, size_t requestSize, uint64_t usTimeout, httpParseCb parseCallback, void *parseArg);
+AsyncOpStatus ioHttpRequest(HTTPClient *client,
+                            const char *request,
+                            size_t requestSize,
+                            uint64_t usTimeout,
+                            httpParseCb parseCallback,
+                            void *parseArg);
                 
 
 #ifdef __cplusplus

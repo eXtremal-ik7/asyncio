@@ -1,6 +1,7 @@
 #include <asyncio/coroutine.h>
 #include <asyncio/socket.h>
 #include <asyncioextras/zmtp.h>
+#include "macro.h"
 #include <zmq.h>
 #include <atomic>
 #include <chrono>

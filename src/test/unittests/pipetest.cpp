@@ -75,7 +75,7 @@ TEST(pipe, sync_device_failures_report_zero_progress)
 // The read half of the device sync fast path: bytes already buffered in the
 // pipe complete aioRead right on the calling thread - the loop never runs in
 // this test, and the fire-and-forget return value is the only completion
-// channel, deliberately independent of the callback budget (api.h). POSIX
+// channel, deliberately independent of the callback budget (asyncioImpl.h). POSIX
 // devices have always taken this path; on Windows it pins deviceSyncRead
 // probing the pipe instead of unconditionally deferring to the IOCP.
 TEST(pipe, test_pipe_buffered_data_completes_read_inline)

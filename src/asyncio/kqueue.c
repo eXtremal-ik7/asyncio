@@ -1,4 +1,5 @@
 #include "asyncioImpl.h"
+#include "io.h"
 #include "reactor.h"
 #include "atomic.h"
 #include "asyncio/ringBuffer.h"

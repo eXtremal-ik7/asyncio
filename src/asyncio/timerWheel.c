@@ -15,6 +15,7 @@
 // confirm CAS, which any thread may perform (helping). Any number of threads
 // may sweep concurrently; there is no lock and no designated sweeper.
 
+#include "timerWheel.h"
 #include "asyncioImpl.h"
 #include "atomic.h"
 #include <stdlib.h>

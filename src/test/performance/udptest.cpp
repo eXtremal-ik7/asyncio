@@ -2,6 +2,7 @@
 #include "asyncio/coroutine.h"
 #include "asyncio/socket.h"
 #include "asyncio/timer.h"
+#include "macro.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <atomic>

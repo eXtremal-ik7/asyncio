@@ -1,6 +1,7 @@
 #include "smtpargs.h"
 
 #include "asyncio/asyncio.h"
+#include "asyncio/coroutine.h"
 #include "asyncio/socket.h"
 #include "asyncio/smtp.h"
 
