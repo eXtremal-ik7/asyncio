@@ -211,8 +211,11 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
   if (client->end - base < 5)
     return aosPending;
 
-  // Check begin of response: 3-digit code and a '-'/' ' separator
-  if (!isDigits(base, 3) || (base[3] != '-' && base[3] != ' '))
+  // Check begin of response: 3-digit code followed by a multiline/single-line
+  // separator, or by CRLF when the optional response text is absent
+  if (!isDigits(base, 3) ||
+      (base[3] != '-' && base[3] != ' ' &&
+       (base[3] != '\r' || base[4] != '\n')))
     return (AsyncOpStatus)smtpInvalidFormat;
 
   firstReplyCode[0] = base[0];
@@ -242,11 +245,12 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
         return aosPending;
 
       linesCount++;
-      if (lf - p < 5 || lf[-1] != '\r' || memcmp(p, firstReplyCode, 3) != 0 ||
-          (p[3] != '-' && p[3] != ' '))
+      if (lf - p < 4 || lf[-1] != '\r' || memcmp(p, firstReplyCode, 3) != 0 ||
+          (p[3] != '-' && p[3] != ' ' &&
+           (p[3] != '\r' || lf != p + 4)))
         return (AsyncOpStatus)smtpInvalidFormat;
 
-      if (p[3] == ' ') {
+      if (p[3] != '-') {
         // Last line in multiline answer
         break;
       }
@@ -260,8 +264,9 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
     for (size_t i = 0; i < linesCount; i++) {
       lf = memchr(p, '\n', client->end - p);
 
-      size_t lineSize = lf-1-(p+4);
-      memmove(out, p+4, lineSize);
+      const char *text = p + (p[3] == '\r' ? 3 : 4);
+      size_t lineSize = lf-1-text;
+      memmove(out, text, lineSize);
 
       out[lineSize] = '\n';
       p = lf + 1;
@@ -271,6 +276,11 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
     *out = 0;
     client->ptr = (char*)p;
     client->Response = base;
+  } else if (base[3] == '\r') {
+    // RFC 5321 permits a reply code without the optional space and text
+    client->Response = base + 3;
+    base[3] = 0;
+    client->ptr = base + 5;
   } else {
     // Other response parse
     // Find '\n'
@@ -462,6 +472,11 @@ static AsyncOpStatus smtpStepConnect(SMTPClient *client, SMTPOp *op)
 // handshake over the established connection
 static AsyncOpStatus smtpStepUpgradeTls(SMTPClient *client, SMTPOp *op, int nextState)
 {
+  // Repeating STARTTLS is a caller error, but the existing TLS wrapper owns
+  // PlainSocket and must not be overwritten or leaked
+  if (client->TlsSocket)
+    return (AsyncOpStatus)smtpError;
+
   // Plaintext buffered past the STARTTLS response would later be parsed as if
   // it were TLS-protected (plaintext injection) - refuse the upgrade
   if (client->ptr != client->end)
@@ -651,6 +666,7 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
   client->Type = type;
   client->ptr = client->buffer;
   client->end = client->buffer;
+  client->ResultCode = 0;
   client->Response = 0;
   if (type == smtpServerPlain) {
     client->PlainSocket = newSocketIo(base, socket);

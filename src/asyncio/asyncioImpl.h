@@ -338,19 +338,23 @@ void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe);
 
 // Map the errno of a failed stream/datagram socket syscall (recv/send/read/
 // write/recvmsg/sendto) to an operation status. EAGAIN means the socket buffer
-// is momentarily empty or full: the operation stays pending and is retried on
-// the next readiness event. EPIPE (peer gone, broken pipe) and ENOTCONN (the
-// socket was never connected) both normalize to aosNotConnected, so callers can
-// tell an absent/lost connection from an opaque failure; ECONNRESET (TCP RST)
-// is aosDisconnected, matching the kqueue EV_EOF and iocp WSAECONNRESET paths;
-// every other errno collapses to aosUnknownError (errno is not otherwise
-// surfaced by the API).
+// is momentarily empty or full, while EINTR means no terminal I/O error
+// occurred: in both cases the operation stays pending and is retried after the
+// readiness interest is rearmed. EPIPE (peer gone, broken pipe) and ENOTCONN
+// (the socket was never connected) both normalize to aosNotConnected, so
+// callers can tell an absent/lost connection from an opaque failure;
+// ECONNRESET (TCP RST) and ECONNREFUSED (an asynchronous connected-UDP ICMP
+// rejection) are aosDisconnected, matching the kqueue EV_EOF and iocp
+// WSAECONNRESET paths; every other errno collapses to aosUnknownError (errno is
+// not otherwise surfaced by the API).
 static inline AsyncOpStatus socketStatusFromErrno(int error)
 {
   switch (error) {
+    case EINTR:
     case EAGAIN: return aosPending;
     case EPIPE:
     case ENOTCONN: return aosNotConnected;
+    case ECONNREFUSED:
     case ECONNRESET: return aosDisconnected;
     default: return aosUnknownError;
   }

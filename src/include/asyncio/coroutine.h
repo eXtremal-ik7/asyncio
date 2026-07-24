@@ -1,3 +1,6 @@
+#ifndef __ASYNCIO_COROUTINE_H_
+#define __ASYNCIO_COROUTINE_H_
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,3 +49,5 @@ void coroutineYield();
 #ifdef __cplusplus
 }
 #endif
+
+#endif //__ASYNCIO_COROUTINE_H_

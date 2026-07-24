@@ -57,4 +57,4 @@ _initFPU:
     mov     eax, DWORD PTR [esp+0x4]
     fnstcw  WORD  PTR [eax+0x18]
     stmxcsr DWORD PTR [eax+0x1C]
-    ret 4
+    ret

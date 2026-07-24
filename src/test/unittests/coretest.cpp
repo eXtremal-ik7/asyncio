@@ -1635,6 +1635,7 @@ TEST(core_sync_path, speculative_allocation_is_released_after_combiner_handoff)
   EXPECT_EQ(scenario.makeResults, 1u);
   ASSERT_NE(scenario.operation, nullptr);
   EXPECT_EQ(object.root.refs, 1u);
+  EXPECT_EQ(scenario.operation->releaseCalls, 1u);
   void *recycled = nullptr;
   ASSERT_TRUE(concurrentQueuePop(&backend.operationPool, &recycled));
   EXPECT_EQ(recycled, &scenario.operation->root);
@@ -1940,14 +1941,16 @@ TEST(core_head, validated_push_accepts_matching_compact_generation_after_wrap)
 #ifndef OS_WINDOWS
 // socketStatusFromErrno centralizes the errno->status mapping shared by the
 // epoll and kqueue read/write/recvmsg/sendto paths. Pin the normalization:
-// EAGAIN parks the operation (retry), EPIPE and ENOTCONN both surface as the
-// unified aosNotConnected, and any other errno stays opaque as aosUnknownError.
+// EAGAIN and EINTR park the operation (retry), EPIPE and ENOTCONN both surface
+// as the unified aosNotConnected, connected-UDP ECONNREFUSED is a peer-side
+// disconnect, and unrelated errors stay opaque as aosUnknownError.
 TEST(core_status, errno_maps_retry_and_broken_connection_distinctly)
 {
   EXPECT_EQ(socketStatusFromErrno(EAGAIN), aosPending);
+  EXPECT_EQ(socketStatusFromErrno(EINTR), aosPending);
   EXPECT_EQ(socketStatusFromErrno(EPIPE), aosNotConnected);
   EXPECT_EQ(socketStatusFromErrno(ENOTCONN), aosNotConnected);
-  EXPECT_EQ(socketStatusFromErrno(ECONNREFUSED), aosUnknownError);
+  EXPECT_EQ(socketStatusFromErrno(ECONNREFUSED), aosDisconnected);
   EXPECT_EQ(socketStatusFromErrno(EINVAL), aosUnknownError);
 }
 #endif

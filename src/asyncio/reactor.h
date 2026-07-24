@@ -163,7 +163,7 @@ static inline AsyncOpStatus connectSyscall(asyncOpRoot *opptr)
     struct sockaddr_storage sa;
     socklen_t saLen = hostAddressToSockaddr(&op->host, &sa);
     int result = connect(fd, (struct sockaddr*)&sa, saLen);
-    if (result == -1 && errno != EINPROGRESS)
+    if (result == -1 && errno != EINPROGRESS && errno != EINTR)
       return aosUnknownError;
     else
       return aosPending;

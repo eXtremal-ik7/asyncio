@@ -1,4 +1,5 @@
 #include "p2putils/uriParse.h"
+#include "p2putils/strExtras.h"
 #include "gtest/gtest.h"
 #include <stdint.h>
 #include <string>
@@ -73,6 +74,78 @@ int captureRawComponent(URIComponent *component, void *arg)
   return 1;
 }
 
+struct CancelCapture {
+  int target;
+  bool cancelled;
+  bool calledAfterCancel;
+
+  explicit CancelCapture(int targetArg) :
+    target(targetArg), cancelled(false), calledAfterCancel(false) {}
+};
+
+int cancelAtComponent(URIComponent *component, void *arg)
+{
+  CancelCapture *capture = static_cast<CancelCapture*>(arg);
+  if (capture->cancelled) {
+    capture->calledAfterCancel = true;
+    return 1;
+  }
+  if (component->type == capture->target) {
+    capture->cancelled = true;
+    return 0;
+  }
+  return 1;
+}
+
+}
+
+TEST(strextras, xitoa_formats_minimum_signed_values)
+{
+  char buffer[32];
+
+  EXPECT_EQ(xitoa(INT32_MIN, buffer), static_cast<size_t>(11));
+  EXPECT_STREQ(buffer, "-2147483648");
+  EXPECT_EQ(xitoa(INT64_MIN, buffer), static_cast<size_t>(20));
+  EXPECT_STREQ(buffer, "-9223372036854775808");
+}
+
+TEST(uriparse, full_parsers_honor_callback_cancellation)
+{
+  struct CancelCase {
+    const char *input;
+    int component;
+  };
+  const CancelCase uriCases[] = {
+    {"http://user@example.com:8080/path?x=1#f", uriCtSchema},
+    {"http://user@example.com:8080/path?x=1#f", uriCtUserInfo},
+    {"http://user@example.com:8080/path?x=1#f", uriCtHostDNS},
+    {"http://127.0.0.1:8080/path", uriCtHostIPv4},
+    {"http://[::1]:8080/path", uriCtHostIPv6},
+    {"http://user@example.com:8080/path?x=1#f", uriCtPort}
+  };
+
+  for (const CancelCase &testCase : uriCases) {
+    SCOPED_TRACE(testCase.input);
+    CancelCapture capture(testCase.component);
+    EXPECT_EQ(uriParse(testCase.input, cancelAtComponent, &capture), 0);
+    EXPECT_TRUE(capture.cancelled);
+    EXPECT_FALSE(capture.calledAfterCancel);
+  }
+
+  const CancelCase hostPortCases[] = {
+    {"example.com:8080", uriCtHostDNS},
+    {"127.0.0.1:8080", uriCtHostIPv4},
+    {"[::1]:8080", uriCtHostIPv6},
+    {"example.com:8080", uriCtPort}
+  };
+
+  for (const CancelCase &testCase : hostPortCases) {
+    SCOPED_TRACE(testCase.input);
+    CancelCapture capture(testCase.component);
+    EXPECT_EQ(uriParseHostPort(testCase.input, cancelAtComponent, &capture), 0);
+    EXPECT_TRUE(capture.cancelled);
+    EXPECT_FALSE(capture.calledAfterCancel);
+  }
 }
 
 TEST(uriparse, test_path_pct_escape_missing_both_hex_digits)

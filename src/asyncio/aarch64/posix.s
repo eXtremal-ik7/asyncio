@@ -3,6 +3,10 @@
   https://github.com/hnes/libaco
 */
 
+#if !defined(__APPLE__)
+.section .note.GNU-stack,"",%progbits
+#endif
+
 .text
 .globl switchContext
 .globl _switchContext

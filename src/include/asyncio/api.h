@@ -57,7 +57,8 @@ typedef enum AsyncOpStatus {
   // The socket is not, or no longer, a usable connection for this operation:
   // a write to a peer that has gone away (EPIPE) or any I/O on a socket that
   // was never connected (ENOTCONN / WSAENOTCONN). Distinct from aosDisconnected,
-  // which marks an established stream ending mid-flight (orderly EOF or reset).
+  // which marks an established stream ending mid-flight (orderly EOF or reset)
+  // or an asynchronous peer rejection reported for a connected datagram.
   aosNotConnected,
   aosCanceled,
   aosBufferTooSmall,
@@ -632,8 +633,14 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
       combiner(object, taggedAsyncOpStub(), allocatedTagged);
       return allocated;
     } else {
-      if (allocated)
+      if (allocated) {
+        // The speculative constructor may already own a captured write buffer
+        // or another operation-specific resource even though the operation
+        // never reached a queue.
+        if (allocated->releaseMethod)
+          allocated->releaseMethod(allocated);
         releaseAsyncOp(allocated);
+      }
       return 0;
     }
   } else {

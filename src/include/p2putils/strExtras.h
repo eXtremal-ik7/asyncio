@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <algorithm>
+#include <type_traits>
 #include "asyncioconfig.h"
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -30,12 +31,13 @@ template<typename IntType> IntType xntoh(IntType value) { return xbetoh(value); 
 
 template<typename Type> size_t xitoa(Type value, char *out)
 {
-  Type lvalue = value;
+  typedef typename std::make_unsigned<Type>::type UnsignedType;
+  UnsignedType lvalue = static_cast<UnsignedType>(value);
   char *lout = out;
   char *pout = out, *pOutEnd;
   
-  if (lvalue < 0) {
-    lvalue = ((Type)0)-lvalue;
+  if (value < 0) {
+    lvalue = UnsignedType(0) - lvalue;
     *pout++ = '-';
     lout++;
   }

@@ -3,6 +3,13 @@
 socketTy socketCreate(int af, int type, int protocol, int isAsync)
 {
   SOCKET hSocket = WSASocket(af, type, protocol, NULL, 0, isAsync ? WSA_FLAG_OVERLAPPED : 0);
+  if (hSocket == INVALID_SOCKET)
+    return INVALID_SOCKET;
+
+  int optval = 1;
+  if (type == SOCK_STREAM)
+    setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&optval, sizeof(optval));
+
   if (isAsync) {
     u_long arg = 1;
     ioctlsocket(hSocket, FIONBIO, &arg);
@@ -55,6 +62,7 @@ int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, siz
       *bytesTransferred = bytesNum;
       return 1;
     } else {
+      *bytesTransferred = 0;
       return 0;
     }
   } else {
@@ -84,6 +92,7 @@ int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitA
       return 1;
     }
     else {
+      *bytesTransferred = 0;
       return 0;
     }
   } else {

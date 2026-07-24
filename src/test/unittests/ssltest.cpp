@@ -931,9 +931,9 @@ TEST(ssl, https_client_nested_active_once_io)
   socketClose(listenSocket);
 }
 
-static const char gSmtpsActiveOnceGreeting[] = "220 localhost ready\r\n";
+static const char gSmtpsActiveOnceGreeting[] = "220\r\n";
 static const char gSmtpsActiveOnceCommand[] = "NOOP\r\n";
-static const char gSmtpsActiveOnceResponse[] = "250 ok\r\n";
+static const char gSmtpsActiveOnceResponse[] = "250-first\r\n250\r\n";
 static const unsigned gSmtpsActiveOnceRounds = 64;
 
 struct SmtpsActiveOnceContext {
@@ -992,7 +992,7 @@ static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx);
 
 static void smtpsActiveOnceCommandCb(AsyncOpStatus status,
                                      unsigned code,
-                                     SMTPClient*,
+                                     SMTPClient *client,
                                      void *arg)
 {
   SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
@@ -1001,7 +1001,8 @@ static void smtpsActiveOnceCommandCb(AsyncOpStatus status,
     postQuitOperation(ctx->base);
     return;
   }
-  if (code != 250)
+  const char *response = smtpClientGetResponse(client);
+  if (code != 250 || !response || strcmp(response, "first\n\n") != 0)
     ctx->responseMismatch = true;
 
   if (ctx->completed.fetch_add(1) + 1 == gSmtpsActiveOnceRounds)
@@ -1020,14 +1021,18 @@ static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx)
                  ctx);
 }
 
-static void smtpsActiveOnceConnectCb(AsyncOpStatus status, SMTPClient*, void *arg)
+static void smtpsActiveOnceConnectCb(AsyncOpStatus status, SMTPClient *client, void *arg)
 {
   SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
   ctx->connectStatus = status;
-  if (status == aosSuccess)
+  if (status == aosSuccess) {
+    const char *response = smtpClientGetResponse(client);
+    if (!response || *response != 0)
+      ctx->responseMismatch = true;
     smtpsActiveOnceSubmit(ctx);
-  else
+  } else {
     postQuitOperation(ctx->base);
+  }
 }
 
 TEST(ssl, smtps_client_nested_active_once_io)

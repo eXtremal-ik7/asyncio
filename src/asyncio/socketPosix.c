@@ -71,6 +71,7 @@ int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, siz
       *bytesTransferred = (size_t)result;
       return 1;
     } else {
+      *bytesTransferred = 0;
       return 0;
     }
   } else {
@@ -96,6 +97,7 @@ int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitA
       *bytesTransferred = (size_t)result;
       return 1;
     } else {
+      *bytesTransferred = 0;
       return 0;
     }
   } else {

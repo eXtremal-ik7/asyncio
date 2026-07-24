@@ -117,7 +117,8 @@ static int uriParseScheme(const char **ptr, uriParseCb callback, void *arg)
         component.type = uriCtSchema;
         component.raw.data = *ptr;
         component.raw.size = static_cast<size_t>(p - *ptr);
-        callback(&component, arg);
+        if (!callback(&component, arg))
+          return 0;
         *ptr = p;
         return 1;
       }
@@ -232,7 +233,8 @@ static int uriParseIpLiteral(const char **ptr, uriParseCb callback, void *arg)
   URIComponent component;
   component.type = uriCtHostIPv6;
   memcpy(component.ipv6, groups, sizeof(component.ipv6));
-  callback(&component, arg);
+  if (!callback(&component, arg))
+    return 0;
 
   *ptr = p + 1;
   return 1;
@@ -270,8 +272,8 @@ static int spanIsIpv4(const char *p, const char *end, uint32_t *out)
 }
 
 // host = full-span IPv4address or reg-name (RFC 3986: IPv4 wins only when the
-// whole span matches); empty span emits nothing; returns consumed length
-static size_t uriParseRegnameHost(const char **ptr, uriParseCb callback, void *arg)
+// whole span matches); an empty span emits nothing and is still successful
+static int uriParseRegnameHost(const char **ptr, uriParseCb callback, void *arg)
 {
   const char *b = *ptr, *p = *ptr;
   for (;;) {
@@ -295,11 +297,12 @@ static size_t uriParseRegnameHost(const char **ptr, uriParseCb callback, void *a
       component.raw.data = b;
       component.raw.size = static_cast<size_t>(p-b);
     }
-    callback(&component, arg);
+    if (!callback(&component, arg))
+      return 0;
   }
 
   *ptr = p;
-  return static_cast<size_t>(p-b);
+  return 1;
 }
 
 
@@ -380,7 +383,8 @@ static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
     component.type = uriCtUserInfo;
     component.raw.data = p;
     component.raw.size = static_cast<size_t>(scan-p);
-    callback(&component, arg);
+    if (!callback(&component, arg))
+      return 0;
     p = scan + 1;
   }
 
@@ -389,7 +393,8 @@ static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
     if (!uriParseIpLiteral(&p, callback, arg))
       return 0;
   } else {
-    uriParseRegnameHost(&p, callback, arg);
+    if (!uriParseRegnameHost(&p, callback, arg))
+      return 0;
   }
 
   if (*p == ':') {
@@ -405,7 +410,8 @@ static int uriParseAuthority(const char **ptr, uriParseCb callback, void *arg)
       URIComponent component;
       component.type = uriCtPort;
       component.i32 = static_cast<int32_t>(port);
-      callback(&component, arg);
+      if (!callback(&component, arg))
+        return 0;
     }
   }
 
@@ -597,7 +603,8 @@ int uriParseHostPort(const char *hostport, uriParseCb callback, void *arg)
     if (!uriParseIpLiteral(&p, callback, arg))
       return 0;
   } else {
-    if (uriParseRegnameHost(&p, callback, arg) == 0)
+    const char *hostBegin = p;
+    if (!uriParseRegnameHost(&p, callback, arg) || p == hostBegin)
       return 0;
   }
 
@@ -615,7 +622,8 @@ int uriParseHostPort(const char *hostport, uriParseCb callback, void *arg)
     URIComponent component;
     component.type = uriCtPort;
     component.i32 = static_cast<int32_t>(port);
-    callback(&component, arg);
+    if (!callback(&component, arg))
+      return 0;
   }
 
   return *p == 0;

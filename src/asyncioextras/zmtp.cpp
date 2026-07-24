@@ -272,6 +272,7 @@ static asyncOpRoot *newReadAsyncOp(aioObjectRoot *object,
   op->data = nullptr;
   op->stream = context->Stream;
   op->size = context->TransactionSize;
+  op->type = zmtpMsgFlagNone;
   return &op->root;
 }
 

@@ -56,6 +56,22 @@ TEST(pipe, test_pipe)
   }
 }
 
+TEST(pipe, sync_device_failures_report_zero_progress)
+{
+  pipeTy unnamedPipe;
+  ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
+
+  char byte = 0;
+  size_t transferred = static_cast<size_t>(-1);
+  EXPECT_EQ(deviceSyncRead(unnamedPipe.read, &byte, sizeof(byte), 0, &transferred), 0);
+  EXPECT_EQ(transferred, 0u);
+  pipeClose(unnamedPipe);
+
+  transferred = static_cast<size_t>(-1);
+  EXPECT_EQ(deviceSyncWrite(INVALID_DEVICE, &byte, sizeof(byte), 0, &transferred), 0);
+  EXPECT_EQ(transferred, 0u);
+}
+
 // The read half of the device sync fast path: bytes already buffered in the
 // pipe complete aioRead right on the calling thread - the loop never runs in
 // this test, and the fire-and-forget return value is the only completion

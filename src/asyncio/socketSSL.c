@@ -164,18 +164,28 @@ static ssize_t coroutineRwFinish(SSLOp *op, SSLSocket *object)
   return status == aosSuccess ? (ssize_t)bytesTransferred : -(int)status;
 }
 
-static size_t copyFromOut(SSLSocket *S)
+static int copyFromOut(SSLSocket *S)
 {
   size_t nBytes = BIO_ctrl_pending(S->bioOut);
+  if (!nBytes)
+    return 0;
+
+  // TODO: support TLS writes whose accumulated ciphertext exceeds INT_MAX by
+  // draining bioOut in bounded chunks instead of one contiguous transport write
+  if (nBytes > INT_MAX)
+    return -1;
+
   if (nBytes > S->sslWriteBufferSize) {
-    S->sslWriteBuffer = realloc(S->sslWriteBuffer, nBytes);
+    void *buffer = realloc(S->sslWriteBuffer, nBytes);
+    if (!buffer)
+      return -1;
+    S->sslWriteBuffer = buffer;
     S->sslWriteBufferSize = nBytes;
     poolCacheHandoff(S->sslWriteBuffer);
   }
 
-  // TODO: correct processing >4Gb data blocks
-  BIO_read(S->bioOut, S->sslWriteBuffer, (int)nBytes);
-  return nBytes;
+  int result = BIO_read(S->bioOut, S->sslWriteBuffer, (int)nBytes);
+  return result == (int)nBytes ? result : -1;
 }
 
 static void sslConnectConnectCb(AsyncOpStatus status, aioObject *object, void *arg)
@@ -235,17 +245,21 @@ static AsyncOpStatus connectProc(asyncOpRoot *opptr)
     // or the server never finishes its accept - and report success only once
     // the transport took it, so a dying connection fails the handshake here
     // instead of surfacing as a lost first application write
-    size_t finalFlightSize = copyFromOut(socket);
+    int finalFlightSize = copyFromOut(socket);
+    if (finalFlightSize < 0)
+      return aosUnknownError;
     if (finalFlightSize) {
       op->state = sslStFinalFlight;
-      aioWrite(socket->object, socket->sslWriteBuffer, finalFlightSize, afWaitAll, 0, sslConnectWriteCb, op);
+      aioWrite(socket->object, socket->sslWriteBuffer, (size_t)finalFlightSize, afWaitAll, 0, sslConnectWriteCb, op);
       return aosPending;
     }
     return aosSuccess;
   } else if (errCode == SSL_ERROR_WANT_READ) {
     // Need data exchange
-    size_t connectSize = copyFromOut(socket);
-    aioWrite(socket->object, socket->sslWriteBuffer, connectSize, afWaitAll, 0, 0, 0);
+    int connectSize = copyFromOut(socket);
+    if (connectSize < 0)
+      return aosUnknownError;
+    aioWrite(socket->object, socket->sslWriteBuffer, (size_t)connectSize, afWaitAll, 0, 0, 0);
     aioRead(socket->object, socket->sslReadBuffer, socket->sslReadBufferSize, afNone, 0, sslConnectReadCb, op);
     return aosPending;
   } else {
@@ -534,8 +548,10 @@ static AsyncOpStatus writeProc(asyncOpRoot *opptr)
       int sslError = SSL_get_error(socket->ssl, writeResult);
       return sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError;
     }
-    size_t writeSize = copyFromOut(socket);
-    asyncOpRoot *writeOp = implWrite(socket->object, socket->sslWriteBuffer, writeSize, afWaitAll, 0, sslWriteWriteCb, op, &bytes);
+    int writeSize = copyFromOut(socket);
+    if (writeSize < 0)
+      return aosUnknownError;
+    asyncOpRoot *writeOp = implWrite(socket->object, socket->sslWriteBuffer, (size_t)writeSize, afWaitAll, 0, sslWriteWriteCb, op, &bytes);
     if (writeOp) {
       combinerPushOperation(writeOp);
       return aosPending;
@@ -572,9 +588,16 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
     return &sslOp->root;
   }
 
-  size_t writeSize = copyFromOut(socket);
+  int writeSize = copyFromOut(socket);
+  if (writeSize < 0) {
+    struct Context context;
+    fillContext(&context, writeProc, rwFinish, (void*)(uintptr_t)buffer, size);
+    SSLOp *sslOp = (SSLOp*)newWriteAsyncOp(&socket->root, flags, usTimeout, (void*)callback, arg, sslOpWrite, &context);
+    opForceStatus(&sslOp->root, aosUnknownError);
+    return &sslOp->root;
+  }
   size_t bytes = 0;
-  asyncOpRoot *op = implWrite(socket->object, socket->sslWriteBuffer, writeSize, afWaitAll, 0, sslWriteWriteCb, 0, &bytes);
+  asyncOpRoot *op = implWrite(socket->object, socket->sslWriteBuffer, (size_t)writeSize, afWaitAll, 0, sslWriteWriteCb, 0, &bytes);
   if (!op) {
     *bytesTransferred = size;
     return 0;

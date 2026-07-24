@@ -38,14 +38,24 @@ aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice);
 void deleteAioObject(aioObject *object);
 asyncBase *aioGetBase(aioObject *object);
 
+// Grows the object's internal read-ahead buffer (this is not SO_RCVBUF).
+// Calls for the same object must be externally serialized and must not overlap
+// any executing or pending read: an IOCP read may retain the old buffer address
+// until its completion is delivered. Configure it before the first read unless
+// the caller has otherwise established read-side quiescence.
 void setSocketBuffer(aioObject *socket, size_t bufferSize);
 
-// A non-NULL user-event callback runs asynchronously on an asyncLoop(base)
-// thread. With isSemaphore == 0, activations coalesce while one delivery is
-// pending; with isSemaphore != 0, every userEventActivate call produces a
-// delivery. The pending gate is released before the callback, so callbacks of
-// the same event may overlap when several threads run asyncLoop(base). The
-// caller receives one initial strong reference. Before publishing event to an
+// A non-NULL user-event callback runs asynchronously. Manual activations and
+// timer activations on reactor backends run on an asyncLoop(base) thread. On
+// IOCP, timer activations run directly on a Windows thread-pool worker and may
+// be delivered before asyncLoop(base) is ever entered. No callback thread
+// affinity is guaranteed across activation sources. With isSemaphore == 0,
+// activations coalesce while one delivery is pending; with isSemaphore != 0,
+// every userEventActivate call produces a delivery. The pending gate is
+// released before the callback, so callbacks of the same event may overlap
+// when several threads run asyncLoop(base); on IOCP, timer delivery can overlap
+// another timer or manual delivery even with one loop thread. The caller
+// receives one initial strong reference. Before publishing event to an
 // independently using thread, retain it with eventIncrementReference(event, 1);
 // that thread releases its reference with eventDecrementReference(event, 1).
 // All strong references are equivalent for lifetime. Exactly one holder closes
@@ -121,6 +131,9 @@ void aioAccept(aioObject *object,
                aioAcceptCb callback,
                void *arg);
 
+// Byte-stream read for devices and stream-oriented sockets. Message-oriented
+// sockets are not supported here: use aioReadMsg so datagram boundaries and
+// truncation are preserved.
 ssize_t aioRead(aioObject *object,
                 void *buffer,
                 size_t size,
@@ -162,6 +175,8 @@ int ioAccept(aioObject *object,
              socketTy *acceptedSocket,
              HostAddress *remoteAddress,
              uint64_t usTimeout);
+// Coroutine counterpart of aioRead with the same byte-stream-only socket
+// contract. Use ioReadMsg for message-oriented sockets.
 ssize_t ioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
 ssize_t ioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout);
@@ -173,7 +188,9 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
 // reference for the complete call, including suspension inside Yield. Thus a
 // concurrent delete must consume a different strong reference; sharing the
 // sole reference between a waiting coroutine and a deleting thread is a
-// contract violation. A pending activation is consumed without suspending.
+// contract violation. A pending activation is consumed without suspending. A
+// coroutine may resume on a different OS thread after suspension; in particular
+// an IOCP timer wake resumes it directly on a Windows thread-pool worker.
 void ioSleep(aioUserEvent *event, uint64_t usTimeout);
 
 void ioWaitUserEvent(aioUserEvent *event);

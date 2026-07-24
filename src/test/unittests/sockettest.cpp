@@ -12,9 +12,35 @@
 
 #ifdef OS_COMMONUNIX
 #include <fcntl.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <unistd.h>
 #include <sys/time.h>
 #endif
+
+TEST(socket, stream_socket_disables_nagle)
+{
+  socketTy socket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  ASSERT_NE(socket, INVALID_SOCKET);
+
+  int noDelay = 0;
+  socketLenTy optionSize = sizeof(noDelay);
+  EXPECT_EQ(getsockopt(socket, IPPROTO_TCP, TCP_NODELAY, (char*)&noDelay, &optionSize), 0);
+  EXPECT_NE(noDelay, 0);
+  socketClose(socket);
+}
+
+TEST(socket, sync_failures_report_zero_progress)
+{
+  char byte = 0;
+  size_t transferred = static_cast<size_t>(-1);
+  EXPECT_EQ(socketSyncRead(INVALID_SOCKET, &byte, sizeof(byte), 0, &transferred), 0);
+  EXPECT_EQ(transferred, 0u);
+
+  transferred = static_cast<size_t>(-1);
+  EXPECT_EQ(socketSyncWrite(INVALID_SOCKET, &byte, sizeof(byte), 0, &transferred), 0);
+  EXPECT_EQ(transferred, 0u);
+}
 
 void test_connect_accept_readcb(AsyncOpStatus status, aioObject *socket, size_t transferred, void *arg)
 {
@@ -1399,6 +1425,74 @@ TEST(socket, test_udp_icmp_error_wakes_parked_read)
   EXPECT_TRUE(context.callbackFired);
   EXPECT_NE(context.status, aosSuccess);
   EXPECT_NE(context.status, aosTimeout) << "the ICMP error did not wake the parked read";
+  deleteAioObject(object);
+}
+
+static bool waitForUdpSocketError(socketTy socket)
+{
+#ifdef OS_WINDOWS
+  fd_set readSet;
+  fd_set errorSet;
+  FD_ZERO(&readSet);
+  FD_ZERO(&errorSet);
+  FD_SET(socket, &readSet);
+  FD_SET(socket, &errorSet);
+  timeval timeout;
+  timeout.tv_sec = 1;
+  timeout.tv_usec = 0;
+  int result = select(0, &readSet, nullptr, &errorSet, &timeout);
+  return result > 0 && (FD_ISSET(socket, &readSet) || FD_ISSET(socket, &errorSet));
+#else
+  pollfd descriptor;
+  descriptor.fd = socket;
+  descriptor.events = POLLIN;
+  descriptor.revents = 0;
+  int result;
+  do {
+    result = poll(&descriptor, 1, 1000);
+  } while (result < 0 && errno == EINTR);
+  return result > 0 && (descriptor.revents & (POLLIN | POLLERR));
+#endif
+}
+
+TEST(socket, test_udp_icmp_error_pending_before_read_is_not_retried)
+{
+  ErrorWakeupContext context(gBase);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = 0;
+  socketTy probeSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  ASSERT_EQ(socketBind(probeSocket, &address), 0);
+  sockaddr_in closedAddress;
+  memset(&closedAddress, 0, sizeof(closedAddress));
+#ifdef OS_WINDOWS
+  int closedAddressLength = static_cast<int>(sizeof(closedAddress));
+#else
+  socklen_t closedAddressLength = sizeof(closedAddress);
+#endif
+  ASSERT_EQ(getsockname(probeSocket, reinterpret_cast<sockaddr*>(&closedAddress), &closedAddressLength), 0);
+  socketClose(probeSocket);
+
+  socketTy clientSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
+  ASSERT_EQ(connect(clientSocket, reinterpret_cast<sockaddr*>(&closedAddress), sizeof(closedAddress)), 0);
+  aioObject *object = newSocketIo(gBase, clientSocket);
+  ASSERT_NE(object, nullptr);
+
+  char probe = 'x';
+  ASSERT_EQ(send(clientSocket, &probe, 1, 0), 1);
+  ASSERT_TRUE(waitForUdpSocketError(clientSocket));
+
+  uint32_t buffer;
+  aioReadMsg(object, &buffer, sizeof(buffer), afNone, 100000,
+             test_udp_icmp_error_readcb, &context);
+  asyncLoop(gBase);
+
+  EXPECT_TRUE(context.callbackFired);
+  EXPECT_NE(context.status, aosSuccess);
+  EXPECT_NE(context.status, aosTimeout)
+    << "the fast recv consumed the pending socket error and parked its retry";
   deleteAioObject(object);
 }
 

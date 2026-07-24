@@ -35,6 +35,9 @@ void pipeClose(struct pipeTy pipePtr);
 // both directions. Windows probes buffered input on pipes and COM ports;
 // writes never complete synchronously because an overlapped handle has no
 // would-block probe and a pending WriteFile owns the caller's buffer.
+// A direct POSIX deviceSyncWrite call retains write(2)'s native SIGPIPE
+// semantics. aioWrite/ioWrite protect descriptors registered through
+// newDeviceIo; callers using this low-level helper directly own signal policy.
 int deviceSyncRead(iodevTy hDevice, void *buffer, size_t size, int waitAll, size_t *bytesTransferred);
 int deviceSyncWrite(iodevTy hDevice, const void *buffer, size_t size, int waitAll, size_t *bytesTransferred);
 

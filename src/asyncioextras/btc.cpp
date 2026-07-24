@@ -45,6 +45,13 @@ struct MessageHeader {
 };
 #pragma pack(pop)
 
+// The Bitcoin P2P message header represents the payload length as uint32_t.
+// TODO: add an explicitly selected wider framing if one is ever needed.
+static bool btcPayloadFitsHeader(size_t size)
+{
+  return size <= UINT32_MAX;
+}
+
 constexpr int USERSPACE_BUFFER_SIZE=1472;
 // Pooled operations keep their scratch buffer up to this size (matches the
 // transport's default read-ahead buffer); larger captures - block-sized
@@ -235,7 +242,9 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
   const Context *context = (const Context*)contextPtr;
   btcOp *op = allocBtcOp(object, flags, usTimeout, callback, arg, opCode, context);
 
-  if (!(flags & afNoCopy)) {
+  // A payload that does not fit the header is rejected by startBtcSend before
+  // it is touched, so a queued operation must not try to capture it.
+  if (!(flags & afNoCopy) && btcPayloadFitsHeader(context->TransactionSize)) {
     if (op->internalBuffer == nullptr) {
       op->internalBuffer = malloc(context->TransactionSize);
       op->internalBufferSize = context->TransactionSize;
@@ -418,6 +427,9 @@ static AsyncOpStatus startBtcSend(asyncOpRoot *opptr)
   asyncOpRoot *childOp = nullptr;
   size_t bytes;
 
+  if (!btcPayloadFitsHeader(op->size))
+    return aosBufferTooSmall;
+
   uint8_t buffer[USERSPACE_BUFFER_SIZE];
 
   while (!childOp) {
@@ -455,6 +467,15 @@ static asyncOpRoot *implBtcSend(BTCSocket *socket,
                                 void *arg,
                                 size_t *bytesTransferred)
 {
+  if (!btcPayloadFitsHeader(size)) {
+    Context context(startBtcSend, sendFinish, nullptr, data, size, nullptr, command);
+    asyncOpRoot *op = newWriteAsyncOp(&socket->root, flags | afNoCopy, timeout,
+                                      reinterpret_cast<void*>(callback), arg,
+                                      btcOpSend, &context);
+    opForceStatus(op, aosBufferTooSmall);
+    return op;
+  }
+
   asyncOpRoot *childOp = nullptr;
   size_t bytes;
   btcOpState state = stInitialize;

@@ -205,6 +205,7 @@ int deviceSyncRead(iodevTy hDevice, void *buffer, size_t size, int waitAll, size
       *bytesTransferred = (size_t)result;
       return 1;
     } else {
+      *bytesTransferred = 0;
       return 0;
     }
   } else {
@@ -225,6 +226,7 @@ int deviceSyncWrite(iodevTy hDevice, const void *buffer, size_t size, int waitAl
       *bytesTransferred = (size_t)result;
       return 1;
     } else {
+      *bytesTransferred = 0;
       return 0;
     }
   } else {

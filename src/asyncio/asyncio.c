@@ -1014,16 +1014,34 @@ ssize_t aioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags 
   return context.Result;
 }
 
-// One receive syscall and truncation oracle for both datagram read paths:
+// One receive syscall and status/truncation oracle for both datagram read paths:
 // Winsock consumes an oversized datagram and reports WSAEMSGSIZE, POSIX
 // returns the clipped payload flagged MSG_TRUNC - either way the datagram is
 // gone and must complete as aosBufferTooSmall, never be retried.
-static ssize_t readMsgSyscall(aioObject *object, void *buffer, size_t size, struct sockaddr_storage *source, int *truncated)
+static ssize_t readMsgSyscall(aioObject *object,
+                              void *buffer,
+                              size_t size,
+                              struct sockaddr_storage *source,
+                              AsyncOpStatus *status)
 {
 #ifdef OS_WINDOWS
   socketLenTy addrlen = sizeof(*source);
   ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)source, &addrlen);
-  *truncated = result == -1 && WSAGetLastError() == WSAEMSGSIZE;
+  if (result >= 0) {
+    *status = aosSuccess;
+  } else {
+    int error = WSAGetLastError();
+    if (error == WSAEMSGSIZE)
+      *status = aosBufferTooSmall;
+    else if (error == WSAEWOULDBLOCK)
+      *status = aosPending;
+    else if (error == WSAECONNRESET)
+      *status = aosDisconnected;
+    else if (error == WSAENOTCONN)
+      *status = aosNotConnected;
+    else
+      *status = aosUnknownError;
+  }
 #else
   struct iovec iov;
   struct msghdr msg;
@@ -1035,7 +1053,10 @@ static ssize_t readMsgSyscall(aioObject *object, void *buffer, size_t size, stru
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
   ssize_t result = recvmsg(object->hSocket, &msg, 0);
-  *truncated = result >= 0 && (msg.msg_flags & MSG_TRUNC);
+  if (result < 0)
+    *status = socketStatusFromErrno(errno);
+  else
+    *status = (msg.msg_flags & MSG_TRUNC) ? aosBufferTooSmall : aosSuccess;
 #endif
   return result;
 }
@@ -1088,25 +1109,28 @@ ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flag
   }
 
   struct sockaddr_storage source;
-  int truncated;
-  ssize_t result = readMsgSyscall(object, buffer, size, &source, &truncated);
+  AsyncOpStatus status;
+  ssize_t result = readMsgSyscall(object, buffer, size, &source, &status);
 
-  if (truncated || result >= 0) {
-    // Either data arrived synchronously, or the datagram was consumed but cut
-    // down to the buffer size - a truncated datagram cannot be retried and
-    // must complete as aosBufferTooSmall, or it would be lost with no
-    // completion at all
+  if (status != aosPending) {
+    // Data, truncation and fatal socket errors are all terminal: only
+    // would-block may be retried by a parked operation. In particular a
+    // pending UDP error is consumed by this syscall and cannot be rediscovered.
     if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION))
-      return truncated ? -(ssize_t)aosBufferTooSmall : result;
+      return status == aosSuccess ? result : -(ssize_t)status;
 
     if (flags & afActiveOnce)
       currentFinishedSync = 0;
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-    op->bytesTransferred = truncated ? size : (size_t)result;
-    sockaddrToHostAddress(&source, &op->host);
-    opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
+    op->bytesTransferred = status == aosBufferTooSmall ? size :
+                           status == aosSuccess ? (size_t)result : 0;
+    if (status == aosSuccess || status == aosBufferTooSmall)
+      sockaddrToHostAddress(&source, &op->host);
+    else
+      memset(&op->host, 0, sizeof(op->host));
+    opForceStatus(&op->root, status);
     addToGlobalQueue(&op->root);
   } else {
     struct Context context;
@@ -1220,22 +1244,21 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
 
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage source;
-  int truncated;
-  ssize_t result = readMsgSyscall(object, buffer, size, &source, &truncated);
+  AsyncOpStatus status;
+  ssize_t result = readMsgSyscall(object, buffer, size, &source, &status);
 
-  if (truncated || result >= 0) {
-    // Either data arrived synchronously, or the datagram was consumed but cut
-    // down to the buffer size - a truncated datagram cannot be retried and
-    // must complete as aosBufferTooSmall, or it would be lost with no
-    // completion at all
+  if (status != aosPending) {
+    // Preserve the fairness budget for every terminal inline result. Fatal
+    // errors cannot be retried: recvmsg/recvfrom may have consumed socket state.
     if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)
-      return truncated ? -(ssize_t)aosBufferTooSmall : result;
+      return status == aosSuccess ? result : -(ssize_t)status;
 
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
-    op->bytesTransferred = truncated ? size : (size_t)result;
-    opForceStatus(&op->root, truncated ? aosBufferTooSmall : aosSuccess);
+    op->bytesTransferred = status == aosBufferTooSmall ? size :
+                           status == aosSuccess ? (size_t)result : 0;
+    opForceStatus(&op->root, status);
     addToGlobalQueue(&op->root);
     coroutineYield();
     return coroutineRwFinish(op);

@@ -3,9 +3,11 @@
 
 #include "unittest.h"
 
+#include "asyncio/socket.h"
 #include "asyncioextras/btc.h"
 #include "p2putils/xmstream.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #ifndef OS_WINDOWS
@@ -86,3 +88,45 @@ TEST(btc, recv_callback_reports_received_command_name)
 }
 
 #endif // !OS_WINDOWS
+
+namespace {
+
+struct BtcSendLimitProbe {
+  asyncBase *base;
+  AsyncOpStatus status = aosPending;
+
+  explicit BtcSendLimitProbe(asyncBase *baseArg) : base(baseArg) {}
+};
+
+void btcSendLimitCb(AsyncOpStatus status, BTCSocket*, void *arg)
+{
+  BtcSendLimitProbe *probe = static_cast<BtcSendLimitProbe*>(arg);
+  probe->status = status;
+  postQuitOperation(probe->base);
+}
+
+} // namespace
+
+TEST(btc, send_rejects_payload_above_header_limit)
+{
+#if SIZE_MAX > UINT32_MAX
+  socketTy rawSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
+  ASSERT_NE(rawSocket, INVALID_SOCKET);
+  BTCSocket *socket = btcSocketNew(gBase, newSocketIo(gBase, rawSocket));
+  ASSERT_NE(socket, nullptr);
+
+  uint8_t payload = 0;
+  BtcSendLimitProbe probe(gBase);
+  const size_t oversized = static_cast<size_t>(UINT32_MAX) + 1;
+
+  EXPECT_EQ(aioBtcSend(socket, "block", &payload, oversized, afNone, 5000000,
+                      btcSendLimitCb, &probe),
+            -aosPending);
+  asyncLoop(gBase);
+
+  EXPECT_EQ(probe.status, aosBufferTooSmall);
+  btcSocketDelete(socket);
+#else
+  GTEST_SKIP() << "size_t cannot represent a payload above UINT32_MAX";
+#endif
+}

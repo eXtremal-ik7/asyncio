@@ -456,7 +456,9 @@ void iocpNextFinishedOperation(asyncBase *base)
           } else if (op->info.root.opCode == actConnect) {
             // Put the socket into the regular connected state, otherwise
             // getpeername/shutdown on it stay broken after ConnectEx
-            setsockopt(object->hSocket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+            if (setsockopt(object->hSocket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
+                           NULL, 0) == SOCKET_ERROR)
+              result = aosUnknownError;
           }
         } else if (result == aosBufferTooSmall && op->info.root.opCode == actReadMsg) {
           // WSAEMSGSIZE: the buffer holds the first part of the datagram, the
@@ -787,8 +789,7 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
   if (op->info.transactionSize <= object->buffer.totalSize) {
     memset(&op->overlapped, 0, sizeof(op->overlapped));
     if (object->root.header.objectType == ioObjectDevice) {
-      // TODO: check totalSize > 4Gb
-      int result = ReadFile(object->hDevice, sb->ptr, (DWORD)sb->totalSize, 0, &op->overlapped);
+      int result = ReadFile(object->hDevice, sb->ptr, wsaChunkSize(sb->totalSize), 0, &op->overlapped);
       if (result == TRUE)
         return aosPending;
       DWORD error = GetLastError();
@@ -807,10 +808,9 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
     wsabuf.len = wsaChunkSize(op->info.transactionSize - op->info.bytesTransferred);
     memset(&op->overlapped, 0, sizeof(op->overlapped));
     if (object->root.header.objectType == ioObjectDevice) {
-      // TODO: check totalSize > 4Gb
       int result = ReadFile(object->hDevice,
                             (CHAR*)op->info.buffer + op->info.bytesTransferred,
-                            (DWORD)(op->info.transactionSize - op->info.bytesTransferred),
+                            wsaChunkSize(op->info.transactionSize - op->info.bytesTransferred),
                             0,
                             &op->overlapped);
       if (result == TRUE)
@@ -834,10 +834,9 @@ AsyncOpStatus iocpAsyncWrite(asyncOpRoot *opptr)
   aioObject *object = getObject(op);
   memset(&op->overlapped, 0, sizeof(op->overlapped));
   if (object->root.header.objectType == ioObjectDevice) {
-    // TODO: check totalSize > 4Gb
     BOOL result = WriteFile(object->hDevice,
                             (CHAR*)op->info.buffer + op->info.bytesTransferred,
-                            (DWORD)(op->info.transactionSize - op->info.bytesTransferred),
+                            wsaChunkSize(op->info.transactionSize - op->info.bytesTransferred),
                             0,
                             &op->overlapped);
     if (result == TRUE)

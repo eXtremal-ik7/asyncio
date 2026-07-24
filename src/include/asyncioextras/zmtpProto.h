@@ -27,12 +27,18 @@ private:
   
   bool readKeyValue(RawData *key, RawData *value) {
     // TODO: validate metadata key length and characters.
+    if (remaining() < sizeof(uint8_t))
+      return false;
     key->size = read<uint8_t>();
-    if ( !(key->data = seek(key->size)) )
+    if (key->size > remaining())
+      return false;
+    key->data = seek(key->size);
+    if (remaining() < sizeof(uint32_t))
       return false;
     value->size = readbe<uint32_t>();
-    if ( !(value->data = seek(value->size)) )
+    if (value->size > remaining())
       return false;
+    value->data = seek(value->size);
     return true;
   }
   

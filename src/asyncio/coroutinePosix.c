@@ -50,9 +50,9 @@ typedef struct contextTy {
   uint64_t D14;         // 144
   uint64_t D15;         // 152
   uint64_t SP;          // 160
-  uint64_t FPCR;        // 176
-  uint64_t PC;          // 184
-  uint64_t X0;          // 192
+  uint64_t FPCR;        // 168
+  uint64_t PC;          // 176
+  uint64_t X0;          // 184
 #pragma pack(pop)
 #else
 #error "Platform not supported"
@@ -166,11 +166,13 @@ static int fiberInit(coroutineTy *coroutine, size_t stackSize)
 #if defined(ARCH_X86)
   // x86 arch
   // EIP = fiberEntryPoint
-  // ESP = stack + stackSize - 4
-  // [ESP] = coroutine
+  // ESP = stack + stackSize - 20
+  // [ESP] = null return address
+  // [ESP + 4] = coroutine
   if (posix_memalign(&coroutine->stack, 16, stackSize) == 0) {
-    uintptr_t *esp = ((uintptr_t*)coroutine->stack) + (stackSize - 4)/sizeof(uintptr_t);
-    *esp = (uintptr_t)coroutine;
+    uintptr_t *esp = ((uintptr_t*)coroutine->stack) + (stackSize - 20)/sizeof(uintptr_t);
+    esp[0] = 0;
+    esp[1] = (uintptr_t)coroutine;
     coroutine->context.registers[CTX_EIP_INDEX] = (uintptr_t)fiberEntryPoint;
     coroutine->context.registers[CTX_ESP_INDEX] = (uintptr_t)esp;
     initFPU(&coroutine->context);
@@ -181,7 +183,7 @@ static int fiberInit(coroutineTy *coroutine, size_t stackSize)
 #elif defined(ARCH_X86_64)
   // x86_64 arch
   // RIP = fiberEntryPoint
-  // RSP = stack + stackSize - 128 - 16
+  // RSP = stack + stackSize - 128 - 8
   // RDI = coroutine
   if (posix_memalign(&coroutine->stack, 32, stackSize) == 0) {
     uintptr_t *rsp = ((uintptr_t*)coroutine->stack) + (stackSize - 128 - 8)/sizeof(uintptr_t);

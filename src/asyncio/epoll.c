@@ -598,6 +598,7 @@ int epollUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t
 
 uint64_t epollConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint32_t generation, uint64_t period)
 {
+  __UNUSED(published);
   __UNUSED(generation);
   __UNUSED(period);
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
@@ -606,9 +607,8 @@ uint64_t epollConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uin
   do {
     bytes = read((int)timer->fd, &expirations, sizeof(expirations));
   } while (bytes < 0 && errno == EINTR);
-  // A competing harvested readiness may find the descriptor drained. Its
-  // provisional control-word tick remains the conservative delivery count.
-  return bytes == (ssize_t)sizeof(expirations) ? expirations : published;
+  // timerfd is the source of truth: a failed read publishes no expirations.
+  return bytes == (ssize_t)sizeof(expirations) ? expirations : 0;
 }
 
 void epollReleaseUserEvent(aioUserEvent *event)

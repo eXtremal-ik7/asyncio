@@ -41,6 +41,8 @@ struct URIComponent {
   } raw2;    
 };
 
+// Return nonzero to continue or zero to cancel. Range parsers report
+// cancellation as ParserResultCancelled; full-string parsers return 0.
 typedef int uriParseCb(URIComponent *component, void *arg);
 
 ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
@@ -76,6 +78,11 @@ public:
   std::string domain;
   int port;   // -1 = no explicit port; build() emits the port only when >= 0
   
+  // Flat, percent-decoded components: path/query do not retain segment or
+  // parameter boundaries, nor whether a reserved delimiter was escaped.
+  // Consequently build() is not a semantic round-trip for inputs such as
+  // path "%2F" or query "%26"; use the low-level callback API when that
+  // distinction must be preserved.
   std::string path;
   std::string query;
   std::string fragment;

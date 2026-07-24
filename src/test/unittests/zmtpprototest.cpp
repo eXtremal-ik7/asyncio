@@ -56,3 +56,17 @@ TEST(zmtpProto, ready_requires_socket_type)
   RawData identity;
   EXPECT_FALSE(rd.readReadyCmd(&socketType, &identity));
 }
+
+TEST(zmtpProto, ready_rejects_truncated_metadata_value_length)
+{
+  zmtpStream w;
+  w.reset();
+  ASSERT_TRUE(w.writeReadyCmd("PULL", nullptr));
+  ASSERT_TRUE(w.write<uint8_t>(1));
+  ASSERT_TRUE(w.write("X", 1));
+
+  zmtpStream rd(w.data(), w.offsetOf());
+  RawData socketType;
+  RawData identity;
+  EXPECT_FALSE(rd.readReadyCmd(&socketType, &identity));
+}
