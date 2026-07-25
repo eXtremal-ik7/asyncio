@@ -46,18 +46,17 @@ struct MessageHeader {
 };
 #pragma pack(pop)
 
-// The Bitcoin P2P message header represents the payload length as uint32_t.
-// TODO: add an explicitly selected wider framing if one is ever needed.
+// The Bitcoin P2P message header represents the payload length as uint32_t. TODO: add an explicitly selected wider framing if one is ever
+// needed.
 static bool btcPayloadFitsHeader(size_t size)
 {
   return size <= UINT32_MAX;
 }
 
-constexpr int USERSPACE_BUFFER_SIZE=1472;
-// Pooled operations keep their scratch buffer up to this size (matches the
-// transport's default read-ahead buffer); larger captures - block-sized
-// payloads reach megabytes - are returned to the allocator on completion
-constexpr size_t POOLED_BUFFER_SIZE_LIMIT=16384;
+constexpr int USERSPACE_BUFFER_SIZE = 1472;
+// Pooled operations keep their scratch buffer up to this size (matches the transport's default read-ahead buffer); larger captures -
+// block-sized payloads reach megabytes - are returned to the allocator on completion
+constexpr size_t POOLED_BUFFER_SIZE_LIMIT = 16384;
 
 enum btcOpTy {
   btcOpRecv = OPCODE_READ,
@@ -70,7 +69,6 @@ enum btcOpState {
   stWriteData,
   stFinished
 };
-
 
 struct BTCSocket {
   aioObjectRoot root;
@@ -92,15 +90,13 @@ struct btcOp {
 };
 
 namespace {
-// The checksum runs twice per message (send and receive); a per-call
-// EVP_MD_CTX_create/destroy pair costs a heap round trip each time.
-// EVP_DigestInit fully reinitializes the context, so one context per thread
-// is equivalent.
+// The checksum runs twice per message (send and receive); a per-call EVP_MD_CTX_create/destroy pair costs a heap round trip each time.
+// EVP_DigestInit fully reinitializes the context, so one context per thread is equivalent.
 struct Sha256Ctx {
   EVP_MD_CTX *ctx = EVP_MD_CTX_create();
   ~Sha256Ctx() { EVP_MD_CTX_destroy(ctx); }
 };
-}
+} // namespace
 
 static uint32_t calculateCheckSum(void *data, size_t size)
 {
@@ -117,17 +113,15 @@ static uint32_t calculateCheckSum(void *data, size_t size)
   return *reinterpret_cast<uint32_t*>(hash2);
 }
 
-// A command is a NUL-padded field that carries no terminator when the name
-// fills it completely, and its sources are both C strings and other command
-// fields: strnlen bounds the read to the field size for the latter.
+// A command is a NUL-padded field that carries no terminator when the name fills it completely, and its sources are both C strings and other
+// command fields: strnlen bounds the read to the field size for the latter.
 static void copyCommand(char *dst, size_t dstSize, const char *src)
 {
   memset(dst, 0, dstSize);
   memcpy(dst, src, strnlen(src, dstSize));
 }
 
-// Receiver-side mirror of the same field contract: nothing may follow the
-// first NUL, and a name filling the whole field is legal
+// Receiver-side mirror of the same field contract: nothing may follow the first NUL, and a name filling the whole field is legal
 static bool commandValid(const char *command, size_t size)
 {
   size_t i = 0;
@@ -170,18 +164,13 @@ static int cancel(asyncOpRoot *opptr)
 static void recvFinish(asyncOpRoot *opptr)
 {
   btcOp *op = reinterpret_cast<btcOp*>(opptr);
-  reinterpret_cast<btcRecvCb*>(opptr->callback)(opGetStatus(opptr),
-                                                      reinterpret_cast<BTCSocket*>(opptr->object),
-                                                      op->commandPtr,
-                                                      op->stream,
-                                                      opptr->arg);
+  reinterpret_cast<btcRecvCb*>(
+      opptr->callback)(opGetStatus(opptr), reinterpret_cast<BTCSocket*>(opptr->object), op->commandPtr, op->stream, opptr->arg);
 }
 
 static void sendFinish(asyncOpRoot *opptr)
 {
-  reinterpret_cast<btcSendCb*>(opptr->callback)(opGetStatus(opptr),
-                                                reinterpret_cast<BTCSocket*>(opptr->object),
-                                                opptr->arg);
+  reinterpret_cast<btcSendCb*>(opptr->callback)(opGetStatus(opptr), reinterpret_cast<BTCSocket*>(opptr->object), opptr->arg);
 }
 
 static void releaseProc(asyncOpRoot *opptr)
@@ -194,9 +183,7 @@ static void releaseProc(asyncOpRoot *opptr)
   }
 }
 
-
-// Common part of the operation constructors: pooled allocation (a fresh
-// operation starts with an empty scratch buffer) and state setup
+// Common part of the operation constructors: pooled allocation (a fresh operation starts with an empty scratch buffer) and state setup
 static btcOp *allocBtcOp(aioObjectRoot *object,
                          AsyncFlags flags,
                          uint64_t usTimeout,
@@ -243,8 +230,7 @@ static asyncOpRoot *newWriteAsyncOp(aioObjectRoot *object,
   const Context *context = (const Context*)contextPtr;
   btcOp *op = allocBtcOp(object, flags, usTimeout, callback, arg, opCode, context);
 
-  // A payload that does not fit the header is rejected by startBtcSend before
-  // it is touched, so a queued operation must not try to capture it.
+  // A payload that does not fit the header is rejected by startBtcSend before it is touched, so a queued operation must not try to capture it.
   if (!(flags & afNoCopy) && btcPayloadFitsHeader(context->TransactionSize)) {
     if (op->internalBuffer == nullptr) {
       op->internalBuffer = malloc(context->TransactionSize);
@@ -278,14 +264,14 @@ static AsyncOpStatus startBtcRecv(asyncOpRoot *opptr)
 
   while (!childOp) {
     switch (op->state) {
-      case stInitialize : {
+      case stInitialize: {
         // Read header first
         op->state = stReadData;
         childOp = implRead(socket->plainSocket, header, sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, opptr, &bytes);
         break;
       }
 
-      case stReadData : {
+      case stReadData: {
         op->state = stFinished;
         decodeMessageHeader(header);
         if (header->magic != socket->magic)
@@ -299,12 +285,11 @@ static AsyncOpStatus startBtcRecv(asyncOpRoot *opptr)
         void *payload = op->stream->reserve(header->length);
         if (!payload)
           return aosBufferTooSmall;
-        childOp = implRead(socket->plainSocket, payload, header->length,
-                           afWaitAll, 0, resumeRwCb, opptr, &bytes);
+        childOp = implRead(socket->plainSocket, payload, header->length, afWaitAll, 0, resumeRwCb, opptr, &bytes);
         break;
       }
 
-      case stFinished : {
+      case stFinished: {
         uint32_t checkSum = calculateCheckSum(op->stream->data(), header->length);
         if (header->checksum != checkSum)
           return btcMakeStatus(btcInvalidChecksum);
@@ -313,8 +298,7 @@ static AsyncOpStatus startBtcRecv(asyncOpRoot *opptr)
         return aosSuccess;
       }
 
-      default :
-        return aosUnknownError;
+      default: return aosUnknownError;
     }
   }
 
@@ -338,7 +322,7 @@ static asyncOpRoot *implBtcRecv(BTCSocket *socket,
   AsyncOpStatus result = aosSuccess;
   state = stReadData;
   MessageHeader *header = reinterpret_cast<MessageHeader*>(socket->receiveBuffer);
-  if ( !(childOp = implRead(socket->plainSocket, header, sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, nullptr, &bytes)) ) {
+  if (!(childOp = implRead(socket->plainSocket, header, sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, nullptr, &bytes))) {
     state = stFinished;
     decodeMessageHeader(header);
     // first failed check wins, same order as the async path
@@ -354,9 +338,7 @@ static asyncOpRoot *implBtcRecv(BTCSocket *socket,
       void *payload = stream.reserve(header->length);
       if (!payload) {
         result = aosBufferTooSmall;
-      } else if (! (childOp = implRead(socket->plainSocket, payload,
-                                      header->length, afWaitAll, 0,
-                                      resumeRwCb, nullptr, &bytes))) {
+      } else if (!(childOp = implRead(socket->plainSocket, payload, header->length, afWaitAll, 0, resumeRwCb, nullptr, &bytes))) {
         uint32_t checkSum = calculateCheckSum(stream.data(), header->length);
         if (header->checksum != checkSum)
           result = btcMakeStatus(btcInvalidChecksum);
@@ -373,7 +355,8 @@ static asyncOpRoot *implBtcRecv(BTCSocket *socket,
 
   if (childOp) {
     Context context(startBtcRecv, recvFinish, &stream, nullptr, sizeLimit, command, nullptr);
-    btcOp *op = reinterpret_cast<btcOp*>(newReadAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, btcOpRecv, &context));
+    btcOp *op = reinterpret_cast<btcOp*>(
+        newReadAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, btcOpRecv, &context));
     op->state = state;
     childOp->arg = op;
     combinerPushOperation(childOp);
@@ -390,14 +373,19 @@ static asyncOpRoot *implBtcRecv(BTCSocket *socket,
 static asyncOpRoot *implBtcRecvProxy(aioObjectRoot *object, AsyncFlags flags, uint64_t usTimeout, void *callback, void *arg, void *contextPtr)
 {
   Context *context = static_cast<Context*>(contextPtr);
-  return implBtcRecv(reinterpret_cast<BTCSocket*>(object), context->CommandBuffer, *context->Stream, context->TransactionSize, flags, usTimeout, reinterpret_cast<btcRecvCb*>(callback), arg, &context->BytesTransferred);
+  return implBtcRecv(reinterpret_cast<BTCSocket*>(object),
+                     context->CommandBuffer,
+                     *context->Stream,
+                     context->TransactionSize,
+                     flags,
+                     usTimeout,
+                     reinterpret_cast<btcRecvCb*>(callback),
+                     arg,
+                     &context->BytesTransferred);
 }
 
-
-// First step of a send, shared by the queued and the inline paths: build the
-// header and either coalesce a small message into a single write or push the
-// header alone. Sets *state (to stFinished or stWriteData) before the write,
-// exactly as the callers did.
+// First step of a send, shared by the queued and the inline paths: build the header and either coalesce a small message into a single write or
+// push the header alone. Sets *state (to stFinished or stWriteData) before the write, exactly as the callers did.
 static asyncOpRoot *btcSendFirstWrite(BTCSocket *socket,
                                       uint8_t (&buffer)[USERSPACE_BUFFER_SIZE],
                                       const char *command,
@@ -410,11 +398,11 @@ static asyncOpRoot *btcSendFirstWrite(BTCSocket *socket,
   MessageHeader *header = reinterpret_cast<MessageHeader*>(buffer);
   buildMessageHeader(header, socket->magic, command, data, static_cast<uint32_t>(size));
 
-  if (size+sizeof(MessageHeader) <= sizeof(buffer)) {
+  if (size + sizeof(MessageHeader) <= sizeof(buffer)) {
     *state = stFinished;
     uint8_t *dataPtr = buffer + sizeof(MessageHeader);
     memcpy(dataPtr, data, size);
-    return implWrite(socket->plainSocket, buffer, size+sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, resumeArg, &bytes);
+    return implWrite(socket->plainSocket, buffer, size + sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, resumeArg, &bytes);
   } else {
     *state = stWriteData;
     return implWrite(socket->plainSocket, buffer, sizeof(MessageHeader), afWaitAll, 0, resumeRwCb, resumeArg, &bytes);
@@ -435,22 +423,20 @@ static AsyncOpStatus startBtcSend(asyncOpRoot *opptr)
 
   while (!childOp) {
     switch (op->state) {
-      case stInitialize : {
+      case stInitialize: {
         childOp = btcSendFirstWrite(socket, buffer, op->command, op->buffer, op->size, opptr, &op->state);
         break;
       }
 
-      case stWriteData : {
+      case stWriteData: {
         op->state = stFinished;
         childOp = implWrite(socket->plainSocket, op->buffer, op->size, afWaitAll, 0, resumeRwCb, opptr, &bytes);
         break;
       }
 
-      case stFinished :
-        return aosSuccess;
+      case stFinished: return aosSuccess;
 
-      default :
-        return aosUnknownError;
+      default: return aosUnknownError;
     }
   }
 
@@ -470,9 +456,7 @@ static asyncOpRoot *implBtcSend(BTCSocket *socket,
 {
   if (!btcPayloadFitsHeader(size)) {
     Context context(startBtcSend, sendFinish, nullptr, data, size, nullptr, command);
-    asyncOpRoot *op = newWriteAsyncOp(&socket->root, flags | afNoCopy, timeout,
-                                      reinterpret_cast<void*>(callback), arg,
-                                      btcOpSend, &context);
+    asyncOpRoot *op = newWriteAsyncOp(&socket->root, flags | afNoCopy, timeout, reinterpret_cast<void*>(callback), arg, btcOpSend, &context);
     opForceStatus(op, aosBufferTooSmall);
     return op;
   }
@@ -492,7 +476,8 @@ static asyncOpRoot *implBtcSend(BTCSocket *socket,
 
   if (childOp) {
     Context context(startBtcSend, sendFinish, nullptr, data, size, nullptr, command);
-    btcOp *op = reinterpret_cast<btcOp*>(newWriteAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, btcOpSend, &context));
+    btcOp *op = reinterpret_cast<btcOp*>(
+        newWriteAsyncOp(&socket->root, flags | afRunning, timeout, reinterpret_cast<void*>(callback), arg, btcOpSend, &context));
     op->state = state;
     childOp->arg = op;
     combinerPushOperation(childOp);
@@ -507,9 +492,16 @@ static asyncOpRoot *implBtcSend(BTCSocket *socket,
 static asyncOpRoot *implBtcSendProxy(aioObjectRoot *object, AsyncFlags flags, uint64_t usTimeout, void *callback, void *arg, void *contextPtr)
 {
   Context *context = static_cast<Context*>(contextPtr);
-  return implBtcSend(reinterpret_cast<BTCSocket*>(object), context->Command, context->Buffer, context->TransactionSize, flags, usTimeout, reinterpret_cast<btcSendCb*>(callback), arg, &context->BytesTransferred);
+  return implBtcSend(reinterpret_cast<BTCSocket*>(object),
+                     context->Command,
+                     context->Buffer,
+                     context->TransactionSize,
+                     flags,
+                     usTimeout,
+                     reinterpret_cast<btcSendCb*>(callback),
+                     arg,
+                     &context->BytesTransferred);
 }
-
 
 static void btcSocketDestructor(aioObjectRoot *object)
 {
@@ -526,8 +518,7 @@ BTCSocket *btcSocketNew(asyncBase *base, aioObject *plainSocket)
 {
   if (!plainSocket)
     return nullptr;
-  BTCSocket *socket = static_cast<BTCSocket*>(
-    objectAlloc(&objectPool, sizeof(BTCSocket), 16));
+  BTCSocket *socket = static_cast<BTCSocket*>(objectAlloc(&objectPool, sizeof(BTCSocket), 16));
   if (!socket)
     return nullptr;
   initObjectRoot(&socket->root, base, ioObjectUserDefined, btcSocketDestructor);
@@ -554,9 +545,7 @@ void btcSocketSetMagic(BTCSocket *socket, uint32_t magic)
   socket->magic = magic;
 }
 
-
-// Inline-completion glue for the aio/io entry points; the operation carries no
-// inline state, so the seed hook is a no-op (the core invokes it
+// Inline-completion glue for the aio/io entry points; the operation carries no inline state, so the seed hook is a no-op (the core invokes it
 // unconditionally)
 static void makeResult(void *contextPtr)
 {
@@ -564,24 +553,55 @@ static void makeResult(void *contextPtr)
   context->Result = static_cast<ssize_t>(context->BytesTransferred);
 }
 
-static void initOpStub(asyncOpRoot*, void*)
-{
-}
+static void initOpStub(asyncOpRoot*, void*) {}
 
-ssize_t aioBtcRecv(BTCSocket *socket, char command[12], xmstream &stream, size_t sizeLimit, AsyncFlags flags, uint64_t timeout, btcRecvCb callback, void *arg)
+ssize_t aioBtcRecv(BTCSocket *socket,
+                   char command[12],
+                   xmstream &stream,
+                   size_t sizeLimit,
+                   AsyncFlags flags,
+                   uint64_t timeout,
+                   btcRecvCb callback,
+                   void *arg)
 {
   Context context(startBtcRecv, recvFinish, &stream, nullptr, sizeLimit, command, nullptr);
-  runAioOperation(&socket->root, newReadAsyncOp, implBtcRecvProxy, makeResult, initOpStub, flags, timeout, reinterpret_cast<void*>(callback), arg, btcOpRecv, &context);
+  runAioOperation(&socket->root,
+                  newReadAsyncOp,
+                  implBtcRecvProxy,
+                  makeResult,
+                  initOpStub,
+                  flags,
+                  timeout,
+                  reinterpret_cast<void*>(callback),
+                  arg,
+                  btcOpRecv,
+                  &context);
   return context.Result;
 }
 
-ssize_t aioBtcSend(BTCSocket *socket, const char *command, void *data, size_t size, AsyncFlags flags, uint64_t timeout, btcSendCb callback, void *arg)
+ssize_t aioBtcSend(BTCSocket *socket,
+                   const char *command,
+                   void *data,
+                   size_t size,
+                   AsyncFlags flags,
+                   uint64_t timeout,
+                   btcSendCb callback,
+                   void *arg)
 {
   Context context(startBtcSend, sendFinish, nullptr, data, size, nullptr, command);
-  runAioOperation(&socket->root, newWriteAsyncOp, implBtcSendProxy, makeResult, initOpStub, flags, timeout, reinterpret_cast<void*>(callback), arg, btcOpSend, &context);
+  runAioOperation(&socket->root,
+                  newWriteAsyncOp,
+                  implBtcSendProxy,
+                  makeResult,
+                  initOpStub,
+                  flags,
+                  timeout,
+                  reinterpret_cast<void*>(callback),
+                  arg,
+                  btcOpSend,
+                  &context);
   return context.Result;
 }
-
 
 ssize_t ioBtcRecv(BTCSocket *socket, char command[12], xmstream &stream, size_t sizeLimit, AsyncFlags flags, uint64_t timeout)
 {

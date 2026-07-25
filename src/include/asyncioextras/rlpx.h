@@ -7,7 +7,8 @@ enum rplxStatusTy {
   // rlpx status
 };
 
-static inline AsyncOpStatus rlpxMakeStatus(rplxStatusTy status) {
+static inline AsyncOpStatus rlpxMakeStatus(rplxStatusTy status)
+{
   return static_cast<AsyncOpStatus>(status);
 }
 

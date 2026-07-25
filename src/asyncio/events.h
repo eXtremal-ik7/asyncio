@@ -33,8 +33,7 @@ typedef struct aioTimerUserEventState {
 } aioTimerUserEventState;
 
 struct aioUserEvent {
-  // Kernel-visible prefix. tag.low carries references and terminal/rendezvous
-  // bits; tag.high is the monotonic incarnation.
+  // Kernel-visible prefix. tag.low carries references and terminal/rendezvous bits; tag.high is the monotonic incarnation.
   objectHeader header;
 
   void *callback;
@@ -42,8 +41,7 @@ struct aioUserEvent {
   volatile uintptr_t signalState;
   uint64_t activationId;
 
-  // The user-event timer control word and coroutine waiter are independent
-  // DWCAS protocols. See events.c for their state transitions.
+  // The user-event timer control word and coroutine waiter are independent DWCAS protocols. See events.c for their state transitions.
   volatile uint128 timerControl;
   volatile uint128 waiter;
   aioTimer *volatile timer;
@@ -120,15 +118,11 @@ static inline int eventReferenceIsDeleting(aioUserEvent *event)
 
 static inline int eventTryClaimReference(aioUserEvent *event, uint64_t eventGeneration, int allowDeletedWaiter)
 {
-  uint128 expected = {
-    __uint64_atomic_load(&event->header.tag.low, amoRelaxed),
-    eventGeneration
-  };
+  uint128 expected = {__uint64_atomic_load(&event->header.tag.low, amoRelaxed), eventGeneration};
   for (;;) {
     if (expected.high != eventGeneration || !(expected.low & TAG_EVENT_REF_MASK))
       return 0;
-    if ((expected.low & TAG_EVENT_DELETE) &&
-        (!allowDeletedWaiter || !(expected.low & TAG_EVENT_WAITER_COMMITTED)))
+    if ((expected.low & TAG_EVENT_DELETE) && (!allowDeletedWaiter || !(expected.low & TAG_EVENT_WAITER_COMMITTED)))
       return 0;
     uint128 desired = {expected.low + 1, expected.high};
     if (__uint128_atomic_compare_and_swap(&event->header.tag, &expected, desired))

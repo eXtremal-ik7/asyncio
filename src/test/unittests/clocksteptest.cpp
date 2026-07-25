@@ -1,18 +1,15 @@
-// Clock-step regression test: timeouts and realtime timers must key off a
-// monotonic clock, not wall-clock time(0). A backward wall-clock step (e.g. an
-// NTP correction on a server whose clock ran fast) must not freeze the timeout
-// grid; a forward step must not fire timeouts prematurely.
+// Clock-step regression test: timeouts and realtime timers must key off a monotonic clock, not wall-clock time(0). A backward wall-clock step
+// (e.g. an NTP correction on a server whose clock ran fast) must not freeze the timeout grid; a forward step must not fire timeouts
+// prematurely.
 //
 // This test MUTATES THE SYSTEM CLOCK, so it is gated twice:
 //   1. the whole suite is named DISABLED_clock_step and requires the explicit
 //      gtest flag --gtest_also_run_disabled_tests,
 //   2. it is skipped unless the process can actually set the clock (root / admin).
-// The clock is restored on every exit path: normal return, watchdog, fatal
-// signal and atexit. Elapsed time is measured with a monotonic steady_clock,
-// which our stepping does not perturb.
+// The clock is restored on every exit path: normal return, watchdog, fatal signal and atexit. Elapsed time is measured with a monotonic
+// steady_clock, which our stepping does not perturb.
 //
-// Coverage: the grid path (afNone I/O timeout, an absolute CLOCK_MONOTONIC
-// deadline tick in asyncioImpl.c) and the realtime-timer path
+// Coverage: the grid path (afNone I/O timeout, an absolute CLOCK_MONOTONIC deadline tick in asyncioImpl.c) and the realtime-timer path
 // (userEventStartTimer -> startTimer, timerfd_create(CLOCK_REALTIME) on epoll).
 //
 // Backend coverage:
@@ -92,20 +89,21 @@ static bool haveClockPrivilege()
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr) &&
-         GetLastError() == ERROR_SUCCESS;
+    ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
   }
   CloseHandle(token);
   return ok;
 }
 #else
-static bool haveClockPrivilege() { return geteuid() == 0; }
+static bool haveClockPrivilege()
+{
+  return geteuid() == 0;
+}
 #endif
 
 // ---- crash-safe clock guard ------------------------------------------------
-// Restore reconstructs correct wall-clock time from a monotonic baseline, so any
-// restore path (watchdog / signal / atexit) lands on real time regardless of how
-// the clock was stepped in between.
+// Restore reconstructs correct wall-clock time from a monotonic baseline, so any restore path (watchdog / signal / atexit) lands on real time
+// regardless of how the clock was stepped in between.
 
 static std::atomic<bool> gClockStepped{false};
 static int64_t gRealBaselineUs = 0;
@@ -121,8 +119,7 @@ static void clockArmGuard()
 static void clockRestore()
 {
   if (gClockStepped.exchange(false)) {
-    int64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - gBaselineMono).count();
+    int64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - gBaselineMono).count();
     wallClockSetUs(gRealBaselineUs + elapsed);
   }
 }
@@ -137,8 +134,7 @@ static void clockStepSignalHandler(int sig)
 // Force-restores the clock and aborts if a run leaves it stepped past the cap.
 class ClockWatchdog {
 public:
-  explicit ClockWatchdog(int capSeconds)
-  {
+  explicit ClockWatchdog(int capSeconds) {
     thread_ = std::thread([this, capSeconds]() {
       for (int i = 0; i < capSeconds * 10 && !done_.load(); i++)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -149,24 +145,23 @@ public:
       }
     });
   }
-  ~ClockWatchdog()
-  {
+  ~ClockWatchdog() {
     done_.store(true);
     if (thread_.joinable())
       thread_.join();
   }
+
 private:
   std::atomic<bool> done_{false};
   std::thread thread_;
 };
 
-// Stops the message loop after a cap so a misbehaving timer can never hang the
-// process while the clock is stepped. If the timer never fires the loop still
-// returns and the test reports a clean failure instead of tripping the watchdog.
+// Stops the message loop after a cap so a misbehaving timer can never hang the process while the clock is stepped. If the timer never fires the
+// loop still returns and the test reports a clean failure instead of tripping the watchdog.
 class LoopGuard {
 public:
-  LoopGuard(asyncBase *base, int capMs) : base_(base)
-  {
+  LoopGuard(asyncBase *base, int capMs) :
+    base_(base) {
     thread_ = std::thread([this, capMs]() {
       for (int i = 0; i < capMs / 50 && !done_.load(); i++)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -174,12 +169,12 @@ public:
         postQuitOperation(base_);
     });
   }
-  ~LoopGuard()
-  {
+  ~LoopGuard() {
     done_.store(true);
     if (thread_.joinable())
       thread_.join();
   }
+
 private:
   asyncBase *base_;
   std::atomic<bool> done_{false};
@@ -196,8 +191,7 @@ struct TimerProbe {
 
 static int64_t monoElapsedUs(const TimerProbe *p)
 {
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::steady_clock::now() - p->armMono).count();
+  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - p->armMono).count();
 }
 
 static void gridTimeoutCb(AsyncOpStatus status, aioObject*, HostAddress, size_t, void *arg)
@@ -231,34 +225,34 @@ static aioObject *makeSilentUDP(asyncBase *base)
 
 // ---- measurement -----------------------------------------------------------
 
-enum class TimerKind { Grid, Realtime };
+enum class TimerKind {
+  Grid,
+  Realtime
+};
 
 struct StepResult {
   int64_t elapsedUs;
   bool stepApplied;
 };
 
-// The grid keys off time(0), i.e. whole-second resolution, so the timer and the
-// step are sized to dwarf that 1 s quantization and keep the pass band robust.
-static constexpr int64_t kTimeoutUs   = 2000000; // 2 s timer under test
-static constexpr int64_t kStepUs      = 4000000; // 4 s wall-clock step
-static constexpr int     kLoopGuardMs = 10000;   // hard cap on a single loop run
+// The grid keys off time(0), i.e. whole-second resolution, so the timer and the step are sized to dwarf that 1 s quantization and keep the pass
+// band robust.
+static constexpr int64_t kTimeoutUs = 2000000; // 2 s timer under test
+static constexpr int64_t kStepUs = 4000000;    // 4 s wall-clock step
+static constexpr int kLoopGuardMs = 10000;     // hard cap on a single loop run
 
-// Correct behavior: the timer fires ~2 s after arming regardless of the step. A
-// forward step that fires it early lands below the low bound; a backward step
-// that freezes the grid (or a timer that never fires) lands above the high one.
-// Bounds leave room for the grid's 1 s quantization on the correct-fire side.
-static constexpr int64_t kBandLowMs  = 1500; // catches premature fire (< 2 s timeout)
+// Correct behavior: the timer fires ~2 s after arming regardless of the step. A forward step that fires it early lands below the low bound; a
+// backward step that freezes the grid (or a timer that never fires) lands above the high one. Bounds leave room for the grid's 1 s quantization
+// on the correct-fire side.
+static constexpr int64_t kBandLowMs = 1500;  // catches premature fire (< 2 s timeout)
 static constexpr int64_t kBandHighMs = 4500; // catches a freeze (> 2 s + quantization)
 
-// One shared base for every test, created by unittest's main(). asyncio has no
-// deleteAsyncBase and its op pools (opPool/opTimerPool/eventPool) are process
-// globals, so spinning up a fresh base per test leaks cross-test state that can
-// stall a later run — unittest shares a single base for exactly this reason.
+// One shared base for every test, created by unittest's main(). asyncio has no deleteAsyncBase and its op pools (opPool/opTimerPool/eventPool)
+// are process globals, so spinning up a fresh base per test leaks cross-test state that can stall a later run — unittest shares a single base
+// for exactly this reason.
 
-// Arms a timer for kTimeoutUs, steps the wall clock by stepUs (signed) while the
-// timer is pending, runs the loop until it fires, restores the clock, and
-// returns the monotonically-measured firing delay.
+// Arms a timer for kTimeoutUs, steps the wall clock by stepUs (signed) while the timer is pending, runs the loop until it fires, restores the
+// clock, and returns the monotonically-measured firing delay.
 static StepResult measureUnderStep(TimerKind kind, int64_t stepUs)
 {
   StepResult result{-1, false};
@@ -304,8 +298,7 @@ static StepResult measureUnderStep(TimerKind kind, int64_t stepUs)
   if (result.stepApplied) {
     int64_t e = probe.elapsedUs.load();
     // -1 means the guard had to stop the loop: the timer never fired within the
-    // cap. Report it as a large elapsed so the high-bound assertion fails cleanly
-    // instead of the run hanging.
+    // cap. Report it as a large elapsed so the high-bound assertion fails cleanly instead of the run hanging.
     result.elapsedUs = (e < 0) ? (int64_t)kLoopGuardMs * 1000 : e;
   }
 
@@ -322,12 +315,12 @@ static void installClockRestoreGuards()
 {
   static const bool installed = []() {
     std::atexit(clockRestore);
-    std::signal(SIGINT,  clockStepSignalHandler);
+    std::signal(SIGINT, clockStepSignalHandler);
     std::signal(SIGTERM, clockStepSignalHandler);
     std::signal(SIGSEGV, clockStepSignalHandler);
     std::signal(SIGABRT, clockStepSignalHandler);
-    std::signal(SIGFPE,  clockStepSignalHandler);
-    std::signal(SIGILL,  clockStepSignalHandler);
+    std::signal(SIGFPE, clockStepSignalHandler);
+    std::signal(SIGILL, clockStepSignalHandler);
 #if defined(SIGBUS)
     std::signal(SIGBUS, clockStepSignalHandler);
 #endif
@@ -348,13 +341,23 @@ static void runClockStepTest(TimerKind kind, int64_t stepUs)
     GTEST_SKIP() << "system clock could not be stepped (sandbox / seccomp?)";
 
   int64_t elapsedMs = r.elapsedUs / 1000;
-  EXPECT_GE(elapsedMs, kBandLowMs)
-      << "timer fired too early under a wall-clock step (premature timeout); elapsed=" << elapsedMs << "ms";
-  EXPECT_LE(elapsedMs, kBandHighMs)
-      << "timer froze or never fired under a wall-clock step (queue stalled); elapsed=" << elapsedMs << "ms";
+  EXPECT_GE(elapsedMs, kBandLowMs) << "timer fired too early under a wall-clock step (premature timeout); elapsed=" << elapsedMs << "ms";
+  EXPECT_LE(elapsedMs, kBandHighMs) << "timer froze or never fired under a wall-clock step (queue stalled); elapsed=" << elapsedMs << "ms";
 }
 
-TEST(DISABLED_clock_step, grid_backward)     { runClockStepTest(TimerKind::Grid,     -kStepUs); }
-TEST(DISABLED_clock_step, grid_forward)      { runClockStepTest(TimerKind::Grid,      kStepUs); }
-TEST(DISABLED_clock_step, realtime_backward) { runClockStepTest(TimerKind::Realtime, -kStepUs); }
-TEST(DISABLED_clock_step, realtime_forward)  { runClockStepTest(TimerKind::Realtime,  kStepUs); }
+TEST(DISABLED_clock_step, grid_backward)
+{
+  runClockStepTest(TimerKind::Grid, -kStepUs);
+}
+TEST(DISABLED_clock_step, grid_forward)
+{
+  runClockStepTest(TimerKind::Grid, kStepUs);
+}
+TEST(DISABLED_clock_step, realtime_backward)
+{
+  runClockStepTest(TimerKind::Realtime, -kStepUs);
+}
+TEST(DISABLED_clock_step, realtime_forward)
+{
+  runClockStepTest(TimerKind::Realtime, kStepUs);
+}

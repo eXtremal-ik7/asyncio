@@ -73,10 +73,8 @@ typedef int httpRequestParseCb(HttpRequestComponent *component, void *arg);
 
 void httpRequestParserInit(HttpRequestParserState *state);
 void httpRequestSetBuffer(HttpRequestParserState *state, const void *buffer, size_t size);
-// table types the header names of the message (NULL = the built-in table of
-// the reserved names only); it is read for the duration of the call
-ParserResultTy httpRequestParse(HttpRequestParserState *state, const HttpHeaderTable *table,
-                                httpRequestParseCb callback, void *arg);
+// table types the header names of the message (NULL = the built-in table of the reserved names only); it is read for the duration of the call
+ParserResultTy httpRequestParse(HttpRequestParserState *state, const HttpHeaderTable *table, httpRequestParseCb callback, void *arg);
 
 const void *httpRequestDataPtr(HttpRequestParserState *state);
 size_t httpRequestDataRemaining(HttpRequestParserState *state);

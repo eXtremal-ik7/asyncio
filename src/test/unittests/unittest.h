@@ -17,7 +17,11 @@ struct TestContext {
   int serverState;
   int clientState;
   bool success;
-  TestContext(asyncBase *baseArg) : base(baseArg), serverState(0), clientState(0), success(false) {}
+  TestContext(asyncBase *baseArg) :
+    base(baseArg),
+    serverState(0),
+    clientState(0),
+    success(false) {}
 };
 
 struct reqStruct {
@@ -34,16 +38,15 @@ struct ErrorWakeupContext {
   AsyncOpStatus status = aosPending;
   bool callbackFired = false;
 
-  explicit ErrorWakeupContext(asyncBase *baseArg) : base(baseArg) {}
+  explicit ErrorWakeupContext(asyncBase *baseArg) :
+    base(baseArg) {}
 };
 
 __NO_PADDING_END
 
-// Connect is an object's one-shot initialization: a second connect submitted
-// while the first is still in flight must be rejected immediately. Shared
-// recorder for that contract across the transports; instantiating the
-// callback templates with the socket type produces the exact C callback
-// signature of each connect flavor (aioObject, SSLSocket, zmtpSocket).
+// Connect is an object's one-shot initialization: a second connect submitted while the first is still in flight must be rejected immediately.
+// Shared recorder for that contract across the transports; instantiating the callback templates with the socket type produces the exact C
+// callback signature of each connect flavor (aioObject, SSLSocket, zmtpSocket).
 struct DoubleConnectRecorder {
   asyncBase *base;
   AsyncOpStatus firstStatus;
@@ -52,8 +55,12 @@ struct DoubleConnectRecorder {
   int firstOrder;
   int secondOrder;
   DoubleConnectRecorder(asyncBase *baseArg) :
-    base(baseArg), firstStatus(aosUnknown), secondStatus(aosUnknown),
-    events(0), firstOrder(-1), secondOrder(-1) {}
+    base(baseArg),
+    firstStatus(aosUnknown),
+    secondStatus(aosUnknown),
+    events(0),
+    firstOrder(-1),
+    secondOrder(-1) {}
 };
 
 template<typename SocketTy>

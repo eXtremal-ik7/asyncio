@@ -59,14 +59,11 @@ static void eventTimerStop(aioUserEvent *event, aioTimer *timer)
   state->armed = 0;
 }
 
-// One attempt at applying the CONFIG in *current: extract its parameters,
-// flip the word to ACTIVE with zero ticks, then arm the backend. Arming
-// strictly after the flip is the ordering that lets every observer decide
-// the word's variant by a generation compare alone (a tick of generation G
-// can only be produced by a timer armed for G, hence after ACTIVE(G)).
-// Returns nonzero on success; on failure a newer config landed, *current is
-// refreshed and the caller retries against it (this config dies unapplied).
-static int eventTimerApplyConfig(aioUserEvent *event, aioTimer **timer, uint128 *current)
+// One attempt at applying the CONFIG in *current: extract its parameters, flip the word to ACTIVE with zero ticks, then arm the backend. Arming
+// strictly after the flip is the ordering that lets every observer decide the word's variant by a generation compare alone (a tick of
+// generation G can only be produced by a timer armed for G, hence after ACTIVE(G)). Returns nonzero on success; on failure a newer config
+// landed, *current is refreshed and the caller retries against it (this config dies unapplied).
+static int eventTimerApplyConfig(aioUserEvent *event, aioTimer**timer, uint128 *current)
 {
   eventTimerStop(event, *timer);
 
@@ -86,8 +83,7 @@ static int eventTimerApplyConfig(aioUserEvent *event, aioTimer **timer, uint128 
     int armed = event->header.base->methodImpl.updateEventTimer(event, etuStart, generation, period);
     *timer = eventTimerLoad(event, amoRelaxed);
     if (*timer) {
-      // Owner-exclusive writes; remaining == 0 means unlimited, so an armed
-      // schedule's finiteness is readable from remaining alone.
+      // Owner-exclusive writes; remaining == 0 means unlimited, so an armed schedule's finiteness is readable from remaining alone.
       aioTimerUserEventState *state = eventTimerState(*timer);
       state->remaining = counter;
       state->armed = (uint32_t)armed;
@@ -97,8 +93,8 @@ static int eventTimerApplyConfig(aioUserEvent *event, aioTimer **timer, uint128 
   return 1;
 }
 
-// One attempt of the owner's release CAS: drop the OWNER bit from the control
-// word exactly as observed. Failure means a concurrent publication landed;
+// One attempt of the owner's release CAS: drop the OWNER bit from the control word exactly as observed. Failure means a concurrent publication
+// landed;
 // *current is refreshed and the owner must reconcile it before retrying.
 static inline int eventTimerTryRelease(aioUserEvent *event, uint128 *current)
 {
@@ -127,8 +123,8 @@ static void eventTimerProcessUserOwner(aioUserEvent *event, uint128 applied, uin
 
     uint64_t pending = eventTimerControlPendingTicks(current);
     if (pending) {
-      // A user owner discards the raced input without spending the private
-      // counter. Zero tells an IOCP backend to rearm even a one-shot last tick.
+      // A user owner discards the raced input without spending the private counter. Zero tells an IOCP backend to rearm even a one-shot last
+      // tick.
       uint128 drained = {0, current.high};
       uint128 expected = current;
       if (!__uint128_atomic_compare_and_swap(&event->timerControl, &expected, drained)) {
@@ -198,15 +194,12 @@ static uintptr_t eventTimerProcessKernelOwner(aioUserEvent *event, uint128 appli
 
 static uint32_t eventTimerPublishConfig(aioUserEvent *event, uint64_t period, int counter, uint32_t requiredGeneration, int terminal)
 {
-  // The single saturation point for event periods: userEventStartTimer and
-  // ioSleep both funnel through here (stop/terminal calls pass 0).
+  // The single saturation point for event periods: userEventStartTimer and ioSleep both funnel through here (stop/terminal calls pass 0).
   if (period > MAX_TIMEOUT_US)
     period = MAX_TIMEOUT_US;
   for (;;) {
-    // The acquire load pairs with the terminal publication's CAS: a word that
-    // shows any post-terminal state guarantees the DELETE bit below is
-    // visible, so no publication can slip in after the terminal one. The
-    // deletion's own publication is the single exemption from that gate.
+    // The acquire load pairs with the terminal publication's CAS: a word that shows any post-terminal state guarantees the DELETE bit below is
+    // visible, so no publication can slip in after the terminal one. The deletion's own publication is the single exemption from that gate.
     uint128 old = __uint128_atomic_load(&event->timerControl);
     if (!terminal && eventReferenceIsDeleting(event))
       return 0;
@@ -236,10 +229,8 @@ static void eventTimerCancelGeneration(aioUserEvent *event, uint32_t generation)
 
 void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t eventGeneration, uint64_t tickCount)
 {
-  // A stale harvested timer may outlive logical release and may inspect only
-  // Head while the rest of the pooled event is ASan-poisoned. The cheap
-  // event-generation prefilter and the DWCAS claim must therefore precede any
-  // access to the timer control word or event tail.
+  // A stale harvested timer may outlive logical release and may inspect only Head while the rest of the pooled event is ASan-poisoned. The
+  // cheap event-generation prefilter and the DWCAS claim must therefore precede any access to the timer control word or event tail.
   if (timerGeneration == 0 || eventHandleGeneration(event) != eventGeneration)
     return;
   if (!eventTimerTryClaimReference(event, eventGeneration))
@@ -247,8 +238,7 @@ void eventTimerSignal(aioUserEvent *event, uint32_t timerGeneration, uint64_t ev
 
   for (;;) {
     uint128 old = __uint128_atomic_load_relaxed(&event->timerControl);
-    // A generation match proves the ACTIVE variant: the timer producing this
-    // tick was armed strictly after the CONFIG->ACTIVE flip of the same
+    // A generation match proves the ACTIVE variant: the timer producing this tick was armed strictly after the CONFIG->ACTIVE flip of the same
     // generation, and any stop/cancel/delete advances the generation.
     if (eventTimerControlGeneration(old) != timerGeneration) {
       eventDecrementReference(event, 1);
@@ -287,10 +277,8 @@ static void eventCoroutineResume(aioUserEvent *event, uintptr_t count, int manua
     int kind = (int)(expected.low & ewtMask);
     if (kind == ewtDeleted)
       return;
-    // A manual wake publishes cancellation before competing for an ioSleep
-    // waiter. A timer validates after loading waiter: any interleaved
-    // transition bumps the sequence and fails the CAS, so an old tick can
-    // steal neither a later credit nor a reinstalled identical sleeper.
+    // A manual wake publishes cancellation before competing for an ioSleep waiter. A timer validates after loading waiter: any interleaved
+    // transition bumps the sequence and fails the CAS, so an old tick can steal neither a later credit nor a reinstalled identical sleeper.
     if (manual && kind == ewtSleep)
       eventTimerPublishConfig(event, 0, 0, 0, 0);
     else if (generation && eventTimerGeneration(event) != generation)
@@ -327,10 +315,8 @@ static void eventCoroutineCancel(aioUserEvent *event)
 
 static void eventActivateCancellation(aioUserEvent *event)
 {
-  // DELETE makes every pending manual count irrelevant. Always post a fresh
-  // personal doorbell: a nonzero signalState may belong to a normal activation
-  // whose owner has not reached its backend call yet, so cancellation must not
-  // wait for that thread to make progress.
+  // DELETE makes every pending manual count irrelevant. Always post a fresh personal doorbell: a nonzero signalState may belong to a normal
+  // activation whose owner has not reached its backend call yet, so cancellation must not wait for that thread to make progress.
   __uintptr_atomic_store(&event->signalState, 1, amoRelease);
   (void)event->header.base->methodImpl.activate(event);
 }
@@ -354,8 +340,7 @@ static int eventInstallWaiter(aioUserEvent *event, unsigned waiterKind)
         eventActivateCancellation(event);
       return 1;
     }
-    // Credits are consumed by CAS only: a concurrent delete may replace them
-    // with the terminal sentinel, which arithmetic would corrupt.
+    // Credits are consumed by CAS only: a concurrent delete may replace them with the terminal sentinel, which arithmetic would corrupt.
     uint128 desired = {expected.low - ewtCreditUnit, expected.high + 1};
     if (__uint128_atomic_compare_and_swap(&event->waiter, &expected, desired))
       return 0;
@@ -370,8 +355,7 @@ static void eventFinishWaiter(aioUserEvent *event)
 
 static void eventProcessCancellation(aioUserEvent *event)
 {
-  // The waiter sentinel stays terminal, so a late kernel owner cannot turn a
-  // timer signal into a credit.
+  // The waiter sentinel stays terminal, so a late kernel owner cannot turn a timer signal into a credit.
   __uintptr_atomic_store(&event->signalState, 0, amoRelaxed);
   eventCoroutineCancel(event);
 }
@@ -390,9 +374,8 @@ void eventManualReady(aioUserEvent *event)
   if (!count)
     return;
 
-  // A callback readiness which claimed before delete remains accepted and
-  // must still be delivered. Callback-less events instead use the personal
-  // doorbell as the asynchronous cancellation path for a committed waiter.
+  // A callback readiness which claimed before delete remains accepted and must still be delivered. Callback-less events instead use the
+  // personal doorbell as the asynchronous cancellation path for a committed waiter.
   if (!event->callback && eventReferenceIsDeleting(event))
     eventProcessCancellation(event);
   else if (event->callback)
@@ -407,10 +390,8 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
   if (!event)
     return 0;
 
-  // A stale kernel envelope may inspect only Head while this slot is pooled
-  // or being reused. Keep the optional backend timer paired with the slot,
-  // preserve its monotonic event generation, reset the tail, and publish the
-  // live refcount only after initialization is complete.
+  // A stale kernel envelope may inspect only Head while this slot is pooled or being reused. Keep the optional backend timer paired with the
+  // slot, preserve its monotonic event generation, reset the tail, and publish the live refcount only after initialization is complete.
   uintptr_t generation = eventHandleGeneration(event);
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   objectHeaderSetType(&event->header, ohtUserEvent);
@@ -424,12 +405,9 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
     state->armed = 0;
     state->period = 0;
   }
-  // The schedule generation survives reuse: reactors validate a stale
-  // envelope against the live tag.high and read the CURRENT incarnation from
-  // timer->event.generation, so restarting the numbering at 1 would let the
-  // previous incarnation's unprocessed readiness pass every gate. Only
-  // pending ticks, the finite counter and OWNER reset (a pooled cell's owner
-  // has always released: OWNER-clear is the resting state).
+  // The schedule generation survives reuse: reactors validate a stale envelope against the live tag.high and read the CURRENT incarnation from
+  // timer->event.generation, so restarting the numbering at 1 would let the previous incarnation's unprocessed readiness pass every gate. Only
+  // pending ticks, the finite counter and OWNER reset (a pooled cell's owner has always released: OWNER-clear is the resting state).
   uint64_t scheduleGeneration = (uint32_t)__uint64_atomic_load(&event->timerControl.high, amoRelaxed);
   __uint64_atomic_store(&event->timerControl.low, 0, amoRelaxed);
   __uint64_atomic_store(&event->timerControl.high, scheduleGeneration, amoRelaxed);
@@ -440,9 +418,8 @@ aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback
   event->destructorCbArg = 0;
   event->activationId = UINT64_MAX;
 
-  // Publish every field above and the incarnation bump performed by the
-  // preceding final release. Kernel claims acquire this word before accepting
-  // an incarnation, so it must be the last initialization store.
+  // Publish every field above and the incarnation bump performed by the preceding final release. Kernel claims acquire this word before
+  // accepting an incarnation, so it must be the last initialization store.
   __uint64_atomic_store(&event->header.tag.low, 1, amoRelease);
   if (!base->methodImpl.initializeUserEvent(event)) {
     __uint64_atomic_store(&event->header.tag.high, generation + 1, amoRelaxed);
@@ -479,10 +456,9 @@ void userEventActivate(aioUserEvent *event)
   else
     old = __uintptr_atomic_exchange(&event->signalState, 1, amoRelease);
 
-  // The personal descriptor/completion is only a manual doorbell. Once one is
-  // pending, signalState carries the exact count or the coalescing gate.
-  // The 0->nonzero edge owns the single doorbell. Interruptible syscall
-  // failures are handled inside the backend; common code never spins here.
+  // The personal descriptor/completion is only a manual doorbell. Once one is pending, signalState carries the exact count or the coalescing
+  // gate. The 0->nonzero edge owns the single doorbell. Interruptible syscall failures are handled inside the backend; common code never spins
+  // here.
   if (old == 0)
     (void)event->header.base->methodImpl.activate(event);
 }
@@ -505,8 +481,7 @@ void ioSleep(aioUserEvent *event, uint64_t usTimeout)
 
   uint128 expected = __uint128_atomic_load_relaxed(&event->waiter);
   while (expected.low) {
-    // Same CAS-only credit consume as eventInstallWaiter: a delete landing
-    // after the liveness check above must find its sentinel intact.
+    // Same CAS-only credit consume as eventInstallWaiter: a delete landing after the liveness check above must find its sentinel intact.
     if ((expected.low & ewtMask) == ewtDeleted)
       return;
     assert((expected.low & ewtMask) == ewtCredits && "Only one coroutine may wait on a user event");

@@ -48,8 +48,7 @@ static int cancel(asyncOpRoot *opptr)
   return 0;
 }
 
-// rlpxAcceptCb and rlpxConnectCb are the same function type, so accept and
-// connect operations share one finish thunk
+// rlpxAcceptCb and rlpxConnectCb are the same function type, so accept and connect operations share one finish thunk
 static void socketOpFinish(asyncOpRoot *opptr)
 {
   reinterpret_cast<rlpxConnectCb*>(opptr->callback)(opGetStatus(opptr), reinterpret_cast<rlpxSocket*>(opptr->object), opptr->arg);
@@ -84,17 +83,16 @@ static AsyncOpStatus startRlpxConnect(asyncOpRoot *opptr)
   asyncOpRoot *childOp = nullptr;
   while (!childOp) {
     switch (op->state) {
-      case StInitialize : {
+      case StInitialize: {
         op->state = StConnectWriteAuth;
         aioConnect(socket->plainSocket, &op->address, 0, resumeConnectCb, op);
         return aosPending;
       }
-      case StConnectWriteAuth : {
+      case StConnectWriteAuth: {
         // auth = auth-size || ecies.encrypt([sig, initiator-pubk, initiator-nonce, auth-vsn, ...])
       }
 
-      default:
-        return aosUnknownError;
+      default: return aosUnknownError;
     }
   }
 
@@ -106,8 +104,7 @@ rlpxSocket *rlpxSocketNew(asyncBase *base, aioObject *plainSocket)
 {
   if (!plainSocket)
     return nullptr;
-  rlpxSocket *socket = static_cast<rlpxSocket*>(
-    objectAlloc(&objectPool, sizeof(rlpxSocket), 16));
+  rlpxSocket *socket = static_cast<rlpxSocket*>(objectAlloc(&objectPool, sizeof(rlpxSocket), 16));
   if (!socket)
     return nullptr;
   initObjectRoot(&socket->root, base, ioObjectUserDefined, rlpxSocketDestructor);
@@ -130,10 +127,8 @@ aioObject *rlpxGetPlainSocket(rlpxSocket *socket)
   return socket->plainSocket;
 }
 
-// RLPx is currently an unfinished API stub, not a supported transport path.
-// The operation entry points below only reserve the intended API/state-machine
-// shape; missing submission and wire processing are deliberate until the
-// protocol implementation is added.
+// RLPx is currently an unfinished API stub, not a supported transport path. The operation entry points below only reserve the intended
+// API/state-machine shape; missing submission and wire processing are deliberate until the protocol implementation is added.
 static AsyncOpStatus startRlpxAccept(asyncOpRoot *opptr)
 {
   __UNUSED(opptr);
@@ -142,8 +137,7 @@ static AsyncOpStatus startRlpxAccept(asyncOpRoot *opptr)
 
 void aioRlpxAccept(rlpxSocket *socket, AsyncFlags flags, uint64_t timeout, rlpxAcceptCb callback, void *arg)
 {
-  RlpxOperation *op =
-    initOp(startRlpxAccept, socketOpFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpAccept);
+  RlpxOperation *op = initOp(startRlpxAccept, socketOpFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpAccept);
   combinerPushOperation(&op->root);
 }
 
@@ -151,7 +145,6 @@ void aioRlpxConnect(rlpxSocket *socket, HostAddress address, AsyncFlags flags, u
 {
   RlpxOperation *op = initOp(startRlpxConnect, socketOpFinish, socket, flags, timeout, reinterpret_cast<void*>(callback), arg, rlpxOpConnect);
   op->address = address;
-
 }
 
 ssize_t aioRlpxRecv(rlpxSocket *socket, xmstream &stream, size_t sizeLimit, AsyncFlags flags, uint64_t timeout, rlpxRecvCb callback, void *arg)

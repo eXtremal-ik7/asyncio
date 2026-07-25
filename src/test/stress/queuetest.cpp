@@ -1,10 +1,8 @@
 // MPMC stress/consistency test for ConcurrentQueue (asyncio/ringBuffer.c)
 //
-// Producers push unique values, consumers pop them concurrently; the test fails
-// if any value is lost, duplicated or was never pushed (garbage). This is the
-// scenario where a missing release/acquire pair on ConcurrentQueueElement::sequence
-// corrupts data on weakly-ordered CPUs (ARM64), so the test is also intended to be
-// run under ThreadSanitizer (configure with -DBUILD_SANITIZE_THREAD=ON).
+// Producers push unique values, consumers pop them concurrently; the test fails if any value is lost, duplicated or was never pushed (garbage).
+// This is the scenario where a missing release/acquire pair on ConcurrentQueueElement::sequence corrupts data on weakly-ordered CPUs (ARM64),
+// so the test is also intended to be run under ThreadSanitizer (configure with -DBUILD_SANITIZE_THREAD=ON).
 //
 // Usage: queuetest [producers] [consumers] [itemsPerProducer] [maxInflight]
 //   maxInflight < 4096 keeps the test inside the first partition;
@@ -74,7 +72,7 @@ static void consumerProc()
   }
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   if (argc > 1)
     producers = (unsigned)atoi(argv[1]);
@@ -94,7 +92,10 @@ int main(int argc, char **argv)
     counter.store(0, std::memory_order_relaxed);
 
   printf("queuetest: %u producer(s), %u consumer(s), %" PRIuPTR " items, max inflight %ld\n",
-         producers, consumers, (uintptr_t)seen.size(), maxInflight);
+         producers,
+         consumers,
+         (uintptr_t)seen.size(),
+         maxInflight);
 
   std::vector<std::thread> threads;
   for (unsigned i = 0; i < consumers; i++)
@@ -110,8 +111,7 @@ int main(int argc, char **argv)
       lost++;
   }
 
-  printf("popped garbage: %" PRIuPTR ", duplicates: %" PRIuPTR ", lost: %" PRIuPTR "\n",
-         errGarbage.load(), errDuplicate.load(), lost);
+  printf("popped garbage: %" PRIuPTR ", duplicates: %" PRIuPTR ", lost: %" PRIuPTR "\n", errGarbage.load(), errDuplicate.load(), lost);
   if (errGarbage.load() || errDuplicate.load() || lost) {
     printf("FAILED\n");
     return 1;

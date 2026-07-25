@@ -14,9 +14,8 @@ typedef struct SSLSocket SSLSocket;
 typedef void sslConnectCb(AsyncOpStatus status, SSLSocket *object, void *arg);
 typedef void sslCb(AsyncOpStatus status, SSLSocket *object, size_t transferred, void *arg);
 
-// userContext: optional shared SSL_CTX (reference counted, the caller keeps
-// ownership of its reference); NULL creates a private client context with
-// certificate verification disabled
+// userContext: optional shared SSL_CTX (reference counted, the caller keeps ownership of its reference); NULL creates a private client context
+// with certificate verification disabled
 SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket, SSL_CTX *userContext);
 void sslSocketDelete(SSLSocket *socket);
 
@@ -40,11 +39,8 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
                           void *arg,
                           size_t *bytesTransferred);
 
-// Operations on one SSLSocket use a single serialized TLS lane. A pending
-// read may delay a later write; full-duplex application progress is not
-// supported.
-// address == NULL: the transport socket is already connected, only the TLS
-// handshake is performed (both flavors)
+// Operations on one SSLSocket use a single serialized TLS lane. A pending read may delay a later write; full-duplex application progress is not
+// supported. address == NULL: the transport socket is already connected, only the TLS handshake is performed (both flavors)
 void aioSslConnect(SSLSocket *socket,
                    const HostAddress *address,
                    const char *tlsextHostName,

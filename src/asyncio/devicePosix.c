@@ -21,8 +21,7 @@ void sigpipeGuardEnter(struct SigpipeGuard *guard)
   sigemptyset(&pipeMask);
   sigaddset(&pipeMask, SIGPIPE);
   pthread_sigmask(SIG_BLOCK, &pipeMask, &guard->savedMask);
-  // Snapshot after blocking: from here on only our own write can add a
-  // pending SIGPIPE to this thread.
+  // Snapshot after blocking: from here on only our own write can add a pending SIGPIPE to this thread.
   sigpending(&pendingSet);
   guard->wasPending = sigismember(&pendingSet, SIGPIPE);
 }
@@ -32,9 +31,8 @@ void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe)
   int savedErrno = errno;
   if (consumeSigpipe && !guard->wasPending) {
 #ifndef F_SETNOSIGPIPE
-    // Only reachable on platforms without per-fd suppression (Linux,
-    // FreeBSD): needSigpipeGuard is always zero elsewhere, and Darwin has
-    // no sigtimedwait to compile.
+    // Only reachable on platforms without per-fd suppression (Linux, FreeBSD): needSigpipeGuard is always zero elsewhere, and Darwin has no
+    // sigtimedwait to compile.
     sigset_t pipeMask;
     struct timespec zeroTimeout = {0, 0};
     sigemptyset(&pipeMask);
@@ -47,7 +45,6 @@ void sigpipeGuardLeave(struct SigpipeGuard *guard, int consumeSigpipe)
   errno = savedErrno;
 }
 
-
 iodevTy serialPortOpen(const char *name)
 {
   return open(name, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -58,11 +55,7 @@ void serialPortClose(iodevTy port)
   close(port);
 }
 
-int serialPortSetConfig(iodevTy port,
-                        int speed,
-                        int dataBits,
-                        int stopBits,
-                        int parity)
+int serialPortSetConfig(iodevTy port, int speed, int dataBits, int stopBits, int parity)
 {
   struct termios tios;
   memset(&tios, 0, sizeof(tios));
@@ -72,22 +65,22 @@ int serialPortSetConfig(iodevTy port,
     int rate;
     speed_t value;
   } baudTable[] = {
-    {110, B110},
-    {300, B300},
-    {600, B600},
-    {1200, B1200},
-    {2400, B2400},
-    {4800, B4800},
-    {9600, B9600},
-    {19200, B19200},
-    {38400, B38400},
-    {57600, B57600},
-    {115200, B115200},
+      {110, B110},
+      {300, B300},
+      {600, B600},
+      {1200, B1200},
+      {2400, B2400},
+      {4800, B4800},
+      {9600, B9600},
+      {19200, B19200},
+      {38400, B38400},
+      {57600, B57600},
+      {115200, B115200},
 #ifndef OS_QNX
-    {230400, B230400},
+      {230400, B230400},
 #ifndef OS_DARWIN
-    {460800, B460800},
-    {921600, B921600},
+      {460800, B460800},
+      {921600, B921600},
 #endif
 #endif
   };
@@ -100,39 +93,30 @@ int serialPortSetConfig(iodevTy port,
     }
   }
 
-  if (cfsetispeed(&tios, localSpeed) == -1 ||
-      cfsetospeed(&tios, localSpeed) == -1)
+  if (cfsetispeed(&tios, localSpeed) == -1 || cfsetospeed(&tios, localSpeed) == -1)
     return 0;
 
   tios.c_cflag |= (CREAD | CLOCAL);
 
   tios.c_cflag &= ~CSIZE;
   switch (dataBits) {
-    case 5:
-      tios.c_cflag |= CS5;
-      break;
-    case 6:
-      tios.c_cflag |= CS6;
-      break;
-    case 7:
-      tios.c_cflag |= CS7;
-      break;
+    case 5: tios.c_cflag |= CS5; break;
+    case 6: tios.c_cflag |= CS6; break;
+    case 7: tios.c_cflag |= CS7; break;
     case 8:
-    default:
-      tios.c_cflag |= CS8;
-      break;
+    default: tios.c_cflag |= CS8; break;
   }
 
   if (stopBits == 1)
-    tios.c_cflag &=~ CSTOPB;
+    tios.c_cflag &= ~CSTOPB;
   else
     tios.c_cflag |= CSTOPB;
 
   if (parity == 'N') {
-    tios.c_cflag &=~ PARENB;    
+    tios.c_cflag &= ~PARENB;
   } else if (parity == 'E') {
     tios.c_cflag |= PARENB;
-    tios.c_cflag &=~ PARODD;
+    tios.c_cflag &= ~PARODD;
   } else {
     tios.c_cflag |= PARENB;
     tios.c_cflag |= PARODD;
@@ -175,9 +159,7 @@ int pipeCreate(struct pipeTy *pipePtr, int isAsync)
   if (isAsync) {
     int rstate = fcntl(fd[0], F_GETFL);
     int wstate = fcntl(fd[1], F_GETFL);
-    if (rstate == -1 || wstate == -1 ||
-        fcntl(fd[0], F_SETFL, O_NONBLOCK | rstate) == -1 ||
-        fcntl(fd[1], F_SETFL, O_NONBLOCK | wstate) == -1) {
+    if (rstate == -1 || wstate == -1 || fcntl(fd[0], F_SETFL, O_NONBLOCK | rstate) == -1 || fcntl(fd[1], F_SETFL, O_NONBLOCK | wstate) == -1) {
       int error = errno;
       close(fd[0]);
       close(fd[1]);

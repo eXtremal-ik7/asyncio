@@ -20,7 +20,7 @@ void printhex(uint8_t *data, size_t size)
   for (size_t i = 0; i < size; i++) {
     fprintf(stderr, "%02X", (unsigned)data[i]);
   }
-  fprintf(stderr, "\n");   
+  fprintf(stderr, "\n");
 }
 
 void readerProc(void *arg)
@@ -49,7 +49,7 @@ void listenerProc(void *arg)
       fprintf(stderr, "new connection accepted\n");
       readerContext *reader = new readerContext;
       reader->base = ctx->base;
-      reader->socket = newSocketIo(ctx->base, acceptSocket);      
+      reader->socket = newSocketIo(ctx->base, acceptSocket);
       coroutineTy *echoProc = coroutineNew(readerProc, reader, 0x10000);
       coroutineCall(echoProc);
     } else {
@@ -58,13 +58,13 @@ void listenerProc(void *arg)
   }
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   if (argc != 3) {
     fprintf(stderr, "usage: %s <method> <port>\n", argv[0]);
     return 1;
   }
-  
+
   AsyncMethod method;
   if (strcmp(argv[1], "default") == 0) {
     method = amOSDefault;
@@ -78,12 +78,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "ERROR: unknown method %s, default used\n", argv[1]);
     method = amOSDefault;
   }
-  
+
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
   address.port = static_cast<uint16_t>(atoi(argv[2]));
-  
+
   initializeAsyncIo(aiNone);
   socketTy hSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
   socketReuseAddr(hSocket);
@@ -99,7 +99,7 @@ int main(int argc, char **argv)
 
   asyncBase *base = createAsyncBase(method, 1);
   aioObject *socketOp = newSocketIo(base, hSocket);
-  
+
   listenerContext ctx;
   ctx.base = base;
   ctx.socket = socketOp;

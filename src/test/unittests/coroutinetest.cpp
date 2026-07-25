@@ -24,10 +24,9 @@ TEST(coroutine, create)
 
 TEST(coroutine, tiny_stack_clamped_to_floor)
 {
-  // Undersized or oddly-aligned stack requests must be raised to the 1 KiB
-  // floor (and platform alignment) instead of placing the initial SP outside
-  // or misaligned within the allocation.
-  for (unsigned stackSize : {0u, 1u, 100u, 1000u, 1030u}) {
+  // Undersized or oddly-aligned stack requests must be raised to the 1 KiB floor (and platform alignment) instead of placing the initial SP
+  // outside or misaligned within the allocation.
+  for (unsigned stackSize: {0u, 1u, 100u, 1000u, 1030u}) {
     int x = 0;
     coroutineTy *coro = coroutineNew(coroutine_create_proc, &x, stackSize);
     ASSERT_NE(coro, nullptr);
@@ -124,7 +123,9 @@ TEST(coroutine, resume_on_another_thread)
   ASSERT_EQ(steps, 1);
 
   int finished = 0;
-  std::thread resumeThread([&]() { finished = coroutineCall(coro); });
+  std::thread resumeThread([&]() {
+    finished = coroutineCall(coro);
+  });
   resumeThread.join();
 
   EXPECT_EQ(finished, 1);
@@ -153,22 +154,15 @@ TEST(coroutine, delete_suspended_coroutine)
   coroutineSuspendedStackAddress = nullptr;
 }
 
-// coroutineCall on a running coroutine does not switch: it records the wakeup
-// in the counter and returns, and the owner consumes the record at the next
-// coroutineYield (which then resumes immediately instead of parking). When the
-// wakeup lands after the final yield, the coroutine finishes with the record
-// still pending, and the caller's re-entry loop (coroutinePosix.c do/while in
-// coroutineCall, same shape in coroutineWin32.c) trusts the counter alone: it
-// switches back into the finished context, where execution falls off the end
-// of fiberEntryPoint - a garbage return address on POSIX, an implicit thread
-// exit with Windows fibers. In production the window opens with several loop
-// threads: one resumes an operation-owning coroutine that is about to return
-// while another delivers a second wakeup for it (a user event, another
-// operation on the same second). The handshake below forces that exact
-// interleaving on every run, no timing involved. The scenario runs in a death
-// test child: today it must die there; with the re-entry loop respecting
-// `finished` it exits through the normal path - coroutineCall reports
-// completion and the finish callback fires exactly once.
+// coroutineCall on a running coroutine does not switch: it records the wakeup in the counter and returns, and the owner consumes the record at
+// the next coroutineYield (which then resumes immediately instead of parking). When the wakeup lands after the final yield, the coroutine
+// finishes with the record still pending, and the caller's re-entry loop (coroutinePosix.c do/while in coroutineCall, same shape in
+// coroutineWin32.c) trusts the counter alone: it switches back into the finished context, where execution falls off the end of fiberEntryPoint
+// - a garbage return address on POSIX, an implicit thread exit with Windows fibers. In production the window opens with several loop threads:
+// one resumes an operation-owning coroutine that is about to return while another delivers a second wakeup for it (a user event, another
+// operation on the same second). The handshake below forces that exact interleaving on every run, no timing involved. The scenario runs in a
+// death test child: today it must die there; with the re-entry loop respecting `finished` it exits through the normal path - coroutineCall
+// reports completion and the finish callback fires exactly once.
 static coroutineTy *coroWakeupRaceCoroutine;
 static std::atomic<int> coroWakeupRacePhase(0);
 static int coroWakeupRaceFinishCalls = 0;
@@ -188,8 +182,8 @@ static void coroWakeupRaceProc(void*)
 
 static void coroWakeupRaceChild()
 {
-  // On Windows the broken path silently exits the calling thread instead of
-  // crashing, which would leave the child hanging; turn a hang into a verdict
+  // On Windows the broken path silently exits the calling thread instead of crashing, which would leave the child hanging; turn a hang into a
+  // verdict
   std::thread watchdog([]() {
     std::this_thread::sleep_for(std::chrono::seconds(10));
     std::_Exit(3);

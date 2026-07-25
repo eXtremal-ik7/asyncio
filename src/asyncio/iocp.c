@@ -93,53 +93,47 @@ AsyncOpStatus iocpAsyncWrite(asyncOpRoot *op);
 AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *op);
 AsyncOpStatus iocpAsyncWriteMsg(asyncOpRoot *op);
 
-static struct asyncImpl iocpImpl = {
-  combinerTaskHandler,
-  iocpEnqueue,
-  iocpNextFinishedOperation,
-  iocpNewAioObject,
-  iocpNewAsyncOp,
-  iocpCancelAsyncOp,
-  iocpInitializeTimer,
-  iocpStartTimer,
-  iocpStopTimer,
-  iocpInitializeUserEvent,
-  iocpActivate,
-  iocpAsyncConnect,
-  iocpAsyncAccept,
-  iocpAsyncRead,
-  iocpAsyncWrite,
-  iocpAsyncReadMsg,
-  iocpAsyncWriteMsg,
-  iocpWakeupLoop,
-  iocpUpdateEventTimer,
-  iocpConsumeEventTimerTick,
-  iocpReleaseUserEvent
-};
+static struct asyncImpl iocpImpl = {combinerTaskHandler,
+                                    iocpEnqueue,
+                                    iocpNextFinishedOperation,
+                                    iocpNewAioObject,
+                                    iocpNewAsyncOp,
+                                    iocpCancelAsyncOp,
+                                    iocpInitializeTimer,
+                                    iocpStartTimer,
+                                    iocpStopTimer,
+                                    iocpInitializeUserEvent,
+                                    iocpActivate,
+                                    iocpAsyncConnect,
+                                    iocpAsyncAccept,
+                                    iocpAsyncRead,
+                                    iocpAsyncWrite,
+                                    iocpAsyncReadMsg,
+                                    iocpAsyncWriteMsg,
+                                    iocpWakeupLoop,
+                                    iocpUpdateEventTimer,
+                                    iocpConsumeEventTimerTick,
+                                    iocpReleaseUserEvent};
 
 static aioObject *getObject(iocpOp *op)
 {
   return (aioObject*)op->info.root.object;
 }
 
-// A socket call that failed to even start its overlapped operation: map the
-// immediate WSA error. WSAENOTCONN (e.g. WSARecv/WSASend before the socket is
+// A socket call that failed to even start its overlapped operation: map the immediate WSA error. WSAENOTCONN (e.g. WSARecv/WSASend before the
+// socket is
 // connected) normalizes to aosNotConnected, mirroring EPIPE/ENOTCONN on POSIX;
-// anything else is opaque. WSA_IO_PENDING (the op is in flight) is handled by
-// the caller before it reaches here.
+// anything else is opaque. WSA_IO_PENDING (the op is in flight) is handled by the caller before it reaches here.
 static AsyncOpStatus iocpInlineErrorStatus(void)
 {
   return WSAGetLastError() == WSAENOTCONN ? aosNotConnected : aosUnknownError;
 }
 
-// Device (pipe/file) error mapping, shared by the completion path and the
-// immediate ReadFile/WriteFile failures: a closed pipe / end-of-stream is the
-// counterpart of the POSIX zero read (transferStatus) and normalizes to
-// aosDisconnected, an abort is a cancel, the rest stays opaque.
+// Device (pipe/file) error mapping, shared by the completion path and the immediate ReadFile/WriteFile failures: a closed pipe / end-of-stream
+// is the counterpart of the POSIX zero read (transferStatus) and normalizes to aosDisconnected, an abort is a cancel, the rest stays opaque.
 static AsyncOpStatus iocpDeviceErrorStatus(DWORD error)
 {
-  if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED ||
-      error == ERROR_NO_DATA || error == ERROR_HANDLE_EOF)
+  if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED || error == ERROR_NO_DATA || error == ERROR_HANDLE_EOF)
     return aosDisconnected;
   else if (error == ERROR_OPERATION_ABORTED)
     return aosCanceled;
@@ -184,10 +178,8 @@ static int iocpArmWaitableTimer(aioTimer *timer, uint64_t timeout)
 {
   LARGE_INTEGER signalTime;
   signalTime.QuadPart = -(int64_t)(timeout * 10);
-  // SetWaitableTimer resets an already-signaled timer. Registering the wait
-  // afterwards cannot miss an early expiration because the handle remains
-  // signaled until the waiter consumes it; it also avoids registering the
-  // previous arm's still-signaled state before the reset.
+  // SetWaitableTimer resets an already-signaled timer. Registering the wait afterwards cannot miss an early expiration because the handle
+  // remains signaled until the waiter consumes it; it also avoids registering the previous arm's still-signaled state before the reset.
   if (!SetWaitableTimer(timer->hTimer, &signalTime, 0, NULL, NULL, FALSE))
     return 0;
   SetThreadpoolWait(timer->wait, timer->hTimer, NULL);
@@ -196,8 +188,7 @@ static int iocpArmWaitableTimer(aioTimer *timer, uint64_t timeout)
 
 static void iocpDisarmWaitableTimer(aioTimer *timer)
 {
-  // STOPPED is only a gate; callback payload travels in local variables, and
-  // WaitForThreadpoolWaitCallbacks is the lifetime barrier. No data is
+  // STOPPED is only a gate; callback payload travels in local variables, and WaitForThreadpoolWaitCallbacks is the lifetime barrier. No data is
   // released through this word.
   __uint64_atomic_store(&timer->header.tag.low, IOCP_TIMER_STOPPED, amoRelaxed);
   CancelWaitableTimer(timer->hTimer);
@@ -208,17 +199,14 @@ static void iocpDisarmWaitableTimer(aioTimer *timer)
 static void iocpUserEventTimerCb(aioTimer *timer, PTP_CALLBACK_INSTANCE instance)
 {
   aioUserEvent *event = (aioUserEvent*)timer->target;
-  // iocpTimerCb's successful acquire CAS already observes the generation
-  // published before ARMED. Copy it before publishing STOPPED/control; a
-  // later rearm may then update the field while this callback only carries
-  // the old value in its local.
+  // iocpTimerCb's successful acquire CAS already observes the generation published before ARMED. Copy it before publishing STOPPED/control; a
+  // later rearm may then update the field while this callback only carries the old value in its local.
   uint32_t timerGeneration = (uint32_t)objectHeaderGeneration(&timer->header);
   uint64_t eventGeneration = __uint64_atomic_load(&timer->eventGeneration, amoRelaxed);
   __uint64_atomic_store(&timer->header.tag.low, IOCP_TIMER_STOPPED, amoRelaxed);
-  // The common kernel owner may run a callback which performs final Delete.
-  // Disassociation keeps that release's threadpool-wait rendezvous from
-  // waiting on itself. Every timer field needed below has already been copied;
-  // a successful event claim protects any backend rearm done by the owner.
+  // The common kernel owner may run a callback which performs final Delete. Disassociation keeps that release's threadpool-wait rendezvous from
+  // waiting on itself. Every timer field needed below has already been copied; a successful event claim protects any backend rearm done by the
+  // owner.
   DisassociateCurrentThreadFromCallback(instance);
   eventTimerSignal(event, timerGeneration, eventGeneration, 1);
 }
@@ -255,16 +243,14 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
   // READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE.
   uint32_t needStart = progress;
 
-  // Start a submitted operation, then reconcile the signal for this node by
-  // status. The proactor has no readiness side-channel: continue/finish/release
-  // all arrive as PROGRESS_*, cancellation as CANCEL.
+  // Start a submitted operation, then reconcile the signal for this node by status. The proactor has no readiness side-channel:
+  // continue/finish/release all arrive as PROGRESS_*, cancellation as CANCEL.
   if (op)
     startOperation(op, &needStart);
 
   if (progress && object->initializationOp)
     processInitializationOp(object, &needStart);
-  // CANCEL/CANCELIO: the CANCELIO position additionally bounds the bulk
-  // cancelIo() sweep
+  // CANCEL/CANCELIO: the CANCELIO position additionally bounds the bulk cancelIo() sweep
   if (sig & (COMBINER_TAG_CANCEL | COMBINER_TAG_CANCELIO))
     reapObject(object, sig, &needStart);
 
@@ -281,8 +267,7 @@ void iocpEnqueue(asyncBase *base, asyncOpRoot *op)
 
 void iocpWakeupLoop(asyncBase *base)
 {
-  // Pure kick of one sleeper: a key 0 + overlapped 0 packet is consumed by
-  // the dispatch as a no-op
+  // Pure kick of one sleeper: a key 0 + overlapped 0 packet is consumed by the dispatch as a no-op
   PostQueuedCompletionStatus(((iocpBase*)base)->completionPort, 1, 0, 0);
 }
 
@@ -296,8 +281,7 @@ asyncBase *iocpNewAsyncBase()
 
     base->completionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
     if (!base->completionPort) {
-      // Without the completion port the message loop cannot run: fail
-      // creation, like the reactor backends do on descriptor exhaustion
+      // Without the completion port the message loop cannot run: fail creation, like the reactor backends do on descriptor exhaustion
       free(base);
       return 0;
     }
@@ -346,32 +330,23 @@ void iocpNextFinishedOperation(asyncBase *base)
       quitting = __uintptr_atomic_load(&base->quitRequested, amoAcquire) != 0;
 
     if (quitting) {
-      // Drain the port dry before leaving (the FIFO semantics of the old
-      // quit packet): completions enqueued before the stop still dispatch.
-      // The exit re-rings the doorbell while other threads remain registered
-      status = GetQueuedCompletionStatusEx(localBase->completionPort,
-                                           entries, maxEntriesNum, &N, 0, FALSE);
+      // Drain the port dry before leaving (the FIFO semantics of the old quit packet): completions enqueued before the stop still dispatch. The
+      // exit re-rings the doorbell while other threads remain registered
+      status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N, 0, FALSE);
       if (status == FALSE) {
         if (loopThreadExit(base))
           iocpWakeupLoop(base);
         return;
       }
     } else {
-      // An idle base plans UINT64_MAX; the last-moment conversion below turns
-      // that into UINT32_MAX, exactly INFINITE for the completion port.
+      // An idle base plans UINT64_MAX; the last-moment conversion below turns that into UINT32_MAX, exactly INFINITE for the completion port.
       uint64_t sleepFrom = getMonotonicTicks();
       uint64_t wakeTick = timerLoopPrepareSleep(base, timerState, sleepFrom);
       uint32_t sleepMs = timerSleepMilliseconds(wakeTick);
-      status = GetQueuedCompletionStatusEx(localBase->completionPort,
-                                           entries,
-                                           maxEntriesNum,
-                                           &N,
-                                           sleepMs,
-                                           FALSE);
+      status = GetQueuedCompletionStatusEx(localBase->completionPort, entries, maxEntriesNum, &N, sleepMs, FALSE);
       timerLoopCancelSleep(timerState);
 
-      // Unconditional sweep (the modulo election is gone): an idle pass
-      // costs one relaxed load, and the wakeup handshake relies on whichever
+      // Unconditional sweep (the modulo election is gone): an idle pass costs one relaxed load, and the wakeup handshake relies on whichever
       // thread the kick lands on doing the sweep itself
       processTimeoutQueue(base, timerState, getMonotonicTicks());
 
@@ -385,8 +360,7 @@ void iocpNextFinishedOperation(asyncBase *base)
       if (entry->lpCompletionKey) {
         if (entry->dwNumberOfBytesTransferred == IOCP_USER_EVENT_PACKET) {
           aioUserEvent *event = (aioUserEvent*)entry->lpCompletionKey;
-          // A manually posted packet round-trips both payload fields verbatim;
-          // this numeric OVERLAPPED value is never dereferenced.
+          // A manually posted packet round-trips both payload fields verbatim; this numeric OVERLAPPED value is never dereferenced.
           uint64_t fullGeneration = (uint64_t)(uintptr_t)entry->lpOverlapped;
           if (!eventManualTryClaimReference(event, fullGeneration))
             continue;
@@ -409,10 +383,8 @@ void iocpNextFinishedOperation(asyncBase *base)
         AsyncOpStatus result = iocpGetOverlappedResult(op);
         if (result == aosSuccess) {
           aioObject *object = (aioObject*)op->info.root.object;
-          // Must mirror the submit-side test in iocpAsyncRead exactly: a read
-          // of precisely the buffer capacity is posted into the object buffer,
-          // and treating it as unbuffered here would account the bytes against
-          // a user buffer that never received them.
+          // Must mirror the submit-side test in iocpAsyncRead exactly: a read of precisely the buffer capacity is posted into the object
+          // buffer, and treating it as unbuffered here would account the bytes against a user buffer that never received them.
           int isBuffered = op->info.root.opCode == actRead && op->info.transactionSize <= object->buffer.totalSize;
           if (!isBuffered)
             op->info.bytesTransferred += entry->dwNumberOfBytesTransferred;
@@ -434,11 +406,13 @@ void iocpNextFinishedOperation(asyncBase *base)
                                  &remoteAddrLength);
             if (localAddr && remoteAddr) {
               sockaddrToHostAddress((struct sockaddr_storage*)remoteAddr, &op->info.host);
-              // AcceptEx counterpart of SO_UPDATE_CONNECT_CONTEXT below: without
-              // it shutdown/getsockname/getpeername stay broken. On failure the
-              // release path closes the accepted socket
-              if (setsockopt(op->info.acceptSocket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                             (const char*)&object->hSocket, sizeof(object->hSocket)) == SOCKET_ERROR)
+              // AcceptEx counterpart of SO_UPDATE_CONNECT_CONTEXT below: without it shutdown/getsockname/getpeername stay broken. On failure
+              // the release path closes the accepted socket
+              if (setsockopt(op->info.acceptSocket,
+                             SOL_SOCKET,
+                             SO_UPDATE_ACCEPT_CONTEXT,
+                             (const char*)&object->hSocket,
+                             sizeof(object->hSocket)) == SOCKET_ERROR)
                 result = aosUnknownError;
             } else {
               result = aosUnknownError;
@@ -452,25 +426,19 @@ void iocpNextFinishedOperation(asyncBase *base)
             struct recvFromData *rf = op->info.internalBuffer;
             sockaddrToHostAddress(&rf->addr, &op->info.host);
           } else if (op->info.root.opCode == actConnect) {
-            // Put the socket into the regular connected state, otherwise
-            // getpeername/shutdown on it stay broken after ConnectEx
-            if (setsockopt(object->hSocket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
-                           NULL, 0) == SOCKET_ERROR)
+            // Put the socket into the regular connected state, otherwise getpeername/shutdown on it stay broken after ConnectEx
+            if (setsockopt(object->hSocket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0) == SOCKET_ERROR)
               result = aosUnknownError;
           }
         } else if (result == aosBufferTooSmall && op->info.root.opCode == actReadMsg) {
-          // WSAEMSGSIZE: the buffer holds the first part of the datagram, the
-          // tail is dropped; the kernel still reports the source address
+          // WSAEMSGSIZE: the buffer holds the first part of the datagram, the tail is dropped; the kernel still reports the source address
           struct recvFromData *rf = op->info.internalBuffer;
           op->info.bytesTransferred = entry->dwNumberOfBytesTransferred;
           sockaddrToHostAddress(&rf->addr, &op->info.host);
         } else if (result == aosDisconnected && op->info.root.opCode == actAccept) {
-          // A connection that died in the backlog (RST) completes the parked
-          // AcceptEx with ERROR_NETNAME_DELETED; posix kernels hand out the
-          // dead socket successfully and let the application find out on the
-          // first read. Don't fail the accept operation over a remote-side
-          // event: drop the corpse and re-post AcceptEx for the next
-          // connection (same re-drive as partial read/write above)
+          // A connection that died in the backlog (RST) completes the parked AcceptEx with ERROR_NETNAME_DELETED; posix kernels hand out the
+          // dead socket successfully and let the application find out on the first read. Don't fail the accept operation over a remote-side
+          // event: drop the corpse and re-post AcceptEx for the next connection (same re-drive as partial read/write above)
           closesocket(op->info.acceptSocket);
           op->info.acceptSocket = INVALID_SOCKET;
           combinerPushProgress(&op->info.root);
@@ -480,9 +448,8 @@ void iocpNextFinishedOperation(asyncBase *base)
         opSetStatus(&op->info.root, opGetGeneration(&op->info.root), result);
         combinerPushProgress(&op->info.root);
       } else {
-        // Wakeup kick (timer producer or quit doorbell): the wait already
-        // returned; the sweep and the quit check at the loop top do the
-        // work, nothing to do with the entry itself
+        // Wakeup kick (timer producer or quit doorbell): the wait already returned; the sweep and the quit check at the loop top do the work,
+        // nothing to do with the entry itself
       }
     }
   }
@@ -528,8 +495,7 @@ asyncOpRoot *iocpNewAsyncOp(asyncBase *base, int isRealTime, ConcurrentQueue *ob
     op->info.internalBufferSize = 0;
   }
 
-  // overlapped stays uninitialized here: every submit path clears it right
-  // before handing it to the kernel, and nothing reads it earlier.
+  // overlapped stays uninitialized here: every submit path clears it right before handing it to the kernel, and nothing reads it earlier.
   return &op->info.root;
 }
 
@@ -557,10 +523,8 @@ void iocpDeleteObject(aioObject *object)
   objectFree(&objectPool, object, sizeof(aioObject));
 }
 
-// Allocates and fully constructs a backend timer cell: a high-resolution
-// waitable timer with a plain fallback, plus its threadpool wait. Returns
-// NULL with nothing left behind when any stage fails, so the caller can
-// simply retry the whole construction on a later arm.
+// Allocates and fully constructs a backend timer cell: a high-resolution waitable timer with a plain fallback, plus its threadpool wait.
+// Returns NULL with nothing left behind when any stage fails, so the caller can simply retry the whole construction on a later arm.
 static aioTimer *iocpNewTimerCell(asyncBase *base, void *target, unsigned kind)
 {
   aioTimer *timer = alignedMalloc(sizeof(aioTimer), TAGGED_POINTER_ALIGNMENT);
@@ -572,8 +536,7 @@ static aioTimer *iocpNewTimerCell(asyncBase *base, void *target, unsigned kind)
     timer->hTimer = CreateWaitableTimer(NULL, FALSE, NULL);
   timer->wait = timer->hTimer ? CreateThreadpoolWait(iocpTimerCb, timer, NULL) : NULL;
   if (!timer->wait) {
-    // A published timer always carries both handles; a partial cell is freed
-    // here so the next arm retries the whole construction.
+    // A published timer always carries both handles; a partial cell is freed here so the next arm retries the whole construction.
     if (timer->hTimer)
       CloseHandle(timer->hTimer);
     alignedFree(timer);
@@ -589,15 +552,14 @@ void iocpInitializeTimer(asyncBase *base, asyncOpRoot *op)
 
 void iocpStartTimer(asyncOpRoot *op)
 {
-  // The paired cell is created once per pooled slot; a constructor-time
-  // allocation failure must not disable this slot's timeouts forever.
+  // The paired cell is created once per pooled slot; a constructor-time allocation failure must not disable this slot's timeouts forever.
   aioTimer *timer = (aioTimer*)opEnsureTimerCell(op);
   if (!timer) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
     return;
   }
-  // The timer cell survives pooled operation reuse. Finish any old callback
-  // rendezvous before replacing the payload that callback may still read.
+  // The timer cell survives pooled operation reuse. Finish any old callback rendezvous before replacing the payload that callback may still
+  // read.
   if (__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != IOCP_TIMER_STOPPED)
     iocpDisarmWaitableTimer(timer);
   timer->target = op;
@@ -621,8 +583,7 @@ void iocpStopTimer(asyncOpRoot *op)
 
 int iocpActivate(aioUserEvent *event)
 {
-  // Manual packets provide two machine-word payloads, so IOCP does not need
-  // the reactor's compact pointer/generation encoding.
+  // Manual packets provide two machine-word payloads, so IOCP does not need the reactor's compact pointer/generation encoding.
   return PostQueuedCompletionStatus(((iocpBase*)event->header.base)->completionPort,
                                     IOCP_USER_EVENT_PACKET,
                                     (ULONG_PTR)event,
@@ -665,10 +626,8 @@ int iocpUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t 
   switch (update) {
     case etuStop:
       assert(timer && "Stopping a user-event timer which was never armed");
-      // A user-event timer callback changes CALLBACK to STOPPED before it
-      // enters the common tick/owner path. Waiting for that same callback
-      // here would deadlock on a finite timer's last tick. The callback has
-      // already copied every timer payload it uses, and final destruction
+      // A user-event timer callback changes CALLBACK to STOPPED before it enters the common tick/owner path. Waiting for that same callback
+      // here would deadlock on a finite timer's last tick. The callback has already copied every timer payload it uses, and final destruction
       // still performs the unconditional callback rendezvous below.
       if (__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != IOCP_TIMER_STOPPED)
         iocpDisarmWaitableTimer(timer);
@@ -692,10 +651,8 @@ uint64_t iocpConsumeEventTimerTick(aioUserEvent *event, uint64_t published, uint
   aioTimer *timer = eventTimerLoad(event, amoRelaxed);
   aioTimerUserEventState *state = eventTimerState(timer);
   uint128 control = __uint128_atomic_load_relaxed(&event->timerControl);
-  // The generation compare is the whole liveness gate - stop, cancel and
-  // delete each advance it. remaining == 0 means an unlimited schedule.
-  if (eventTimerControlGeneration(control) == generation &&
-      (!state->remaining || state->remaining > published)) {
+  // The generation compare is the whole liveness gate - stop, cancel and delete each advance it. remaining == 0 means an unlimited schedule.
+  if (eventTimerControlGeneration(control) == generation && (!state->remaining || state->remaining > published)) {
     if (!iocpArmEventTimer(event, timer, generation, period))
       state->armed = 0;
   }
@@ -724,10 +681,8 @@ AsyncOpStatus iocpAsyncConnect(asyncOpRoot *opptr)
   struct sockaddr_storage sa;
   socklen_t saLen = hostAddressToSockaddr(&op->info.host, &sa);
   memset(&op->overlapped, 0, sizeof(op->overlapped));
-  // ConnectEx is BOOL: nonzero = synchronous success with the completion
-  // packet still queued to the port - park and let it finish there. Zero
-  // with an error other than WSA_IO_PENDING means nothing was submitted:
-  // parking such an operation leaves a zombie no completion or CancelIoEx
+  // ConnectEx is BOOL: nonzero = synchronous success with the completion packet still queued to the port - park and let it finish there. Zero
+  // with an error other than WSA_IO_PENDING means nothing was submitted: parking such an operation leaves a zombie no completion or CancelIoEx
   // packet can ever finish
   int result = localBase->ConnectExPtr(object->hSocket, (const struct sockaddr*)&sa, saLen, NULL, 0, NULL, &op->overlapped);
   if (result != 0)
@@ -760,8 +715,7 @@ AsyncOpStatus iocpAsyncAccept(asyncOpRoot *opptr)
   memset(&op->overlapped, 0, sizeof(op->overlapped));
   int result = AcceptEx(object->hSocket, op->info.acceptSocket, op->info.internalBuffer, 0, addrSize, addrSize, NULL, &op->overlapped);
 
-  // AcceptEx is BOOL like ConnectEx: nonzero = synchronous success (packet
-  // still queued), zero + WSA_IO_PENDING = in flight, anything else was
+  // AcceptEx is BOOL like ConnectEx: nonzero = synchronous success (packet still queued), zero + WSA_IO_PENDING = in flight, anything else was
   // never submitted and must fail here instead of parking a zombie
   if (result != 0)
     return aosPending;
@@ -778,9 +732,8 @@ AsyncOpStatus iocpAsyncRead(asyncOpRoot *opptr)
 
   if (copyFromBuffer(op->info.buffer, &op->info.bytesTransferred, sb, op->info.transactionSize))
     return aosSuccess;
-  // A partial hit from the read-ahead buffer completes a non-afWaitAll read,
-  // matching the reactor backends: parking here would hold already delivered
-  // bytes hostage to future traffic.
+  // A partial hit from the read-ahead buffer completes a non-afWaitAll read, matching the reactor backends: parking here would hold already
+  // delivered bytes hostage to future traffic.
   if (op->info.bytesTransferred != 0 && !(opptr->flags & afWaitAll))
     return aosSuccess;
 
@@ -874,8 +827,7 @@ AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *opptr)
   if (result == 0 || WSAGetLastError() == WSA_IO_PENDING) {
     return aosPending;
   } else if (WSAGetLastError() == WSAEMSGSIZE) {
-    // The datagram is consumed and cut down to the buffer size right away;
-    // no completion packet follows an immediate failure
+    // The datagram is consumed and cut down to the buffer size right away; no completion packet follows an immediate failure
     op->info.bytesTransferred = op->info.transactionSize;
     sockaddrToHostAddress(&rf->addr, &op->info.host);
     return aosBufferTooSmall;

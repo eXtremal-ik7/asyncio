@@ -36,8 +36,7 @@ static void sanitizerDestroyCoroutine(coroutineTy *coroutine)
     asanDestroyFakeStack(coroutine->asanFakeStack);
     coroutine->asanFakeStack = 0;
   }
-  __asan_unpoison_memory_region(coroutine->asanStackBottom,
-                                coroutine->asanStackSize);
+  __asan_unpoison_memory_region(coroutine->asanStackBottom, coroutine->asanStackSize);
 }
 #else
 static void sanitizerDestroyCoroutine(coroutineTy *coroutine)
@@ -46,24 +45,19 @@ static void sanitizerDestroyCoroutine(coroutineTy *coroutine)
 }
 #endif
 
-static NO_SANITIZE_ADDRESS void coroutineSwitchFiber(coroutineTy *from,
-                                                      coroutineTy *to,
-                                                      int finalSwitch)
+static NO_SANITIZE_ADDRESS void coroutineSwitchFiber(coroutineTy *from, coroutineTy *to, int finalSwitch)
 {
 #ifdef BUILD_SANITIZE_ADDRESS
   to->asanPrevious = from;
-  __sanitizer_start_switch_fiber(finalSwitch ? 0 : &from->asanFakeStack,
-                                  to->asanStackBottom,
-                                  to->asanStackSize);
+  __sanitizer_start_switch_fiber(finalSwitch ? 0 : &from->asanFakeStack, to->asanStackBottom, to->asanStackSize);
 #else
   (void)from;
   (void)finalSwitch;
 #endif
   SwitchToFiber(to->fiber);
 #ifdef BUILD_SANITIZE_ADDRESS
-  // This invocation resumes only after another fiber switches back to `from`.
-  // Keep this helper uninstrumented so finish_switch is the first ASan action
-  // performed on the restored stack.
+  // This invocation resumes only after another fiber switches back to `from`. Keep this helper uninstrumented so finish_switch is the first
+  // ASan action performed on the restored stack.
   sanitizerFinishSwitch(from, from->asanPrevious);
 #endif
 }
@@ -81,9 +75,8 @@ static NO_SANITIZE_ADDRESS VOID __stdcall fiberEntryPoint(LPVOID lpParameter)
 {
   coroutineTy *coro = (coroutineTy*)lpParameter;
 #ifdef BUILD_SANITIZE_ADDRESS
-  // CreateFiber does not expose the new stack bounds. Enter it once without
-  // running instrumented code, record the bounds, and bounce back. The next
-  // entry is the real, annotated switch started by coroutineSwitchFiber().
+  // CreateFiber does not expose the new stack bounds. Enter it once without running instrumented code, record the bounds, and bounce back. The
+  // next entry is the real, annotated switch started by coroutineSwitchFiber().
   ULONG_PTR stackLow;
   ULONG_PTR stackHigh;
   GetCurrentThreadStackLimits(&stackLow, &stackHigh);
@@ -93,9 +86,8 @@ static NO_SANITIZE_ADDRESS VOID __stdcall fiberEntryPoint(LPVOID lpParameter)
   sanitizerFinishSwitch(coro, coro->asanPrevious);
 #endif
   coro->entryPoint(coro->arg);
-  // A wakeup racing from another loop thread reads the flag before claiming
-  // the counter, so the write must be atomic; release orders the coroutine's
-  // final state before the flag for that reader
+  // A wakeup racing from another loop thread reads the flag before claiming the counter, so the write must be atomic; release orders the
+  // coroutine's final state before the flag for that reader
   __uint_atomic_store(&coro->finished, 1, amoRelease);
   __uint_atomic_fetch_and_add(&coro->counter, -1, amoSeqCst);
   currentCoroutine = coro->prev;
@@ -149,8 +141,7 @@ coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
   }
 #ifdef BUILD_SANITIZE_ADDRESS
   SwitchToFiber(coroutine->fiber);
-  assert(coroutine->asanStackBottom && coroutine->asanStackSize &&
-         "Unable to determine fiber stack bounds");
+  assert(coroutine->asanStackBottom && coroutine->asanStackSize && "Unable to determine fiber stack bounds");
 #endif
   return coroutine;
 }
@@ -187,14 +178,10 @@ int coroutineCall(coroutineTy *coroutine)
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
       coroutineSwitchFiber(coroutine->prev, coroutine, 0);
-      // A wakeup that lands after the last yield leaves the counter above 1
-      // when the coroutine returns; re-entering a finished fiber would run
-      // off the end of fiberEntryPoint (which terminates the thread). The
-      // pending wakeup is consumed by the finished path below.
-      // The flag is captured before the decrement: the decrement that drains
-      // the counter hands ownership away, another thread may become the
-      // runner, finish the coroutine and free it - nothing may be read from
-      // the coroutine after our last decrement
+      // A wakeup that lands after the last yield leaves the counter above 1 when the coroutine returns; re-entering a finished fiber would run
+      // off the end of fiberEntryPoint (which terminates the thread). The pending wakeup is consumed by the finished path below. The flag is
+      // captured before the decrement: the decrement that drains the counter hands ownership away, another thread may become the runner, finish
+      // the coroutine and free it - nothing may be read from the coroutine after our last decrement
       finished = __uint_atomic_load(&coroutine->finished, amoAcquire);
     } while (__uint_atomic_fetch_and_add(&coroutine->counter, -1, amoSeqCst) != 1 && !finished);
 

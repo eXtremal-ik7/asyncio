@@ -38,7 +38,7 @@ void responseCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *clie
   return;
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   SmtpArgs args;
   int parseResult = parseSmtpArgs(argc, argv, args);
@@ -56,8 +56,20 @@ int main(int argc, char **argv)
   SMTPClient *client = smtpClientNew(base, localHost, args.serverType);
 
   context.Base = base;
-  aioSmtpSendMail(client, args.serverAddress, args.startTls, args.clientHost, args.login, args.password,
-                  args.from, args.to, args.subject, args.text, afNone, 5000000, responseCb, &context);
+  aioSmtpSendMail(client,
+                  args.serverAddress,
+                  args.startTls,
+                  args.clientHost,
+                  args.login,
+                  args.password,
+                  args.from,
+                  args.to,
+                  args.subject,
+                  args.text,
+                  afNone,
+                  5000000,
+                  responseCb,
+                  &context);
   asyncLoop(base);
   return 0;
 }

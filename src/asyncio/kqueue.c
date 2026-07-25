@@ -24,10 +24,8 @@ typedef struct kqueueBase {
   int kqueueFd;
 } kqueueBase;
 
-// Base part of the composite kevent ident (reactor.h). Process-global
-// like the op pools themselves: a pooled op slot - and its timer - can be
-// recycled into any base, so per-base counters could hand two timers equal
-// bases and let their idents collide inside one kqueue
+// Base part of the composite kevent ident (reactor.h). Process-global like the op pools themselves: a pooled op slot - and its timer - can be
+// recycled into any base, so per-base counters could hand two timers equal bases and let their idents collide inside one kqueue
 static volatile uint64_t timerIdCounter;
 
 enum {
@@ -62,32 +60,29 @@ uint64_t kqueueConsumeEventTimerTick(aioUserEvent *event, uint64_t published, ui
 void kqueueReleaseUserEvent(aioUserEvent *event);
 AsyncOpStatus kqueueAsyncWrite(asyncOpRoot *opptr);
 
-static struct asyncImpl kqueueImpl = {
-  combinerTaskHandler,
-  kqueueEnqueue,
-  kqueueNextFinishedOperation,
-  kqueueNewAioObject,
-  newAsyncOp,
-  cancelAsyncOp,
-  kqueueInitializeTimer,
-  kqueueStartTimer,
-  kqueueStopTimer,
-  kqueueInitializeUserEvent,
-  kqueueActivate,
-  connectSyscall,
-  acceptSyscall,
-  readSyscall,
-  kqueueAsyncWrite,
-  readMsgSyscall,
-  writeMsgSyscall,
-  kqueueWakeupLoop,
-  kqueueUpdateEventTimer,
-  kqueueConsumeEventTimerTick,
-  kqueueReleaseUserEvent
-};
+static struct asyncImpl kqueueImpl = {combinerTaskHandler,
+                                      kqueueEnqueue,
+                                      kqueueNextFinishedOperation,
+                                      kqueueNewAioObject,
+                                      newAsyncOp,
+                                      cancelAsyncOp,
+                                      kqueueInitializeTimer,
+                                      kqueueStartTimer,
+                                      kqueueStopTimer,
+                                      kqueueInitializeUserEvent,
+                                      kqueueActivate,
+                                      connectSyscall,
+                                      acceptSyscall,
+                                      readSyscall,
+                                      kqueueAsyncWrite,
+                                      readMsgSyscall,
+                                      writeMsgSyscall,
+                                      kqueueWakeupLoop,
+                                      kqueueUpdateEventTimer,
+                                      kqueueConsumeEventTimerTick,
+                                      kqueueReleaseUserEvent};
 
-// Single-change submission on the configuration plane; every such kevent
-// call shares this EINTR retry. errno of the final attempt is preserved.
+// Single-change submission on the configuration plane; every such kevent call shares this EINTR retry. errno of the final attempt is preserved.
 static int kqueueSubmit(int kqueueFd, const struct kevent *event)
 {
   int result;
@@ -104,8 +99,8 @@ static int kqueueControl(int kqueueFd, uint16_t flags, int16_t filter, uintptr_t
   return kqueueSubmit(kqueueFd, &event);
 }
 
-// Triggers the base's own EVFILT_USER doorbell knote. Intentionally a single
-// kevent call with no EINTR retry: doorbell posts are fire-and-forget.
+// Triggers the base's own EVFILT_USER doorbell knote. Intentionally a single kevent call with no EINTR retry: doorbell posts are
+// fire-and-forget.
 static void kqueueDoorbell(kqueueBase *base)
 {
   struct kevent ev;
@@ -120,8 +115,8 @@ asyncBase *kqueueNewAsyncBase()
     base->B.methodImpl = kqueueImpl;
     base->kqueueFd = kqueue();
     if (base->kqueueFd == -1) {
-      // Descriptor exhaustion. Without the kqueue fd every kevent call fails
-      // and the message loop would spin hot on EBADF: fail creation instead
+      // Descriptor exhaustion. Without the kqueue fd every kevent call fails and the message loop would spin hot on EBADF: fail creation
+      // instead
       free(base);
       return 0;
     }
@@ -145,8 +140,7 @@ void kqueueEnqueue(asyncBase *base, asyncOpRoot *op)
 
 void kqueueWakeupLoop(asyncBase *base)
 {
-  // Pure kick: trigger the user event without a queue node. One sleeper
-  // wakes; the loop's udata==0 branch is a no-op and EV_CLEAR resets the
+  // Pure kick: trigger the user event without a queue node. One sleeper wakes; the loop's udata==0 branch is a no-op and EV_CLEAR resets the
   // event on delivery
   kqueueDoorbell((kqueueBase*)base);
 }
@@ -190,8 +184,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
     do {
       executeGlobalQueue(base);
 
-      // Checked after the drain (already-queued callbacks run) and before
-      // every kernel wait; the exit re-rings the doorbell while other threads
+      // Checked after the drain (already-queued callbacks run) and before every kernel wait; the exit re-rings the doorbell while other threads
       // remain registered, so one postQuitOperation reaches every sleeper
       if (__uintptr_atomic_load(&base->quitRequested, amoAcquire)) {
         if (loopThreadExit(base))
@@ -199,8 +192,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
         return;
       }
 
-      // UINT32_MAX = wait with no timeout: an idle base blocks until queue
-      // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
+      // UINT32_MAX = wait with no timeout: an idle base blocks until queue traffic, a timer-arm kick or kernel readiness supplies a doorbell.
       uint64_t sleepFrom = getMonotonicTicks();
       uint64_t wakeTick = timerLoopPrepareSleep(base, timerState, sleepFrom);
       uint32_t sleepMs = timerSleepMilliseconds(wakeTick);
@@ -210,9 +202,8 @@ void kqueueNextFinishedOperation(asyncBase *base)
       nfds = kevent(localBase->kqueueFd, 0, 0, events, MAX_EVENTS, sleepMs == UINT32_MAX ? 0 : &timeout);
       timerLoopCancelSleep(timerState);
 
-      // Unconditional sweep (the modulo election is gone): an idle pass costs
-      // one relaxed load, and the wakeup handshake relies on whichever thread
-      // the kick lands on doing the sweep itself
+      // Unconditional sweep (the modulo election is gone): an idle pass costs one relaxed load, and the wakeup handshake relies on whichever
+      // thread the kick lands on doing the sweep itself
       processTimeoutQueue(base, timerState, getMonotonicTicks());
     } while (nfds <= 0 && errno == EINTR);
 
@@ -249,7 +240,7 @@ void kqueueNextFinishedOperation(asyncBase *base)
           if (timer->header.timer.kind == tkUserEvent)
             eventGeneration = __uint64_atomic_load(&timer->event.generation, amoAcquire);
           else {
-            object = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&timer->operation.object, amoRelaxed);
+            object = (aioObjectRoot*)__pointer_atomic_load((void* volatile*)&timer->operation.object, amoRelaxed);
             objectGeneration = __uint64_atomic_load(&timer->operation.objectGeneration, amoRelaxed);
           }
           isStale |= __uint64_atomic_load(&timer->header.tag.low, amoRelaxed) != eventIdent;
@@ -265,10 +256,8 @@ void kqueueNextFinishedOperation(asyncBase *base)
 
         case ohtObject: {
           aioObject *object = (aioObject*)header;
-          // EV_EOF raises the error sweep only from the read filter, where it
-          // means the peer half-closed. On EVFILT_WRITE it means our transmit
-          // path is dead: plain write progress lets the parked ops fail on
-          // the syscall per-op instead of a wrong-direction sweep.
+          // EV_EOF raises the error sweep only from the read filter, where it means the peer half-closed. On EVFILT_WRITE it means our transmit
+          // path is dead: plain write progress lets the parked ops fail on the syscall per-op instead of a wrong-direction sweep.
           uint32_t bits = 0;
           if (events[n].filter == EVFILT_READ)
             bits = COMBINER_TAG_PROGRESS_READ | ((events[n].flags & EV_EOF) ? COMBINER_TAG_ERROR : 0);
@@ -360,9 +349,9 @@ static int kqueueArmTimer(asyncOpRoot *op)
   aioObjectRoot *object = op->object;
 
   timerPublishBegin(timer);
-    timer->fd = (intptr_t)ident;
-    __pointer_atomic_store((void *volatile*)&timer->operation.object, object, amoRelaxed);
-    __uint64_atomic_store(&timer->operation.objectGeneration, objectHeaderGeneration(&object->header), amoRelaxed);
+  timer->fd = (intptr_t)ident;
+  __pointer_atomic_store((void* volatile*)&timer->operation.object, object, amoRelaxed);
+  __uint64_atomic_store(&timer->operation.objectGeneration, objectHeaderGeneration(&object->header), amoRelaxed);
   timerPublishEnd(timer, opGetGeneration(op), ident);
 
   uint64_t envelope = kernelHandleEncode(&timer->header);
@@ -386,13 +375,11 @@ static int kqueueDisarmTimer(aioTimer *timer)
   struct kevent event;
   timerUnpublish(timer);
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DELETE, 0, 0, 0);
-  // ENOENT is the normal outcome whenever the oneshot already fired and was
-  // harvested (every expiry-driven stop) or the timer was never armed
+  // ENOENT is the normal outcome whenever the oneshot already fired and was harvested (every expiry-driven stop) or the timer was never armed
   if (kqueueSubmit(((kqueueBase*)timer->header.base)->kqueueFd, &event) == 0 || errno == ENOENT)
     return 1;
 
-  // Keep a failed-delete knote quiet. Its old ident cannot match a later arm
-  // of the same physical timer cell.
+  // Keep a failed-delete knote quiet. Its old ident cannot match a later arm of the same physical timer cell.
   EV_SET(&event, timer->fd, EVFILT_TIMER, EV_DISABLE, 0, 0, 0);
   (void)kqueueSubmit(((kqueueBase*)timer->header.base)->kqueueFd, &event);
   return 1;
@@ -446,8 +433,8 @@ static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_
   uint64_t ident = timerNextIdent(timer);
 
   timerPublishBegin(timer);
-    timer->fd = (intptr_t)ident;
-    __uint64_atomic_store(&timer->event.generation, eventHandleGeneration(event), amoRelease);
+  timer->fd = (intptr_t)ident;
+  __uint64_atomic_store(&timer->event.generation, eventHandleGeneration(event), amoRelease);
   timerPublishEnd(timer, generation, ident);
 
   void *envelope = (void*)kernelHandleEncode(&timer->header);
@@ -463,8 +450,7 @@ static int kqueueArmEventTimer(aioUserEvent *event, uint32_t generation, uint64_
 int kqueueUpdateEventTimer(aioUserEvent *event, EventTimerUpdate update, uint32_t generation, uint64_t period)
 {
   switch (update) {
-    case etuStart:
-      return kqueueArmEventTimer(event, generation, period);
+    case etuStart: return kqueueArmEventTimer(event, generation, period);
     case etuStop: {
       aioTimer *timer = eventTimerLoad(event, amoRelaxed);
       assert(timer && "Stopping a user-event timer which was never armed");
@@ -479,8 +465,7 @@ uint64_t kqueueConsumeEventTimerTick(aioUserEvent *event, uint64_t published, ui
   __UNUSED(event);
   __UNUSED(generation);
   __UNUSED(period);
-  // EVFILT_TIMER is periodic and the exact kevent batch arrived through the
-  // 64-bit pending-tick word intact.
+  // EVFILT_TIMER is periodic and the exact kevent batch arrived through the 64-bit pending-tick word intact.
   return published;
 }
 
@@ -497,9 +482,8 @@ void kqueueReleaseUserEvent(aioUserEvent *event)
   if (timer)
     assert(__uint64_atomic_load(&timer->header.tag.low, amoRelaxed) == 0 && "Recycling an armed user-event timer");
 #endif
-  // EV_DELETE/expiry has made the knote inert, but harvested kevents may
-  // retain timer's address indefinitely. Park the immutable event/timer pair
-  // together; the next incarnation continues the timer's ident sequence.
+  // EV_DELETE/expiry has made the knote inert, but harvested kevents may retain timer's address indefinitely. Park the immutable event/timer
+  // pair together; the next incarnation continues the timer's ident sequence.
   objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
 }
 
@@ -508,12 +492,9 @@ AsyncOpStatus kqueueAsyncWrite(asyncOpRoot *opptr)
   asyncOp *op = (asyncOp*)opptr;
   aioObject *object = (aioObject*)op->root.object;
 
-  // Sockets are covered by SO_NOSIGPIPE from newSocketIo, and on Darwin/NetBSD
-  // pipes are covered by F_SETNOSIGPIPE (needSigpipeGuard stays zero); the
-  // masked branch is only reachable for pipes on FreeBSD.
-  ssize_t bytesWritten = guardedWrite(object,
-                                      getFd(object),
-                                      (uint8_t*)op->buffer + op->bytesTransferred,
-                                      op->transactionSize - op->bytesTransferred);
+  // Sockets are covered by SO_NOSIGPIPE from newSocketIo, and on Darwin/NetBSD pipes are covered by F_SETNOSIGPIPE (needSigpipeGuard stays
+  // zero); the masked branch is only reachable for pipes on FreeBSD.
+  ssize_t bytesWritten =
+      guardedWrite(object, getFd(object), (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred);
   return transferStatus(op, bytesWritten);
 }

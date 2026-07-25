@@ -1,5 +1,4 @@
-// Compact kernel handles, timer state and I/O executors shared by epoll and
-// kqueue.
+// Compact kernel handles, timer state and I/O executors shared by epoll and kqueue.
 #ifndef __ASYNCIO_REACTOR_H_
 #define __ASYNCIO_REACTOR_H_
 
@@ -24,8 +23,7 @@ enum {
   REACTOR_HANDLE_GENERATION_BITS = 22
 };
 
-// 42 pointer bits plus 22 low generation bits. ABA requires a full 2^22 wrap
-// of one cell while its old kernel event remains unprocessed.
+// 42 pointer bits plus 22 low generation bits. ABA requires a full 2^22 wrap of one cell while its old kernel event remains unprocessed.
 enum {
   REACTOR_HANDLE_GENERATION_SHIFT = 64 - REACTOR_HANDLE_GENERATION_BITS,
   REACTOR_HANDLE_POINTER_SHIFT = TAGGED_POINTER_DATA_SIZE
@@ -46,8 +44,7 @@ static inline objectHeader *kernelHandleDecode(uint64_t encoded, uint64_t *gener
 {
   objectHeader *decoded = (objectHeader*)((encoded & REACTOR_HANDLE_POINTER_MASK) << REACTOR_HANDLE_POINTER_SHIFT);
   uint64_t current = objectHeaderGeneration(decoded);
-  // The live header supplies the upper generation bits; validation happens
-  // in the type-specific claim.
+  // The live header supplies the upper generation bits; validation happens in the type-specific claim.
   *generation = (current & ~REACTOR_HANDLE_GENERATION_MASK) | (encoded >> REACTOR_HANDLE_GENERATION_SHIFT);
   return decoded;
 }
@@ -59,8 +56,7 @@ typedef enum TimerKind {
 } TimerKind;
 
 struct aioTimer {
-  // tag.low: published kqueue ident or epoll armed marker; zero rejects delivery.
-  // tag.high: operation or timer generation.
+  // tag.low: published kqueue ident or epoll armed marker; zero rejects delivery. tag.high: operation or timer generation.
   objectHeader header;
   union {
     struct {
@@ -94,7 +90,7 @@ static inline void timerInitialize(aioTimer *timer)
   timer->header.timer.registered = 0;
   timer->header.timer.reserved = 0;
   __uint64_atomic_store(&timer->operation.deadline, 0, amoRelaxed);
-  __pointer_atomic_store((void *volatile*)&timer->operation.object, 0, amoRelaxed);
+  __pointer_atomic_store((void* volatile*)&timer->operation.object, 0, amoRelaxed);
   __uint64_atomic_store(&timer->operation.objectGeneration, 0, amoRelaxed);
   timer->operation.op = 0;
 }
@@ -117,15 +113,11 @@ static inline void timerPublishEnd(aioTimer *timer, uint64_t generation, uint64_
 
 #ifndef OS_WINDOWS
 // ---- I/O executors ----------------------------------------------------------
-// kqueue and epoll drive nonblocking POSIX descriptors with identical
-// executor bodies, kept here as the single copy both backends reference from
-// their impl tables. Exactly one readiness backend is compiled into a build
-// and only its TU takes these addresses; under Windows (where this header is
-// pulled in by white-box tests) the section compiles away. Stream-write
-// dispatch is the one backend-specific piece - BSD kernels suppress SIGPIPE
-// per socket via SO_NOSIGPIPE while Linux needs an explicit
-// send(MSG_NOSIGNAL) - so each backend keeps its own write executor built
-// from guardedWrite and transferStatus below.
+// kqueue and epoll drive nonblocking POSIX descriptors with identical executor bodies, kept here as the single copy both backends reference
+// from their impl tables. Exactly one readiness backend is compiled into a build and only its TU takes these addresses; under Windows (where
+// this header is pulled in by white-box tests) the section compiles away. Stream-write dispatch is the one backend-specific piece - BSD kernels
+// suppress SIGPIPE per socket via SO_NOSIGPIPE while Linux needs an explicit send(MSG_NOSIGNAL) - so each backend keeps its own write executor
+// built from guardedWrite and transferStatus below.
 
 static inline int getFd(aioObject *object)
 {
@@ -147,8 +139,7 @@ static inline asyncOpRoot *newAsyncOp(asyncBase *base, int isRealTime, Concurren
   return &op->root;
 }
 
-// A readiness backend has nothing in flight inside the kernel to abort: a
-// cancelled operation is releasable immediately.
+// A readiness backend has nothing in flight inside the kernel to abort: a cancelled operation is releasable immediately.
 static inline int cancelAsyncOp(asyncOpRoot *opptr)
 {
   (void)opptr;
@@ -201,18 +192,16 @@ static inline AsyncOpStatus acceptSyscall(asyncOpRoot *opptr)
     sockaddrToHostAddress(&clientAddr, &op->host);
     return aosSuccess;
   } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EPROTO || errno == EINTR) {
-    // The connection can be gone from the backlog by the time accept runs
-    // (stolen by another thread, aborted by the peer): wait for the next one.
-    // Resource exhaustion (EMFILE/ENFILE/ENOBUFS) must NOT retry: the
-    // backlog stays readable and the retry loop would spin hot
+    // The connection can be gone from the backlog by the time accept runs (stolen by another thread, aborted by the peer): wait for the next
+    // one. Resource exhaustion (EMFILE/ENFILE/ENOBUFS) must NOT retry: the backlog stays readable and the retry loop would spin hot
     return aosPending;
   } else {
     return aosUnknownError;
   }
 }
 
-// write() with SIGPIPE masked around the syscall for pipe descriptors on
-// platforms without per-fd suppression; everything else takes the plain call.
+// write() with SIGPIPE masked around the syscall for pipe descriptors on platforms without per-fd suppression; everything else takes the plain
+// call.
 static inline ssize_t guardedWrite(aioObject *object, int fd, const void *data, size_t size)
 {
   ssize_t bytesWritten;
@@ -227,10 +216,8 @@ static inline ssize_t guardedWrite(aioObject *object, int fd, const void *data, 
   return bytesWritten;
 }
 
-// Common epilogue of the stream read/write executors: accumulate progress,
-// stay pending while afWaitAll has not drained the transaction, map an
-// end-of-stream zero to aosDisconnected and a failed syscall through
-// socketStatusFromErrno (errno must still belong to that syscall).
+// Common epilogue of the stream read/write executors: accumulate progress, stay pending while afWaitAll has not drained the transaction, map an
+// end-of-stream zero to aosDisconnected and a failed syscall through socketStatusFromErrno (errno must still belong to that syscall).
 static inline AsyncOpStatus transferStatus(asyncOp *op, ssize_t transferred)
 {
   if (transferred > 0) {
@@ -255,8 +242,7 @@ static inline AsyncOpStatus readSyscall(asyncOpRoot *opptr)
 
   if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize))
     return aosSuccess;
-  // A partial hit from the read-ahead buffer completes a non-afWaitAll read
-  // (shared contract with implRead and the iocp executor)
+  // A partial hit from the read-ahead buffer completes a non-afWaitAll read (shared contract with implRead and the iocp executor)
   if (op->bytesTransferred != 0 && !(opptr->flags & afWaitAll))
     return aosSuccess;
 
@@ -271,8 +257,7 @@ static inline AsyncOpStatus readSyscall(asyncOpRoot *opptr)
 
       if (copyFromBuffer(op->buffer, &op->bytesTransferred, sb, op->transactionSize) || !(opptr->flags & afWaitAll))
         break;
-      // A short read means the queue is drained: stay parked instead of
-      // collecting the EAGAIN
+      // A short read means the queue is drained: stay parked instead of collecting the EAGAIN
       if ((size_t)bytesRead < sb->totalSize)
         return aosPending;
     }
@@ -333,9 +318,8 @@ typedef struct {
   uint32_t ioEvents;
 } CombinerPassEvents;
 
-// The backend-independent middle of the readiness combiner pass, between the
-// envelope decode and the backend's kernel rearm epilogue. The order is the
-// protocol:
+// The backend-independent middle of the readiness combiner pass, between the envelope decode and the backend's kernel rearm epilogue. The order
+// is the protocol:
 //  1. start the submitted node first: a start delivered together with an
 //     event must enter its queue before a failed connect cancels the queues,
 //     otherwise the operation would start on the dead socket afterwards;
@@ -353,12 +337,9 @@ typedef struct {
 //     and a parked response must complete (IOCP parity); on a truly dead
 //     connection the writes fail per-op with EPIPE/ECONNRESET;
 //  5. execute whatever became startable.
-// A dying object gets no fd readiness processing: its operations are being
-// cancelled wholesale anyway, and its descriptor may already be closed; the
-// error path ioctl and the caller's rearm syscall must not run on a reused
-// fd - the returned ioEvents are already zeroed for it. fdObject is the
-// object itself for fd-backed objects (READ/WRITE tag values deliberately
-// match IO_EVENT_READ/WRITE), null otherwise.
+// A dying object gets no fd readiness processing: its operations are being cancelled wholesale anyway, and its descriptor may already be
+// closed; the error path ioctl and the caller's rearm syscall must not run on a reused fd - the returned ioEvents are already zeroed for it.
+// fdObject is the object itself for fd-backed objects (READ/WRITE tag values deliberately match IO_EVENT_READ/WRITE), null otherwise.
 static inline CombinerPassEvents reactorCombinerCore(aioObjectRoot *object, aioObject *fdObject, asyncOpRoot *op, uint32_t sig)
 {
   uint32_t oldIoEvents = fdObject ? combinerActiveIoEvents(object) : 0;
@@ -382,9 +363,8 @@ static inline CombinerPassEvents reactorCombinerCore(aioObjectRoot *object, aioO
     reapObject(object, sig, &needStart);
 
   if (ioEvents & IO_EVENT_ERROR) {
-    // FIONREAD failure (ENOTTY on an exotic device fd) counts as drained:
-    // an error event with unknowable backlog must resolve to a deterministic
-    // disconnect, not a read queue waiting forever
+    // FIONREAD failure (ENOTTY on an exotic device fd) counts as drained: an error event with unknowable backlog must resolve to a
+    // deterministic disconnect, not a read queue waiting forever
     int available = 0;
     int fd = getFd(fdObject);
     if (ioctl(fd, FIONREAD, &available) == -1)
@@ -398,7 +378,7 @@ static inline CombinerPassEvents reactorCombinerCore(aioObjectRoot *object, aioO
   if (needStart & IO_EVENT_WRITE)
     executeOperationList(&object->writeQueue);
 
-  CombinerPassEvents result = { oldIoEvents, ioEvents };
+  CombinerPassEvents result = {oldIoEvents, ioEvents};
   return result;
 }
 #endif // !OS_WINDOWS

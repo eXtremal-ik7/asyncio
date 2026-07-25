@@ -16,21 +16,29 @@ private:
   uint8_t *_p;
   size_t _size;
   size_t _msize;
-  
+
   int _eof;
   int _own;
-  
+
 public:
-  xmstream(void *data, size_t size) : _m((uint8_t*)data), _p((uint8_t*)data), _size(size), _msize(size), _eof(0), _own(0) {}
-  xmstream(size_t size = 64) : _size(0), _msize(size), _eof(0), _own(1) {
-    _m = size <= static_cast<size_t>(PTRDIFF_MAX)
-           ? static_cast<uint8_t*>(operator new(size, std::nothrow))
-           : nullptr;
+  xmstream(void *data, size_t size) :
+    _m((uint8_t*)data),
+    _p((uint8_t*)data),
+    _size(size),
+    _msize(size),
+    _eof(0),
+    _own(0) {}
+  xmstream(size_t size = 64) :
+    _size(0),
+    _msize(size),
+    _eof(0),
+    _own(1) {
+    _m = size <= static_cast<size_t>(PTRDIFF_MAX) ? static_cast<uint8_t*>(operator new(size, std::nothrow)) : nullptr;
     if (!_m)
       _msize = 0;
     _p = _m;
   }
-  
+
   ~xmstream() {
     if (_own)
       operator delete(_m);
@@ -68,17 +76,23 @@ public:
     _own(s._own) {
     s._m = nullptr;
   }
-  
+
   size_t offsetOf() const { return _m ? static_cast<size_t>(_p - _m) : 0; }
   size_t sizeOf() const { return _size; }
   size_t capacity() const { return _msize; }
   bool own() const { return _own; }
   size_t remaining() const { return _size - offsetOf(); }
   int eof() const { return _eof; }
-  
+
   void *data() const { return _m; }
-  template<typename T> T *data() const { return (T*)_m; }
-  template<typename T> T *ptr() const { return (T*)_p; }
+  template<typename T>
+  T *data() const {
+    return (T*)_m;
+  }
+  template<typename T>
+  T *ptr() const {
+    return (T*)_p;
+  }
 
   void *capture() {
     void *data = _m;
@@ -87,7 +101,7 @@ public:
     _own = 0;
     return data;
   }
-  
+
   void *reserve(size_t size) {
     _eof = 0;
     size_t offset = offsetOf();
@@ -126,13 +140,14 @@ public:
       return p;
     }
   }
-  
-  template<typename T> T *reserve(size_t num) {
+
+  template<typename T>
+  T *reserve(size_t num) {
     if (num > SIZE_MAX / sizeof(T))
       return nullptr;
-    return static_cast<T*>(reserve(num*sizeof(T)));
+    return static_cast<T*>(reserve(num * sizeof(T)));
   }
-  
+
   // pointer move functions
   void reset() {
     _p = _m;
@@ -140,14 +155,13 @@ public:
     _eof = 0;
   }
 
-  void seekSet(size_t offset) {
-    _p = _m + ((offset < _size) ? offset : _size);
-  }
-  
+  void seekSet(size_t offset) { _p = _m + ((offset < _size) ? offset : _size); }
+
   // read functions
-  template<typename T=uint8_t> T *seek(ssize_t num) {
+  template<typename T = uint8_t>
+  T *seek(ssize_t num) {
     void *old = _p;
-    _p += sizeof(T)*num;
+    _p += sizeof(T) * num;
 
     ssize_t newSize = _p - _m;
     if (newSize < 0) {
@@ -161,22 +175,23 @@ public:
     return reinterpret_cast<T*>(old);
   }
 
-  template<typename T=uint8_t> void seekEnd(size_t num, bool setEof = false) {
-    size_t size = (num > SIZE_MAX / sizeof(T)) ? SIZE_MAX : sizeof(T)*num;
+  template<typename T = uint8_t>
+  void seekEnd(size_t num, bool setEof = false) {
+    size_t size = (num > SIZE_MAX / sizeof(T)) ? SIZE_MAX : sizeof(T) * num;
     _p = _m + (_size - std::min(size, _size));
     if (num == 0 && setEof)
       _eof = true;
   }
-  
+
   void read(void *data, size_t size) {
     if (void *p = seek(size))
       memcpy(data, p, size);
   }
-  
-  // the cursor moves by arbitrary byte offsets, so scalar accesses go through
-  // fixed-size memcpy: compiles to the same single unaligned load/store, but
-  // without the alignment UB of dereferencing a misaligned T*
-  template<typename T> T read() {
+
+  // the cursor moves by arbitrary byte offsets, so scalar accesses go through fixed-size memcpy: compiles to the same single unaligned
+  // load/store, but without the alignment UB of dereferencing a misaligned T*
+  template<typename T>
+  T read() {
     T *p = seek<T>(1);
     T value;
     if (!p)
@@ -185,11 +200,13 @@ public:
     return value;
   }
 
-  template<typename T> T readle() {
+  template<typename T>
+  T readle() {
     return xletoh<T>(read<T>());
   }
 
-  template<typename T> T readbe() {
+  template<typename T>
+  T readbe() {
     return xbetoh<T>(read<T>());
   }
 
@@ -201,17 +218,24 @@ public:
     memcpy(target, data, size);
     return true;
   }
-  template<typename T> bool write(const T& data) { return write(&data, sizeof(T)); }
-  template<typename T> bool writele(T data) { T value = xhtole(data); return write(&value, sizeof(T)); }
-  template<typename T> bool writebe(T data) { T value = xhtobe(data); return write(&value, sizeof(T)); }
-
-  bool write(const char *data) {
-    return write(data, strlen(data));
+  template<typename T>
+  bool write(const T &data) {
+    return write(&data, sizeof(T));
+  }
+  template<typename T>
+  bool writele(T data) {
+    T value = xhtole(data);
+    return write(&value, sizeof(T));
+  }
+  template<typename T>
+  bool writebe(T data) {
+    T value = xhtobe(data);
+    return write(&value, sizeof(T));
   }
 
-  void truncate() {
-    _size = _p - _m;
-  }
+  bool write(const char *data) { return write(data, strlen(data)); }
+
+  void truncate() { _size = _p - _m; }
 };
 
 #endif //__XMSTREAM_H_

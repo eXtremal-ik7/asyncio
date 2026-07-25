@@ -24,9 +24,8 @@ typedef struct SMTPResult {
   const char *response;
 } SMTPResult;
 
-// A callback borrows result through its return. An io* function transfers its
-// result to the optional output parameter; release that response with
-// smtpResultFree before reusing the SMTPResult.
+// A callback borrows result through its return. An io* function transfers its result to the optional output parameter; release that response
+// with smtpResultFree before reusing the SMTPResult.
 typedef void smtpConnectCb(AsyncOpStatus, const SMTPResult*, struct SMTPClient*, void*);
 typedef void smtpResponseCb(AsyncOpStatus, const SMTPResult*, struct SMTPClient*, void*);
 
@@ -67,18 +66,18 @@ void aioSmtpSendMail(SMTPClient *client,
                      void *arg);
 
 int ioSmtpSendMail(SMTPClient *client,
-                    HostAddress smtpServerAddress,
-                    int startTls,
-                    const char *localHost,
-                    const char *login,
-                    const char *password,
-                    const char *from,
-                    const char *to,
-                    const char *subject,
-                    const char *text,
-                    SMTPResult *result,
-                    AsyncFlags flags,
-                    uint64_t usTimeout);
+                   HostAddress smtpServerAddress,
+                   int startTls,
+                   const char *localHost,
+                   const char *login,
+                   const char *password,
+                   const char *from,
+                   const char *to,
+                   const char *subject,
+                   const char *text,
+                   SMTPResult *result,
+                   AsyncFlags flags,
+                   uint64_t usTimeout);
 
 #ifdef __cplusplus
 }

@@ -10,10 +10,8 @@
 #include <limits.h>
 #include <string.h>
 
-// One full TLS record on the wire is 16384 bytes of plaintext plus header and
-// AEAD overhead; a transport buffer of exactly 16384 would split every full
-// record into two recv/BIO_write rounds. 32K holds a complete record with room
-// to start the next one.
+// One full TLS record on the wire is 16384 bytes of plaintext plus header and AEAD overhead; a transport buffer of exactly 16384 would split
+// every full record into two recv/BIO_write rounds. 32K holds a complete record with room to start the next one.
 #define DEFAULT_SSL_READ_BUFFER_SIZE 32768
 
 static ConcurrentQueue opPool;
@@ -73,10 +71,8 @@ typedef enum {
   sslStFinalFlight
 } SSLSocketStateTy;
 
-// SSL operations intentionally share one serialized lane. Full-duplex
-// progress cannot be enabled by simply splitting read/write queues:
-// SSL_write may need input and SSL_read may produce output, so that would
-// require one coordinated TLS/BIO pump.
+// SSL operations intentionally share one serialized lane. Full-duplex progress cannot be enabled by simply splitting read/write queues:
+// SSL_write may need input and SSL_read may produce output, so that would require one coordinated TLS/BIO pump.
 typedef enum {
   sslOpConnect = OPCODE_INIT,
   sslOpRead = 1,
@@ -112,9 +108,8 @@ static void rwFinish(asyncOpRoot *opptr)
 static void releaseOp(asyncOpRoot *opptr)
 {
   SSLOp *op = (SSLOp*)opptr;
-  // Pool-sized scratch stays with the pooled operation for the next parked
-  // write (a full 16K TLS-record payload fits); only oversized bulk captures
-  // go back to the allocator
+  // Pool-sized scratch stays with the pooled operation for the next parked write (a full 16K TLS-record payload fits); only oversized bulk
+  // captures go back to the allocator
   if (op->internalBufferSize > DEFAULT_SOCKET_BUFFER_SIZE) {
     free(op->internalBuffer);
     op->internalBuffer = 0;
@@ -122,8 +117,8 @@ static void releaseOp(asyncOpRoot *opptr)
   }
 }
 
-// Common part of the read/write operation constructors: pooled allocation
-// (a fresh operation starts with an empty scratch buffer) and field setup
+// Common part of the read/write operation constructors: pooled allocation (a fresh operation starts with an empty scratch buffer) and field
+// setup
 static SSLOp *allocSslOp(aioObjectRoot *object,
                          AsyncFlags flags,
                          uint64_t usTimeout,
@@ -195,8 +190,8 @@ static int copyFromOut(SSLSocket *S)
   if (!nBytes)
     return 0;
 
-  // TODO: support TLS writes whose accumulated ciphertext exceeds INT_MAX by
-  // draining bioOut in bounded chunks instead of one contiguous transport write
+  // TODO: support TLS writes whose accumulated ciphertext exceeds INT_MAX by draining bioOut in bounded chunks instead of one contiguous
+  // transport write
   if (nBytes > INT_MAX)
     return -1;
 
@@ -241,13 +236,11 @@ static AsyncOpStatus connectProc(asyncOpRoot *opptr)
   SSLOp *op = (SSLOp*)opptr;
   SSLSocket *socket = (SSLSocket*)op->root.object;
 
-  // The start node reaches this callback only after the combiner has stored
-  // this operation in initializationOp. Configure the shared SSL state once;
-  // subsequent child completions re-enter with arRunning.
+  // The start node reaches this callback only after the combiner has stored this operation in initializationOp. Configure the shared SSL state
+  // once; subsequent child completions re-enter with arRunning.
   if (opptr->running == arWaiting) {
     SSL_set_connect_state(socket->ssl);
-    if (op->transactionSize &&
-        !SSL_set_tlsext_host_name(socket->ssl, op->buffer))
+    if (op->transactionSize && !SSL_set_tlsext_host_name(socket->ssl, op->buffer))
       return aosUnknownError;
   }
 
@@ -265,11 +258,9 @@ static AsyncOpStatus connectProc(asyncOpRoot *opptr)
   int connectResult = SSL_connect(socket->ssl);
   int errCode = SSL_get_error(socket->ssl, connectResult);
   if (connectResult == 1) {
-    // Successfully connected. In TLS 1.3 the handshake completes on our side
-    // right after the final flight (Finished) is queued to bioOut: flush it,
-    // or the server never finishes its accept - and report success only once
-    // the transport took it, so a dying connection fails the handshake here
-    // instead of surfacing as a lost first application write
+    // Successfully connected. In TLS 1.3 the handshake completes on our side right after the final flight (Finished) is queued to bioOut: flush
+    // it, or the server never finishes its accept - and report success only once the transport took it, so a dying connection fails the
+    // handshake here instead of surfacing as a lost first application write
     int finalFlightSize = copyFromOut(socket);
     if (finalFlightSize < 0)
       return aosUnknownError;
@@ -310,12 +301,12 @@ static AsyncOpStatus readProc(asyncOpRoot *opptr)
 
   for (;;) {
     uint8_t *ptr = ((uint8_t*)op->buffer) + op->bytesTransferred;
-    size_t size = op->transactionSize-op->bytesTransferred;
+    size_t size = op->transactionSize - op->bytesTransferred;
 
     size_t readResult = 0;
     int R;
     // TODO: correct processing >4Gb data blocks
-    while ( (R = SSL_read(socket->ssl, ptr, (int)size)) > 0) {
+    while ((R = SSL_read(socket->ssl, ptr, (int)size)) > 0) {
       readResult += (size_t)R;
       ptr += R;
       size -= (size_t)R;
@@ -325,8 +316,7 @@ static AsyncOpStatus readProc(asyncOpRoot *opptr)
     if (op->bytesTransferred == op->transactionSize || (op->bytesTransferred && !(op->root.flags & afWaitAll))) {
       return aosSuccess;
     } else {
-      // only "want more transport data" may continue the loop: a fatal TLS
-      // error is sticky, no amount of new data can revive the stream
+      // only "want more transport data" may continue the loop: a fatal TLS error is sticky, no amount of new data can revive the stream
       int sslError = SSL_get_error(socket->ssl, R);
       if (sslError != SSL_ERROR_WANT_READ)
         return sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError;
@@ -352,11 +342,9 @@ static void sslSocketDestructor(aioObjectRoot *root)
   objectFree(&objectPool, socket, sizeof(SSLSocket));
 }
 
-
 SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket, SSL_CTX *userContext)
 {
-  // The caller always provides the transport socket and thereby chooses the
-  // address family, as in the http/btc/zmtp/rlpx modules
+  // The caller always provides the transport socket and thereby chooses the address family, as in the http/btc/zmtp/rlpx modules
   if (!socket)
     return 0;
 
@@ -384,9 +372,9 @@ SSLSocket *sslSocketNew(asyncBase *base, aioObject *socket, SSL_CTX *userContext
     S->sslContext = userContext;
   } else {
 #ifdef DEPRECATEDIN_1_1_0
-    S->sslContext = SSL_CTX_new (TLS_client_method());
+    S->sslContext = SSL_CTX_new(TLS_client_method());
 #else
-    S->sslContext = SSL_CTX_new (TLS_method());
+    S->sslContext = SSL_CTX_new(TLS_method());
 #endif
     if (!S->sslContext) {
       objectFree(&objectPool, S, sizeof(SSLSocket));
@@ -436,7 +424,7 @@ void aioSslConnect(SSLSocket *socket,
                    void *arg)
 {
   struct Context context;
-  fillContext(&context, connectProc, connectFinish, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
+  fillContext(&context, connectProc, connectFinish, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName) + 1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afNone, usTimeout, (void*)callback, arg, sslOpConnect, &context);
 
   if (address)
@@ -464,7 +452,7 @@ asyncOpRoot *implSslRead(SSLSocket *socket,
     size_t readResult = 0;
     int R;
     // TODO: correct processing >4Gb data blocks
-    while ( (R = SSL_read(socket->ssl, ptr, (int)remaining)) > 0) {
+    while ((R = SSL_read(socket->ssl, ptr, (int)remaining)) > 0) {
       readResult += (size_t)R;
       ptr += R;
       remaining -= (size_t)R;
@@ -475,8 +463,7 @@ asyncOpRoot *implSslRead(SSLSocket *socket,
       *bytesTransferred = sslBytesTransferred;
       return 0;
     } else {
-      // only "want more transport data" may continue the loop: a fatal TLS
-      // error is sticky, no amount of new data can revive the stream; report
+      // only "want more transport data" may continue the loop: a fatal TLS error is sticky, no amount of new data can revive the stream; report
       // it through an already finished operation
       int sslError = SSL_get_error(socket->ssl, R);
       if (sslError != SSL_ERROR_WANT_READ) {
@@ -508,7 +495,14 @@ asyncOpRoot *implSslRead(SSLSocket *socket,
 static asyncOpRoot *implSslReadProxy(aioObjectRoot *object, AsyncFlags flags, uint64_t usTimeout, void *callback, void *arg, void *contextPtr)
 {
   struct Context *context = (struct Context*)contextPtr;
-  return implSslRead((SSLSocket*)object, context->Buffer, context->TransactionSize, flags, usTimeout, (sslCb*)callback, arg, &context->BytesTransferred);
+  return implSslRead((SSLSocket*)object,
+                     context->Buffer,
+                     context->TransactionSize,
+                     flags,
+                     usTimeout,
+                     (sslCb*)callback,
+                     arg,
+                     &context->BytesTransferred);
 }
 
 static void makeResult(void *contextPtr)
@@ -523,24 +517,26 @@ static void initOp(asyncOpRoot *op, void *contextPtr)
   ((SSLOp*)op)->bytesTransferred = context->BytesTransferred;
 }
 
-ssize_t aioSslRead(SSLSocket *socket,
-                   void *buffer,
-                   size_t size,
-                   AsyncFlags flags,
-                   uint64_t usTimeout,
-                   sslCb callback,
-                   void *arg)
+ssize_t aioSslRead(SSLSocket *socket, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, sslCb callback, void *arg)
 {
   struct Context context;
   fillContext(&context, readProc, rwFinish, buffer, size);
-  runAioOperation(&socket->root, newReadAsyncOp, implSslReadProxy, makeResult, initOp, flags, usTimeout, (void*)callback, arg, sslOpRead, &context);
+  runAioOperation(&socket->root,
+                  newReadAsyncOp,
+                  implSslReadProxy,
+                  makeResult,
+                  initOp,
+                  flags,
+                  usTimeout,
+                  (void*)callback,
+                  arg,
+                  sslOpRead,
+                  &context);
   return context.Result;
 }
 
-// A caller-supplied SSL_CTX may carry SSL_MODE_ENABLE_PARTIAL_WRITE: a
-// positive SSL_write then means "at least one byte was framed", not "the
-// whole plaintext was accepted". The memory BIO never pushes back, so
-// feeding the remainder always terminates with full acceptance or an error.
+// A caller-supplied SSL_CTX may carry SSL_MODE_ENABLE_PARTIAL_WRITE: a positive SSL_write then means "at least one byte was framed", not "the
+// whole plaintext was accepted". The memory BIO never pushes back, so feeding the remainder always terminates with full acceptance or an error.
 static int sslWriteAll(SSL *ssl, const uint8_t *ptr, size_t size)
 {
   size_t written = 0;
@@ -573,8 +569,7 @@ static AsyncOpStatus writeProc(asyncOpRoot *opptr)
     op->state = sslStProcessing;
     int writeResult = sslWriteAll(socket->ssl, (const uint8_t*)op->buffer, op->transactionSize);
     if (writeResult <= 0) {
-      // Same as the sync path: the stream is dead, any prefix it framed
-      // stays unflushed - the caller sees an error, not a partial send
+      // Same as the sync path: the stream is dead, any prefix it framed stays unflushed - the caller sees an error, not a partial send
       int sslError = SSL_get_error(socket->ssl, writeResult);
       return sslError == SSL_ERROR_ZERO_RETURN ? aosDisconnected : aosUnknownError;
     }
@@ -605,10 +600,8 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
 {
   int writeResult = sslWriteAll(socket->ssl, (const uint8_t*)buffer, size);
   if (writeResult <= 0) {
-    // Mirror of the read path: a fatal TLS error is sticky, and WANT_READ
-    // here means the handshake is not complete - either way the stream took
-    // none (or not all) of the plaintext, and silently flushing bioOut would
-    // report the payload as sent; report the error through an already
+    // Mirror of the read path: a fatal TLS error is sticky, and WANT_READ here means the handshake is not complete - either way the stream took
+    // none (or not all) of the plaintext, and silently flushing bioOut would report the payload as sent; report the error through an already
     // finished operation instead
     int sslError = SSL_get_error(socket->ssl, writeResult);
     struct Context context;
@@ -645,27 +638,38 @@ asyncOpRoot *implSslWrite(SSLSocket *socket,
 static asyncOpRoot *implSslWriteProxy(aioObjectRoot *object, AsyncFlags flags, uint64_t usTimeout, void *callback, void *arg, void *contextPtr)
 {
   struct Context *context = (struct Context*)contextPtr;
-  return implSslWrite((SSLSocket*)object, context->Buffer, context->TransactionSize, flags, usTimeout, (sslCb*)callback, arg, &context->BytesTransferred);
+  return implSslWrite((SSLSocket*)object,
+                      context->Buffer,
+                      context->TransactionSize,
+                      flags,
+                      usTimeout,
+                      (sslCb*)callback,
+                      arg,
+                      &context->BytesTransferred);
 }
 
-ssize_t aioSslWrite(SSLSocket *socket,
-                   const void *buffer,
-                   size_t size,
-                   AsyncFlags flags,
-                   uint64_t usTimeout,
-                   sslCb callback,
-                   void *arg)
+ssize_t aioSslWrite(SSLSocket *socket, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, sslCb callback, void *arg)
 {
   struct Context context;
   fillContext(&context, writeProc, rwFinish, (void*)(uintptr_t)buffer, size);
-  runAioOperation(&socket->root, newWriteAsyncOp, implSslWriteProxy, makeResult, initOp, flags, usTimeout, (void*)callback, arg, sslOpWrite, &context);
+  runAioOperation(&socket->root,
+                  newWriteAsyncOp,
+                  implSslWriteProxy,
+                  makeResult,
+                  initOp,
+                  flags,
+                  usTimeout,
+                  (void*)callback,
+                  arg,
+                  sslOpWrite,
+                  &context);
   return context.Result;
 }
 
 int ioSslConnect(SSLSocket *socket, const HostAddress *address, const char *tlsextHostName, uint64_t usTimeout)
 {
   struct Context context;
-  fillContext(&context, connectProc, 0, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName)+1 : 0);
+  fillContext(&context, connectProc, 0, (void*)(uintptr_t)tlsextHostName, tlsextHostName ? strlen(tlsextHostName) + 1 : 0);
   SSLOp *op = (SSLOp*)newWriteAsyncOp(&socket->root, afCoroutine, usTimeout, 0, 0, sslOpConnect, &context);
   if (address)
     op->address = *address;

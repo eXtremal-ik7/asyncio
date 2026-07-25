@@ -58,44 +58,34 @@
 #include "asyncio/base64.h"
 
 static const unsigned char base64DecodeTable[256] = {
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
-  52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64,
-  64,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
-  15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
-  64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
-  41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-  64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
-};
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64,
+    64, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
+    64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64};
 
 static const char base64EncodeTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 size_t base64GetDecodeLength(const char *in)
 {
-  // Count the valid prefix only - exactly what base64Decode consumes. No
-  // padding subtraction: malformed '=' runs can no longer underflow the size
+  // Count the valid prefix only - exactly what base64Decode consumes. No padding subtraction: malformed '=' runs can no longer underflow the
+  // size
   const uint8_t *p = (const uint8_t*)in;
   while (base64DecodeTable[*p++] <= 63)
     continue;
   size_t n = (size_t)(p - (const uint8_t*)in) - 1;
-  return n/4*3 + n%4*3/4 + 1;
+  return n / 4 * 3 + n % 4 * 3 / 4 + 1;
 }
-
 
 size_t base64getEncodeLength(size_t len)
 {
-  size_t groups = len/3 + (len%3 != 0);
-  if (groups > (SIZE_MAX-1)/4)
+  size_t groups = len / 3 + (len % 3 != 0);
+  if (groups > (SIZE_MAX - 1) / 4)
     return 0;
-  return groups*4 + 1;
+  return groups * 4 + 1;
 }
 
 size_t base64Decode(uint8_t *out, const char *in)
@@ -109,14 +99,14 @@ size_t base64Decode(uint8_t *out, const char *in)
     const uint8_t *p = (const uint8_t*)in;
     while (base64DecodeTable[*(p++)] <= 63)
       continue;
-    bytesRemaining = (p - (const unsigned char *) in) - 1;
-    bytesDecoded = bytesRemaining/4*3 + bytesRemaining%4*3/4;
+    bytesRemaining = (p - (const unsigned char*)in) - 1;
+    bytesDecoded = bytesRemaining / 4 * 3 + bytesRemaining % 4 * 3 / 4;
   }
 
   while (bytesRemaining > 4) {
-    pOut[0] = (uint8_t) (base64DecodeTable[*pIn] << 2 | base64DecodeTable[pIn[1]] >> 4);
-    pOut[1] = (uint8_t) (base64DecodeTable[pIn[1]] << 4 | base64DecodeTable[pIn[2]] >> 2);
-    pOut[2] = (uint8_t) (base64DecodeTable[pIn[2]] << 6 | base64DecodeTable[pIn[3]]);
+    pOut[0] = (uint8_t)(base64DecodeTable[*pIn] << 2 | base64DecodeTable[pIn[1]] >> 4);
+    pOut[1] = (uint8_t)(base64DecodeTable[pIn[1]] << 4 | base64DecodeTable[pIn[2]] >> 2);
+    pOut[2] = (uint8_t)(base64DecodeTable[pIn[2]] << 6 | base64DecodeTable[pIn[3]]);
     pOut += 3;
     pIn += 4;
     bytesRemaining -= 4;
@@ -154,7 +144,7 @@ size_t base64Encode(char *out, const uint8_t *in, size_t size)
       *p++ = base64EncodeTable[((in[i] & 0x3) << 4)];
       *p++ = '=';
     } else {
-      *p++ = base64EncodeTable[((in[i] & 0x3) << 4) | ((int) (in[i + 1] & 0xF0) >> 4)];
+      *p++ = base64EncodeTable[((in[i] & 0x3) << 4) | ((int)(in[i + 1] & 0xF0) >> 4)];
       *p++ = base64EncodeTable[((in[i + 1] & 0xF) << 2)];
     }
 

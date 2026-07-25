@@ -13,18 +13,15 @@
 
 namespace {
 
-// Asserts that a parsed fragment equals the expected string; the size check
-// stays first as the guard of the memcmp against out-of-bounds reads.
+// Asserts that a parsed fragment equals the expected string; the size check stays first as the guard of the memcmp against out-of-bounds reads.
 void expectData(const Raw &data, const char *expected)
 {
   ASSERT_EQ(data.size, strlen(expected));
   ASSERT_EQ(memcmp(data.data, expected, strlen(expected)), 0);
 }
 
-// Single-buffer request parse driver: init, hand over the whole buffer,
-// return the parser verdict. No table = the reserved names only.
-ParserResultTy parseRequest(const void *request, size_t size, httpRequestParseCb *callback, void *arg,
-                            const HttpHeaderTable *table = nullptr)
+// Single-buffer request parse driver: init, hand over the whole buffer, return the parser verdict. No table = the reserved names only.
+ParserResultTy parseRequest(const void *request, size_t size, httpRequestParseCb *callback, void *arg, const HttpHeaderTable *table = nullptr)
 {
   HttpRequestParserState state;
   httpRequestParserInit(&state);
@@ -46,8 +43,7 @@ int requestCompletionCb(HttpRequestComponent *component, void *arg)
 
 #if GTEST_HAS_DEATH_TEST
 
-void parseRequestWithLeadingQueryByte(const char *request, size_t size,
-                                      ParserResultTy expected)
+void parseRequestWithLeadingQueryByte(const char *request, size_t size, ParserResultTy expected)
 {
   armDeathTestWatchdog(3);
   RequestCompletionContext context;
@@ -58,21 +54,18 @@ void parseRequestWithLeadingQueryByte(const char *request, size_t size,
 TEST(UriParseDeathTest, empty_query_before_space_returns)
 {
   const char request[] = "GET /? HTTP/1.1\r\n\r\n";
-  EXPECT_EXIT(parseRequestWithLeadingQueryByte(request, sizeof(request)-1, ParserResultOk),
-              ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(parseRequestWithLeadingQueryByte(request, sizeof(request) - 1, ParserResultOk), ::testing::ExitedWithCode(0), "");
 }
 
 TEST(UriParseDeathTest, empty_query_before_fragment_returns)
 {
   const char request[] = "GET /?#fragment HTTP/1.1\r\n\r\n";
-  EXPECT_EXIT(parseRequestWithLeadingQueryByte(request, sizeof(request)-1, ParserResultOk),
-              ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(parseRequestWithLeadingQueryByte(request, sizeof(request) - 1, ParserResultOk), ::testing::ExitedWithCode(0), "");
 }
 
 #endif
 
-void expectIncrementalRequestCompletes(const char *name, const char *first,
-                                       const char *continuation)
+void expectIncrementalRequestCompletes(const char *name, const char *first, const char *continuation)
 {
   SCOPED_TRACE(name);
 
@@ -84,8 +77,7 @@ void expectIncrementalRequestCompletes(const char *name, const char *first,
   httpRequestParserInit(&state);
   httpRequestSetBuffer(&state, exactBuffer.get(), firstSize);
   RequestCompletionContext context;
-  ASSERT_EQ(httpRequestParse(&state, nullptr, requestCompletionCb, &context),
-            ParserResultNeedMoreData);
+  ASSERT_EQ(httpRequestParse(&state, nullptr, requestCompletionCb, &context), ParserResultNeedMoreData);
   ASSERT_FALSE(context.done);
 
   const char *remaining = static_cast<const char*>(httpRequestDataPtr(&state));
@@ -95,8 +87,7 @@ void expectIncrementalRequestCompletes(const char *name, const char *first,
   exactBuffer.reset();
 
   httpRequestSetBuffer(&state, resumed.data(), resumed.size());
-  ASSERT_EQ(httpRequestParse(&state, nullptr, requestCompletionCb, &context),
-            ParserResultOk);
+  ASSERT_EQ(httpRequestParse(&state, nullptr, requestCompletionCb, &context), ParserResultOk);
   EXPECT_TRUE(context.done);
 }
 
@@ -107,21 +98,19 @@ TEST(http, request_line_incremental_resume_from_retained_tail)
     const char *first;
     const char *continuation;
   };
-  static const ResumeCase cases[] = {
-    {"path starts in next buffer", "GET ", "/x HTTP/1.1\r\n\r\n"},
-    {"multi-space method separator is split", "GET ", " /x HTTP/1.1\r\n\r\n"},
-    {"path ends at buffer boundary", "GET /abc", " HTTP/1.1\r\n\r\n"},
-    {"path percent escape is split", "GET /%A", "B HTTP/1.1\r\n\r\n"},
-    {"query starts in next buffer", "GET /?", "q=x HTTP/1.1\r\n\r\n"},
-    {"query percent escape is split", "GET /?q=%A", "B HTTP/1.1\r\n\r\n"},
-    {"fragment starts in next buffer", "GET /#", "frag HTTP/1.1\r\n\r\n"},
-    {"fragment percent escape is split", "GET /#%A", "B HTTP/1.1\r\n\r\n"},
-    {"version starts in next buffer", "GET /x ", "HTTP/1.1\r\n\r\n"},
-    {"multi-space version separator is split", "GET /x ", " HTTP/1.1\r\n\r\n"},
-    {"version token is split", "GET /x HTT", "P/1.1\r\n\r\n"}
-  };
+  static const ResumeCase cases[] = {{"path starts in next buffer", "GET ", "/x HTTP/1.1\r\n\r\n"},
+                                     {"multi-space method separator is split", "GET ", " /x HTTP/1.1\r\n\r\n"},
+                                     {"path ends at buffer boundary", "GET /abc", " HTTP/1.1\r\n\r\n"},
+                                     {"path percent escape is split", "GET /%A", "B HTTP/1.1\r\n\r\n"},
+                                     {"query starts in next buffer", "GET /?", "q=x HTTP/1.1\r\n\r\n"},
+                                     {"query percent escape is split", "GET /?q=%A", "B HTTP/1.1\r\n\r\n"},
+                                     {"fragment starts in next buffer", "GET /#", "frag HTTP/1.1\r\n\r\n"},
+                                     {"fragment percent escape is split", "GET /#%A", "B HTTP/1.1\r\n\r\n"},
+                                     {"version starts in next buffer", "GET /x ", "HTTP/1.1\r\n\r\n"},
+                                     {"multi-space version separator is split", "GET /x ", " HTTP/1.1\r\n\r\n"},
+                                     {"version token is split", "GET /x HTT", "P/1.1\r\n\r\n"}};
 
-  for (const ResumeCase &test : cases)
+  for (const ResumeCase &test: cases)
     expectIncrementalRequestCompletes(test.name, test.first, test.continuation);
 }
 
@@ -234,19 +223,25 @@ TEST(http, http_request_parser)
 {
   {
     int callNum = 0;
-    const char request1[] = "GET /path/to/page?qname=value#fragment HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/7.58.0\r\nAccept: */*\r\n\r\n\r\n";
-    ParserResultTy result = parseRequest(request1, sizeof(request1)-1, httpRequestCb1, &callNum);
+    const char request1[] =
+        "GET /path/to/page?qname=value#fragment HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/7.58.0\r\nAccept: */*\r\n\r\n\r\n";
+    ParserResultTy result = parseRequest(request1, sizeof(request1) - 1, httpRequestCb1, &callNum);
     ASSERT_EQ(result, ParserResultOk);
     ASSERT_EQ(callNum, 11);
   }
 
   {
     int callNum = 0;
-    const char request[] = "POST /api/usercreate HTTP/1.1\r\nHost: localhost:18880\r\nUser-Agent: curl/7.58.0\r\nAccept: */*\r\nContent-Length: 2\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n{}";
-    ParserResultTy result = parseRequest(request, sizeof(request)-1, [](HttpRequestComponent *component, void *arg) -> int {
-      httpRequestCb2Impl(component, arg);
-      return 1;
-    }, &callNum);
+    const char request[] = "POST /api/usercreate HTTP/1.1\r\nHost: localhost:18880\r\nUser-Agent: curl/7.58.0\r\nAccept: "
+                           "*/*\r\nContent-Length: 2\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n{}";
+    ParserResultTy result = parseRequest(
+        request,
+        sizeof(request) - 1,
+        [](HttpRequestComponent *component, void *arg) -> int {
+          httpRequestCb2Impl(component, arg);
+          return 1;
+        },
+        &callNum);
     ASSERT_EQ(result, ParserResultOk);
     ASSERT_EQ(callNum, 10);
   }
@@ -266,43 +261,36 @@ int httpRequestTestCb(HttpRequestComponent *component, void *arg)
 {
   HttpRequestTestContext *ctx = static_cast<HttpRequestTestContext*>(arg);
   switch (component->type) {
-    case httpRequestDtMethod :
-      ctx->method = component->method;
-      break;
-    case httpRequestDtHeaderEntry :
+    case httpRequestDtMethod: ctx->method = component->method; break;
+    case httpRequestDtHeaderEntry:
       ctx->headerTypes.push_back(component->header.entryType);
       ctx->headerNames.emplace_back(component->header.entryName.data, component->header.entryName.size);
       ctx->headerValues.emplace_back(component->header.stringValue.data, component->header.stringValue.size);
       if (component->header.entryType == hhContentLength)
         ctx->contentLength = component->header.sizeValue;
       break;
-    case httpRequestDtData :
-      ctx->body.append(component->data.data, component->data.size);
-      break;
-    case httpRequestDtDataLast :
+    case httpRequestDtData: ctx->body.append(component->data.data, component->data.size); break;
+    case httpRequestDtDataLast:
       if (component->data.size)
         ctx->body.append(component->data.data, component->data.size);
       ctx->done = true;
       break;
-    default :
-      break;
+    default: break;
   }
   return 1;
 }
 
-ParserResultTy parseRequest(const void *request, size_t size, HttpRequestTestContext &context,
-                            const HttpHeaderTable *table = nullptr)
+ParserResultTy parseRequest(const void *request, size_t size, HttpRequestTestContext &context, const HttpHeaderTable *table = nullptr)
 {
   return parseRequest(request, size, httpRequestTestCb, &context, table);
 }
 
 TEST(http, chunked_body_incremental_resume_from_every_retained_tail)
 {
-  const std::string request =
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
-    "3\r\nabc\r\n"
-    "4;ext=v\r\ndefg\r\n"
-    "0\r\n\r\n";
+  const std::string request = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              "3\r\nabc\r\n"
+                              "4;ext=v\r\ndefg\r\n"
+                              "0\r\n\r\n";
 
   for (size_t cut = 0; cut < request.size(); cut++) {
     SCOPED_TRACE(cut);
@@ -315,8 +303,7 @@ TEST(http, chunked_body_incremental_resume_from_every_retained_tail)
     httpRequestParserInit(&state);
     httpRequestSetBuffer(&state, first.get(), cut);
     HttpRequestTestContext context;
-    ParserResultTy result = httpRequestParse(&state, nullptr, httpRequestTestCb,
-                                             &context);
+    ParserResultTy result = httpRequestParse(&state, nullptr, httpRequestTestCb, &context);
     if (result != ParserResultNeedMoreData) {
       ADD_FAILURE() << "proper prefix returned " << result;
       continue;
@@ -351,18 +338,18 @@ void httpResponseTestCb(HttpComponent *component, void *arg)
 {
   HttpResponseTestContext *ctx = static_cast<HttpResponseTestContext*>(arg);
   switch (component->type) {
-    case httpDtStartLine :
+    case httpDtStartLine:
       ctx->code = component->startLine.code;
       ctx->description.assign(component->startLine.description.data, component->startLine.description.size);
       break;
-    case httpDtHeaderEntry :
+    case httpDtHeaderEntry:
       ctx->headerTypes.push_back(component->header.entryType);
       ctx->headerValues.emplace_back(component->header.stringValue.data, component->header.stringValue.size);
       if (component->header.entryType == hhContentLength)
         ctx->contentLength = component->header.sizeValue;
       break;
-    case httpDtData :
-    case httpDtDataFragment :
+    case httpDtData:
+    case httpDtDataFragment:
       ctx->body.append(component->data.data, component->data.size);
       if (component->type == httpDtData)
         ctx->finalDataEvents++;
@@ -371,8 +358,7 @@ void httpResponseTestCb(HttpComponent *component, void *arg)
 }
 
 // Response-side driver, symmetric to parseRequest.
-ParserResultTy parseResponse(const void *response, size_t size, HttpResponseTestContext &context,
-                             const HttpHeaderTable *table = nullptr)
+ParserResultTy parseResponse(const void *response, size_t size, HttpResponseTestContext &context, const HttpHeaderTable *table = nullptr)
 {
   HttpParserState state;
   httpInit(&state);
@@ -380,8 +366,7 @@ ParserResultTy parseResponse(const void *response, size_t size, HttpResponseTest
   return httpParse(&state, table, httpResponseTestCb, &context);
 }
 
-void expectIncrementalRequestAtEveryCut(const std::string &request,
-                                        const char *expectedBody)
+void expectIncrementalRequestAtEveryCut(const std::string &request, const char *expectedBody)
 {
   for (size_t cut = 0; cut < request.size(); cut++) {
     SCOPED_TRACE(cut);
@@ -394,8 +379,7 @@ void expectIncrementalRequestAtEveryCut(const std::string &request,
     httpRequestParserInit(&state);
     httpRequestSetBuffer(&state, first.get(), cut);
     HttpRequestTestContext context;
-    ParserResultTy result = httpRequestParse(&state, nullptr, httpRequestTestCb,
-                                             &context);
+    ParserResultTy result = httpRequestParse(&state, nullptr, httpRequestTestCb, &context);
     ASSERT_EQ(result, ParserResultNeedMoreData);
     ASSERT_FALSE(context.done);
 
@@ -413,9 +397,7 @@ void expectIncrementalRequestAtEveryCut(const std::string &request,
   }
 }
 
-void expectIncrementalResponseAtEveryCut(const std::string &response,
-                                         const char *expectedBody,
-                                         int expectedFinalDataEvents = -1)
+void expectIncrementalResponseAtEveryCut(const std::string &response, const char *expectedBody, int expectedFinalDataEvents = -1)
 {
   for (size_t cut = 0; cut < response.size(); cut++) {
     SCOPED_TRACE(cut);
@@ -428,8 +410,7 @@ void expectIncrementalResponseAtEveryCut(const std::string &response,
     httpInit(&state);
     httpSetBuffer(&state, first.get(), cut);
     HttpResponseTestContext context;
-    ParserResultTy result = httpParse(&state, nullptr, httpResponseTestCb,
-                                      &context);
+    ParserResultTy result = httpParse(&state, nullptr, httpResponseTestCb, &context);
     ASSERT_EQ(result, ParserResultNeedMoreData);
 
     const char *remaining = static_cast<const char*>(httpDataPtr(&state));
@@ -449,69 +430,62 @@ void expectIncrementalResponseAtEveryCut(const std::string &response,
 
 TEST(http, fixed_length_request_incremental_resume_from_every_retained_tail)
 {
-  const std::string request =
-    "POST /fixed HTTP/1.1\r\n"
-    "X-Test: yes\r\n"
-    "Content-Length: 11\r\n"
-    "\r\n"
-    "hello world";
+  const std::string request = "POST /fixed HTTP/1.1\r\n"
+                              "X-Test: yes\r\n"
+                              "Content-Length: 11\r\n"
+                              "\r\n"
+                              "hello world";
   expectIncrementalRequestAtEveryCut(request, "hello world");
 }
 
 TEST(http, fixed_length_response_incremental_resume_from_every_retained_tail)
 {
-  const std::string response =
-    "HTTP/1.1 200 OK\r\n"
-    "X-Test: yes\r\n"
-    "Content-Length: 11\r\n"
-    "\r\n"
-    "hello world";
+  const std::string response = "HTTP/1.1 200 OK\r\n"
+                               "X-Test: yes\r\n"
+                               "Content-Length: 11\r\n"
+                               "\r\n"
+                               "hello world";
   expectIncrementalResponseAtEveryCut(response, "hello world");
 }
 
 TEST(http, chunked_request_trailers_incremental_resume_from_every_retained_tail)
 {
-  const std::string request =
-    "POST /trailers HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
-    "3\r\nabc\r\n"
-    "0\r\n"
-    "First-Trailer: one\r\n"
-    "Second-Trailer: two\r\n"
-    "\r\n";
+  const std::string request = "POST /trailers HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              "3\r\nabc\r\n"
+                              "0\r\n"
+                              "First-Trailer: one\r\n"
+                              "Second-Trailer: two\r\n"
+                              "\r\n";
   expectIncrementalRequestAtEveryCut(request, "abc");
 }
 
 TEST(http, chunked_response_trailers_incremental_resume_from_every_retained_tail)
 {
-  const std::string response =
-    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-    "3\r\nabc\r\n"
-    "0\r\n"
-    "First-Trailer: one\r\n"
-    "Second-Trailer: two\r\n"
-    "\r\n";
+  const std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                               "3\r\nabc\r\n"
+                               "0\r\n"
+                               "First-Trailer: one\r\n"
+                               "Second-Trailer: two\r\n"
+                               "\r\n";
   expectIncrementalResponseAtEveryCut(response, "abc", 1);
 }
 
 TEST(http, chunked_trailers_can_exceed_the_refill_buffer)
 {
-  const std::string trailers =
-    "A: 12345\r\n"
-    "B: 67890\r\n"
-    "C: abcde\r\n"
-    "\r\n";
+  const std::string trailers = "A: 12345\r\n"
+                               "B: 67890\r\n"
+                               "C: abcde\r\n"
+                               "\r\n";
   const size_t refillCapacity = 14;
   ASSERT_GT(trailers.size(), refillCapacity);
 
-  const std::string requestPrefix =
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
-    "1\r\nx\r\n0\r\n";
+  const std::string requestPrefix = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                    "1\r\nx\r\n0\r\n";
   HttpRequestParserState requestState;
   httpRequestParserInit(&requestState);
   httpRequestSetBuffer(&requestState, requestPrefix.data(), requestPrefix.size());
   HttpRequestTestContext requestContext;
-  ASSERT_EQ(httpRequestParse(&requestState, nullptr, httpRequestTestCb,
-                             &requestContext), ParserResultNeedMoreData);
+  ASSERT_EQ(httpRequestParse(&requestState, nullptr, httpRequestTestCb, &requestContext), ParserResultNeedMoreData);
   ASSERT_EQ(requestState.state, httpRequestTrailer);
 
   size_t requestOffset = 0;
@@ -520,31 +494,26 @@ TEST(http, chunked_trailers_can_exceed_the_refill_buffer)
     const char *retained = static_cast<const char*>(httpRequestDataPtr(&requestState));
     const size_t retainedSize = httpRequestDataRemaining(&requestState);
     ASSERT_LT(retainedSize, refillCapacity);
-    const size_t appended = std::min(refillCapacity - retainedSize,
-                                     trailers.size() - requestOffset);
+    const size_t appended = std::min(refillCapacity - retainedSize, trailers.size() - requestOffset);
     std::string nextRefill(retained, retainedSize);
     nextRefill.append(trailers.data() + requestOffset, appended);
     requestRefill.swap(nextRefill);
     requestOffset += appended;
 
     httpRequestSetBuffer(&requestState, requestRefill.data(), requestRefill.size());
-    ParserResultTy result = httpRequestParse(&requestState, nullptr,
-                                             httpRequestTestCb, &requestContext);
-    EXPECT_EQ(result, requestOffset == trailers.size()
-                      ? ParserResultOk : ParserResultNeedMoreData);
+    ParserResultTy result = httpRequestParse(&requestState, nullptr, httpRequestTestCb, &requestContext);
+    EXPECT_EQ(result, requestOffset == trailers.size() ? ParserResultOk : ParserResultNeedMoreData);
   }
   EXPECT_TRUE(requestContext.done);
   EXPECT_EQ(requestContext.body, "x");
 
-  const std::string responsePrefix =
-    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-    "1\r\nx\r\n0\r\n";
+  const std::string responsePrefix = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                     "1\r\nx\r\n0\r\n";
   HttpParserState responseState;
   httpInit(&responseState);
   httpSetBuffer(&responseState, responsePrefix.data(), responsePrefix.size());
   HttpResponseTestContext responseContext;
-  ASSERT_EQ(httpParse(&responseState, nullptr, httpResponseTestCb,
-                      &responseContext), ParserResultNeedMoreData);
+  ASSERT_EQ(httpParse(&responseState, nullptr, httpResponseTestCb, &responseContext), ParserResultNeedMoreData);
   ASSERT_EQ(responseState.state, httpStTrailer);
 
   size_t responseOffset = 0;
@@ -553,18 +522,15 @@ TEST(http, chunked_trailers_can_exceed_the_refill_buffer)
     const char *retained = static_cast<const char*>(httpDataPtr(&responseState));
     const size_t retainedSize = httpDataRemaining(&responseState);
     ASSERT_LT(retainedSize, refillCapacity);
-    const size_t appended = std::min(refillCapacity - retainedSize,
-                                     trailers.size() - responseOffset);
+    const size_t appended = std::min(refillCapacity - retainedSize, trailers.size() - responseOffset);
     std::string nextRefill(retained, retainedSize);
     nextRefill.append(trailers.data() + responseOffset, appended);
     responseRefill.swap(nextRefill);
     responseOffset += appended;
 
     httpSetBuffer(&responseState, responseRefill.data(), responseRefill.size());
-    ParserResultTy result = httpParse(&responseState, nullptr,
-                                      httpResponseTestCb, &responseContext);
-    EXPECT_EQ(result, responseOffset == trailers.size()
-                      ? ParserResultOk : ParserResultNeedMoreData);
+    ParserResultTy result = httpParse(&responseState, nullptr, httpResponseTestCb, &responseContext);
+    EXPECT_EQ(result, responseOffset == trailers.size() ? ParserResultOk : ParserResultNeedMoreData);
   }
   EXPECT_EQ(responseContext.body, "x");
   EXPECT_EQ(responseContext.finalDataEvents, 1);
@@ -575,26 +541,22 @@ struct HeaderTokenPair {
   int token;
 };
 
-// the complete reserved set: every name the library recognizes with any
-// table; a stale committed table, an edited enum or a hash disagreement
+// the complete reserved set: every name the library recognizes with any table; a stale committed table, an edited enum or a hash disagreement
 // between the generator and the runtime lookup shows up here
-const HeaderTokenPair gReservedHeaders[] = {
-  {"Content-Length", hhContentLength},
-  {"Transfer-Encoding", hhTransferEncoding},
-  {"Content-Encoding", hhContentEncoding},
-  {"Connection", hhConnection},
-  {"Keep-Alive", hhKeepAlive},
-  {"Host", hhHost},
-  {"Expect", hhExpect},
-  {"Upgrade", hhUpgrade},
-  {"Location", hhLocation}
-};
+const HeaderTokenPair gReservedHeaders[] = {{"Content-Length", hhContentLength},
+                                            {"Transfer-Encoding", hhTransferEncoding},
+                                            {"Content-Encoding", hhContentEncoding},
+                                            {"Connection", hhConnection},
+                                            {"Keep-Alive", hhKeepAlive},
+                                            {"Host", hhHost},
+                                            {"Expect", hhExpect},
+                                            {"Upgrade", hhUpgrade},
+                                            {"Location", hhLocation}};
 
 TEST(http, reserved_tokens)
 {
-  // Content-Length and Transfer-Encoding may not share a message, so the
-  // names ride two requests
-  const size_t count = sizeof(gReservedHeaders)/sizeof(gReservedHeaders[0]);
+  // Content-Length and Transfer-Encoding may not share a message, so the names ride two requests
+  const size_t count = sizeof(gReservedHeaders) / sizeof(gReservedHeaders[0]);
   std::string request = "GET /x HTTP/1.1\r\n";
   std::vector<int> expectedTypes;
   std::vector<std::string> expectedNames;
@@ -616,23 +578,21 @@ TEST(http, reserved_tokens)
 
   const char chunkedRequest[] = "GET /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
   HttpRequestTestContext teContext;
-  ASSERT_EQ(parseRequest(chunkedRequest, sizeof(chunkedRequest)-1, teContext), ParserResultOk);
+  ASSERT_EQ(parseRequest(chunkedRequest, sizeof(chunkedRequest) - 1, teContext), ParserResultOk);
   ASSERT_TRUE(teContext.done);
   EXPECT_EQ(teContext.headerTypes, (std::vector<int>{hhTransferEncoding}));
   EXPECT_EQ(teContext.headerNames, (std::vector<std::string>{"Transfer-Encoding"}));
 
-  static const HeaderTokenPair methods[] = {
-    {"GET", hmGet},
-    {"HEAD", hmHead},
-    {"POST", hmPost},
-    {"PUT", hmPut},
-    {"DELETE", hmDelete},
-    {"CONNECT", hmConnect},
-    {"OPTIONS", hmOptions},
-    {"TRACE", hmTrace},
-    {"PATCH", hmPatch}
-  };
-  for (const HeaderTokenPair &method : methods) {
+  static const HeaderTokenPair methods[] = {{"GET", hmGet},
+                                            {"HEAD", hmHead},
+                                            {"POST", hmPost},
+                                            {"PUT", hmPut},
+                                            {"DELETE", hmDelete},
+                                            {"CONNECT", hmConnect},
+                                            {"OPTIONS", hmOptions},
+                                            {"TRACE", hmTrace},
+                                            {"PATCH", hmPatch}};
+  for (const HeaderTokenPair &method: methods) {
     std::string methodRequest = std::string(method.name) + " /x HTTP/1.1\r\n\r\n";
     HttpRequestTestContext methodContext;
     ASSERT_EQ(parseRequest(methodRequest.data(), methodRequest.size(), methodContext), ParserResultOk);
@@ -642,7 +602,10 @@ TEST(http, reserved_tokens)
 
 TEST(http, parser_user_table)
 {
-  enum { myXCustom = 1, myETag = 2 };
+  enum {
+    myXCustom = 1,
+    myETag = 2
+  };
   const HttpHeaderTableEntry entries[] = {{"X-Custom", myXCustom}, {"ETag", myETag}};
   HttpHeaderTable table;
   ASSERT_TRUE(httpHeaderTablePrepare(&table, entries, 2));
@@ -655,19 +618,17 @@ TEST(http, parser_user_table)
                          "Server: s\r\n"
                          "\r\nab";
   HttpRequestTestContext context;
-  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context, &table), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request) - 1, context, &table), ParserResultOk);
   ASSERT_TRUE(context.done);
-  EXPECT_EQ(context.headerTypes,
-            (std::vector<int>{myXCustom, myETag, hhContentLength, hhUnknown}));
-  EXPECT_EQ(context.headerValues,
-            (std::vector<std::string>{"a", "\"v1\"", "2", "s"}));
+  EXPECT_EQ(context.headerTypes, (std::vector<int>{myXCustom, myETag, hhContentLength, hhUnknown}));
+  EXPECT_EQ(context.headerValues, (std::vector<std::string>{"a", "\"v1\"", "2", "s"}));
   EXPECT_EQ(context.contentLength, 2u);
   EXPECT_EQ(context.body, "ab");
 
   // response side shares the lookup
   const char response[] = "HTTP/1.1 200 OK\r\nETAG: \"v2\"\r\nContent-Length: 0\r\n\r\n";
   HttpResponseTestContext responseContext;
-  ASSERT_EQ(parseResponse(response, sizeof(response)-1, responseContext, &table), ParserResultOk);
+  ASSERT_EQ(parseResponse(response, sizeof(response) - 1, responseContext, &table), ParserResultOk);
   EXPECT_EQ(responseContext.headerTypes, (std::vector<int>{myETag, hhContentLength}));
 
   httpHeaderTableFree(&table);
@@ -679,19 +640,18 @@ TEST(http, header_incremental_resume)
   HttpHeaderTable table;
   ASSERT_TRUE(httpHeaderTablePrepare(&table, entries, 1));
 
-  // interrupted mid-name: nothing of the header line is consumed, the caller
-  // re-feeds it from httpRequestDataPtr with more bytes appended
+  // interrupted mid-name: nothing of the header line is consumed, the caller re-feeds it from httpRequestDataPtr with more bytes appended
   HttpRequestTestContext context;
   HttpRequestParserState state;
   httpRequestParserInit(&state);
   const char firstPart[] = "GET /x HTTP/1.1\r\nX-Cus";
-  httpRequestSetBuffer(&state, firstPart, sizeof(firstPart)-1);
+  httpRequestSetBuffer(&state, firstPart, sizeof(firstPart) - 1);
   ASSERT_EQ(httpRequestParse(&state, &table, httpRequestTestCb, &context), ParserResultNeedMoreData);
-  const size_t consumed = sizeof(firstPart)-1 - httpRequestDataRemaining(&state);
+  const size_t consumed = sizeof(firstPart) - 1 - httpRequestDataRemaining(&state);
   EXPECT_EQ(std::string(firstPart + consumed), "X-Cus");
 
   const char resumed[] = "X-Custom: value\r\n\r\n";
-  httpRequestSetBuffer(&state, resumed, sizeof(resumed)-1);
+  httpRequestSetBuffer(&state, resumed, sizeof(resumed) - 1);
   ASSERT_EQ(httpRequestParse(&state, &table, httpRequestTestCb, &context), ParserResultOk);
   ASSERT_TRUE(context.done);
   EXPECT_EQ(context.headerTypes, (std::vector<int>{7}));
@@ -702,18 +662,16 @@ TEST(http, header_incremental_resume)
 
 TEST(http, header_name_near_miss)
 {
-  // names one edit away from Content-Length must stay unknown and must not
-  // affect body framing. A colliding full 64-bit hash is not constructible
-  // in a test, so the reject branch of the key verification is unreachable
-  // from outside; the accept branch is pinned by header_name_case_insensitive
-  // (a folded name reaches the Content-Length slot with an equal hash)
+  // names one edit away from Content-Length must stay unknown and must not affect body framing. A colliding full 64-bit hash is not
+  // constructible in a test, so the reject branch of the key verification is unreachable from outside; the accept branch is pinned by
+  // header_name_case_insensitive (a folded name reaches the Content-Length slot with an equal hash)
   static const char *names[] = {
-    "Content-Lengt",     // truncated
-    "Content-Lengths",   // extended
-    "Content-Lengtx",    // same length, last byte differs
-    "Kontent-Length"     // same length, first byte differs
+      "Content-Lengt",   // truncated
+      "Content-Lengths", // extended
+      "Content-Lengtx",  // same length, last byte differs
+      "Kontent-Length"   // same length, first byte differs
   };
-  for (const char *name : names) {
+  for (const char *name: names) {
     std::string request = std::string("GET /x HTTP/1.1\r\n") + name + ": 999\r\n\r\n";
     HttpRequestTestContext context;
     ASSERT_EQ(parseRequest(request.data(), request.size(), context), ParserResultOk) << name;
@@ -730,7 +688,7 @@ TEST(http, header_name_case_insensitive)
 {
   const char request[] = "POST /x HTTP/1.1\r\ncontent-length: 2\r\nX-CUSTOM: y\r\n\r\nab";
   HttpRequestTestContext context;
-  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request) - 1, context), ParserResultOk);
   ASSERT_TRUE(context.done);
   ASSERT_EQ(context.headerTypes.size(), 2u);
   EXPECT_EQ(context.headerTypes[0], static_cast<int>(hhContentLength));
@@ -751,7 +709,7 @@ TEST(http, request_chunked_body)
                          "Trailer-Header: v\r\n"
                          "\r\n";
   HttpRequestTestContext context;
-  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request) - 1, context), ParserResultOk);
   ASSERT_TRUE(context.done);
   ASSERT_EQ(context.headerTypes.size(), 1u);
   EXPECT_EQ(context.headerTypes[0], static_cast<int>(hhTransferEncoding));
@@ -761,11 +719,11 @@ TEST(http, request_chunked_body)
 TEST(http, malformed_header_names)
 {
   static const char *requests[] = {
-    "GET /x HTTP/1.1\r\nBad Header: x\r\n\r\n",         // space inside the name
-    "GET /x HTTP/1.1\r\nContent-Length : 5\r\n\r\n",    // space before the colon
-    "GET /x HTTP/1.1\r\n: x\r\n\r\n"                    // empty name
+      "GET /x HTTP/1.1\r\nBad Header: x\r\n\r\n",      // space inside the name
+      "GET /x HTTP/1.1\r\nContent-Length : 5\r\n\r\n", // space before the colon
+      "GET /x HTTP/1.1\r\n: x\r\n\r\n"                 // empty name
   };
-  for (const char *request : requests) {
+  for (const char *request: requests) {
     HttpRequestTestContext context;
     EXPECT_EQ(parseRequest(request, strlen(request), context), ParserResultError) << request;
   }
@@ -774,23 +732,21 @@ TEST(http, malformed_header_names)
 TEST(http, bare_cr_lf_rejected_in_header_values)
 {
   static const char controls[] = {'\r', '\n'};
-  for (char control : controls) {
+  for (char control: controls) {
     SCOPED_TRACE(control == '\r' ? "bare CR" : "bare LF");
 
     std::string request = "GET /x HTTP/1.1\r\nX-Test: alpha";
     request.push_back(control);
     request += "beta\r\n\r\n";
     HttpRequestTestContext requestContext;
-    EXPECT_EQ(parseRequest(request.data(), request.size(), requestContext),
-              ParserResultError);
+    EXPECT_EQ(parseRequest(request.data(), request.size(), requestContext), ParserResultError);
     EXPECT_FALSE(requestContext.done);
 
     std::string response = "HTTP/1.1 200 OK\r\nX-Test: alpha";
     response.push_back(control);
     response += "beta\r\nContent-Length: 0\r\n\r\n";
     HttpResponseTestContext responseContext;
-    EXPECT_EQ(parseResponse(response.data(), response.size(), responseContext),
-              ParserResultError);
+    EXPECT_EQ(parseResponse(response.data(), response.size(), responseContext), ParserResultError);
     EXPECT_EQ(responseContext.finalDataEvents, 0);
   }
 }
@@ -798,15 +754,14 @@ TEST(http, bare_cr_lf_rejected_in_header_values)
 TEST(http, bare_cr_lf_rejected_in_response_reason_phrase)
 {
   static const char controls[] = {'\r', '\n'};
-  for (char control : controls) {
+  for (char control: controls) {
     SCOPED_TRACE(control == '\r' ? "bare CR" : "bare LF");
 
     std::string response = "HTTP/1.1 200 alpha";
     response.push_back(control);
     response += "beta\r\nContent-Length: 0\r\n\r\n";
     HttpResponseTestContext context;
-    EXPECT_EQ(parseResponse(response.data(), response.size(), context),
-              ParserResultError);
+    EXPECT_EQ(parseResponse(response.data(), response.size(), context), ParserResultError);
     EXPECT_EQ(context.code, 0u);
     EXPECT_EQ(context.finalDataEvents, 0);
   }
@@ -815,28 +770,24 @@ TEST(http, bare_cr_lf_rejected_in_response_reason_phrase)
 TEST(http, bare_cr_lf_rejected_in_chunked_trailers)
 {
   static const char controls[] = {'\r', '\n'};
-  for (char control : controls) {
+  for (char control: controls) {
     SCOPED_TRACE(control == '\r' ? "bare CR" : "bare LF");
 
-    std::string request =
-      "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
-      "3\r\nabc\r\n0\r\nX-Trailer: alpha";
+    std::string request = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                          "3\r\nabc\r\n0\r\nX-Trailer: alpha";
     request.push_back(control);
     request += "beta\r\n\r\n";
     HttpRequestTestContext requestContext;
-    EXPECT_EQ(parseRequest(request.data(), request.size(), requestContext),
-              ParserResultError);
+    EXPECT_EQ(parseRequest(request.data(), request.size(), requestContext), ParserResultError);
     EXPECT_EQ(requestContext.body, "abc");
     EXPECT_FALSE(requestContext.done);
 
-    std::string response =
-      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-      "3\r\nabc\r\n0\r\nX-Trailer: alpha";
+    std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                           "3\r\nabc\r\n0\r\nX-Trailer: alpha";
     response.push_back(control);
     response += "beta\r\n\r\n";
     HttpResponseTestContext responseContext;
-    EXPECT_EQ(parseResponse(response.data(), response.size(), responseContext),
-              ParserResultError);
+    EXPECT_EQ(parseResponse(response.data(), response.size(), responseContext), ParserResultError);
     EXPECT_EQ(responseContext.body, "abc");
     EXPECT_EQ(responseContext.finalDataEvents, 0);
   }
@@ -844,12 +795,10 @@ TEST(http, bare_cr_lf_rejected_in_chunked_trailers)
 
 TEST(http, content_length_invalid)
 {
-  static const char *requests[] = {
-    "GET /x HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n",  // 2^64
-    "GET /x HTTP/1.1\r\nContent-Length:\r\n\r\n",
-    "GET /x HTTP/1.1\r\nContent-Length: 12x\r\n\r\n"
-  };
-  for (const char *request : requests) {
+  static const char *requests[] = {"GET /x HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n", // 2^64
+                                   "GET /x HTTP/1.1\r\nContent-Length:\r\n\r\n",
+                                   "GET /x HTTP/1.1\r\nContent-Length: 12x\r\n\r\n"};
+  for (const char *request: requests) {
     HttpRequestTestContext context;
     EXPECT_EQ(parseRequest(request, strlen(request), context), ParserResultError) << request;
   }
@@ -857,18 +806,18 @@ TEST(http, content_length_invalid)
 
 TEST(http, request_framing_conflicts)
 {
-  // conflicting Content-Length / Transfer-Encoding sets let two HTTP nodes
-  // disagree on the request boundary (request smuggling) - all are rejected
+  // conflicting Content-Length / Transfer-Encoding sets let two HTTP nodes disagree on the request boundary (request smuggling) - all are
+  // rejected
   static const char *requests[] = {
-    "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nHELLO",                        // differing repeat
-    "POST /x HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",           // CL, then TE
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",           // TE, then CL
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n", // codings after chunked
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",                          // chunked not final
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: gzip chunked\r\n\r\n0\r\n\r\n",                          // missing list comma
-    "POST /x HTTP/1.1\r\nTransfer-Encoding: identity\r\n\r\n"                                         // no chunked at all
+      "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nHELLO",                        // differing repeat
+      "POST /x HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",           // CL, then TE
+      "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",           // TE, then CL
+      "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n", // codings after chunked
+      "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",                          // chunked not final
+      "POST /x HTTP/1.1\r\nTransfer-Encoding: gzip chunked\r\n\r\n0\r\n\r\n",                           // missing list comma
+      "POST /x HTTP/1.1\r\nTransfer-Encoding: identity\r\n\r\n"                                         // no chunked at all
   };
-  for (const char *request : requests) {
+  for (const char *request: requests) {
     HttpRequestTestContext context;
     EXPECT_EQ(parseRequest(request, strlen(request), context), ParserResultError) << request;
   }
@@ -876,7 +825,7 @@ TEST(http, request_framing_conflicts)
   // an identical repeated Content-Length is recoverable (RFC 9110 8.6)
   const char identical[] = "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nHELLO";
   HttpRequestTestContext identicalContext;
-  ASSERT_EQ(parseRequest(identical, sizeof(identical)-1, identicalContext), ParserResultOk);
+  ASSERT_EQ(parseRequest(identical, sizeof(identical) - 1, identicalContext), ParserResultOk);
   ASSERT_TRUE(identicalContext.done);
   EXPECT_EQ(identicalContext.body, "HELLO");
 
@@ -885,23 +834,20 @@ TEST(http, request_framing_conflicts)
                         "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n"
                         "\r\n3\r\nabc\r\n0\r\n\r\n";
   HttpRequestTestContext joinedContext;
-  ASSERT_EQ(parseRequest(joined, sizeof(joined)-1, joinedContext), ParserResultOk);
+  ASSERT_EQ(parseRequest(joined, sizeof(joined) - 1, joinedContext), ParserResultOk);
   ASSERT_TRUE(joinedContext.done);
   EXPECT_EQ(joinedContext.body, "abc");
 }
 
 TEST(http, response_framing_conflicts)
 {
-  // same rejections on the response side; the last case would need
-  // read-until-close framing the parser does not have
-  static const char *responses[] = {
-    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nHELLO",
-    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",
-    "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip chunked\r\n\r\n0\r\n\r\n",
-    "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"
-  };
-  for (const char *response : responses) {
+  // same rejections on the response side; the last case would need read-until-close framing the parser does not have
+  static const char *responses[] = {"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\nHELLO",
+                                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n",
+                                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip chunked\r\n\r\n0\r\n\r\n",
+                                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"};
+  for (const char *response: responses) {
     HttpResponseTestContext context;
     EXPECT_EQ(parseResponse(response, strlen(response), context), ParserResultError) << response;
   }
@@ -910,22 +856,20 @@ TEST(http, response_framing_conflicts)
 TEST(http, malformed_chunked_framing)
 {
   static const char *bodies[] = {
-    "4\r\nWikiXX0\r\n\r\n",       // payload must be followed by CRLF
-    "4garbage\r\nWiki\r\n0\r\n\r\n" // chunk extensions require a semicolon
+      "4\r\nWikiXX0\r\n\r\n",         // payload must be followed by CRLF
+      "4garbage\r\nWiki\r\n0\r\n\r\n" // chunk extensions require a semicolon
   };
 
-  for (const char *body : bodies) {
+  for (const char *body: bodies) {
     std::string request = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
     request += body;
     HttpRequestTestContext requestContext;
-    EXPECT_EQ(parseRequest(request.data(), request.size(), requestContext), ParserResultError)
-      << body;
+    EXPECT_EQ(parseRequest(request.data(), request.size(), requestContext), ParserResultError) << body;
 
     std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
     response += body;
     HttpResponseTestContext responseContext;
-    EXPECT_EQ(parseResponse(response.data(), response.size(), responseContext), ParserResultError)
-      << body;
+    EXPECT_EQ(parseResponse(response.data(), response.size(), responseContext), ParserResultError) << body;
   }
 }
 
@@ -934,7 +878,7 @@ TEST(http, method_case_sensitive)
   // RFC 9110: methods are case-sensitive, "get" is an unknown extension method
   const char request[] = "get /x HTTP/1.1\r\n\r\n";
   HttpRequestTestContext context;
-  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request) - 1, context), ParserResultOk);
   EXPECT_EQ(context.method, static_cast<int>(hmUnknown));
 }
 
@@ -944,16 +888,16 @@ TEST(http, incremental_method_resume)
   HttpRequestParserState state;
   httpRequestParserInit(&state);
 
-  // the incomplete method must not be consumed: the caller keeps the tail
-  // starting at httpRequestDataPtr and appends freshly received bytes to it
+  // the incomplete method must not be consumed: the caller keeps the tail starting at httpRequestDataPtr and appends freshly received bytes to
+  // it
   const char firstPart[] = "GE";
-  httpRequestSetBuffer(&state, firstPart, sizeof(firstPart)-1);
+  httpRequestSetBuffer(&state, firstPart, sizeof(firstPart) - 1);
   ASSERT_EQ(httpRequestParse(&state, nullptr, httpRequestTestCb, &context), ParserResultNeedMoreData);
   ASSERT_EQ(httpRequestDataPtr(&state), static_cast<const void*>(firstPart));
-  ASSERT_EQ(httpRequestDataRemaining(&state), sizeof(firstPart)-1);
+  ASSERT_EQ(httpRequestDataRemaining(&state), sizeof(firstPart) - 1);
 
   const char request[] = "GET /x HTTP/1.1\r\n\r\n";
-  httpRequestSetBuffer(&state, request, sizeof(request)-1);
+  httpRequestSetBuffer(&state, request, sizeof(request) - 1);
   ASSERT_EQ(httpRequestParse(&state, nullptr, httpRequestTestCb, &context), ParserResultOk);
   EXPECT_EQ(context.method, static_cast<int>(hmGet));
   EXPECT_TRUE(context.done);
@@ -963,7 +907,7 @@ TEST(http, header_value_ows)
 {
   const char request[] = "GET /x HTTP/1.1\r\nHost:\tlocalhost \r\nUser-Agent:no-space\r\n\r\n";
   HttpRequestTestContext context;
-  ASSERT_EQ(parseRequest(request, sizeof(request)-1, context), ParserResultOk);
+  ASSERT_EQ(parseRequest(request, sizeof(request) - 1, context), ParserResultOk);
   ASSERT_EQ(context.headerValues.size(), 2u);
   EXPECT_EQ(context.headerValues[0], "localhost");
   EXPECT_EQ(context.headerValues[1], "no-space");
@@ -979,7 +923,7 @@ TEST(http, response_parser)
                             "\r\n"
                             "Hello";
     HttpResponseTestContext context;
-    ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
+    ASSERT_EQ(parseResponse(response, sizeof(response) - 1, context), ParserResultOk);
     EXPECT_EQ(context.code, 404u);
     EXPECT_EQ(context.description, "Not Found");
     EXPECT_EQ(context.headerTypes, (std::vector<int>{hhUnknown, hhUnknown, hhContentLength}));
@@ -993,7 +937,7 @@ TEST(http, response_parser)
     // reason phrase is optional
     const char response[] = "HTTP/1.1 200\r\n\r\n";
     HttpResponseTestContext context;
-    ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
+    ASSERT_EQ(parseResponse(response, sizeof(response) - 1, context), ParserResultOk);
     EXPECT_EQ(context.code, 200u);
     EXPECT_EQ(context.description.size(), 0u);
     EXPECT_EQ(context.body.size(), 0u);
@@ -1011,11 +955,11 @@ TEST(http, response_chunked)
                           "Expires: never\r\n"
                           "\r\n";
   HttpResponseTestContext context;
-  ASSERT_EQ(parseResponse(response, sizeof(response)-1, context), ParserResultOk);
+  ASSERT_EQ(parseResponse(response, sizeof(response) - 1, context), ParserResultOk);
   EXPECT_EQ(context.code, 200u);
   EXPECT_EQ(context.headerTypes, (std::vector<int>{hhTransferEncoding}));
   EXPECT_EQ(context.body, "Wikipedia");
   EXPECT_EQ(context.finalDataEvents, 1);
 }
 
-}
+} // namespace

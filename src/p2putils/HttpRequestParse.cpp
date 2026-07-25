@@ -26,22 +26,19 @@ void httpRequestSetBuffer(HttpRequestParserState *state, const void *buffer, siz
   state->end = state->ptr + size;
 }
 
-static __NOINLINE ParserResultTy
-httpRequestParseBody(HttpRequestParserState *state,
-                     httpRequestParseCb callback, void *arg)
+static __NOINLINE ParserResultTy httpRequestParseBody(HttpRequestParserState *state, httpRequestParseCb callback, void *arg)
 {
   ParserResultTy result;
   HttpRequestComponent component;
 
   if (state->state == httpRequestBody) {
     if (state->chunked) {
-      result = parseChunkedBody(state, httpRequestTrailer,
-        [&](const char *data, size_t size) {
-          component.type = httpRequestDtData;
-          component.data.data = data;
-          component.data.size = size;
-          return callback(&component, arg) != 0;
-        });
+      result = parseChunkedBody(state, httpRequestTrailer, [&](const char *data, size_t size) {
+        component.type = httpRequestDtData;
+        component.data.data = data;
+        component.data.size = size;
+        return callback(&component, arg) != 0;
+      });
       if (result != ParserResultOk)
         return result;
     } else {
@@ -88,10 +85,10 @@ httpRequestParseBody(HttpRequestParserState *state,
   return ParserResultOk;
 }
 
-static __NOINLINE ParserResultTy
-httpRequestParseHead(HttpRequestParserState *state,
-                     const HttpHeaderTable *table,
-                     httpRequestParseCb callback, void *arg)
+static __NOINLINE ParserResultTy httpRequestParseHead(HttpRequestParserState *state,
+                                                      const HttpHeaderTable *table,
+                                                      httpRequestParseCb callback,
+                                                      void *arg)
 {
   ParserResultTy localResult;
   HttpRequestComponent component;
@@ -106,42 +103,44 @@ httpRequestParseHead(HttpRequestParserState *state,
     if (!callback(&component, arg))
       return ParserResultCancelled;
 
-    // Consume the method/path separator exactly once. Once the parser is in
-    // httpRequestUriPath, state->ptr is the retained path tail and a resumed
-    // buffer starts directly with path data.
+    // Consume the method/path separator exactly once. Once the parser is in httpRequestUriPath, state->ptr is the retained path tail and a
+    // resumed buffer starts directly with path data.
     if ((localResult = skipSPCharacters(&state->ptr, state->end)) != ParserResultOk)
       return localResult;
     state->state = httpRequestUriPath;
   }
 
-  if (state->state >= httpRequestUriPath &&
-      state->state <= httpRequestUriFragment) {
+  if (state->state >= httpRequestUriPath && state->state <= httpRequestUriFragment) {
     UriArg uriArg = {callback, arg};
 
     if (state->state == httpRequestUriPath) {
-      // skipSPCharacters may have reached the previous buffer boundary in the
-      // middle of a lenient multi-SP separator
+      // skipSPCharacters may have reached the previous buffer boundary in the middle of a lenient multi-SP separator
       while (state->ptr != state->end && *state->ptr == ' ')
         state->ptr++;
 
       // Parse URI path
-      localResult = uriParsePath(&state->ptr, state->end, false, [](URIComponent *source, void *arg) {
-        HttpRequestComponent component;
-        UriArg *uriArg = static_cast<UriArg*>(arg);
-        if (source->type == uriCtPathElement) {
-          component.type = httpRequestDtUriPathElement;
-          component.data.data = source->raw.data;
-          component.data.size = source->raw.size;
-          return uriArg->callback(&component, uriArg->arg);
-        } else {
-          return 1;
-        }
-      }, &uriArg);
+      localResult = uriParsePath(
+          &state->ptr,
+          state->end,
+          false,
+          [](URIComponent *source, void *arg) {
+            HttpRequestComponent component;
+            UriArg *uriArg = static_cast<UriArg*>(arg);
+            if (source->type == uriCtPathElement) {
+              component.type = httpRequestDtUriPathElement;
+              component.data.data = source->raw.data;
+              component.data.size = source->raw.size;
+              return uriArg->callback(&component, uriArg->arg);
+            } else {
+              return 1;
+            }
+          },
+          &uriArg);
       if (localResult != ParserResultOk)
         return localResult;
 
-      // uriParsePath(..., false) succeeds only once it sees the request-target
-      // delimiter, so the normal path can choose the next phase immediately.
+      // uriParsePath(..., false) succeeds only once it sees the request-target delimiter, so the normal path can choose the next phase
+      // immediately.
       if (state->ptr == state->end)
         return ParserResultNeedMoreData;
       if (*state->ptr == '?') {
@@ -154,20 +153,25 @@ httpRequestParseHead(HttpRequestParserState *state,
 
     // Parse URI query
     if (state->state == httpRequestUriQuery) {
-      localResult = uriParseQuery(&state->ptr, state->end, false, [](URIComponent *source, void *arg) {
-        HttpRequestComponent component;
-        UriArg *uriArg = static_cast<UriArg*>(arg);
-        if (source->type == uriCtQueryElement) {
-          component.type = httpRequestDtUriQueryElement;
-          component.data.data = source->raw.data;
-          component.data.size = source->raw.size;
-          component.data2.data = source->raw2.data;
-          component.data2.size = source->raw2.size;
-          return uriArg->callback(&component, uriArg->arg);
-        } else {
-          return 1;
-        }
-      }, &uriArg);
+      localResult = uriParseQuery(
+          &state->ptr,
+          state->end,
+          false,
+          [](URIComponent *source, void *arg) {
+            HttpRequestComponent component;
+            UriArg *uriArg = static_cast<UriArg*>(arg);
+            if (source->type == uriCtQueryElement) {
+              component.type = httpRequestDtUriQueryElement;
+              component.data.data = source->raw.data;
+              component.data.size = source->raw.size;
+              component.data2.data = source->raw2.data;
+              component.data2.size = source->raw2.size;
+              return uriArg->callback(&component, uriArg->arg);
+            } else {
+              return 1;
+            }
+          },
+          &uriArg);
       if (localResult != ParserResultOk)
         return localResult;
       state->state = httpRequestUriFragment;
@@ -181,21 +185,25 @@ httpRequestParseHead(HttpRequestParserState *state,
       if (*state->ptr == '#') {
         const char *fragmentMarker = state->ptr;
         state->ptr++;
-        localResult = uriParseFragment(&state->ptr, state->end, false, [](URIComponent *source, void *arg) {
-          HttpRequestComponent component;
-          UriArg *uriArg = static_cast<UriArg*>(arg);
-          if (source->type == uriCtFragment) {
-            component.type = httpRequestDtUriFragment;
-            component.data.data = source->raw.data;
-            component.data.size = source->raw.size;
-            return uriArg->callback(&component, uriArg->arg);
-          } else {
-            return 1;
-          }
-        }, &uriArg);
+        localResult = uriParseFragment(
+            &state->ptr,
+            state->end,
+            false,
+            [](URIComponent *source, void *arg) {
+              HttpRequestComponent component;
+              UriArg *uriArg = static_cast<UriArg*>(arg);
+              if (source->type == uriCtFragment) {
+                component.type = httpRequestDtUriFragment;
+                component.data.data = source->raw.data;
+                component.data.size = source->raw.size;
+                return uriArg->callback(&component, uriArg->arg);
+              } else {
+                return 1;
+              }
+            },
+            &uriArg);
         if (localResult != ParserResultOk) {
-          // Fragment parsing does not emit or consume anything before it knows
-          // the terminating SP. Retain the marker as well so this state can
+          // Fragment parsing does not emit or consume anything before it knows the terminating SP. Retain the marker as well so this state can
           // consume it again after the caller appends more bytes.
           if (localResult == ParserResultNeedMoreData)
             state->ptr = fragmentMarker;
@@ -203,8 +211,7 @@ httpRequestParseHead(HttpRequestParserState *state,
         }
       }
 
-      // As with the method separator, consume this once before entering the
-      // resumable version state.
+      // As with the method separator, consume this once before entering the resumable version state.
       if ((localResult = skipSPCharacters(&state->ptr, state->end)) != ParserResultOk)
         return localResult;
       state->state = httpRequestVersion;
@@ -217,17 +224,17 @@ httpRequestParseHead(HttpRequestParserState *state,
       state->ptr++;
 
     const char version[] = "HTTP/";
-    if (!canRead(state->ptr, state->end, sizeof(version)-1 + 3 + 2))
+    if (!canRead(state->ptr, state->end, sizeof(version) - 1 + 3 + 2))
       return ParserResultNeedMoreData;
 
-    if ( (localResult = compareUnchecked(&state->ptr, version, sizeof(version)-1)) != ParserResultOk )
+    if ((localResult = compareUnchecked(&state->ptr, version, sizeof(version) - 1)) != ParserResultOk)
       return localResult;
-    if ( !(isDigit(state->ptr[0]) && state->ptr[1] == '.' && isDigit(state->ptr[2]) && state->ptr[3] == '\r' && state->ptr[4] == '\n') )
+    if (!(isDigit(state->ptr[0]) && state->ptr[1] == '.' && isDigit(state->ptr[2]) && state->ptr[3] == '\r' && state->ptr[4] == '\n'))
       return ParserResultError;
 
     component.type = httpRequestDtVersion;
-    component.version.majorVersion = static_cast<unsigned char>(state->ptr[0]-'0');
-    component.version.minorVersion = static_cast<unsigned char>(state->ptr[2]-'0');
+    component.version.majorVersion = static_cast<unsigned char>(state->ptr[0] - '0');
+    component.version.minorVersion = static_cast<unsigned char>(state->ptr[2] - '0');
     if (!callback(&component, arg))
       return ParserResultCancelled;
     state->ptr += 5;
@@ -243,12 +250,10 @@ httpRequestParseHead(HttpRequestParserState *state,
 
       if (state->ptr[0] == '\r' && state->ptr[1] == '\n') {
         state->ptr += 2;
-        // Transfer-Encoding without a final chunked leaves the request length
-        // undeterminable (RFC 9112: reject with 400)
+        // Transfer-Encoding without a final chunked leaves the request length undeterminable (RFC 9112: reject with 400)
         if (state->seenTransferEncoding && !state->chunked)
           return ParserResultError;
-        // RFC 9110: a request has a body when Content-Length or a chunked
-        // Transfer-Encoding is present, whatever the method is
+        // RFC 9110: a request has a body when Content-Length or a chunked Transfer-Encoding is present, whatever the method is
         if (state->chunked || state->dataRemaining != 0) {
           state->state = httpRequestBody;
         } else {
@@ -276,9 +281,7 @@ httpRequestParseHead(HttpRequestParserState *state,
   return httpRequestParseBody(state, callback, arg);
 }
 
-ParserResultTy httpRequestParse(HttpRequestParserState *state,
-                                const HttpHeaderTable *table,
-                                httpRequestParseCb callback, void *arg)
+ParserResultTy httpRequestParse(HttpRequestParserState *state, const HttpHeaderTable *table, httpRequestParseCb callback, void *arg)
 {
   if (state->state == httpRequestStLast)
     return ParserResultOk;

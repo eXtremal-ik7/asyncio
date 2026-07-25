@@ -47,13 +47,13 @@ void responseCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *clie
   }
 
   switch (context->State) {
-    case stStartTls : {
+    case stStartTls: {
       context->State = stEhlo2;
       aioSmtpStartTls(client, afNone, 5000000, responseCb, arg);
       break;
     }
 
-    case stEhlo2 : {
+    case stEhlo2: {
       context->State = stAuth;
       std::string ehlo = "EHLO ";
       ehlo.append(context->Args.clientHost);
@@ -62,48 +62,45 @@ void responseCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *clie
       break;
     }
 
-    case stAuth : {
+    case stAuth: {
       context->State = stFrom;
       aioSmtpLogin(client, context->Args.login, context->Args.password, afNone, 5000000, responseCb, arg);
       break;
     }
 
-    case stFrom : {
+    case stFrom: {
       context->State = stTo;
-      std::string from = (std::string)"MAIL From: <" + context->Args.from + ">";
+      std::string from = (std::string) "MAIL From: <" + context->Args.from + ">";
       aioSmtpCommand(client, from.c_str(), afNone, 5000000, responseCb, arg);
       fprintf(stdout, "<-- %s\n", from.c_str());
       break;
     }
 
-    case stTo : {
+    case stTo: {
       context->State = stDataMessage;
-      std::string to = (std::string)"RCPT To: <" + context->Args.to + ">";
+      std::string to = (std::string) "RCPT To: <" + context->Args.to + ">";
       aioSmtpCommand(client, to.c_str(), afNone, 5000000, responseCb, arg);
       fprintf(stdout, "<-- %s\n", to.c_str());
       break;
     }
 
-    case stDataMessage : {
+    case stDataMessage: {
       context->State = stData;
       aioSmtpCommand(client, "DATA", afNone, 5000000, responseCb, arg);
       fprintf(stdout, "<-- %s\n", "DATA");
       break;
     }
 
-    case stData : {
+    case stData: {
       context->State = stLast;
-      std::string text = (std::string)
-        "From: " + context->Args.from + "\r\n" +
-        "To: " + context->Args.to + "\r\n" +
-        "Subject: " + context->Args.subject + "\r\n" +
-        context->Args.text + "\r\n.\r\n";
+      std::string text = (std::string) "From: " + context->Args.from + "\r\n" + "To: " + context->Args.to + "\r\n" +
+                         "Subject: " + context->Args.subject + "\r\n" + context->Args.text + "\r\n.\r\n";
       aioSmtpCommand(client, text.c_str(), afNone, 5000000, responseCb, arg);
       fprintf(stdout, "<-- %s\n", text.c_str());
       break;
     }
 
-    case stLast : {
+    case stLast: {
       postQuitOperation(context->Base);
       break;
     }
@@ -131,7 +128,7 @@ void connectCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *clien
   fprintf(stdout, "<-- %s\n", ehlo.c_str());
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   Context context;
   int parseResult = parseSmtpArgs(argc, argv, context.Args);

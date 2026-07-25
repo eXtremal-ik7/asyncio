@@ -23,7 +23,6 @@ enum uriComponentTy {
   uriCtFragment
 };
 
-
 struct URIComponent {
   int type;
   union {
@@ -33,26 +32,24 @@ struct URIComponent {
     } raw;
     int32_t i32;
     uint32_t u32;
-    uint16_t ipv6[8];   // groups in written order, host byte order
+    uint16_t ipv6[8]; // groups in written order, host byte order
   };
   struct {
     const char *data;
     size_t size;
-  } raw2;    
+  } raw2;
 };
 
-// Return nonzero to continue or zero to cancel. Range parsers report
-// cancellation as ParserResultCancelled; full-string parsers return 0.
+// Return nonzero to continue or zero to cancel. Range parsers report cancellation as ParserResultCancelled; full-string parsers return 0.
 typedef int uriParseCb(URIComponent *component, void *arg);
 
-ParserResultTy uriParsePath(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
-ParserResultTy uriParseQuery(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
-ParserResultTy uriParseFragment(const char **ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
+ParserResultTy uriParsePath(const char**ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
+ParserResultTy uriParseQuery(const char**ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
+ParserResultTy uriParseFragment(const char**ptr, const char *end, bool uriOnly, uriParseCb callback, void *arg);
 
 int uriParse(const char *uri, uriParseCb callback, void *arg);
 
-// host[:port] without scheme/userinfo/path; the whole string must match.
-// uriCtPort is emitted only when the port is present
+// host[:port] without scheme/userinfo/path; the whole string must match. uriCtPort is emitted only when the port is present
 int uriParseHostPort(const char *hostport, uriParseCb callback, void *arg);
 
 // High-level interface
@@ -65,28 +62,26 @@ public:
     HostTypeIPv6,
     HostTypeDNS
   };
-  
+
   std::string schema;
   std::string userInfo;
-  
+
   int hostType;
   union {
     uint32_t ipv4;
     uint16_t ipv6[8];
   };
-  
+
   std::string domain;
-  int port;   // -1 = no explicit port; build() emits the port only when >= 0
-  
-  // Flat, percent-decoded components: path/query do not retain segment or
-  // parameter boundaries, nor whether a reserved delimiter was escaped.
-  // Consequently build() is not a semantic round-trip for inputs such as
-  // path "%2F" or query "%26"; use the low-level callback API when that
+  int port; // -1 = no explicit port; build() emits the port only when >= 0
+
+  // Flat, percent-decoded components: path/query do not retain segment or parameter boundaries, nor whether a reserved delimiter was escaped.
+  // Consequently build() is not a semantic round-trip for inputs such as path "%2F" or query "%26"; use the low-level callback API when that
   // distinction must be preserved.
   std::string path;
   std::string query;
   std::string fragment;
-  
+
 public:
   void build(std::string &out);
 };

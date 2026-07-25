@@ -19,40 +19,39 @@ typedef struct contextTy {
 #define CTX_RSP_INDEX 5
   uint64_t registers[9];
 #elif defined(ARCH_AARCH64)
-// Stackful coroutines under Shadow Call Stack require a per-coroutine shadow
-// stack with X18 swapped on every context switch. switchContext leaves X18
-// untouched, which is correct for Apple ARM64 and non-SCS Android but unsafe
-// under SCS; refuse to build that configuration rather than crash silently.
+// Stackful coroutines under Shadow Call Stack require a per-coroutine shadow stack with X18 swapped on every context switch. switchContext
+// leaves X18 untouched, which is correct for Apple ARM64 and non-SCS Android but unsafe under SCS; refuse to build that configuration rather
+// than crash silently.
 #if defined(__has_feature)
-#  if __has_feature(shadow_call_stack)
-#    error "Stackful coroutines are unsupported under -fsanitize=shadow-call-stack (need per-coroutine shadow stacks)"
-#  endif
+#if __has_feature(shadow_call_stack)
+#error "Stackful coroutines are unsupported under -fsanitize=shadow-call-stack (need per-coroutine shadow stacks)"
+#endif
 #endif
 #pragma pack(push, 1)
-  uint64_t X18;         // 0
-  uint64_t X19;         // 8
-  uint64_t X20;         // 16
-  uint64_t X21;         // 24
-  uint64_t X22;         // 32
-  uint64_t X23;         // 40
-  uint64_t X24;         // 48
-  uint64_t X25;         // 56
-  uint64_t X26;         // 64
-  uint64_t X27;         // 72
-  uint64_t X28;         // 80
-  uint64_t X29;         // 88
-  uint64_t D8;          // 96
-  uint64_t D9;          // 104
-  uint64_t D10;         // 112
-  uint64_t D11;         // 120
-  uint64_t D12;         // 128
-  uint64_t D13;         // 136
-  uint64_t D14;         // 144
-  uint64_t D15;         // 152
-  uint64_t SP;          // 160
-  uint64_t FPCR;        // 168
-  uint64_t PC;          // 176
-  uint64_t X0;          // 184
+  uint64_t X18;  // 0
+  uint64_t X19;  // 8
+  uint64_t X20;  // 16
+  uint64_t X21;  // 24
+  uint64_t X22;  // 32
+  uint64_t X23;  // 40
+  uint64_t X24;  // 48
+  uint64_t X25;  // 56
+  uint64_t X26;  // 64
+  uint64_t X27;  // 72
+  uint64_t X28;  // 80
+  uint64_t X29;  // 88
+  uint64_t D8;   // 96
+  uint64_t D9;   // 104
+  uint64_t D10;  // 112
+  uint64_t D11;  // 120
+  uint64_t D12;  // 128
+  uint64_t D13;  // 136
+  uint64_t D14;  // 144
+  uint64_t D15;  // 152
+  uint64_t SP;   // 160
+  uint64_t FPCR; // 168
+  uint64_t PC;   // 176
+  uint64_t X0;   // 184
 #pragma pack(pop)
 #else
 #error "Platform not supported"
@@ -89,36 +88,29 @@ static __thread coroutineTy *currentCoroutine;
 void switchContext(contextTy *from, contextTy *to);
 void initFPU(contextTy *context);
 
-static inline __attribute__((always_inline))
-void coroutineSwitchContext(coroutineTy *from, coroutineTy *to, int finalSwitch)
+static inline __attribute__((always_inline)) void coroutineSwitchContext(coroutineTy *from, coroutineTy *to, int finalSwitch)
 {
 #ifdef BUILD_SANITIZE_ADDRESS
   to->asanPrevious = from;
-  __sanitizer_start_switch_fiber(finalSwitch ? 0 : &from->asanFakeStack,
-                                  to->asanStackBottom,
-                                  to->asanStackSize);
+  __sanitizer_start_switch_fiber(finalSwitch ? 0 : &from->asanFakeStack, to->asanStackBottom, to->asanStackSize);
 #else
   (void)finalSwitch;
 #endif
 #ifdef BUILD_SANITIZE_THREAD
-  // Control is transferred, not run concurrently, so the destination observes
-  // everything sequenced before this switch. Calls of an already active
-  // coroutine return before reaching here and therefore add no false ordering.
+  // Control is transferred, not run concurrently, so the destination observes everything sequenced before this switch. Calls of an already
+  // active coroutine return before reaching here and therefore add no false ordering.
   __tsan_switch_to_fiber(to->tsanFiber, 0);
 #endif
   switchContext(&from->context, &to->context);
 
-  // This invocation resumes when another context switches back to `from`.
-  // asanPrevious is assigned by that incoming switch, which also covers a
-  // coroutine resuming on a different OS thread. A new coroutine has no
-  // suspended invocation and completes its first switch in fiberEntryPoint.
+  // This invocation resumes when another context switches back to `from`. asanPrevious is assigned by that incoming switch, which also covers a
+  // coroutine resuming on a different OS thread. A new coroutine has no suspended invocation and completes its first switch in fiberEntryPoint.
 #ifdef BUILD_SANITIZE_ADDRESS
   sanitizerFinishSwitch(from, from->asanPrevious);
 #endif
 }
 
-static inline __attribute__((always_inline))
-void sanitizerDestroyCoroutine(coroutineTy *coroutine)
+static inline __attribute__((always_inline)) void sanitizerDestroyCoroutine(coroutineTy *coroutine)
 {
   (void)coroutine;
 #ifdef BUILD_SANITIZE_ADDRESS
@@ -133,8 +125,7 @@ void sanitizerDestroyCoroutine(coroutineTy *coroutine)
 #endif
 }
 
-static inline __attribute__((always_inline))
-void ensureCurrentCoroutine(void)
+static inline __attribute__((always_inline)) void ensureCurrentCoroutine(void)
 {
   if (!currentCoroutine)
     mainCoroutine = currentCoroutine = (coroutineTy*)calloc(sizeof(coroutineTy), 1);
@@ -150,9 +141,8 @@ static void fiberEntryPoint(coroutineTy *coroutine)
   sanitizerFinishSwitch(coroutine, coroutine->asanPrevious);
 #endif
   coroutine->entryPoint(coroutine->arg);
-  // A wakeup racing from another loop thread reads the flag before claiming
-  // the counter, so the write must be atomic; release orders the coroutine's
-  // final state before the flag for that reader
+  // A wakeup racing from another loop thread reads the flag before claiming the counter, so the write must be atomic; release orders the
+  // coroutine's final state before the flag for that reader
   __uint_atomic_store(&coroutine->finished, 1, amoRelease);
   __sync_fetch_and_add(&coroutine->counter, -1);
   currentCoroutine = currentCoroutine->prev;
@@ -164,13 +154,9 @@ static void fiberEntryPoint(coroutineTy *coroutine)
 static int fiberInit(coroutineTy *coroutine, size_t stackSize)
 {
 #if defined(ARCH_X86)
-  // x86 arch
-  // EIP = fiberEntryPoint
-  // ESP = stack + stackSize - 20
-  // [ESP] = null return address
-  // [ESP + 4] = coroutine
+  // x86 arch EIP = fiberEntryPoint ESP = stack + stackSize - 20 [ESP] = null return address [ESP + 4] = coroutine
   if (posix_memalign(&coroutine->stack, 16, stackSize) == 0) {
-    uintptr_t *esp = ((uintptr_t*)coroutine->stack) + (stackSize - 20)/sizeof(uintptr_t);
+    uintptr_t *esp = ((uintptr_t*)coroutine->stack) + (stackSize - 20) / sizeof(uintptr_t);
     esp[0] = 0;
     esp[1] = (uintptr_t)coroutine;
     coroutine->context.registers[CTX_EIP_INDEX] = (uintptr_t)fiberEntryPoint;
@@ -181,12 +167,9 @@ static int fiberInit(coroutineTy *coroutine, size_t stackSize)
     return 0;
   }
 #elif defined(ARCH_X86_64)
-  // x86_64 arch
-  // RIP = fiberEntryPoint
-  // RSP = stack + stackSize - 128 - 8
-  // RDI = coroutine
+  // x86_64 arch RIP = fiberEntryPoint RSP = stack + stackSize - 128 - 8 RDI = coroutine
   if (posix_memalign(&coroutine->stack, 32, stackSize) == 0) {
-    uintptr_t *rsp = ((uintptr_t*)coroutine->stack) + (stackSize - 128 - 8)/sizeof(uintptr_t);
+    uintptr_t *rsp = ((uintptr_t*)coroutine->stack) + (stackSize - 128 - 8) / sizeof(uintptr_t);
     coroutine->context.registers[CTX_RIP_INDEX] = (uintptr_t)fiberEntryPoint;
     coroutine->context.registers[CTX_RSP_INDEX] = (uintptr_t)rsp;
     initFPU(&coroutine->context);
@@ -195,19 +178,16 @@ static int fiberInit(coroutineTy *coroutine, size_t stackSize)
     return 0;
   }
 #elif defined(ARCH_AARCH64)
-    // ARM 64-bit arch
-    // PC = fiberEntryPoint
-    // SP = stack + stackSize - 16
-    // X0 = coroutine
-    if (posix_memalign(&coroutine->stack, 32, stackSize) == 0) {
-      coroutine->context.PC = (uintptr_t)fiberEntryPoint;
-      coroutine->context.SP = (uintptr_t)coroutine->stack + stackSize - 16;
-      coroutine->context.X0 = (uintptr_t)coroutine;
-      initFPU(&coroutine->context);
-      return 1;
-    } else {
-      return 0;
-    }
+  // ARM 64-bit arch PC = fiberEntryPoint SP = stack + stackSize - 16 X0 = coroutine
+  if (posix_memalign(&coroutine->stack, 32, stackSize) == 0) {
+    coroutine->context.PC = (uintptr_t)fiberEntryPoint;
+    coroutine->context.SP = (uintptr_t)coroutine->stack + stackSize - 16;
+    coroutine->context.X0 = (uintptr_t)coroutine;
+    initFPU(&coroutine->context);
+    return 1;
+  } else {
+    return 0;
+  }
 #else
 #error "Platform not supported"
 #endif
@@ -235,8 +215,8 @@ coroutineTy *coroutineNew(coroutineProcTy entry, void *arg, unsigned stackSize)
   ensureCurrentCoroutine();
 
   // Contract (coroutine.h): a request below the 1 KiB floor still gets 1 KiB;
-  // rounding to 16 keeps the initial SP aligned. size_t math with a saturate,
-  // so a near-UINT_MAX request fails in the allocator instead of wrapping.
+  // rounding to 16 keeps the initial SP aligned. size_t math with a saturate, so a near-UINT_MAX request fails in the allocator instead of
+  // wrapping.
   size_t alignedStackSize = ((size_t)stackSize + 15) & ~(size_t)15;
   if (alignedStackSize < stackSize)
     alignedStackSize = SIZE_MAX & ~(size_t)15;
@@ -305,15 +285,11 @@ int coroutineCall(coroutineTy *coroutine)
       coroutine->prev = currentCoroutine;
       currentCoroutine = coroutine;
       coroutineSwitchContext(coroutine->prev, coroutine, 0);
-      // A wakeup that lands after the last yield leaves the counter above 1
-      // when the coroutine returns; re-entering a finished context would run
-      // off the end of fiberEntryPoint. The pending wakeup is consumed by the
-      // finished path below (free + finishCb), same as a call on a finished
-      // coroutine is a no-op.
-      // The flag is captured before the decrement: the decrement that drains
-      // the counter hands ownership away, another thread may become the
-      // runner, finish the coroutine and free it - nothing may be read from
-      // the coroutine after our last decrement
+      // A wakeup that lands after the last yield leaves the counter above 1 when the coroutine returns; re-entering a finished context would
+      // run off the end of fiberEntryPoint. The pending wakeup is consumed by the finished path below (free + finishCb), same as a call on a
+      // finished coroutine is a no-op. The flag is captured before the decrement: the decrement that drains the counter hands ownership away,
+      // another thread may become the runner, finish the coroutine and free it - nothing may be read from the coroutine after our last
+      // decrement
       finished = __uint_atomic_load(&coroutine->finished, amoAcquire);
     } while (__sync_fetch_and_add(&coroutine->counter, -1) != 1 && !finished);
 
@@ -344,7 +320,6 @@ void coroutineYield()
       __sync_fetch_and_add(&old->counter, -1);
       return;
     }
-
 
     currentCoroutine = currentCoroutine->prev;
     coroutineSwitchContext(old, currentCoroutine, 0);

@@ -19,7 +19,12 @@ struct zmtpContext {
   zmtpSocket *clientSocket;
   zmtpSocket *serverSocket;
   zmtpStream stream;
-  zmtpContext(asyncBase *baseArg) : base(baseArg), serverRunning(false), clientRunning(false), clientState(0), serverState(0) {}
+  zmtpContext(asyncBase *baseArg) :
+    base(baseArg),
+    serverRunning(false),
+    clientRunning(false),
+    clientState(0),
+    serverState(0) {}
 };
 __NO_PADDING_END
 
@@ -34,7 +39,7 @@ static bool waitClient(zmtpContext *ctx)
   return ctx->clientRunning == false;
 }
 
-static bool waitServer(zmtpContext *ctx, bool event=false)
+static bool waitServer(zmtpContext *ctx, bool event = false)
 {
   for (unsigned i = 0; i < 5000; i++) {
     if (ctx->serverRunning == event)
@@ -51,12 +56,12 @@ static void zmq_server_pull(zmtpContext *ctx, uint16_t port)
   auto socket = zmq_socket(zmqCtx, ZMQ_PULL);
 
   int timeout = 3000;
-  zmq_setsockopt (socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
+  zmq_setsockopt(socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
 
   char address[128];
   snprintf(address, sizeof(address), "tcp://127.0.0.1:%u", static_cast<unsigned>(port));
   int bindResult;
-  if ( (bindResult = zmq_bind(socket, address)) != 0) {
+  if ((bindResult = zmq_bind(socket, address)) != 0) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     bindResult = zmq_bind(socket, address);
   }
@@ -115,7 +120,7 @@ static void zmq_server_rep(zmtpContext *ctx, uint16_t port)
   char address[128];
   snprintf(address, sizeof(address), "tcp://127.0.0.1:%u", static_cast<unsigned>(port));
   int bindResult;
-  if ( (bindResult = zmq_bind(socket, address)) != 0) {
+  if ((bindResult = zmq_bind(socket, address)) != 0) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     bindResult = zmq_bind(socket, address);
   }
@@ -188,7 +193,7 @@ static void zmq_server_push(zmtpContext *ctx, uint16_t port)
 
   int linger = 0;
   int timeout = 3000;
-  zmq_setsockopt (socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
+  zmq_setsockopt(socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
   zmq_setsockopt(socket, ZMQ_LINGER, &linger, sizeof(int));
 
   char address[128];
@@ -213,7 +218,7 @@ static void zmq_server_push(zmtpContext *ctx, uint16_t port)
         data[i].a = i;
         data[i].b = i;
       }
-      if (zmq_send(socket, data.get(), 1024*sizeof(reqStruct), 0) == 1024*sizeof(reqStruct))
+      if (zmq_send(socket, data.get(), 1024 * sizeof(reqStruct), 0) == 1024 * sizeof(reqStruct))
         ctx->clientState++;
     }
 
@@ -240,7 +245,7 @@ static void zmq_server_req(zmtpContext *ctx, uint16_t port)
 
   int linger = 0;
   int timeout = 3000;
-  zmq_setsockopt (socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
+  zmq_setsockopt(socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
   zmq_setsockopt(socket, ZMQ_LINGER, &linger, sizeof(int));
 
   char address[128];
@@ -259,8 +264,8 @@ static void zmq_server_req(zmtpContext *ctx, uint16_t port)
       zmq_send(socket, &req, sizeof(req), 0);
       recvResult = zmq_recv(socket, &rep, sizeof(rep), 0);
       EXPECT_EQ(recvResult, static_cast<ssize_t>(sizeof(rep)));
-      EXPECT_EQ(rep.c, req.a+req.b);
-      if (recvResult == sizeof(rep) && rep.c == req.a+req.b)
+      EXPECT_EQ(rep.c, req.a + req.b);
+      if (recvResult == sizeof(rep) && rep.c == req.a + req.b)
         ctx->clientState++;
     }
 
@@ -273,10 +278,10 @@ static void zmq_server_req(zmtpContext *ctx, uint16_t port)
         data[i].a = i;
         data[i].b = i;
       }
-      zmq_send(socket, data.get(), 1024*sizeof(reqStruct), 0);
-      recvResult = zmq_recv(socket, rep.get(), 1024*sizeof(repStruct), 0);
-      EXPECT_EQ(recvResult, static_cast<ssize_t>(1024*sizeof(repStruct)));
-      if (recvResult == 1024*sizeof(repStruct)) {
+      zmq_send(socket, data.get(), 1024 * sizeof(reqStruct), 0);
+      recvResult = zmq_recv(socket, rep.get(), 1024 * sizeof(repStruct), 0);
+      EXPECT_EQ(recvResult, static_cast<ssize_t>(1024 * sizeof(repStruct)));
+      if (recvResult == 1024 * sizeof(repStruct)) {
         for (unsigned i = 0; i < 1024; i++) {
           EXPECT_EQ(rep[i].c, data[i].a + data[i].b);
           if (rep[i].c != data[i].a + data[i].b) {
@@ -336,7 +341,7 @@ static void aio_push_connectcb(AsyncOpStatus status, zmtpSocket *client, void *a
         data[i].a = i;
         data[i].b = i;
       }
-      aioZmtpSend(ctx->clientSocket, data.get(), 1024*sizeof(reqStruct), zmtpMessage, afNone, 1000000, aio_push_writecb, ctx);
+      aioZmtpSend(ctx->clientSocket, data.get(), 1024 * sizeof(reqStruct), zmtpMessage, afNone, 1000000, aio_push_writecb, ctx);
     }
   }
 
@@ -345,7 +350,6 @@ static void aio_push_connectcb(AsyncOpStatus status, zmtpSocket *client, void *a
   postQuitOperation(ctx->base);
   ctx->clientRunning = false;
 }
-
 
 TEST(zmtp, aio_push)
 {
@@ -399,9 +403,9 @@ void aio_push_client_coro(void *arg)
         data[i].a = i;
         data[i].b = i;
       }
-      sendResult = ioZmtpSend(ctx->clientSocket, data.get(), 1024*sizeof(reqStruct), zmtpMessage, afNone, 1000000);
-      EXPECT_EQ(sendResult, static_cast<ssize_t>(1024*sizeof(reqStruct)));
-      if (sendResult == 1024*sizeof(reqStruct))
+      sendResult = ioZmtpSend(ctx->clientSocket, data.get(), 1024 * sizeof(reqStruct), zmtpMessage, afNone, 1000000);
+      EXPECT_EQ(sendResult, static_cast<ssize_t>(1024 * sizeof(reqStruct)));
+      if (sendResult == 1024 * sizeof(reqStruct))
         ctx->clientState++;
     }
   }
@@ -441,10 +445,7 @@ static void aio_pull_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMs
     EXPECT_EQ(stream->sizeOf(), sizeof(reqStruct));
     EXPECT_EQ(req->a, 11u);
     EXPECT_EQ(req->b, 77u);
-    if (status == aosSuccess &&
-        stream->sizeOf() == sizeof(reqStruct) &&
-        req->a == 11 &&
-        req->b == 77) {
+    if (status == aosSuccess && stream->sizeOf() == sizeof(reqStruct) && req->a == 11 && req->b == 77) {
       ctx->serverState = 2;
       aioZmtpRecv(socket, ctx->stream, 65536, afNone, 1000000, aio_pull_readcb, ctx);
       end = false;
@@ -455,7 +456,7 @@ static void aio_pull_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMs
     reqStruct *req = stream->data<reqStruct>();
     EXPECT_EQ(status, aosSuccess);
     EXPECT_EQ(type, zmtpMessage);
-    EXPECT_EQ(stream->sizeOf(), 1024*sizeof(reqStruct));
+    EXPECT_EQ(stream->sizeOf(), 1024 * sizeof(reqStruct));
     for (unsigned i = 0; i < 1024; i++) {
       EXPECT_EQ(req[i].a, i);
       EXPECT_EQ(req[i].b, i);
@@ -465,7 +466,7 @@ static void aio_pull_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMs
       }
     }
 
-    if (status == aosSuccess && stream->sizeOf() == 1024*sizeof(reqStruct) && valid) {
+    if (status == aosSuccess && stream->sizeOf() == 1024 * sizeof(reqStruct) && valid) {
       ctx->serverState = 3;
       aioZmtpRecv(socket, ctx->stream, 8, afNone, 1000000, aio_pull_readcb, ctx);
       end = false;
@@ -568,8 +569,8 @@ void aio_pull_accept_coro(void *arg)
         recvResult = ioZmtpRecv(socket, ctx->stream, 65536, afNone, 1000000, &msgType);
         reqStruct *req = ctx->stream.data<reqStruct>();
         EXPECT_EQ(msgType, zmtpMessage);
-        EXPECT_EQ(recvResult, static_cast<ssize_t>(1024*sizeof(reqStruct)));
-        EXPECT_EQ(ctx->stream.sizeOf(), 1024*sizeof(reqStruct));
+        EXPECT_EQ(recvResult, static_cast<ssize_t>(1024 * sizeof(reqStruct)));
+        EXPECT_EQ(ctx->stream.sizeOf(), 1024 * sizeof(reqStruct));
         for (unsigned i = 0; i < 1024; i++) {
           EXPECT_EQ(req[i].a, i);
           EXPECT_EQ(req[i].b, i);
@@ -579,10 +580,7 @@ void aio_pull_accept_coro(void *arg)
           }
         }
 
-        if (msgType == zmtpMessage &&
-            recvResult == 1024*sizeof(reqStruct) &&
-            ctx->stream.sizeOf() == 1024*sizeof(reqStruct) &&
-            valid) {
+        if (msgType == zmtpMessage && recvResult == 1024 * sizeof(reqStruct) && ctx->stream.sizeOf() == 1024 * sizeof(reqStruct) && valid) {
           ctx->serverState++;
         }
       }
@@ -641,10 +639,7 @@ static void aio_req_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsg
     EXPECT_EQ(type, zmtpMessage);
     EXPECT_EQ(stream->sizeOf(), sizeof(repStruct));
     EXPECT_EQ(stream->data<repStruct>()->c, 88u);
-    if (status == aosSuccess &&
-        type == zmtpMessage &&
-        stream->sizeOf() == sizeof(repStruct) &&
-        stream->data<repStruct>()->c == 88) {
+    if (status == aosSuccess && type == zmtpMessage && stream->sizeOf() == sizeof(repStruct) && stream->data<repStruct>()->c == 88) {
       ctx->clientState = 2;
       end = false;
 
@@ -655,7 +650,7 @@ static void aio_req_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsg
           data[i].a = i;
           data[i].b = i;
         }
-        aioZmtpSend(socket, data.get(), 1024*sizeof(reqStruct), zmtpMessage, afNone, 1000000, aio_req_writecb, ctx);
+        aioZmtpSend(socket, data.get(), 1024 * sizeof(reqStruct), zmtpMessage, afNone, 1000000, aio_req_writecb, ctx);
         aioZmtpRecv(socket, ctx->stream, 65536, afNone, 1000000, aio_req_readcb, ctx);
       }
     }
@@ -665,11 +660,11 @@ static void aio_req_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsg
     repStruct *rep = ctx->stream.data<repStruct>();
     EXPECT_EQ(status, aosSuccess);
     EXPECT_EQ(type, zmtpMessage);
-    EXPECT_EQ(stream->sizeOf(), 1024*sizeof(repStruct));
-    if (stream->sizeOf() == 1024*sizeof(repStruct)) {
+    EXPECT_EQ(stream->sizeOf(), 1024 * sizeof(repStruct));
+    if (stream->sizeOf() == 1024 * sizeof(repStruct)) {
       for (unsigned i = 0; i < 1024; i++) {
-        EXPECT_EQ(rep[i].c, i+i);
-        if (rep[i].c != i+i) {
+        EXPECT_EQ(rep[i].c, i + i);
+        if (rep[i].c != i + i) {
           valid = false;
           break;
         }
@@ -771,10 +766,7 @@ void aio_req_client_coro(void *arg)
       EXPECT_EQ(msgType, zmtpMessage);
       EXPECT_EQ(ctx->stream.sizeOf(), sizeof(repStruct));
       EXPECT_EQ(rep->c, req.a + req.b);
-      if (msgType == zmtpMessage &&
-          recvResult == sizeof(repStruct) &&
-          ctx->stream.sizeOf() == sizeof(repStruct) &&
-          rep->c == req.a + req.b) {
+      if (msgType == zmtpMessage && recvResult == sizeof(repStruct) && ctx->stream.sizeOf() == sizeof(repStruct) && rep->c == req.a + req.b) {
         ctx->clientState++;
       }
     }
@@ -787,16 +779,16 @@ void aio_req_client_coro(void *arg)
         data[i].a = i;
         data[i].b = i;
       }
-      sendResult = ioZmtpSend(ctx->clientSocket, data.get(), 1024*sizeof(reqStruct), zmtpMessage, afNone, 1000000);
+      sendResult = ioZmtpSend(ctx->clientSocket, data.get(), 1024 * sizeof(reqStruct), zmtpMessage, afNone, 1000000);
       recvResult = ioZmtpRecv(ctx->clientSocket, ctx->stream, 65536, afNone, 1000000, &msgType);
       repStruct *rep = ctx->stream.data<repStruct>();
-      EXPECT_EQ(sendResult, static_cast<ssize_t>(1024*sizeof(reqStruct)));
-      EXPECT_EQ(recvResult, static_cast<ssize_t>(1024*sizeof(repStruct)));
-      EXPECT_EQ(ctx->stream.sizeOf(), 1024*sizeof(repStruct));
-      if (ctx->stream.sizeOf() == 1024*sizeof(repStruct)) {
+      EXPECT_EQ(sendResult, static_cast<ssize_t>(1024 * sizeof(reqStruct)));
+      EXPECT_EQ(recvResult, static_cast<ssize_t>(1024 * sizeof(repStruct)));
+      EXPECT_EQ(ctx->stream.sizeOf(), 1024 * sizeof(repStruct));
+      if (ctx->stream.sizeOf() == 1024 * sizeof(repStruct)) {
         for (unsigned i = 0; i < 1024; i++) {
-          EXPECT_EQ(rep[i].c, i+i);
-          if (rep[i].c != i+i) {
+          EXPECT_EQ(rep[i].c, i + i);
+          if (rep[i].c != i + i) {
             valid = false;
             break;
           }
@@ -869,10 +861,7 @@ static void aio_rep_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsg
     EXPECT_EQ(stream->sizeOf(), sizeof(reqStruct));
     EXPECT_EQ(req->a, 11u);
     EXPECT_EQ(req->b, 77u);
-    if (status == aosSuccess &&
-        stream->sizeOf() == sizeof(reqStruct) &&
-        req->a == 11 &&
-        req->b == 77) {
+    if (status == aosSuccess && stream->sizeOf() == sizeof(reqStruct) && req->a == 11 && req->b == 77) {
       ctx->serverState = 2;
       repStruct rep;
       rep.c = req->a + req->b;
@@ -887,7 +876,7 @@ static void aio_rep_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsg
     reqStruct *req = stream->data<reqStruct>();
     EXPECT_EQ(status, aosSuccess);
     EXPECT_EQ(type, zmtpMessage);
-    EXPECT_EQ(stream->sizeOf(), 1024*sizeof(reqStruct));
+    EXPECT_EQ(stream->sizeOf(), 1024 * sizeof(reqStruct));
     for (unsigned i = 0; i < 1024; i++) {
       rep[i].c = req[i].a + req[i].b;
       EXPECT_EQ(req[i].a, i);
@@ -898,7 +887,7 @@ static void aio_rep_readcb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsg
       }
     }
 
-    if (status == aosSuccess && stream->sizeOf() == 1024*sizeof(reqStruct) && valid) {
+    if (status == aosSuccess && stream->sizeOf() == 1024 * sizeof(reqStruct) && valid) {
       ctx->serverState = 3;
       aioZmtpSend(socket, rep, sizeof(rep), zmtpMessage, afNone, 1000000, aio_rep_writecb, ctx);
       aioZmtpRecv(socket, ctx->stream, 8, afNone, 1000000, aio_rep_readcb, ctx);
@@ -933,7 +922,6 @@ static void aio_rep_zmtpacceptcb(AsyncOpStatus status, zmtpSocket *socket, void 
     postQuitOperation(ctx->base);
   }
 }
-
 
 static void aio_rep_acceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
 {
@@ -1010,8 +998,8 @@ void aio_rep_accept_coro(void *arg)
         reqStruct *req = ctx->stream.data<reqStruct>();
         repStruct rep[1024];
         EXPECT_EQ(msgType, zmtpMessage);
-        EXPECT_EQ(recvResult, static_cast<ssize_t>(1024*sizeof(reqStruct)));
-        EXPECT_EQ(ctx->stream.sizeOf(), 1024*sizeof(reqStruct));
+        EXPECT_EQ(recvResult, static_cast<ssize_t>(1024 * sizeof(reqStruct)));
+        EXPECT_EQ(ctx->stream.sizeOf(), 1024 * sizeof(reqStruct));
         for (unsigned i = 0; i < 1024; i++) {
           rep[i].c = req[i].a + req[i].b;
           EXPECT_EQ(req[i].a, i);
@@ -1022,10 +1010,7 @@ void aio_rep_accept_coro(void *arg)
           }
         }
 
-        if (msgType == zmtpMessage &&
-            recvResult == 1024*sizeof(reqStruct) &&
-            ctx->stream.sizeOf() == 1024*sizeof(reqStruct) &&
-            valid) {
+        if (msgType == zmtpMessage && recvResult == 1024 * sizeof(reqStruct) && ctx->stream.sizeOf() == 1024 * sizeof(reqStruct) && valid) {
           sendResult = ioZmtpSend(socket, rep, sizeof(rep), zmtpMessage, afNone, 1000000);
           EXPECT_EQ(sendResult, static_cast<ssize_t>(sizeof(rep)));
           if (sendResult == sizeof(rep))
@@ -1066,14 +1051,11 @@ TEST(zmtp, aio_rep_coro)
   ASSERT_EQ(context.serverState, 4);
 }
 
-// The ZMTP handshake operations (connect and accept) initialize the transport:
-// the combiner stores them in initializationOp, and recv/send submitted
-// behind them stay frozen in the object queues until the handshake outcome. Without the
-// slot the opposite lane is open: connect lives in the write queue, so a
-// pipelined recv used to take the inline fast path and read on the plain
-// socket, stealing greeting bytes from the handshake state machine (and
-// mirrored for send during accept). Both ends run on this library in one
-// event loop - the peer must also be driven while the handshake is parked.
+// The ZMTP handshake operations (connect and accept) initialize the transport: the combiner stores them in initializationOp, and recv/send
+// submitted behind them stay frozen in the object queues until the handshake outcome. Without the slot the opposite lane is open: connect lives
+// in the write queue, so a pipelined recv used to take the inline fast path and read on the plain socket, stealing greeting bytes from the
+// handshake state machine (and mirrored for send during accept). Both ends run on this library in one event loop - the peer must also be driven
+// while the handshake is parked.
 struct zmtpPipelineContext {
   asyncBase *base;
   aioObject *listener;
@@ -1089,10 +1071,16 @@ struct zmtpPipelineContext {
   AsyncOpStatus recvStatus;
   int pending;
   zmtpPipelineContext(asyncBase *baseArg) :
-    base(baseArg), listener(nullptr), clientSocket(nullptr), serverSocket(nullptr),
+    base(baseArg),
+    listener(nullptr),
+    clientSocket(nullptr),
+    serverSocket(nullptr),
     rawServerFd(0),
-    connectStatus(aosUnknown), acceptStatus(aosUnknown),
-    sendStatus(aosUnknown), recvStatus(aosUnknown), pending(0) {}
+    connectStatus(aosUnknown),
+    acceptStatus(aosUnknown),
+    sendStatus(aosUnknown),
+    recvStatus(aosUnknown),
+    pending(0) {}
   void completed() {
     if (--pending == 0)
       postQuitOperation(base);
@@ -1129,7 +1117,7 @@ static void recv_pipeline_zmtpacceptcb(AsyncOpStatus status, zmtpSocket *socket,
     ctx->serverReq.b = 77;
     aioZmtpSend(socket, &ctx->serverReq, sizeof(ctx->serverReq), zmtpMessage, afNone, 3000000, pipeline_sendcb, ctx);
   } else {
-    ctx->completed();  // the send that will never be submitted
+    ctx->completed(); // the send that will never be submitted
   }
   ctx->completed();
 }
@@ -1142,7 +1130,7 @@ static void recv_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddr
     ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
     aioZmtpAccept(ctx->serverSocket, afNone, 3000000, recv_pipeline_zmtpacceptcb, ctx);
   } else {
-    ctx->pending -= 2;  // neither accept nor send will be submitted
+    ctx->pending -= 2; // neither accept nor send will be submitted
     ctx->completed();
   }
 }
@@ -1150,7 +1138,7 @@ static void recv_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddr
 TEST(zmtp, recv_pipelined_with_connect)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 4;  // connect, recv, accept, send
+  ctx.pending = 4; // connect, recv, accept, send
   ctx.listener = startTCPServer(gBase, recv_pipeline_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
@@ -1160,8 +1148,7 @@ TEST(zmtp, recv_pipelined_with_connect)
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   aioZmtpConnect(ctx.clientSocket, &address, afNone, 3000000, pipeline_connectcb, &ctx);
-  // pipelined right behind the connect: must wait for the handshake outcome
-  // instead of racing it for the greeting bytes
+  // pipelined right behind the connect: must wait for the handshake outcome instead of racing it for the greeting bytes
   aioZmtpRecv(ctx.clientSocket, ctx.stream, 1024, afNone, 3000000, pipeline_recvcb, &ctx);
 
   asyncLoop(gBase);
@@ -1197,7 +1184,7 @@ static void send_pipeline_connectcb(AsyncOpStatus status, zmtpSocket *socket, vo
   if (status == aosSuccess) {
     aioZmtpRecv(socket, ctx->stream, 1024, afNone, 3000000, pipeline_recvcb, ctx);
   } else {
-    ctx->completed();  // the recv that will never be submitted
+    ctx->completed(); // the recv that will never be submitted
   }
   ctx->completed();
 }
@@ -1211,11 +1198,10 @@ static void send_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddr
     ctx->serverReq.a = 11;
     ctx->serverReq.b = 77;
     aioZmtpAccept(ctx->serverSocket, afNone, 3000000, send_pipeline_zmtpacceptcb, ctx);
-    // pipelined right behind the accept: the frame must not hit the wire
-    // before the greeting exchange completes
+    // pipelined right behind the accept: the frame must not hit the wire before the greeting exchange completes
     aioZmtpSend(ctx->serverSocket, &ctx->serverReq, sizeof(ctx->serverReq), zmtpMessage, afNone, 3000000, pipeline_sendcb, ctx);
   } else {
-    ctx->pending -= 2;  // neither accept nor send will be submitted
+    ctx->pending -= 2; // neither accept nor send will be submitted
     ctx->completed();
   }
 }
@@ -1223,7 +1209,7 @@ static void send_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddr
 TEST(zmtp, send_pipelined_with_accept)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 4;  // connect, recv, accept, send
+  ctx.pending = 4; // connect, recv, accept, send
   ctx.listener = startTCPServer(gBase, send_pipeline_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
@@ -1260,15 +1246,14 @@ static void capture_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostA
   if (status == aosSuccess) {
     ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
     aioZmtpAccept(ctx->serverSocket, afNone, 3000000, send_pipeline_zmtpacceptcb, ctx);
-    // queued behind the accept from a scoped buffer: without afNoCopy the
-    // payload must be captured before the call returns
+    // queued behind the accept from a scoped buffer: without afNoCopy the payload must be captured before the call returns
     reqStruct req;
     req.a = 11;
     req.b = 77;
     aioZmtpSend(ctx->serverSocket, &req, sizeof(req), zmtpMessage, afNone, 3000000, pipeline_sendcb, ctx);
     memset(&req, 0xAA, sizeof(req));
   } else {
-    ctx->pending -= 2;  // neither accept nor send will be submitted
+    ctx->pending -= 2; // neither accept nor send will be submitted
     ctx->completed();
   }
 }
@@ -1276,7 +1261,7 @@ static void capture_pipeline_tcpacceptcb(AsyncOpStatus status, aioObject*, HostA
 TEST(zmtp, queued_send_captures_payload)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 4;  // connect, recv, accept, send
+  ctx.pending = 4; // connect, recv, accept, send
   ctx.listener = startTCPServer(gBase, capture_pipeline_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
@@ -1306,10 +1291,8 @@ TEST(zmtp, queued_send_captures_payload)
   deleteAioObject(ctx.listener);
 }
 
-// After its handshake the server writes one frame to the raw fd in two
-// chunks split inside the 2-byte short header: the length byte arrives a
-// pause later than the flags byte, so the receiver must wait for it instead
-// of decoding a stale one.
+// After its handshake the server writes one frame to the raw fd in two chunks split inside the 2-byte short header: the length byte arrives a
+// pause later than the flags byte, so the receiver must wait for it instead of decoding a stale one.
 static void split_header_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
 {
   auto ctx = static_cast<zmtpPipelineContext*>(arg);
@@ -1340,7 +1323,7 @@ static void split_header_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddre
     ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
     aioZmtpAccept(ctx->serverSocket, afNone, 3000000, split_header_zmtpacceptcb, ctx);
   } else {
-    ctx->pending -= 1;  // the accept that will never be submitted
+    ctx->pending -= 1; // the accept that will never be submitted
     ctx->completed();
   }
 }
@@ -1348,7 +1331,7 @@ static void split_header_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddre
 TEST(zmtp, recv_split_frame_header)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 3;  // connect, recv, accept
+  ctx.pending = 3; // connect, recv, accept
   ctx.listener = startTCPServer(gBase, split_header_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
@@ -1379,18 +1362,17 @@ TEST(zmtp, recv_split_frame_header)
   deleteAioObject(ctx.listener);
 }
 
-// 6+6 multipart via the raw fd: each frame alone fits the receive limit of 8,
-// the accumulated message must not
+// 6+6 multipart via the raw fd: each frame alone fits the receive limit of 8, the accumulated message must not
 static void multipart_limit_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
 {
   auto ctx = static_cast<zmtpPipelineContext*>(arg);
   ctx->acceptStatus = status;
   if (status == aosSuccess) {
     uint8_t frames[16];
-    frames[0] = 1;  // MORE
+    frames[0] = 1; // MORE
     frames[1] = 6;
     memset(frames + 2, 'A', 6);
-    frames[8] = 0;  // final
+    frames[8] = 0; // final
     frames[9] = 6;
     memset(frames + 10, 'B', 6);
     send(ctx->rawServerFd, reinterpret_cast<const char*>(frames), sizeof(frames), 0);
@@ -1405,7 +1387,7 @@ static void multipart_limit_connectcb(AsyncOpStatus status, zmtpSocket *socket, 
   if (status == aosSuccess) {
     aioZmtpRecv(socket, ctx->stream, 8, afNone, 3000000, pipeline_recvcb, ctx);
   } else {
-    ctx->completed();  // the recv that will never be submitted
+    ctx->completed(); // the recv that will never be submitted
   }
   ctx->completed();
 }
@@ -1419,7 +1401,7 @@ static void multipart_limit_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAd
     ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
     aioZmtpAccept(ctx->serverSocket, afNone, 3000000, multipart_limit_zmtpacceptcb, ctx);
   } else {
-    ctx->pending -= 1;  // the accept that will never be submitted
+    ctx->pending -= 1; // the accept that will never be submitted
     ctx->completed();
   }
 }
@@ -1427,7 +1409,7 @@ static void multipart_limit_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAd
 TEST(zmtp, recv_limit_caps_whole_message)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 3;  // connect, recv, accept
+  ctx.pending = 3; // connect, recv, accept
   ctx.listener = startTCPServer(gBase, multipart_limit_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPULL);
@@ -1450,8 +1432,8 @@ TEST(zmtp, recv_limit_caps_whole_message)
   deleteAioObject(ctx.listener);
 }
 
-// ZMTP 3.0 mandates peer socket-type validation: PUSH pairs only with PULL,
-// so a PUSH client must be rejected by a PUSH server on the accept side
+// ZMTP 3.0 mandates peer socket-type validation: PUSH pairs only with PULL, so a PUSH client must be rejected by a PUSH server on the accept
+// side
 static void incompat_zmtpacceptcb(AsyncOpStatus status, zmtpSocket*, void *arg)
 {
   auto ctx = static_cast<zmtpPipelineContext*>(arg);
@@ -1467,7 +1449,7 @@ static void incompat_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, 
     ctx->serverSocket = zmtpSocketNew(ctx->base, newSocketIo(ctx->base, acceptSocket), zmtpSocketPUSH);
     aioZmtpAccept(ctx->serverSocket, afNone, 300000, incompat_zmtpacceptcb, ctx);
   } else {
-    ctx->pending -= 1;  // the accept that will never be submitted
+    ctx->pending -= 1; // the accept that will never be submitted
     ctx->completed();
   }
 }
@@ -1482,7 +1464,7 @@ static void incompat_connectcb(AsyncOpStatus status, zmtpSocket*, void *arg)
 TEST(zmtp, accept_rejects_incompatible_peer)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 2;  // connect, accept
+  ctx.pending = 2; // connect, accept
   ctx.listener = startTCPServer(gBase, incompat_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
@@ -1504,8 +1486,8 @@ TEST(zmtp, accept_rejects_incompatible_peer)
   deleteAioObject(ctx.listener);
 }
 
-// Scripted greeting plus READY(PUSH) written to the raw fd in one shot: the
-// connect side itself must parse the READY and reject the incompatible peer
+// Scripted greeting plus READY(PUSH) written to the raw fd in one shot: the connect side itself must parse the READY and reject the
+// incompatible peer
 static void scripted_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
 {
   auto ctx = static_cast<zmtpPipelineContext*>(arg);
@@ -1513,27 +1495,22 @@ static void scripted_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAdd
   if (status == aosSuccess) {
     ctx->rawServerFd = acceptSocket;
     static const uint8_t script[] = {
-      0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F,                                    // signature
-      3,                                                                     // major
-      0,                                                                     // minor
-      'N', 'U', 'L', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // mechanism
-      0,                                                                     // as-server
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                       // filler
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0x04, 0x1A,                                                            // command frame
-      5, 'R', 'E', 'A', 'D', 'Y',
-      11, 'S', 'o', 'c', 'k', 'e', 't', '-', 'T', 'y', 'p', 'e',
-      0, 0, 0, 4, 'P', 'U', 'S', 'H'
-    };
+        0xFF, 0,   0,   0,   0,   0,   0,  0,   0,   0x7F,                                                 // signature
+        3,                                                                                                 // major
+        0,                                                                                                 // minor
+        'N',  'U', 'L', 'L', 0,   0,   0,  0,   0,   0,    0,   0,   0,   0,   0,   0,    0,    0,   0, 0, // mechanism
+        0,                                                                                                 // as-server
+        0,    0,   0,   0,   0,   0,   0,  0,   0,   0,    0,   0,   0,   0,   0,   0,                     // filler
+        0,    0,   0,   0,   0,   0,   0,  0,   0,   0,    0,   0,   0,   0,   0,   0x04, 0x1A,            // command frame
+        5,    'R', 'E', 'A', 'D', 'Y', 11, 'S', 'o', 'c',  'k', 'e', 't', '-', 'T', 'y',  'p',  'e', 0, 0, 0, 4, 'P', 'U', 'S', 'H'};
     static_assert(sizeof(script) == 10 + 1 + 53 + 2 + 26, "greeting+READY layout");
     send(acceptSocket, reinterpret_cast<const char*>(script), sizeof(script), 0);
   }
   ctx->completed();
 }
 
-// The same scripted handshake, but the READY payload sits in a plain data
-// frame (no COMMAND flag) with a compatible Socket-Type: the connect side
-// must reject it by the frame type alone
+// The same scripted handshake, but the READY payload sits in a plain data frame (no COMMAND flag) with a compatible Socket-Type: the connect
+// side must reject it by the frame type alone
 static void data_frame_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
 {
   auto ctx = static_cast<zmtpPipelineContext*>(arg);
@@ -1541,18 +1518,14 @@ static void data_frame_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostA
   if (status == aosSuccess) {
     ctx->rawServerFd = acceptSocket;
     static const uint8_t script[] = {
-      0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x7F,                                    // signature
-      3,                                                                     // major
-      0,                                                                     // minor
-      'N', 'U', 'L', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // mechanism
-      0,                                                                     // as-server
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                       // filler
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0x00, 0x1A,                                                            // data frame
-      5, 'R', 'E', 'A', 'D', 'Y',
-      11, 'S', 'o', 'c', 'k', 'e', 't', '-', 'T', 'y', 'p', 'e',
-      0, 0, 0, 4, 'P', 'U', 'L', 'L'
-    };
+        0xFF, 0,   0,   0,   0,   0,   0,  0,   0,   0x7F,                                                 // signature
+        3,                                                                                                 // major
+        0,                                                                                                 // minor
+        'N',  'U', 'L', 'L', 0,   0,   0,  0,   0,   0,    0,   0,   0,   0,   0,   0,    0,    0,   0, 0, // mechanism
+        0,                                                                                                 // as-server
+        0,    0,   0,   0,   0,   0,   0,  0,   0,   0,    0,   0,   0,   0,   0,   0,                     // filler
+        0,    0,   0,   0,   0,   0,   0,  0,   0,   0,    0,   0,   0,   0,   0,   0x00, 0x1A,            // data frame
+        5,    'R', 'E', 'A', 'D', 'Y', 11, 'S', 'o', 'c',  'k', 'e', 't', '-', 'T', 'y',  'p',  'e', 0, 0, 0, 4, 'P', 'U', 'L', 'L'};
     static_assert(sizeof(script) == 10 + 1 + 53 + 2 + 26, "greeting+READY layout");
     send(acceptSocket, reinterpret_cast<const char*>(script), sizeof(script), 0);
   }
@@ -1562,7 +1535,7 @@ static void data_frame_ready_tcpacceptcb(AsyncOpStatus status, aioObject*, HostA
 TEST(zmtp, connect_rejects_ready_without_command_flag)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 2;  // connect, raw accept
+  ctx.pending = 2; // connect, raw accept
   ctx.listener = startTCPServer(gBase, data_frame_ready_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
@@ -1586,7 +1559,7 @@ TEST(zmtp, connect_rejects_ready_without_command_flag)
 TEST(zmtp, connect_rejects_incompatible_ready)
 {
   zmtpPipelineContext ctx(gBase);
-  ctx.pending = 2;  // connect, raw accept
+  ctx.pending = 2; // connect, raw accept
   ctx.listener = startTCPServer(gBase, scripted_ready_tcpacceptcb, &ctx, gPort);
   ASSERT_NE(ctx.listener, nullptr);
   ctx.clientSocket = zmtpSocketNew(gBase, initializeTCPClient(gBase, nullptr, nullptr, 0), zmtpSocketPUSH);
@@ -1607,9 +1580,8 @@ TEST(zmtp, connect_rejects_incompatible_ready)
   deleteAioObject(ctx.listener);
 }
 
-// Same contract as connect.double_connect_rejected on the plain socket: a
-// second handshake operation on a zmtp socket must fail immediately while
-// the first one is still in flight.
+// Same contract as connect.double_connect_rejected on the plain socket: a second handshake operation on a zmtp socket must fail immediately
+// while the first one is still in flight.
 TEST(zmtp, double_connect_rejected)
 {
   DoubleConnectRecorder ctx(gBase);
@@ -1629,6 +1601,5 @@ TEST(zmtp, double_connect_rejected)
     GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
                  << "), initialization slot contention cannot be exercised on this network";
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
-  EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
-    << "the second zmtp connect was not rejected while the first was in flight";
+  EXPECT_LT(ctx.secondOrder, ctx.firstOrder) << "the second zmtp connect was not rejected while the first was in flight";
 }

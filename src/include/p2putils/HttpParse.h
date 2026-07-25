@@ -3,7 +3,7 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif 
+#endif
 
 #include <stddef.h>
 #include <stdint.h>
@@ -13,7 +13,7 @@ extern "C" {
 
 typedef enum HttpParserStateTy {
   httpStStartLine = 0,
-  httpStHeader,  
+  httpStHeader,
   httpStBody,
   httpStLast,
   httpStTrailer
@@ -49,7 +49,7 @@ typedef struct HttpComponent {
       unsigned code;
       Raw description;
     } startLine;
-    
+
     // Header
     struct {
       int entryType;    // id from the parse-call table / reserved hh* id / 0
@@ -66,10 +66,8 @@ typedef void httpParseCb(HttpComponent *component, void *arg);
 
 void httpInit(HttpParserState *state);
 void httpSetBuffer(HttpParserState *state, const void *buffer, size_t size);
-// table types the header names of the message (NULL = the built-in table of
-// the reserved names only); it is read for the duration of the call
-ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
-                         httpParseCb callback, void *arg);
+// table types the header names of the message (NULL = the built-in table of the reserved names only); it is read for the duration of the call
+ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table, httpParseCb callback, void *arg);
 
 const void *httpDataPtr(HttpParserState *state);
 size_t httpDataRemaining(HttpParserState *state);

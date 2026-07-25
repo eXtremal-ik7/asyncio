@@ -8,29 +8,27 @@ static ParserResultTy httpParseStartLine(HttpParserState *state, httpParseCb cal
   ParserResultTy result;
   HttpComponent component;
   const char *ptr = state->ptr;
-  if (!canRead(ptr, state->end, sizeof(prefix)-1 + 3))
+  if (!canRead(ptr, state->end, sizeof(prefix) - 1 + 3))
     return ParserResultNeedMoreData;
 
   // HTTP protocol version
-  if (compareUnchecked(&ptr, prefix, sizeof(prefix)-1) != ParserResultOk)
+  if (compareUnchecked(&ptr, prefix, sizeof(prefix) - 1) != ParserResultOk)
     return ParserResultError;
-  if ( !(isDigit(ptr[0]) && ptr[1] == '.' && isDigit(ptr[2])) )
+  if (!(isDigit(ptr[0]) && ptr[1] == '.' && isDigit(ptr[2])))
     return ParserResultError;
-  component.startLine.majorVersion = static_cast<unsigned char>(ptr[0]-'0');
-  component.startLine.minorVersion = static_cast<unsigned char>(ptr[2]-'0');
+  component.startLine.majorVersion = static_cast<unsigned char>(ptr[0] - '0');
+  component.startLine.minorVersion = static_cast<unsigned char>(ptr[2] - '0');
   ptr += 3;
 
   // HTTP response code
-  if ( (result = skipSPCharacters(&ptr, state->end)) != ParserResultOk )
+  if ((result = skipSPCharacters(&ptr, state->end)) != ParserResultOk)
     return result;
   if (!canRead(ptr, state->end, 3))
     return ParserResultNeedMoreData;
-  if ( !(isDigit(ptr[0]) && isDigit(ptr[1]) && isDigit(ptr[2])) )
+  if (!(isDigit(ptr[0]) && isDigit(ptr[1]) && isDigit(ptr[2])))
     return ParserResultError;
-  component.startLine.code =
-      100u*static_cast<unsigned char>(ptr[0]-'0') +
-      10u*static_cast<unsigned char>(ptr[1]-'0') +
-      static_cast<unsigned char>(ptr[2]-'0');
+  component.startLine.code = 100u * static_cast<unsigned char>(ptr[0] - '0') + 10u * static_cast<unsigned char>(ptr[1] - '0') +
+                             static_cast<unsigned char>(ptr[2] - '0');
   ptr += 3;
 
   // associated textual phrase (optional)
@@ -41,9 +39,9 @@ static ParserResultTy httpParseStartLine(HttpParserState *state, httpParseCb cal
   else if (*ptr != '\r')
     return ParserResultError;
   component.startLine.description.data = ptr;
-  if ( (result = readUntilCRLF(&ptr, state->end)) != ParserResultOk )
+  if ((result = readUntilCRLF(&ptr, state->end)) != ParserResultOk)
     return result;
-  component.startLine.description.size = static_cast<size_t>(ptr-component.startLine.description.data-2);
+  component.startLine.description.size = static_cast<size_t>(ptr - component.startLine.description.data - 2);
   component.type = httpDtStartLine;
   callback(&component, arg);
 
@@ -69,22 +67,20 @@ void httpSetBuffer(HttpParserState *state, const void *buffer, size_t size)
   state->end = state->ptr + size;
 }
 
-static __NOINLINE ParserResultTy
-httpParseBody(HttpParserState *state, httpParseCb callback, void *arg)
+static __NOINLINE ParserResultTy httpParseBody(HttpParserState *state, httpParseCb callback, void *arg)
 {
   ParserResultTy result;
   HttpComponent component;
 
   if (state->state == httpStBody) {
     if (state->chunked) {
-      result = parseChunkedBody(state, httpStTrailer,
-        [&](const char *data, size_t size) {
-          component.type = httpDtDataFragment;
-          component.data.data = data;
-          component.data.size = size;
-          callback(&component, arg);
-          return true;
-        });
+      result = parseChunkedBody(state, httpStTrailer, [&](const char *data, size_t size) {
+        component.type = httpDtDataFragment;
+        component.data.data = data;
+        component.data.size = size;
+        callback(&component, arg);
+        return true;
+      });
       if (result != ParserResultOk)
         return result;
     } else {
@@ -129,15 +125,13 @@ httpParseBody(HttpParserState *state, httpParseCb callback, void *arg)
   return ParserResultOk;
 }
 
-static __NOINLINE ParserResultTy
-httpParseHead(HttpParserState *state, const HttpHeaderTable *table,
-              httpParseCb callback, void *arg)
+static __NOINLINE ParserResultTy httpParseHead(HttpParserState *state, const HttpHeaderTable *table, httpParseCb callback, void *arg)
 {
   ParserResultTy result;
   HttpComponent component;
 
   if (state->state == httpStStartLine) {
-    if ( (result = httpParseStartLine(state, callback, arg)) != ParserResultOk)
+    if ((result = httpParseStartLine(state, callback, arg)) != ParserResultOk)
       return result;
     state->state = httpStHeader;
   }
@@ -151,8 +145,7 @@ httpParseHead(HttpParserState *state, const HttpHeaderTable *table,
 
       if (state->ptr[0] == '\r' && state->ptr[1] == '\n') {
         state->ptr += 2;
-        // Transfer-Encoding without a final chunked means read-until-close
-        // framing, which this parser does not have; the old silent zero-length
+        // Transfer-Encoding without a final chunked means read-until-close framing, which this parser does not have; the old silent zero-length
         // framing desynchronized the connection
         if (state->seenTransferEncoding && !state->chunked)
           return ParserResultError;
@@ -173,8 +166,7 @@ httpParseHead(HttpParserState *state, const HttpHeaderTable *table,
   return httpParseBody(state, callback, arg);
 }
 
-ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table,
-                         httpParseCb callback, void *arg)
+ParserResultTy httpParse(HttpParserState *state, const HttpHeaderTable *table, httpParseCb callback, void *arg)
 {
   if (state->state == httpStLast)
     return ParserResultOk;

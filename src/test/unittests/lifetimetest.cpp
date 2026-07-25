@@ -6,19 +6,15 @@
 #include <algorithm>
 #include <thread>
 
-// The lifetime suite pins the destruction contract that callers rely on to
-// free their own state:
+// The lifetime suite pins the destruction contract that callers rely on to free their own state:
 // - every submitted operation reports exactly once; cancellation delivers
 //   aosCanceled through the regular callback, nothing is silently dropped;
 // - the destructor callback fires exactly once, strictly after the last
 //   operation callback of the object, and no callback fires after it;
 // - cancelIo cancels everything pending but leaves the object usable.
-// Everything here is deterministic on a single loop thread: completions and
-// the delete tag travel through the global queue in submission order, so the
-// destructor is always the last word. The concurrent side of the same
-// contract (destruction racing a combiner held by another thread) has no
-// deterministic interleaving reachable from the public API and is exercised
-// by the lifetimetest stress binary instead.
+// Everything here is deterministic on a single loop thread: completions and the delete tag travel through the global queue in submission order,
+// so the destructor is always the last word. The concurrent side of the same contract (destruction racing a combiner held by another thread)
+// has no deterministic interleaving reachable from the public API and is exercised by the lifetimetest stress binary instead.
 struct LifetimeContext {
   asyncBase *base;
   unsigned canceledCallbacks = 0;
@@ -28,7 +24,8 @@ struct LifetimeContext {
   unsigned destructorCalls = 0;
   unsigned eventFires = 0;
   AsyncOpStatus connectStatus = aosUnknown;
-  LifetimeContext(asyncBase *baseArg) : base(baseArg) {}
+  LifetimeContext(asyncBase *baseArg) :
+    base(baseArg) {}
 };
 
 static void lifetimeAccount(LifetimeContext *ctx, AsyncOpStatus status)
@@ -75,9 +72,8 @@ TEST(lifetime, delete_with_parked_reads)
   ASSERT_NE(object, nullptr);
   objectSetDestructorCb(aioObjectHandle(object), lifetimeDestructorCb, &context);
 
-  // The timeouts protect the test, not the contract: were cancellation to
-  // lose an operation, it would surface as aosTimeout in unexpectedCallbacks
-  // instead of hanging the loop forever
+  // The timeouts protect the test, not the contract: were cancellation to lose an operation, it would surface as aosTimeout in
+  // unexpectedCallbacks instead of hanging the loop forever
   constexpr unsigned opsNum = 16;
   static uint32_t buffers[opsNum];
   for (unsigned i = 0; i < opsNum; i++)
@@ -92,8 +88,8 @@ TEST(lifetime, delete_with_parked_reads)
   EXPECT_EQ(context.callbacksAfterDestructor, 0u);
 }
 
-// The successful probe read deletes the object from its own callback, so the
-// destructor ordering is exercised from a loop-thread callback as well
+// The successful probe read deletes the object from its own callback, so the destructor ordering is exercised from a loop-thread callback as
+// well
 static void lifetimeProbeReadCb(AsyncOpStatus status, aioObject *socket, HostAddress, size_t transferred, void *arg)
 {
   LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
@@ -141,13 +137,10 @@ TEST(lifetime, cancel_io_keeps_object_alive)
   deleteAioObject(client);
 }
 
-// Operations submitted behind a connect sit frozen in the read/write queues
-// (the initialization slot gates them); deleteAioObject must cancel the parked
-// connect and both gated operations, then destruct - one aosCanceled per
-// operation, nothing leaks, nothing outlives the destructor callback. The
-// blackhole address keeps the connect in flight, but no loop iteration runs
-// between the submissions and the delete, so the test does not depend on the
-// network answering or staying silent
+// Operations submitted behind a connect sit frozen in the read/write queues (the initialization slot gates them); deleteAioObject must cancel
+// the parked connect and both gated operations, then destruct - one aosCanceled per operation, nothing leaks, nothing outlives the destructor
+// callback. The blackhole address keeps the connect in flight, but no loop iteration runs between the submissions and the delete, so the test
+// does not depend on the network answering or staying silent
 TEST(lifetime, delete_with_connect_in_flight)
 {
   LifetimeContext context(gBase);
@@ -177,9 +170,8 @@ TEST(lifetime, delete_with_connect_in_flight)
   EXPECT_EQ(context.callbacksAfterDestructor, 0u);
 }
 
-// Same contract for user events, which have their own reference mechanics:
-// deleting the event from inside its own callback must still deliver the
-// destructor callback exactly once and nothing may fire afterwards
+// Same contract for user events, which have their own reference mechanics: deleting the event from inside its own callback must still deliver
+// the destructor callback exactly once and nothing may fire afterwards
 static void lifetimeEventCb(aioUserEvent *event, void *arg)
 {
   LifetimeContext *ctx = static_cast<LifetimeContext*>(arg);
@@ -241,7 +233,13 @@ TEST(lifetime, test_delete_object)
   ASSERT_NE(context.serverSocket, nullptr);
 
   for (int i = 0; i < 1000; i++)
-    aioReadMsg(context.serverSocket, context.serverBuffer, sizeof(context.serverBuffer), afNone, 3*1000000, test_delete_object_readcb, &context);
+    aioReadMsg(context.serverSocket,
+               context.serverBuffer,
+               sizeof(context.serverBuffer),
+               afNone,
+               3 * 1000000,
+               test_delete_object_readcb,
+               &context);
 
   aioUserEvent *event = newUserEvent(gBase, 0, test_delete_object_eventcb, &context);
   userEventStartTimer(event, 5000, 1);
@@ -253,9 +251,7 @@ TEST(lifetime, test_delete_object)
 void test_userevent_cb(aioUserEvent *event, void *arg)
 {
   TestContext *ctx = static_cast<TestContext*>(arg);
-  unsigned value = __uint_atomic_fetch_and_add(reinterpret_cast<unsigned*>(&ctx->serverState),
-                                                1,
-                                                amoSeqCst);
+  unsigned value = __uint_atomic_fetch_and_add(reinterpret_cast<unsigned*>(&ctx->serverState), 1, amoSeqCst);
   if (value == 256) {
     userEventActivate(event);
   } else if (value == 257) {
@@ -272,11 +268,11 @@ TEST(user_event, test_userevent)
   userEventActivate(event);
   std::thread threads[4];
   for (unsigned i = 0; i < 4; i++) {
-    threads[i] = std::thread([](){
+    threads[i] = std::thread([]() {
       asyncLoop(gBase);
     });
   }
-  std::for_each(threads, threads+4, [](std::thread &thread) {
+  std::for_each(threads, threads + 4, [](std::thread &thread) {
     thread.join();
   });
   deleteUserEvent(event);

@@ -126,7 +126,7 @@ void test_tcp_rw_server_readcb(AsyncOpStatus status, aioObject *socket, size_t t
 {
   TestContext *ctx = static_cast<TestContext*>(arg);
   if (status == aosSuccess) {
-    for (size_t i = 0; i < transferred-1; i++)
+    for (size_t i = 0; i < transferred - 1; i++)
       ctx->serverBuffer[i]++;
     aioWrite(socket, ctx->serverBuffer, transferred, afNone, 0, nullptr, nullptr);
     aioRead(socket, ctx->serverBuffer, sizeof(ctx->serverBuffer), afNone, 0, test_tcp_rw_server_readcb, ctx);
@@ -163,10 +163,9 @@ TEST(socket, test_tcp_rw)
   ASSERT_TRUE(context.success);
 }
 
-// IPv6 counterpart of test_tcp_rw. Both endpoints are set up through the
-// public API only: socketBind() with an AF_INET6 HostAddress ([::1] listener,
-// [::] client), then aioConnect/aioAccept over IPv6 loopback. The accept
-// callback must see the peer as AF_INET6 loopback with a non-zero port.
+// IPv6 counterpart of test_tcp_rw. Both endpoints are set up through the public API only: socketBind() with an AF_INET6 HostAddress ([::1]
+// listener, [::] client), then aioConnect/aioAccept over IPv6 loopback. The accept callback must see the peer as AF_INET6 loopback with a
+// non-zero port.
 void test_tcp_rw_ipv6_acceptcb(AsyncOpStatus status, aioObject *listener, HostAddress client, socketTy acceptSocket, void *arg)
 {
   __UNUSED(listener);
@@ -197,8 +196,7 @@ TEST(socket, test_tcp_rw_ipv6)
   context.serverSocket = newSocketIo(gBase, serverSocket);
   aioAccept(context.serverSocket, 333000, test_tcp_rw_ipv6_acceptcb, &context);
 
-  // the client socket must be bound before aioConnect: iocp ConnectEx
-  // requires an already bound socket
+  // the client socket must be bound before aioConnect: iocp ConnectEx requires an already bound socket
   HostAddress clientAddress;
   ASSERT_EQ(hostAddressFromAscii("::", &clientAddress), 1);
   socketTy clientSocket = socketCreate(AF_INET6, SOCK_STREAM, IPPROTO_TCP, 1);
@@ -211,10 +209,8 @@ TEST(socket, test_tcp_rw_ipv6)
   ASSERT_TRUE(context.success);
 }
 
-// A non-afWaitAll read that picks up a partial tail from the read-ahead
-// buffer must complete with those bytes: chasing the drained socket with one
-// more syscall would park the operation and strand the already delivered
-// bytes until unrelated traffic or the timeout.
+// A non-afWaitAll read that picks up a partial tail from the read-ahead buffer must complete with those bytes: chasing the drained socket with
+// one more syscall would park the operation and strand the already delivered bytes until unrelated traffic or the timeout.
 struct BufferedPartialContext {
   asyncBase *base;
   aioObject *client;
@@ -223,9 +219,13 @@ struct BufferedPartialContext {
   ssize_t secondRead;
   uint8_t firstByte;
   uint8_t buf[16];
-  explicit BufferedPartialContext(asyncBase *baseArg)
-    : base(baseArg), client(nullptr), conn(nullptr), firstRead(-1), secondRead(-1), firstByte(0)
-  {
+  explicit BufferedPartialContext(asyncBase *baseArg) :
+    base(baseArg),
+    client(nullptr),
+    conn(nullptr),
+    firstRead(-1),
+    secondRead(-1),
+    firstByte(0) {
     memset(buf, 0, sizeof(buf));
   }
 };
@@ -255,8 +255,7 @@ static void bufferedPartialReadProc(void *arg)
     // One byte: the whole 5-byte segment lands in the read-ahead buffer
     ctx->firstRead = ioRead(ctx->client, ctx->buf, 1, afNone, 2000000);
     ctx->firstByte = ctx->buf[0];
-    // Asks for more than the 4 buffered bytes: must return them at once
-    // instead of waiting out the 500 ms timeout on the drained socket
+    // Asks for more than the 4 buffered bytes: must return them at once instead of waiting out the 500 ms timeout on the drained socket
     ctx->secondRead = ioRead(ctx->client, ctx->buf, sizeof(ctx->buf), afNone, 500000);
   }
   postQuitOperation(ctx->base);
@@ -293,9 +292,11 @@ struct IoAcceptTimeoutContext {
   socketTy acceptedSocket;
   HostAddress remoteAddress;
 
-  explicit IoAcceptTimeoutContext(asyncBase *baseArg)
-    : base(baseArg), listener(nullptr), status(1), acceptedSocket(0)
-  {
+  explicit IoAcceptTimeoutContext(asyncBase *baseArg) :
+    base(baseArg),
+    listener(nullptr),
+    status(1),
+    acceptedSocket(0) {
     memset(&remoteAddress, 0xff, sizeof(remoteAddress));
   }
 };
@@ -303,10 +304,7 @@ struct IoAcceptTimeoutContext {
 static void ioAcceptTimeoutProc(void *arg)
 {
   IoAcceptTimeoutContext *ctx = static_cast<IoAcceptTimeoutContext*>(arg);
-  ctx->status = ioAccept(ctx->listener,
-                         &ctx->acceptedSocket,
-                         &ctx->remoteAddress,
-                         10000);
+  ctx->status = ioAccept(ctx->listener, &ctx->acceptedSocket, &ctx->remoteAddress, 10000);
   postQuitOperation(ctx->base);
 }
 
@@ -335,26 +333,27 @@ TEST(socket, io_accept_timeout_returns_status_separately)
   deleteAioObject(ctx.listener);
 }
 
-// Sleep-handshake regression: a grid timeout armed from an application
-// thread while the only loop thread is deep in its long idle wait must be
-// delivered within about a grid step - the producer observes the published
-// sleep horizon and kicks the sleeper. Without the kick the delivery would
-// wait out the rest of the idle sleep (~450 ms on epoll/iocp, ~950 ms on
-// kqueue with the 50 ms head start below), which the duration bound catches.
+// Sleep-handshake regression: a grid timeout armed from an application thread while the only loop thread is deep in its long idle wait must be
+// delivered within about a grid step - the producer observes the published sleep horizon and kicks the sleeper. Without the kick the delivery
+// would wait out the rest of the idle sleep (~450 ms on epoll/iocp, ~950 ms on kqueue with the 50 ms head start below), which the duration
+// bound catches.
 struct SleepingArmContext {
   asyncBase *base;
   std::chrono::steady_clock::time_point armed;
   AsyncOpStatus status;
   long deliveryMs;
-  SleepingArmContext(asyncBase *baseArg) : base(baseArg), status(aosUnknown), deliveryMs(-1) {}
+  SleepingArmContext(asyncBase *baseArg) :
+    base(baseArg),
+    status(aosUnknown),
+    deliveryMs(-1) {}
 };
 
 static void sleepingArmReadCb(AsyncOpStatus status, aioObject*, HostAddress, size_t, void *arg)
 {
   SleepingArmContext *ctx = static_cast<SleepingArmContext*>(arg);
   ctx->status = status;
-  ctx->deliveryMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::steady_clock::now() - ctx->armed).count());
+  ctx->deliveryMs =
+      static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ctx->armed).count());
   postQuitOperation(ctx->base);
 }
 
@@ -370,7 +369,9 @@ TEST(socket, timeout_armed_against_sleeping_loop_is_delivered_within_grid_step)
   ASSERT_EQ(socketBind(udpSocket, &address), 0);
   aioObject *object = newSocketIo(gBase, udpSocket);
 
-  std::thread loop([] { asyncLoop(gBase); });
+  std::thread loop([] {
+    asyncLoop(gBase);
+  });
   // Let the loop thread settle into its idle wait with an empty wheel
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -381,18 +382,14 @@ TEST(socket, timeout_armed_against_sleeping_loop_is_delivered_within_grid_step)
 
   EXPECT_EQ(ctx.status, aosTimeout);
   EXPECT_GE(ctx.deliveryMs, 0);
-  EXPECT_LT(ctx.deliveryMs, 400)
-    << "the sleeping loop was not kicked and the timeout waited out the idle sleep";
+  EXPECT_LT(ctx.deliveryMs, 400) << "the sleeping loop was not kicked and the timeout waited out the idle sleep";
   deleteAioObject(object);
 }
 
 #ifdef OS_COMMONUNIX
-// Regression test: aioWrite() to a connection dropped by the peer must
-// report an error through the operation status, never kill the process with
-// SIGPIPE. The protection is per-fd: MSG_NOSIGNAL on send paths where the
-// flag exists (Linux/BSD), SO_NOSIGPIPE as a descriptor property on
-// Darwin/BSD (set in socketCreate and in newSocketIo - the latter also
-// covers accept()ed sockets, which never pass through socketCreate).
+// Regression test: aioWrite() to a connection dropped by the peer must report an error through the operation status, never kill the process
+// with SIGPIPE. The protection is per-fd: MSG_NOSIGNAL on send paths where the flag exists (Linux/BSD), SO_NOSIGPIPE as a descriptor property
+// on Darwin/BSD (set in socketCreate and in newSocketIo - the latter also covers accept()ed sockets, which never pass through socketCreate).
 // The death-test child must reach exit(0).
 //
 // Determinism:
@@ -408,14 +405,14 @@ TEST(socket, timeout_armed_against_sleeping_loop_is_delivered_within_grid_step)
 //   do not survive fork(), the shared gBase must not be touched here.
 static void writeTwiceAfterPeerReset()
 {
-  alarm(30);  // if anything blocks, fail the death test instead of hanging it
+  alarm(30); // if anything blocks, fail the death test instead of hanging it
 
   socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
   sockaddr_in address;
   memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  address.sin_port = 0;  // ephemeral port: immune to gPort clashes and TIME_WAIT
+  address.sin_port = 0; // ephemeral port: immune to gPort clashes and TIME_WAIT
   ASSERT_EQ(bind(listenSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
   ASSERT_EQ(listen(listenSocket, 1), 0);
   socklen_t addressLength = sizeof(address);
@@ -449,16 +446,12 @@ TEST(SocketDeathTest, write_after_peer_reset)
 }
 #endif
 
-// Pipelined "aioConnect; aioRead" on one TCP socket: an operation submitted
-// after the connect must wait for the connect outcome instead of completing
-// ahead of it. On epoll/kqueue the kernel provides this gate (read() during
-// SYN_SENT returns EAGAIN, the op parks and later times out - after the
-// connect did); on iocp WSARecv on a not-yet-connected socket fails
-// synchronously with WSAENOTCONN, so the read completes with aosNotConnected
-// while the connect is still in flight. The connect target is a TEST-NET-1
-// blackhole (RFC 5737, never answers), which keeps the connect pending until
-// its timeout; if the local network answers it with an ICMP error instead,
-// the gating scenario cannot be exercised and the test skips.
+// Pipelined "aioConnect; aioRead" on one TCP socket: an operation submitted after the connect must wait for the connect outcome instead of
+// completing ahead of it. On epoll/kqueue the kernel provides this gate (read() during SYN_SENT returns EAGAIN, the op parks and later times
+// out - after the connect did); on iocp WSARecv on a not-yet-connected socket fails synchronously with WSAENOTCONN, so the read completes with
+// aosNotConnected while the connect is still in flight. The connect target is a TEST-NET-1 blackhole (RFC 5737, never answers), which keeps the
+// connect pending until its timeout; if the local network answers it with an ICMP error instead, the gating scenario cannot be exercised and
+// the test skips.
 struct TcpPipelineContext {
   asyncBase *base;
   AsyncOpStatus connectStatus;
@@ -468,8 +461,12 @@ struct TcpPipelineContext {
   int readOrder;
   uint8_t buffer[16];
   TcpPipelineContext(asyncBase *baseArg) :
-    base(baseArg), connectStatus(aosUnknown), readStatus(aosUnknown),
-    events(0), connectOrder(-1), readOrder(-1) {}
+    base(baseArg),
+    connectStatus(aosUnknown),
+    readStatus(aosUnknown),
+    events(0),
+    connectOrder(-1),
+    readOrder(-1) {}
 };
 
 static void tcpPipelineConnectCb(AsyncOpStatus status, aioObject*, void *arg)
@@ -508,17 +505,12 @@ TEST(socket, test_tcp_read_pipelined_with_connect)
   deleteAioObject(client);
 
   if (ctx.connectStatus != aosTimeout)
-    GTEST_SKIP() << "blackhole answered (connect status " << ctx.connectStatus
-                 << "), connect gating cannot be exercised on this network";
-  EXPECT_LT(ctx.connectOrder, ctx.readOrder)
-    << "read completed (status " << ctx.readStatus
-    << ") while the connect was still in flight";
+    GTEST_SKIP() << "blackhole answered (connect status " << ctx.connectStatus << "), connect gating cannot be exercised on this network";
+  EXPECT_LT(ctx.connectOrder, ctx.readOrder) << "read completed (status " << ctx.readStatus << ") while the connect was still in flight";
 }
 
-// Connect is the object's one-shot initialization: the combiner places it in
-// aioObjectRoot::initializationOp. A second connect submitted while the
-// first is still in flight must complete as an error without corrupting the
-// slot.
+// Connect is the object's one-shot initialization: the combiner places it in aioObjectRoot::initializationOp. A second connect submitted while
+// the first is still in flight must complete as an error without corrupting the slot.
 TEST(socket, double_connect_rejected)
 {
   DoubleConnectRecorder ctx(gBase);
@@ -540,18 +532,17 @@ TEST(socket, double_connect_rejected)
     GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
                  << "), initialization slot contention cannot be exercised on this network";
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
-  EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
-    << "the second connect was not rejected while the first was in flight";
+  EXPECT_LT(ctx.secondOrder, ctx.firstOrder) << "the second connect was not rejected while the first was in flight";
 }
 
-// deleteAioObject on an object with a connect in flight: the internal cancelIo
-// sweep must find the operation in the initialization slot (it is not in the
-// read/write queues anymore), cancel it and let the object die instead of
-// leaking a parked connect and a permanently frozen object.
+// deleteAioObject on an object with a connect in flight: the internal cancelIo sweep must find the operation in the initialization slot (it is
+// not in the read/write queues anymore), cancel it and let the object die instead of leaking a parked connect and a permanently frozen object.
 struct DeleteWhileConnectingContext {
   asyncBase *base;
   AsyncOpStatus status;
-  DeleteWhileConnectingContext(asyncBase *baseArg) : base(baseArg), status(aosUnknown) {}
+  DeleteWhileConnectingContext(asyncBase *baseArg) :
+    base(baseArg),
+    status(aosUnknown) {}
 };
 
 static void deleteWhileConnectingCb(AsyncOpStatus status, aioObject*, void *arg)
@@ -582,38 +573,27 @@ TEST(socket, delete_object_while_connecting)
   auto started = std::chrono::steady_clock::now();
   asyncLoop(gBase);
   deleter.join();
-  auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::steady_clock::now() - started).count();
+  auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 
   if (ctx.status != aosCanceled && ctx.status != aosTimeout)
     GTEST_SKIP() << "blackhole answered (connect status " << ctx.status
                  << "), cancellation of an in-flight connect cannot be exercised on this network";
   EXPECT_EQ(ctx.status, aosCanceled);
-  EXPECT_LT(elapsedMs, 2000)
-    << "connect was not cancelled by deleteAioObject, it ran to its own timeout";
+  EXPECT_LT(elapsedMs, 2000) << "connect was not cancelled by deleteAioObject, it ran to its own timeout";
 }
 
-// A connect that resolves synchronously must report right away. The reactor
-// backends do that: connect() failing with anything but EINPROGRESS becomes
-// an immediate error status. The proactor path must match: ConnectEx
-// returning FALSE with a real error (not WSA_IO_PENDING) means no completion
-// packet will ever arrive, and treating it as pending - which is what the
-// WSARecv-style check in iocpAsyncConnect does, reading BOOL FALSE as the
-// WSA*-convention success (AcceptEx in iocpAsyncAccept has the same shape) -
-// parks the operation beyond recovery: the timeout pushes a cancel, the
-// cancel leans on CancelIoEx, but nothing was ever submitted, so no abort
-// packet comes and the operation sits in the initialization slot forever, holding
-// the object and freezing its queues. A hang, not a late error - hence a
-// death-test child, where the watchdog turns the hang into a verdict.
-// The trigger is a second connect on an already-connected socket (submitted
-// from the first connect's callback: the initialization slot is released before
-// the finish callback runs). What it reports is per-kernel semantics: macOS
-// gives EISCONN (the TCP layer advances the socket state at handshake time),
-// Linux returns 0 and reports success (the state advances lazily on the next
-// connect() call - SO_ERROR confirmation does not move it, so the retry
-// legitimately completes the first connect), Windows fails ConnectEx
-// synchronously with WSAEISCONN - probed on a real system - with no packet
-// following. So the asserted contract is promptness alone, not the status.
+// A connect that resolves synchronously must report right away. The reactor backends do that: connect() failing with anything but EINPROGRESS
+// becomes an immediate error status. The proactor path must match: ConnectEx returning FALSE with a real error (not WSA_IO_PENDING) means no
+// completion packet will ever arrive, and treating it as pending - which is what the WSARecv-style check in iocpAsyncConnect does, reading BOOL
+// FALSE as the WSA*-convention success (AcceptEx in iocpAsyncAccept has the same shape) - parks the operation beyond recovery: the timeout
+// pushes a cancel, the cancel leans on CancelIoEx, but nothing was ever submitted, so no abort packet comes and the operation sits in the
+// initialization slot forever, holding the object and freezing its queues. A hang, not a late error - hence a death-test child, where the
+// watchdog turns the hang into a verdict. The trigger is a second connect on an already-connected socket (submitted from the first connect's
+// callback: the initialization slot is released before the finish callback runs). What it reports is per-kernel semantics: macOS gives EISCONN
+// (the TCP layer advances the socket state at handshake time), Linux returns 0 and reports success (the state advances lazily on the next
+// connect() call - SO_ERROR confirmation does not move it, so the retry legitimately completes the first connect), Windows fails ConnectEx
+// synchronously with WSAEISCONN - probed on a real system - with no packet following. So the asserted contract is promptness alone, not the
+// status.
 struct ConnectedReconnectContext {
   asyncBase *base;
   aioObject *client;
@@ -652,8 +632,7 @@ static void connectedReconnectScenario()
   ctx.firstStatus = aosUnknown;
   ctx.secondStatus = aosUnknown;
 
-  // A live listener; accepting is not needed, the loopback handshake
-  // completes through the backlog
+  // A live listener; accepting is not needed, the loopback handshake completes through the backlog
   if (!startTCPServer(ctx.base, nullptr, nullptr, gPort))
     exit(2);
   ctx.client = initializeTCPClient(ctx.base, connectedReconnectFirstCb, &ctx, gPort);
@@ -661,8 +640,7 @@ static void connectedReconnectScenario()
     exit(2);
 
   asyncLoop(ctx.base);
-  // aosTimeout would mean the synchronous resolution was parked until the
-  // operation timeout; anything else that arrived at all arrived promptly
+  // aosTimeout would mean the synchronous resolution was parked until the operation timeout; anything else that arrived at all arrived promptly
   exit(ctx.secondStatus == aosTimeout || ctx.secondStatus == aosUnknown ? 1 : 0);
 }
 
@@ -671,11 +649,9 @@ TEST(ConnectDeathTest, connect_on_connected_socket_reports_promptly)
   EXPECT_EXIT(connectedReconnectScenario(), ::testing::ExitedWithCode(0), "");
 }
 
-// A client that completes the handshake and dies (abortive close, RST) while
-// still parked in the listen backlog must not fail the accept operation: a
-// flaky or hostile remote peer would otherwise kill the server's pending
-// accept at will.
-// Kernel semantics for this scenario, probed on real systems:
+// A client that completes the handshake and dies (abortive close, RST) while still parked in the listen backlog must not fail the accept
+// operation: a flaky or hostile remote peer would otherwise kill the server's pending accept at will. Kernel semantics for this scenario,
+// probed on real systems:
 // - Linux and macOS hand the dead connection out of accept() successfully;
 //   the first read on it reports the reset. Neither prunes the queue nor
 //   returns ECONNABORTED (the BSD classic survives on FreeBSD at most), so
@@ -686,14 +662,16 @@ TEST(ConnectDeathTest, connect_on_connected_socket_reports_promptly)
 //   test - completes with ERROR_NETNAME_DELETED, which the completion path
 //   maps to aosDisconnected, and the operation dies instead of re-posting
 //   AcceptEx and waiting on.
-// The asserted contract is aosSuccess: either the dead socket itself (POSIX
-// semantics - detecting the reset is the application's job on first I/O) or,
-// once the backend retries, the live client queued behind it.
+// The asserted contract is aosSuccess: either the dead socket itself (POSIX semantics - detecting the reset is the application's job on first
+// I/O) or, once the backend retries, the live client queued behind it.
 struct DeadBacklogAcceptContext {
   asyncBase *base;
   AsyncOpStatus status;
   socketTy acceptedSocket;
-  DeadBacklogAcceptContext(asyncBase *baseArg) : base(baseArg), status(aosUnknown), acceptedSocket(0) {}
+  DeadBacklogAcceptContext(asyncBase *baseArg) :
+    base(baseArg),
+    status(aosUnknown),
+    acceptedSocket(0) {}
 };
 
 static void deadBacklogAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
@@ -716,45 +694,36 @@ TEST(socket, client_reset_in_backlog_does_not_fail_accept)
   address.sin_addr.s_addr = inet_addr("127.0.0.1");
   address.sin_port = htons(gPort);
 
-  // blocking socket: connect() returning 0 means the handshake completed and
-  // the connection is parked in the backlog
+  // blocking socket: connect() returning 0 means the handshake completed and the connection is parked in the backlog
   socketTy victim = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
   ASSERT_EQ(connect(victim, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
   linger abortiveClose;
   abortiveClose.l_onoff = 1;
   abortiveClose.l_linger = 0;
-  ASSERT_EQ(setsockopt(victim, SOL_SOCKET, SO_LINGER,
-                       reinterpret_cast<const char*>(&abortiveClose), sizeof(abortiveClose)), 0);
+  ASSERT_EQ(setsockopt(victim, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&abortiveClose), sizeof(abortiveClose)), 0);
   socketClose(victim);
-  // the RST travels through loopback and is processed in microseconds; the
-  // margin only has to cover scheduling noise
+  // the RST travels through loopback and is processed in microseconds; the margin only has to cover scheduling noise
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   aioAccept(listener, 2000000, deadBacklogAcceptCb, &ctx);
 
-  // the live client the accept should end up with once the dead one is dealt
-  // with; queued behind the dead connection before the loop runs
+  // the live client the accept should end up with once the dead one is dealt with; queued behind the dead connection before the loop runs
   socketTy liveClient = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
   ASSERT_EQ(connect(liveClient, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
 
   asyncLoop(gBase);
 
-  EXPECT_EQ(ctx.status, aosSuccess)
-    << "a client that died in the backlog must not fail the accept operation";
+  EXPECT_EQ(ctx.status, aosSuccess) << "a client that died in the backlog must not fail the accept operation";
   if (ctx.status == aosSuccess)
     socketClose(ctx.acceptedSocket);
   socketClose(liveClient);
   deleteAioObject(listener);
 }
-// Operations pushed while an object's combiner is held by another thread are
-// stacked LIFO (Treiber stack, asyncioImpl.h) and the combiner drains the captured
-// chain from its head, newest-first, without reversing it (asyncioImpl.c):
-// two writes submitted back-to-back by one thread land in the socket in
-// swapped order - silent TCP stream corruption. The producer (test main
-// thread) writes strictly increasing 4-byte counters while a server thread
-// floods the client socket with garbage so the loop thread keeps entering
-// the client's combiner for read-readiness; the server verifies that the
-// counter stream it receives back is monotonic.
+// Operations pushed while an object's combiner is held by another thread are stacked LIFO (Treiber stack, asyncioImpl.h) and the combiner
+// drains the captured chain from its head, newest-first, without reversing it (asyncioImpl.c): two writes submitted back-to-back by one thread
+// land in the socket in swapped order - silent TCP stream corruption. The producer (test main thread) writes strictly increasing 4-byte
+// counters while a server thread floods the client socket with garbage so the loop thread keeps entering the client's combiner for
+// read-readiness; the server verifies that the counter stream it receives back is monotonic.
 struct CombinerOrderContext {
   asyncBase *base;
   aioObject *client;
@@ -765,8 +734,13 @@ struct CombinerOrderContext {
   std::atomic<long> valuesReceived;
   uint8_t sink[65536];
   CombinerOrderContext() :
-    base(nullptr), client(nullptr), connected(0), stopFlood(0), serverDone(0),
-    inversions(0), valuesReceived(0) {}
+    base(nullptr),
+    client(nullptr),
+    connected(0),
+    stopFlood(0),
+    serverDone(0),
+    inversions(0),
+    valuesReceived(0) {}
 };
 
 static void combinerOrderFloodReadCb(AsyncOpStatus status, aioObject *object, size_t, void *arg)
@@ -804,7 +778,7 @@ static void combinerOrderServer(socketTy listenSocket, CombinerOrderContext *ctx
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   while (ctx->valuesReceived.load() < (long)total && std::chrono::steady_clock::now() < deadline) {
     // keep the client's combiner busy on the loop thread, but bounded
-    if (!ctx->stopFlood.load() && flooded < 32*1024*1024) {
+    if (!ctx->stopFlood.load() && flooded < 32 * 1024 * 1024) {
       send(fd, (const char*)garbage.data(), (int)garbage.size(), 0);
       flooded += (long)garbage.size();
     }
@@ -815,7 +789,7 @@ static void combinerOrderServer(socketTy listenSocket, CombinerOrderContext *ctx
 
     size_t offset = 0;
     while (offset < (size_t)r) {
-      size_t take = (size_t)4 - tailSize;  // windows.h defines a min() macro, avoid std::min
+      size_t take = (size_t)4 - tailSize; // windows.h defines a min() macro, avoid std::min
       if (take > (size_t)r - offset)
         take = (size_t)r - offset;
       memcpy(tail + tailSize, rx.data() + offset, take);
@@ -842,7 +816,7 @@ TEST(socket, write_submission_order)
   constexpr uint32_t total = 100000;
 
   CombinerOrderContext ctx;
-  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: MT hammering stays off gBase
+  ctx.base = createAsyncBase(amOSDefault, 1); // own base: MT hammering stays off gBase
 
   HostAddress address;
   address.family = AF_INET;
@@ -859,7 +833,9 @@ TEST(socket, write_submission_order)
   ASSERT_EQ(socketBind(clientSocket, &address), 0);
   ctx.client = newSocketIo(ctx.base, clientSocket);
 
-  std::thread loopThread([&ctx]() { asyncLoop(ctx.base); });
+  std::thread loopThread([&ctx]() {
+    asyncLoop(ctx.base);
+  });
 
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
@@ -887,8 +863,7 @@ TEST(socket, write_submission_order)
 
   ASSERT_EQ(ctx.connected.load(), 1);
   EXPECT_EQ(ctx.valuesReceived.load(), (long)total);
-  EXPECT_EQ(ctx.inversions.load(), 0)
-    << "single-thread submission order was not preserved on the wire";
+  EXPECT_EQ(ctx.inversions.load(), 0) << "single-thread submission order was not preserved on the wire";
 }
 
 void test_udp_rw_client_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
@@ -898,9 +873,7 @@ void test_udp_rw_client_readcb(AsyncOpStatus status, aioObject *socket, HostAddr
   EXPECT_EQ(status, aosSuccess);
   EXPECT_EQ(transferred, 7u);
   EXPECT_EQ(ctx->serverState, 1);
-  if (status == aosSuccess &&
-      transferred == 7 &&
-      ctx->serverState == 1) {
+  if (status == aosSuccess && transferred == 7 && ctx->serverState == 1) {
     EXPECT_STREQ(reinterpret_cast<const char*>(ctx->clientBuffer), "234567");
     if (strcmp(reinterpret_cast<const char*>(ctx->clientBuffer), "234567") == 0)
       ctx->serverState++;
@@ -915,7 +888,7 @@ void test_udp_rw_server_readcb(AsyncOpStatus status, aioObject *socket, HostAddr
   TestContext *ctx = static_cast<TestContext*>(arg);
   if (status == aosSuccess) {
     ctx->serverState++;
-    for (size_t i = 0; i < transferred-1; i++)
+    for (size_t i = 0; i < transferred - 1; i++)
       ctx->serverBuffer[i]++;
     aioWriteMsg(socket, &address, ctx->serverBuffer, transferred, afNone, 0, nullptr, nullptr);
     aioReadMsg(socket, ctx->serverBuffer, sizeof(ctx->serverBuffer), afNone, 1000000, test_udp_rw_server_readcb, ctx);
@@ -944,16 +917,11 @@ TEST(socket, test_udp_rw)
   ASSERT_TRUE(context.success);
 }
 
-// aioReadMsg reports the sender address through two code paths that must
-// agree. A read armed before the datagram arrives completes through the event
-// loop, which fills HostAddress from sockaddr_storage; a datagram already
-// buffered at aioReadMsg call time is consumed by the synchronous fast path.
-// Both datagrams below are placed into the server socket buffer inside the
-// loopback sendto calls, before asyncLoop() starts, so path selection is
-// deterministic: the first one is picked up by the parked operation (event
-// loop path), the second is found in the buffer by the re-armed read (fast
-// path). Without a valid 'family' the HostAddress union cannot be interpreted
-// and aioWriteMsg cannot reply to the sender.
+// aioReadMsg reports the sender address through two code paths that must agree. A read armed before the datagram arrives completes through the
+// event loop, which fills HostAddress from sockaddr_storage; a datagram already buffered at aioReadMsg call time is consumed by the synchronous
+// fast path. Both datagrams below are placed into the server socket buffer inside the loopback sendto calls, before asyncLoop() starts, so path
+// selection is deterministic: the first one is picked up by the parked operation (event loop path), the second is found in the buffer by the
+// re-armed read (fast path). Without a valid 'family' the HostAddress union cannot be interpreted and aioWriteMsg cannot reply to the sender.
 void test_udp_sender_address_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   TestContext *ctx = static_cast<TestContext*>(arg);
@@ -979,7 +947,8 @@ void test_udp_sender_address_readcb(AsyncOpStatus status, aioObject *socket, Hos
 TEST(socket, test_udp_sender_address)
 {
   TestContext context(gBase);
-  context.serverSocket = startUDPServer(gBase, test_udp_sender_address_readcb, &context, context.serverBuffer, sizeof(context.serverBuffer), gPort);
+  context.serverSocket =
+      startUDPServer(gBase, test_udp_sender_address_readcb, &context, context.serverBuffer, sizeof(context.serverBuffer), gPort);
   context.clientSocket = initializeUDPClient(gBase);
   ASSERT_NE(context.serverSocket, nullptr);
   ASSERT_NE(context.clientSocket, nullptr);
@@ -994,10 +963,8 @@ TEST(socket, test_udp_sender_address)
   ASSERT_TRUE(context.success);
 }
 
-// Same two-path check for an IPv6 socket: the sender address must survive
-// both paths as AF_INET6 with intact address bytes. Both endpoints are set up
-// through the public API only (socketCreate + socketBind with an AF_INET6
-// HostAddress).
+// Same two-path check for an IPv6 socket: the sender address must survive both paths as AF_INET6 with intact address bytes. Both endpoints are
+// set up through the public API only (socketCreate + socketBind with an AF_INET6 HostAddress).
 void test_udp_sender_address_ipv6_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   TestContext *ctx = static_cast<TestContext*>(arg);
@@ -1032,7 +999,13 @@ TEST(socket, test_udp_sender_address_ipv6)
   context.clientSocket = newSocketIo(gBase, socketCreate(AF_INET6, SOCK_DGRAM, IPPROTO_UDP, 1));
   ASSERT_NE(context.serverSocket, nullptr);
   ASSERT_NE(context.clientSocket, nullptr);
-  aioReadMsg(context.serverSocket, context.serverBuffer, sizeof(context.serverBuffer), afNone, 1000000, test_udp_sender_address_ipv6_readcb, &context);
+  aioReadMsg(context.serverSocket,
+             context.serverBuffer,
+             sizeof(context.serverBuffer),
+             afNone,
+             1000000,
+             test_udp_sender_address_ipv6_readcb,
+             &context);
 
   aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
   aioWriteMsg(context.clientSocket, &address, "ping", 5, afNone, 0, nullptr, nullptr);
@@ -1040,13 +1013,10 @@ TEST(socket, test_udp_sender_address_ipv6)
   ASSERT_TRUE(context.success);
 }
 
-// A sendto() error must finish the operation with an error callback.
-// A 70 KB datagram cannot fit into a UDP packet (65507-byte payload limit),
-// so sendto() fails with EMSGSIZE deterministically - no peer and no network
-// are involved. The broken path treats every sendto() error as aosPending and
-// re-arms the always-writable UDP socket, so the callback never fires and the
-// event loop spins on sendto() at 100% CPU: the test then hangs instead of
-// failing.
+// A sendto() error must finish the operation with an error callback. A 70 KB datagram cannot fit into a UDP packet (65507-byte payload limit),
+// so sendto() fails with EMSGSIZE deterministically - no peer and no network are involved. The broken path treats every sendto() error as
+// aosPending and re-arms the always-writable UDP socket, so the callback never fires and the event loop spins on sendto() at 100% CPU: the test
+// then hangs instead of failing.
 void test_udp_write_error_writecb(AsyncOpStatus status, aioObject *socket, size_t transferred, void *arg)
 {
   __UNUSED(socket);
@@ -1074,19 +1044,13 @@ TEST(socket, test_udp_write_error)
   ASSERT_TRUE(context.success);
 }
 
-// A datagram that does not fit into the caller's buffer must complete with
-// aosBufferTooSmall on every backend. Both delivery paths are exercised the
-// same way as in test_udp_sender_address: the first 100-byte datagram
-// completes a parked read through the event loop, the second is picked up by
-// the re-armed read's synchronous fast path. Broken behavior differs by
-// platform. The POSIX backends call recvfrom() without MSG_TRUNC, so the
-// kernel silently drops the tail and both reads complete with aosSuccess and
-// 10 transferred bytes. On Windows the parked overlapped read is completed
-// correctly (WSAEMSGSIZE -> aosBufferTooSmall), but the fast-path recvfrom()
-// in aioReadMsg fails with WSAEMSGSIZE - which on Windows consumes and drops
-// the datagram - and the error code is never examined: the operation is
-// parked as if no data had arrived, so the second read loses its datagram and
-// ends in aosTimeout.
+// A datagram that does not fit into the caller's buffer must complete with aosBufferTooSmall on every backend. Both delivery paths are
+// exercised the same way as in test_udp_sender_address: the first 100-byte datagram completes a parked read through the event loop, the second
+// is picked up by the re-armed read's synchronous fast path. Broken behavior differs by platform. The POSIX backends call recvfrom() without
+// MSG_TRUNC, so the kernel silently drops the tail and both reads complete with aosSuccess and 10 transferred bytes. On Windows the parked
+// overlapped read is completed correctly (WSAEMSGSIZE -> aosBufferTooSmall), but the fast-path recvfrom() in aioReadMsg fails with WSAEMSGSIZE
+// - which on Windows consumes and drops the datagram - and the error code is never examined: the operation is parked as if no data had arrived,
+// so the second read loses its datagram and ends in aosTimeout.
 void test_udp_read_truncated_readcb(AsyncOpStatus status, aioObject *socket, HostAddress address, size_t transferred, void *arg)
 {
   __UNUSED(address);
@@ -1126,18 +1090,14 @@ TEST(socket, test_udp_read_truncated)
   ASSERT_TRUE(context.success);
 }
 
-// afActiveOnce makes the callback a fallback rather than a guarantee: an
-// operation that completed inline reports through the return value and its
-// callback never fires, -aosPending means the callback will. Which way a
-// completed operation is reported is decided by the per-thread budget: at
-// most MAX_SYNCHRONOUS_FINISHED_OPERATION consecutive inline reports, then
-// one completion goes through the event loop and the window restarts. Only
-// afActiveOnce makes both outcomes countable - the coroutine variants hide
-// which path delivered the result. Submissions run on freshly created
-// threads so the thread-local budget deterministically starts at zero (the
-// main thread's counter state depends on previous tests).
+// afActiveOnce makes the callback a fallback rather than a guarantee: an operation that completed inline reports through the return value and
+// its callback never fires, -aosPending means the callback will. Which way a completed operation is reported is decided by the per-thread
+// budget: at most MAX_SYNCHRONOUS_FINISHED_OPERATION consecutive inline reports, then one completion goes through the event loop and the window
+// restarts. Only afActiveOnce makes both outcomes countable - the coroutine variants hide which path delivered the result. Submissions run on
+// freshly created threads so the thread-local budget deterministically starts at zero (the main thread's counter state depends on previous
+// tests).
 constexpr unsigned udpBudgetPeriod = MAX_SYNCHRONOUS_FINISHED_OPERATION + 1;
-constexpr unsigned udpBudgetTotal = 3*udpBudgetPeriod;
+constexpr unsigned udpBudgetTotal = 3 * udpBudgetPeriod;
 
 struct UdpBudgetContext;
 
@@ -1160,7 +1120,8 @@ struct UdpBudgetContext {
   UdpBudgetSlot readSlot[udpBudgetTotal];
   unsigned expectedCallbacks = 0;
   unsigned deliveredCallbacks = 0;
-  UdpBudgetContext(asyncBase *baseArg) : base(baseArg) {}
+  UdpBudgetContext(asyncBase *baseArg) :
+    base(baseArg) {}
 };
 
 static void udpBudgetCallbackDelivered(UdpBudgetContext *ctx)
@@ -1205,20 +1166,31 @@ TEST(socket, test_udp_active_once_sync_budget)
       context.writePayload[i] = i;
       context.writeSlot[i].ctx = &context;
       context.writeSlot[i].index = i;
-      context.writeResult[i] = aioWriteMsg(context.clientSocket, &address, &context.writePayload[i], sizeof(uint32_t), afActiveOnce, 1000000, test_udp_active_once_writecb, &context.writeSlot[i]);
+      context.writeResult[i] = aioWriteMsg(context.clientSocket,
+                                           &address,
+                                           &context.writePayload[i],
+                                           sizeof(uint32_t),
+                                           afActiveOnce,
+                                           1000000,
+                                           test_udp_active_once_writecb,
+                                           &context.writeSlot[i]);
     }
   });
   writer.join();
 
-  // sendto always runs inside aioWriteMsg no matter how the result is
-  // reported: by now every datagram sits in the server socket buffer and
-  // each aioReadMsg below consumes one inline, so only the budget decides
-  // between the return value and the callback
+  // sendto always runs inside aioWriteMsg no matter how the result is reported: by now every datagram sits in the server socket buffer and each
+  // aioReadMsg below consumes one inline, so only the budget decides between the return value and the callback
   std::thread reader([&context]() {
     for (unsigned i = 0; i < udpBudgetTotal; i++) {
       context.readSlot[i].ctx = &context;
       context.readSlot[i].index = i;
-      context.readResult[i] = aioReadMsg(context.serverSocket, &context.readPayload[i], sizeof(uint32_t), afActiveOnce, 1000000, test_udp_active_once_readcb, &context.readSlot[i]);
+      context.readResult[i] = aioReadMsg(context.serverSocket,
+                                         &context.readPayload[i],
+                                         sizeof(uint32_t),
+                                         afActiveOnce,
+                                         1000000,
+                                         test_udp_active_once_readcb,
+                                         &context.readSlot[i]);
     }
   });
   reader.join();
@@ -1234,7 +1206,7 @@ TEST(socket, test_udp_active_once_sync_budget)
   EXPECT_EQ(syncWrites, udpBudgetTotal - 3);
   EXPECT_EQ(syncReads, udpBudgetTotal - 3);
 
-  context.expectedCallbacks = 2*udpBudgetTotal - syncWrites - syncReads;
+  context.expectedCallbacks = 2 * udpBudgetTotal - syncWrites - syncReads;
   if (context.expectedCallbacks)
     asyncLoop(gBase);
   deleteAioObject(context.clientSocket);
@@ -1244,17 +1216,14 @@ TEST(socket, test_udp_active_once_sync_budget)
     // exactly one report per operation: inline return or callback, never both
     EXPECT_NE(context.writeResult[i] >= 0, context.writeCallbackFired[i]) << "write " << i;
     EXPECT_NE(context.readResult[i] >= 0, context.readCallbackFired[i]) << "read " << i;
-    // loopback keeps datagrams ordered: every payload landed in the buffer
-    // of its own read no matter which path reported the completion
+    // loopback keeps datagrams ordered: every payload landed in the buffer of its own read no matter which path reported the completion
     EXPECT_EQ(context.readPayload[i], i) << "read " << i;
   }
 }
 
-// With no callback at all the return value is the only channel that exists,
-// so an inline completion must be reported inline no matter how many came
-// before it: a -aosPending here would throw the result away (the operation
-// finishes through the loop, where a null callback is silently dropped) -
-// for reads that loses an already consumed datagram
+// With no callback at all the return value is the only channel that exists, so an inline completion must be reported inline no matter how many
+// came before it: a -aosPending here would throw the result away (the operation finishes through the loop, where a null callback is silently
+// dropped) - for reads that loses an already consumed datagram
 TEST(socket, test_udp_fire_and_forget_sync_result)
 {
   TestContext context(gBase);
@@ -1339,17 +1308,12 @@ TEST(socket, unsupported_datagram_size_is_rejected)
   deleteAioObject(context.socket);
 }
 
-// The coroutine datagram variants have a single reporting channel - the
-// return value - but two delivery paths behind it: the inline syscall
-// result, and a loop round trip when the consecutive-synchronous-completion
-// budget runs out. The rerouted completion op is created without a payload
-// capture (the datagram already left through the syscall), so the
-// transferred byte count must be carried on the op explicitly: losing it
-// turns every budget-boundary write into a reported zero-byte transfer.
-// The thread-local budget counter starts at an arbitrary in-window value
-// (previous tests moved it), so the test does not predict which calls hit
-// the boundary - it demands the count from every call, and enough calls are
-// made to cross the boundary several times whatever the starting point.
+// The coroutine datagram variants have a single reporting channel - the return value - but two delivery paths behind it: the inline syscall
+// result, and a loop round trip when the consecutive-synchronous-completion budget runs out. The rerouted completion op is created without a
+// payload capture (the datagram already left through the syscall), so the transferred byte count must be carried on the op explicitly: losing
+// it turns every budget-boundary write into a reported zero-byte transfer. The thread-local budget counter starts at an arbitrary in-window
+// value (previous tests moved it), so the test does not predict which calls hit the boundary - it demands the count from every call, and enough
+// calls are made to cross the boundary several times whatever the starting point.
 struct UdpCoroutineBudgetContext {
   asyncBase *base;
   aioObject *serverSocket = nullptr;
@@ -1359,7 +1323,8 @@ struct UdpCoroutineBudgetContext {
   uint32_t readPayload[udpBudgetTotal];
   ssize_t writeResult[udpBudgetTotal];
   ssize_t readResult[udpBudgetTotal];
-  UdpCoroutineBudgetContext(asyncBase *baseArg) : base(baseArg) {}
+  UdpCoroutineBudgetContext(asyncBase *baseArg) :
+    base(baseArg) {}
 };
 
 static void udpCoroutineBudgetProc(void *arg)
@@ -1394,30 +1359,24 @@ TEST(socket, test_udp_coroutine_sync_budget)
   for (unsigned i = 0; i < udpBudgetTotal; i++) {
     EXPECT_EQ(context.writeResult[i], (ssize_t)sizeof(uint32_t)) << "write " << i;
     EXPECT_EQ(context.readResult[i], (ssize_t)sizeof(uint32_t)) << "read " << i;
-    // loopback keeps datagrams ordered: every payload landed in the buffer
-    // of its own read no matter which path reported the completion
+    // loopback keeps datagrams ordered: every payload landed in the buffer of its own read no matter which path reported the completion
     EXPECT_EQ(context.readPayload[i], i) << "read " << i;
   }
   deleteAioObject(context.clientSocket);
   deleteAioObject(context.serverSocket);
 }
 
-// The kernel reports some socket failures only through the "exceptional"
-// poll state: on Linux EPOLLERR/EPOLLHUP are delivered regardless of the
-// interest mask and can arrive with no readable/writable bit at all. Two
-// natural sources, one per direction:
+// The kernel reports some socket failures only through the "exceptional" poll state: on Linux EPOLLERR/EPOLLHUP are delivered regardless of the
+// interest mask and can arrive with no readable/writable bit at all. Two natural sources, one per direction:
 // - a connected UDP socket after an ICMP port unreachable for a datagram it
 //   sent: the receive queue is empty, so the wakeup carries only the error
 //   bit, and the parked read must be driven to pick up ECONNREFUSED;
 // - a pipe whose reader closed while the pipe is full: no room to write and
 //   no readers left, so again only the error bit.
-// kqueue delivers both through the armed filter itself (EVFILT_READ fires
-// on so_error, EVFILT_WRITE comes with EV_EOF), IOCP completes the parked
-// overlapped operation with WSAECONNRESET. A backend that drops an
-// error-only event kills the descriptor: the oneshot registration is
-// already consumed, nothing ever rearms it, and the operation dies by its
-// own timeout instead of reporting the error - or hangs forever when it has
-// none. The exact status differs by backend (aosUnknownError from errno on
+// kqueue delivers both through the armed filter itself (EVFILT_READ fires on so_error, EVFILT_WRITE comes with EV_EOF), IOCP completes the
+// parked overlapped operation with WSAECONNRESET. A backend that drops an error-only event kills the descriptor: the oneshot registration is
+// already consumed, nothing ever rearms it, and the operation dies by its own timeout instead of reporting the error - or hangs forever when it
+// has none. The exact status differs by backend (aosUnknownError from errno on
 // the POSIX paths, aosDisconnected from the EV_EOF/WSAECONNRESET sweeps);
 // the invariant is a prompt completion that is neither success nor timeout.
 
@@ -1433,8 +1392,7 @@ TEST(socket, test_udp_icmp_error_wakes_parked_read)
 {
   ErrorWakeupContext context(gBase);
 
-  // A guaranteed-closed port: let the kernel assign an ephemeral one, then
-  // release it
+  // A guaranteed-closed port: let the kernel assign an ephemeral one, then release it
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
@@ -1451,14 +1409,12 @@ TEST(socket, test_udp_icmp_error_wakes_parked_read)
   ASSERT_EQ(getsockname(probeSocket, reinterpret_cast<sockaddr*>(&closedAddress), &closedAddressLength), 0);
   socketClose(probeSocket);
 
-  // connect() makes the kernel deliver the ICMP error to this socket
-  // (an unconnected one silently drops it)
+  // connect() makes the kernel deliver the ICMP error to this socket (an unconnected one silently drops it)
   socketTy clientSocket = socketCreate(AF_INET, SOCK_DGRAM, IPPROTO_UDP, 1);
   ASSERT_EQ(connect(clientSocket, reinterpret_cast<sockaddr*>(&closedAddress), sizeof(closedAddress)), 0);
   aioObject *object = newSocketIo(gBase, clientSocket);
 
-  // Park the read before anything is sent: a datagram sent first would
-  // bounce before the submission-time synchronous attempt, which would
+  // Park the read before anything is sent: a datagram sent first would bounce before the submission-time synchronous attempt, which would
   // consume the error inline and never exercise the event-loop wakeup
   uint32_t buffer;
   aioReadMsg(object, &buffer, sizeof(buffer), afNone, 1000000, test_udp_icmp_error_readcb, &context);
@@ -1530,30 +1486,23 @@ TEST(socket, test_udp_icmp_error_pending_before_read_is_not_retried)
   ASSERT_TRUE(waitForUdpSocketError(clientSocket));
 
   uint32_t buffer;
-  aioReadMsg(object, &buffer, sizeof(buffer), afNone, 100000,
-             test_udp_icmp_error_readcb, &context);
+  aioReadMsg(object, &buffer, sizeof(buffer), afNone, 100000, test_udp_icmp_error_readcb, &context);
   asyncLoop(gBase);
 
   EXPECT_TRUE(context.callbackFired);
   EXPECT_NE(context.status, aosSuccess);
-  EXPECT_NE(context.status, aosTimeout)
-    << "the fast recv consumed the pending socket error and parked its retry";
+  EXPECT_NE(context.status, aosTimeout) << "the fast recv consumed the pending socket error and parked its retry";
   deleteAioObject(object);
 }
 
 #ifdef OS_COMMONUNIX
-// A peer that shut down its transmit half (shutdown(SHUT_WR), a plain FIN)
-// has only said "no more requests": it still reads, and our transmit path
-// toward it is fully alive. The classic client pattern - send the request,
-// half-close, collect the whole response - relies on that, and IOCP (which
-// has no readiness-level EOF signal) always let the response finish. So on
-// the reactor backends EPOLLRDHUP/EV_EOF may kill reads once nothing is left
-// buffered, but a parked write must survive and complete against the peer's
-// open receive half. The write is parked by real backpressure (tiny kernel
-// buffers, payload far larger); the armed read both mirrors a server awaiting
-// its next request and keeps read readiness registered so the kernel EOF
-// event is delivered; the client half-closes and only starts draining after
-// a delay, so the EOF event provably meets the parked write.
+// A peer that shut down its transmit half (shutdown(SHUT_WR), a plain FIN) has only said "no more requests": it still reads, and our transmit
+// path toward it is fully alive. The classic client pattern - send the request, half-close, collect the whole response - relies on that, and
+// IOCP (which has no readiness-level EOF signal) always let the response finish. So on the reactor backends EPOLLRDHUP/EV_EOF may kill reads
+// once nothing is left buffered, but a parked write must survive and complete against the peer's open receive half. The write is parked by real
+// backpressure (tiny kernel buffers, payload far larger); the armed read both mirrors a server awaiting its next request and keeps read
+// readiness registered so the kernel EOF event is delivered; the client half-closes and only starts draining after a delay, so the EOF event
+// provably meets the parked write.
 struct HalfCloseContext {
   asyncBase *base;
   AsyncOpStatus writeStatus = aosPending;
@@ -1561,7 +1510,8 @@ struct HalfCloseContext {
   size_t writeTransferred = 0;
   int callbacksFired = 0;
 
-  explicit HalfCloseContext(asyncBase *baseArg) : base(baseArg) {}
+  explicit HalfCloseContext(asyncBase *baseArg) :
+    base(baseArg) {}
 };
 
 static void test_halfclose_writecb(AsyncOpStatus status, aioObject*, size_t transferred, void *arg)
@@ -1600,7 +1550,7 @@ TEST(socket, test_halfclose_peer_keeps_parked_write_alive)
   ASSERT_GE(clientFd, 0);
   int bufferSize = 16384;
   setsockopt(clientFd, SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize));
-  timeval receiveTimeout = {10, 0};  // hang belt: drain must never block forever
+  timeval receiveTimeout = {10, 0}; // hang belt: drain must never block forever
   setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, sizeof(receiveTimeout));
   ASSERT_EQ(connect(clientFd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
   int serverFd = accept(listener, nullptr, nullptr);
@@ -1645,11 +1595,9 @@ TEST(socket, test_halfclose_peer_keeps_parked_write_alive)
 }
 #endif
 
-// A "practically infinite" realtime timeout must arm and wait, not complete:
-// unclamped it reached the kernel as a wrapped interval - kqueue rejects the
-// negative payload (EINVAL -> prompt aosUnknownError), the iocp due time
-// wraps into the past (instant aosTimeout) - turning "wait forever" into an
-// immediate completion.
+// A "practically infinite" realtime timeout must arm and wait, not complete: unclamped it reached the kernel as a wrapped interval - kqueue
+// rejects the negative payload (EINVAL -> prompt aosUnknownError), the iocp due time wraps into the past (instant aosTimeout) - turning "wait
+// forever" into an immediate completion.
 struct RealtimeTimeoutProbe {
   std::atomic<bool> fired{false};
   std::atomic<AsyncOpStatus> status{aosPending};
@@ -1665,7 +1613,9 @@ static void test_realtime_huge_timeout_readcb(AsyncOpStatus status, aioObject*, 
 TEST(socket, test_realtime_huge_timeout_does_not_fire_early)
 {
   asyncBase *base = createAsyncBase(amOSDefault, 1);
-  std::thread loopThread([base]() { asyncLoop(base); });
+  std::thread loopThread([base]() {
+    asyncLoop(base);
+  });
 
   RealtimeTimeoutProbe probe;
   aioObject *object = initializeUDPClient(base);
@@ -1675,8 +1625,7 @@ TEST(socket, test_realtime_huge_timeout_does_not_fire_early)
 
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   EXPECT_FALSE(probe.fired.load(std::memory_order_acquire))
-    << "practically-infinite realtime timeout completed with status "
-    << probe.status.load(std::memory_order_relaxed);
+      << "practically-infinite realtime timeout completed with status " << probe.status.load(std::memory_order_relaxed);
 
   deleteAioObject(object);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1693,7 +1642,7 @@ void test_timeout_readcb(AsyncOpStatus status, aioObject *socket, HostAddress ad
   EXPECT_EQ(status, aosTimeout);
   if (status == aosTimeout) {
     ctx->serverState++;
-    if (ctx->serverState == 1000+1+1+1+1000) {
+    if (ctx->serverState == 1000 + 1 + 1 + 1 + 1000) {
       ctx->success = true;
       postQuitOperation(ctx->base);
     }

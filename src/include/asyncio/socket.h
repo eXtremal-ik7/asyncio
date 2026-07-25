@@ -26,8 +26,8 @@ int socketListen(socketTy hSocket);
 int socketShutdown(socketTy hSocket, int how);
 void socketReuseAddr(socketTy hSocket);
 
-// Internal byte-stream fast path for aioRead/ioRead. Datagram reads use the
-// message-oriented API and do not pass through this helper. On every return,
+// Internal byte-stream fast path for aioRead/ioRead. Datagram reads use the message-oriented API and do not pass through this helper. On every
+// return,
 // *bytesTransferred reports progress made by the synchronous attempt.
 int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, size_t *bytesTransferred);
 int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitAll, size_t *bytesTransferred);

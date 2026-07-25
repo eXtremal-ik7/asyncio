@@ -72,12 +72,10 @@ TEST(pipe, sync_device_failures_report_zero_progress)
   EXPECT_EQ(transferred, 0u);
 }
 
-// The read half of the device sync fast path: bytes already buffered in the
-// pipe complete aioRead right on the calling thread - the loop never runs in
-// this test, and the fire-and-forget return value is the only completion
-// channel, deliberately independent of the callback budget (asyncioImpl.h). POSIX
-// devices have always taken this path; on Windows it pins deviceSyncRead
-// probing the pipe instead of unconditionally deferring to the IOCP.
+// The read half of the device sync fast path: bytes already buffered in the pipe complete aioRead right on the calling thread - the loop never
+// runs in this test, and the fire-and-forget return value is the only completion channel, deliberately independent of the callback budget
+// (asyncioImpl.h). POSIX devices have always taken this path; on Windows it pins deviceSyncRead probing the pipe instead of unconditionally
+// deferring to the IOCP.
 TEST(pipe, test_pipe_buffered_data_completes_read_inline)
 {
   pipeTy unnamedPipe;
@@ -85,8 +83,8 @@ TEST(pipe, test_pipe_buffered_data_completes_read_inline)
 
   const char payload[] = {'p', 'i', 'n', 'g'};
 #ifdef OS_WINDOWS
-  // the write end stays a bare handle (no aioObject, no IOCP association),
-  // so a plain event-driven overlapped write lands the bytes deterministically
+  // the write end stays a bare handle (no aioObject, no IOCP association), so a plain event-driven overlapped write lands the bytes
+  // deterministically
   OVERLAPPED overlapped;
   memset(&overlapped, 0, sizeof(overlapped));
   overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -100,17 +98,14 @@ TEST(pipe, test_pipe_buffered_data_completes_read_inline)
   ASSERT_EQ(bytesWritten, sizeof(payload));
   CloseHandle(overlapped.hEvent);
 #else
-  ASSERT_EQ(write(unnamedPipe.write, payload, sizeof(payload)),
-            (ssize_t)sizeof(payload));
+  ASSERT_EQ(write(unnamedPipe.write, payload, sizeof(payload)), (ssize_t)sizeof(payload));
 #endif
 
   aioObject *pipeRead = newDeviceIo(gBase, unnamedPipe.read);
   char buffer[8] = {};
-  ssize_t result = aioRead(pipeRead, buffer, sizeof(payload), afNone, 1000000,
-                           nullptr, nullptr);
+  ssize_t result = aioRead(pipeRead, buffer, sizeof(payload), afNone, 1000000, nullptr, nullptr);
 
-  EXPECT_EQ(result, (ssize_t)sizeof(payload))
-    << "buffered pipe data must complete the read synchronously";
+  EXPECT_EQ(result, (ssize_t)sizeof(payload)) << "buffered pipe data must complete the read synchronously";
   EXPECT_EQ(memcmp(buffer, payload, sizeof(payload)), 0);
 
   deleteAioObject(pipeRead);
@@ -121,20 +116,17 @@ TEST(pipe, test_pipe_buffered_data_completes_read_inline)
 #endif
 }
 #ifdef OS_COMMONUNIX
-// Same contract for the device path: writing to a pipe whose reader is gone
-// must not kill the process. write() has no MSG_NOSIGNAL equivalent, so the
-// shield depends on the platform and init flags, and each variant below pins
-// one of them:
+// Same contract for the device path: writing to a pipe whose reader is gone must not kill the process. write() has no MSG_NOSIGNAL equivalent,
+// so the shield depends on the platform and init flags, and each variant below pins one of them:
 // - aiNone on Darwin/NetBSD: F_SETNOSIGPIPE set by newDeviceIo (per-fd);
 // - aiNone on Linux/FreeBSD: SIGPIPE masked around the write itself
 //   (sigpipeGuard, libpq pattern) - there is no per-fd opt-out there;
 // - aiIgnoreSigpipe anywhere: process-wide SIG_IGN, masking is skipped.
-// Fully deterministic: the kernel tracks pipe readers synchronously, so the
-// first write() after the last reader closed raises SIGPIPE, no timing
-// involved.
+// Fully deterministic: the kernel tracks pipe readers synchronously, so the first write() after the last reader closed raises SIGPIPE, no
+// timing involved.
 static void writeTwiceAfterPipeReaderClosed(AsyncInitFlags initFlags)
 {
-  alarm(30);  // if anything blocks, fail the death test instead of hanging it
+  alarm(30); // if anything blocks, fail the death test instead of hanging it
   initializeAsyncIo(initFlags);
 
   pipeTy unnamedPipe;
@@ -194,33 +186,27 @@ TEST(pipe, test_pipe_reader_close_wakes_parked_write)
   deleteAioObject(pipeWrite);
 }
 
-// An idle object must not cost CPU, whatever state its fd is in. epoll
-// registers the fd with an empty event mask right at object creation
-// (epollNewAioObject) and going idle re-arms it with an empty mask, but
-// EPOLLERR/EPOLLHUP cannot be masked out: the kernel reports them for as
-// long as the condition holds. With no operation parked there is nothing to
-// consume the condition, the event translates to an empty mask and is
-// swallowed, so every epoll_wait returns immediately and the loop thread
-// burns a full core until the object is deleted. Probed on the real kernel
-// (scratchpad/acceptprobe/epollstorm.c): an fd registered with events=0
-// floods EPOLLERR every call, while an EPOLLONESHOT-disarmed fd stays fully
-// silent - so a parked operation does not storm and this is specifically
-// about idle objects. A pipe whose reader is gone is the deterministic worst
-// case: the error condition is permanent, nothing can consume it. kqueue
-// registers filters per operation and iocp has no readiness reporting, so
-// the contract holds there as is; the burn is epoll-only.
-// The loop runs in its own thread so it can spin while this thread sleeps
-// and meters the process CPU clock; the idle baseline over the window is
-// microseconds, four orders of magnitude under the threshold.
+// An idle object must not cost CPU, whatever state its fd is in. epoll registers the fd with an empty event mask right at object creation
+// (epollNewAioObject) and going idle re-arms it with an empty mask, but EPOLLERR/EPOLLHUP cannot be masked out: the kernel reports them for as
+// long as the condition holds. With no operation parked there is nothing to consume the condition, the event translates to an empty mask and is
+// swallowed, so every epoll_wait returns immediately and the loop thread burns a full core until the object is deleted. Probed on the real
+// kernel (scratchpad/acceptprobe/epollstorm.c): an fd registered with events=0 floods EPOLLERR every call, while an EPOLLONESHOT-disarmed fd
+// stays fully silent - so a parked operation does not storm and this is specifically about idle objects. A pipe whose reader is gone is the
+// deterministic worst case: the error condition is permanent, nothing can consume it. kqueue registers filters per operation and iocp has no
+// readiness reporting, so the contract holds there as is; the burn is epoll-only. The loop runs in its own thread so it can spin while this
+// thread sleeps and meters the process CPU clock; the idle baseline over the window is microseconds, four orders of magnitude under the
+// threshold.
 TEST(pipe, test_error_on_idle_object_keeps_loop_asleep)
 {
   asyncBase *base = createAsyncBase(amOSDefault, 1);
-  std::thread loopThread([base]() { asyncLoop(base); });
+  std::thread loopThread([base]() {
+    asyncLoop(base);
+  });
 
   pipeTy unnamedPipe;
   ASSERT_EQ(pipeCreate(&unnamedPipe, 1), 0);
   aioObject *pipeWrite = newDeviceIo(base, unnamedPipe.write);
-  close(unnamedPipe.read);  // permanent error condition on an idle fd
+  close(unnamedPipe.read); // permanent error condition on an idle fd
 
   // let the loop thread face the condition before metering starts
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -234,8 +220,7 @@ TEST(pipe, test_error_on_idle_object_keeps_loop_asleep)
     return static_cast<uint64_t>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000 +
            static_cast<uint64_t>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec);
   };
-  EXPECT_LT(cpuMicroseconds(after) - cpuMicroseconds(before), 200000u)
-    << "the loop thread spins on the error condition of an idle object";
+  EXPECT_LT(cpuMicroseconds(after) - cpuMicroseconds(before), 200000u) << "the loop thread spins on the error condition of an idle object";
 
   deleteAioObject(pipeWrite);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -245,9 +230,8 @@ TEST(pipe, test_error_on_idle_object_keeps_loop_asleep)
 #endif
 
 #ifdef OS_WINDOWS
-// Both halves of the device EOF contract: a pipe whose peer is gone completes
-// the read with aosDisconnected, whether ReadFile refuses right at submit
-// (peer closed first) or the close finishes an already parked overlapped read.
+// Both halves of the device EOF contract: a pipe whose peer is gone completes the read with aosDisconnected, whether ReadFile refuses right at
+// submit (peer closed first) or the close finishes an already parked overlapped read.
 void test_pipe_eof_readcb(AsyncOpStatus status, aioObject*, size_t, void *arg)
 {
   ErrorWakeupContext *ctx = static_cast<ErrorWakeupContext*>(arg);

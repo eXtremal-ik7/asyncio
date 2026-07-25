@@ -35,7 +35,14 @@ void zmtpSocketDelete(zmtpSocket *socket);
 void aioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout, zmtpAcceptCb callback, void *arg);
 void aioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags flags, uint64_t timeout, zmtpConnectCb callback, void *arg);
 ssize_t aioZmtpRecv(zmtpSocket *socket, zmtpStream &msg, size_t limit, AsyncFlags flags, uint64_t timeout, zmtpRecvCb callback, void *arg);
-ssize_t aioZmtpSend(zmtpSocket *socket, void *data, size_t size, zmtpUserMsgTy type, AsyncFlags flags, uint64_t timeout, zmtpSendCb callback, void *arg);
+ssize_t aioZmtpSend(zmtpSocket *socket,
+                    void *data,
+                    size_t size,
+                    zmtpUserMsgTy type,
+                    AsyncFlags flags,
+                    uint64_t timeout,
+                    zmtpSendCb callback,
+                    void *arg);
 
 int ioZmtpAccept(zmtpSocket *socket, AsyncFlags flags, uint64_t timeout);
 int ioZmtpConnect(zmtpSocket *socket, const HostAddress *address, AsyncFlags flags, uint64_t timeout);

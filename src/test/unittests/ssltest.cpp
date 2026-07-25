@@ -25,8 +25,7 @@
 #include <thread>
 #include <vector>
 
-// Server SSL_CTX with a fresh self-signed certificate for helper-thread
-// servers. Returns nullptr on failure; the certificate and key stay
+// Server SSL_CTX with a fresh self-signed certificate for helper-thread servers. Returns nullptr on failure; the certificate and key stay
 // referenced by the context only.
 static SSL_CTX *sslTestMakeServerContext()
 {
@@ -53,11 +52,9 @@ static SSL_CTX *sslTestMakeServerContext()
   return serverContext;
 }
 
-// Blocking server side of a genuine TLS handshake, for helper threads.
-// Returns the connected SSL (the caller frees it and closes *acceptedFd) or
-// nullptr; *acceptedFd is valid whenever accept() succeeded. A receive
-// timeout is armed before the handshake so a wedged peer fails the helper
-// instead of blocking it forever.
+// Blocking server side of a genuine TLS handshake, for helper threads. Returns the connected SSL (the caller frees it and closes *acceptedFd)
+// or nullptr; *acceptedFd is valid whenever accept() succeeded. A receive timeout is armed before the handshake so a wedged peer fails the
+// helper instead of blocking it forever.
 static SSL *sslTestServerHandshake(socketTy listenSocket, socketTy *acceptedFd)
 {
   *acceptedFd = (socketTy)(-1);
@@ -79,7 +76,7 @@ static SSL *sslTestServerHandshake(socketTy listenSocket, socketTy *acceptedFd)
   if (!serverContext)
     return nullptr;
   SSL *ssl = SSL_new(serverContext);
-  SSL_CTX_free(serverContext);  // the SSL keeps its own reference
+  SSL_CTX_free(serverContext); // the SSL keeps its own reference
   SSL_set_fd(ssl, (int)fd);
   if (SSL_accept(ssl) != 1) {
     SSL_free(ssl);
@@ -90,10 +87,9 @@ static SSL *sslTestServerHandshake(socketTy listenSocket, socketTy *acceptedFd)
 
 #if GTEST_HAS_DEATH_TEST
 
-// A plain-text server answers the ClientHello with garbage. The connect
-// must fail with a protocol error: OpenSSL knows the stream is dead (fatal
-// SSL error), and treating that as "want more data" hangs the operation (or
-// spins when the peer keeps streaming). Same watchdog scheme as above.
+// A plain-text server answers the ClientHello with garbage. The connect must fail with a protocol error: OpenSSL knows the stream is dead
+// (fatal SSL error), and treating that as "want more data" hangs the operation (or spins when the peer keeps streaming). Same watchdog scheme
+// as above.
 static const char gSslGarbage[] = "this is a plain text server, definitely not TLS\r\n";
 
 struct SslGarbageContext {
@@ -108,7 +104,7 @@ static void sslGarbageWriteCb(AsyncOpStatus status, aioObject *object, size_t, v
 {
   SslGarbageContext *ctx = static_cast<SslGarbageContext*>(arg);
   if (ctx->flood && status == aosSuccess)
-    aioWrite(object, gSslGarbage, sizeof(gSslGarbage)-1, afWaitAll, 0, sslGarbageWriteCb, ctx);
+    aioWrite(object, gSslGarbage, sizeof(gSslGarbage) - 1, afWaitAll, 0, sslGarbageWriteCb, ctx);
 }
 
 static void sslGarbageAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
@@ -118,7 +114,7 @@ static void sslGarbageAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, so
     exit(2);
 
   ctx->serverConn = newSocketIo(ctx->base, acceptSocket);
-  aioWrite(ctx->serverConn, gSslGarbage, sizeof(gSslGarbage)-1, afWaitAll, 0, sslGarbageWriteCb, ctx);
+  aioWrite(ctx->serverConn, gSslGarbage, sizeof(gSslGarbage) - 1, afWaitAll, 0, sslGarbageWriteCb, ctx);
 }
 
 static void sslGarbageConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
@@ -133,7 +129,7 @@ static void sslConnectGarbageScenario(int flood)
   armDeathTestWatchdog(30);
 
   SslGarbageContext ctx;
-  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1); // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.serverConn = nullptr;
   ctx.flood = flood;
@@ -154,7 +150,7 @@ static void sslConnectGarbageScenario(int flood)
   aioSslConnect(ctx.client, &address, nullptr, 0, sslGarbageConnectCb, &ctx);
 
   asyncLoop(ctx.base);
-  exit(3);  // event loop ended without the connect callback
+  exit(3); // event loop ended without the connect callback
 }
 
 TEST(SslDeathTest, connect_plain_garbage)
@@ -167,26 +163,20 @@ TEST(SslDeathTest, connect_plain_garbage_flood)
   EXPECT_EXIT(sslConnectGarbageScenario(1), ::testing::ExitedWithCode(0), "");
 }
 
-// A peer that accepts the TCP connection and drops it without ever speaking
-// TLS. This is NOT connect_plain_garbage: garbage makes SSL_connect() fail
-// fatally (a terminal SSL error -> the operation is released), but a bare
-// disconnect keeps SSL_connect() in SSL_ERROR_WANT_READ - it never saw a
-// ServerHello. The handshake read completes with aosDisconnected and
-// resumeParent() sets that terminal status on the parent connect op, so the
-// initialization-slot handler must RELEASE on the terminal status instead of
-// re-running the connect state machine. Re-executing connectProc() calls
-// SSL_connect() again, gets WANT_READ again, and re-posts the handshake read on
-// the dead socket - forever: the connect never completes, its initialization slot
-// stays pinned, the object leaks. There is no rescue timeout by design -
-// resumeParent() already set a terminal status, so a timer's opSetStatus()
-// loses the CAS and the timer is a no-op; the live-lock cannot be broken from
-// outside. The watchdog turns the hang into a verdict.
+// A peer that accepts the TCP connection and drops it without ever speaking TLS. This is NOT connect_plain_garbage: garbage makes SSL_connect()
+// fail fatally (a terminal SSL error -> the operation is released), but a bare disconnect keeps SSL_connect() in SSL_ERROR_WANT_READ - it never
+// saw a ServerHello. The handshake read completes with aosDisconnected and resumeParent() sets that terminal status on the parent connect op,
+// so the initialization-slot handler must RELEASE on the terminal status instead of re-running the connect state machine. Re-executing
+// connectProc() calls SSL_connect() again, gets WANT_READ again, and re-posts the handshake read on the dead socket - forever: the connect
+// never completes, its initialization slot stays pinned, the object leaks. There is no rescue timeout by design - resumeParent() already set a
+// terminal status, so a timer's opSetStatus() loses the CAS and the timer is a no-op; the live-lock cannot be broken from outside. The watchdog
+// turns the hang into a verdict.
 static void sslConnectPeerDropAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
 {
   __UNUSED(arg);
   if (status != aosSuccess)
     exit(2);
-  socketClose(acceptSocket);  // FIN before a single TLS byte: the client's handshake read fails
+  socketClose(acceptSocket); // FIN before a single TLS byte: the client's handshake read fails
 }
 
 static void sslConnectPeerDropConnectCb(AsyncOpStatus status, SSLSocket*, void *arg)
@@ -201,7 +191,7 @@ static void sslConnectPeerDropScenario()
   armDeathTestWatchdog(15);
 
   SslGarbageContext ctx;
-  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1); // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.serverConn = nullptr;
   ctx.flood = 0;
@@ -218,12 +208,11 @@ static void sslConnectPeerDropScenario()
   address.family = AF_INET;
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
-  // no timeout: releasing on the child's terminal status is the contract (and a
-  // rescue timer could not break the live-lock anyway, see above)
+  // no timeout: releasing on the child's terminal status is the contract (and a rescue timer could not break the live-lock anyway, see above)
   aioSslConnect(ctx.client, &address, nullptr, 0, sslConnectPeerDropConnectCb, &ctx);
 
   asyncLoop(ctx.base);
-  exit(3);  // event loop drained without the connect callback
+  exit(3); // event loop drained without the connect callback
 }
 
 TEST(SslDeathTest, connect_peer_disconnect_during_handshake)
@@ -231,13 +220,10 @@ TEST(SslDeathTest, connect_peer_disconnect_during_handshake)
   EXPECT_EXIT(sslConnectPeerDropScenario(), ::testing::ExitedWithCode(0), "");
 }
 
-// The same garbage after a completed handshake exercises the read path,
-// which never calls SSL_get_error. The server does a genuine TLS handshake
-// (self-signed cert, blocking OpenSSL in a helper thread), then the wire
-// turns into a plain-text stream. SSL_read fails fatally and can never
-// recover, yet the code treats any non-positive result as "want more data":
-// with a silent peer the operation waits forever, with a streaming peer it
-// cycles forever.
+// The same garbage after a completed handshake exercises the read path, which never calls SSL_get_error. The server does a genuine TLS
+// handshake (self-signed cert, blocking OpenSSL in a helper thread), then the wire turns into a plain-text stream. SSL_read fails fatally and
+// can never recover, yet the code treats any non-positive result as "want more data": with a silent peer the operation waits forever, with a
+// streaming peer it cycles forever.
 static void sslTlsThenGarbageServer(socketTy listenSocket, int flood)
 {
   socketTy fd;
@@ -246,7 +232,7 @@ static void sslTlsThenGarbageServer(socketTy listenSocket, int flood)
     _Exit(4);
 
   do {
-    if (send(fd, (const char*)gSslGarbage, (int)(sizeof(gSslGarbage)-1), 0) <= 0)
+    if (send(fd, (const char*)gSslGarbage, (int)(sizeof(gSslGarbage) - 1), 0) <= 0)
       break;
   } while (flood);
   SSL_free(ssl);
@@ -263,7 +249,7 @@ static void sslGarbageHandshakeConnectCb(AsyncOpStatus status, SSLSocket *socket
 {
   SslGarbageContext *ctx = static_cast<SslGarbageContext*>(arg);
   if (status != aosSuccess)
-    exit(4);  // the handshake against a real TLS server must succeed
+    exit(4); // the handshake against a real TLS server must succeed
 
   aioSslRead(socket, ctx->readBuffer, sizeof(ctx->readBuffer), afNone, 0, sslGarbageReadCb, ctx);
 }
@@ -273,7 +259,7 @@ static void sslReadGarbageScenario(int flood)
   armDeathTestWatchdog(30);
 
   SslGarbageContext ctx;
-  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1); // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.serverConn = nullptr;
   ctx.flood = flood;
@@ -301,7 +287,7 @@ static void sslReadGarbageScenario(int flood)
   aioSslConnect(ctx.client, &address, nullptr, 0, sslGarbageHandshakeConnectCb, &ctx);
 
   asyncLoop(ctx.base);
-  exit(3);  // event loop ended without the read callback
+  exit(3); // event loop ended without the read callback
 }
 
 TEST(SslDeathTest, read_garbage_after_handshake)
@@ -315,13 +301,10 @@ TEST(SslDeathTest, read_garbage_after_handshake_flood)
 }
 #endif
 
-// A write queued while the TLS handshake is still in flight must not report
-// success for bytes that never entered the SSL stream. The server accepts the
-// TCP connection but never answers the ClientHello, so the connect op fails
-// by timeout; the queued write then runs with an incomplete handshake:
-// SSL_write() rejects the payload (WANT_READ), but its result is ignored,
-// bioOut is empty, and the operation completes with aosSuccess claiming the
-// full payload size - the application believes the data was sent.
+// A write queued while the TLS handshake is still in flight must not report success for bytes that never entered the SSL stream. The server
+// accepts the TCP connection but never answers the ClientHello, so the connect op fails by timeout; the queued write then runs with an
+// incomplete handshake: SSL_write() rejects the payload (WANT_READ), but its result is ignored, bioOut is empty, and the operation completes
+// with aosSuccess claiming the full payload size - the application believes the data was sent.
 struct SslSilentServerContext {
   asyncBase *base;
   SSLSocket *client;
@@ -331,9 +314,13 @@ struct SslSilentServerContext {
   size_t writeTransferred;
   bool writeFinished;
   SslSilentServerContext(asyncBase *baseArg) :
-    base(baseArg), client(nullptr), serverConn(nullptr),
-    connectStatus(aosUnknown), writeStatus(aosUnknown),
-    writeTransferred(0), writeFinished(false) {}
+    base(baseArg),
+    client(nullptr),
+    serverConn(nullptr),
+    connectStatus(aosUnknown),
+    writeStatus(aosUnknown),
+    writeTransferred(0),
+    writeFinished(false) {}
 };
 
 static void sslSilentServerAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
@@ -341,7 +328,7 @@ static void sslSilentServerAcceptCb(AsyncOpStatus status, aioObject*, HostAddres
   SslSilentServerContext *ctx = static_cast<SslSilentServerContext*>(arg);
   EXPECT_EQ(status, aosSuccess);
   if (status == aosSuccess)
-    ctx->serverConn = newSocketIo(ctx->base, acceptSocket);  // keep the connection open, never answer
+    ctx->serverConn = newSocketIo(ctx->base, acceptSocket); // keep the connection open, never answer
   else
     postQuitOperation(ctx->base);
 }
@@ -378,18 +365,15 @@ TEST(ssl, write_before_handshake)
   address.ipv4 = inet_addr("127.0.0.1");
   address.port = gPort;
   aioSslConnect(ctx.client, &address, nullptr, 150000, sslWriteBeforeHandshakeConnectCb, &ctx);
-  // queued right behind the connect, as an application pipelining its first
-  // request would do; the write timeout only bounds the test if a fix leaves
-  // the operation waiting for a handshake that can no longer complete
-  aioSslWrite(ctx.client, payload, sizeof(payload)-1, afNone, 3000000, sslWriteBeforeHandshakeWriteCb, &ctx);
+  // queued right behind the connect, as an application pipelining its first request would do; the write timeout only bounds the test if a fix
+  // leaves the operation waiting for a handshake that can no longer complete
+  aioSslWrite(ctx.client, payload, sizeof(payload) - 1, afNone, 3000000, sslWriteBeforeHandshakeWriteCb, &ctx);
 
   asyncLoop(gBase);
 
   EXPECT_EQ(ctx.connectStatus, aosTimeout);
   ASSERT_TRUE(ctx.writeFinished);
-  EXPECT_NE(ctx.writeStatus, aosSuccess)
-    << "write reported success for " << ctx.writeTransferred
-    << " bytes that never entered the TLS stream";
+  EXPECT_NE(ctx.writeStatus, aosSuccess) << "write reported success for " << ctx.writeTransferred << " bytes that never entered the TLS stream";
 
   sslSocketDelete(ctx.client);
   deleteAioObject(listener);
@@ -397,16 +381,18 @@ TEST(ssl, write_before_handshake)
     deleteAioObject(ctx.serverConn);
 }
 
-// SSL_write on a socket whose handshake was never even started can accept
-// nothing: the operation must fail instead of claiming the payload was sent
-// (the write path used to ignore the SSL_write result entirely).
+// SSL_write on a socket whose handshake was never even started can accept nothing: the operation must fail instead of claiming the payload was
+// sent (the write path used to ignore the SSL_write result entirely).
 struct SslWriteNoConnectContext {
   asyncBase *base;
   AsyncOpStatus status;
   size_t transferred;
   bool finished;
   SslWriteNoConnectContext(asyncBase *baseArg) :
-    base(baseArg), status(aosUnknown), transferred(0), finished(false) {}
+    base(baseArg),
+    status(aosUnknown),
+    transferred(0),
+    finished(false) {}
 };
 
 static void sslWriteNoConnectCb(AsyncOpStatus status, SSLSocket*, size_t transferred, void *arg)
@@ -428,7 +414,7 @@ TEST(ssl, write_without_connect)
   ASSERT_NE(clientIo, nullptr);
   SSLSocket *client = sslSocketNew(gBase, clientIo, nullptr);
 
-  aioSslWrite(client, payload, sizeof(payload)-1, afNone, 1000000, sslWriteNoConnectCb, &ctx);
+  aioSslWrite(client, payload, sizeof(payload) - 1, afNone, 1000000, sslWriteNoConnectCb, &ctx);
   asyncLoop(gBase);
 
   ASSERT_TRUE(ctx.finished);
@@ -437,9 +423,8 @@ TEST(ssl, write_without_connect)
   sslSocketDelete(client);
 }
 
-// The combiner installs the SSL initialization operation just as for plain TCP.
-// A second handshake submitted while the first is still in flight must fail
-// without touching the shared SSL state machine.
+// The combiner installs the SSL initialization operation just as for plain TCP. A second handshake submitted while the first is still in flight
+// must fail without touching the shared SSL state machine.
 TEST(ssl, double_connect_rejected)
 {
   DoubleConnectRecorder ctx(gBase);
@@ -462,13 +447,11 @@ TEST(ssl, double_connect_rejected)
     GTEST_SKIP() << "blackhole answered (first connect status " << ctx.firstStatus
                  << "), initialization slot contention cannot be exercised on this network";
   EXPECT_EQ(ctx.secondStatus, aosUnknownError);
-  EXPECT_LT(ctx.secondOrder, ctx.firstOrder)
-    << "the second SSL connect was not rejected while the first was in flight";
+  EXPECT_LT(ctx.secondOrder, ctx.firstOrder) << "the second SSL connect was not rejected while the first was in flight";
 }
 
-// A caller-supplied SSL_CTX is shared, not consumed: the socket must take its
-// own reference, so the caller may drop theirs right away and several sockets
-// may share one context. ASAN turns a missing up_ref into a double free here.
+// A caller-supplied SSL_CTX is shared, not consumed: the socket must take its own reference, so the caller may drop theirs right away and
+// several sockets may share one context. ASAN turns a missing up_ref into a double free here.
 TEST(ssl, shared_user_context)
 {
   SSL_CTX *userContext = SSL_CTX_new(TLS_client_method());
@@ -484,21 +467,16 @@ TEST(ssl, shared_user_context)
   ASSERT_NE(first, nullptr);
   ASSERT_NE(second, nullptr);
 
-  SSL_CTX_free(userContext);  // the sockets keep the context alive on their own
+  SSL_CTX_free(userContext); // the sockets keep the context alive on their own
   sslSocketDelete(first);
   sslSocketDelete(second);
 }
 
-// SSL_MODE_ENABLE_PARTIAL_WRITE in a caller-supplied SSL_CTX makes SSL_write
-// accept as little as one TLS record (16K) per call. A positive result is
-// not "the whole plaintext was taken": the write path must keep feeding the
-// remainder, or the tail of the payload silently vanishes while the
-// operation still reports the full size as sent. A real TLS server receives
-// into a sink and the test compares byte counts on both sides; a receive
-// timeout on the sink turns the lost tail into a countable shortfall
-// instead of a hang. Two flavors: the write submitted after the handshake
-// (synchronous fast path) and pipelined right behind the connect (queued
-// operation path).
+// SSL_MODE_ENABLE_PARTIAL_WRITE in a caller-supplied SSL_CTX makes SSL_write accept as little as one TLS record (16K) per call. A positive
+// result is not "the whole plaintext was taken": the write path must keep feeding the remainder, or the tail of the payload silently vanishes
+// while the operation still reports the full size as sent. A real TLS server receives into a sink and the test compares byte counts on both
+// sides; a receive timeout on the sink turns the lost tail into a countable shortfall instead of a hang. Two flavors: the write submitted after
+// the handshake (synchronous fast path) and pipelined right behind the connect (queued operation path).
 struct SslPartialWriteContext {
   asyncBase *base;
   std::vector<uint8_t> payload;
@@ -510,10 +488,14 @@ struct SslPartialWriteContext {
   ssize_t serverReceived;
   bool serverMismatch;
   SslPartialWriteContext(asyncBase *baseArg) :
-    base(baseArg), writeFromConnectCb(false),
-    connectStatus(aosUnknown), writeStatus(aosUnknown),
-    writeTransferred(0), writeFinished(false),
-    serverReceived(0), serverMismatch(false) {}
+    base(baseArg),
+    writeFromConnectCb(false),
+    connectStatus(aosUnknown),
+    writeStatus(aosUnknown),
+    writeTransferred(0),
+    writeFinished(false),
+    serverReceived(0),
+    serverMismatch(false) {}
 };
 
 static void sslPartialWriteSink(socketTy listenSocket, SslPartialWriteContext *ctx)
@@ -533,8 +515,7 @@ static void sslPartialWriteSink(socketTy listenSocket, SslPartialWriteContext *c
     int R = SSL_read(ssl, chunk, (int)sizeof(chunk));
     if (R <= 0)
       break;
-    if (received + (size_t)R > ctx->payload.size() ||
-        memcmp(chunk, ctx->payload.data() + received, (size_t)R) != 0) {
+    if (received + (size_t)R > ctx->payload.size() || memcmp(chunk, ctx->payload.data() + received, (size_t)R) != 0) {
       ctx->serverMismatch = true;
       break;
     }
@@ -570,8 +551,7 @@ static void sslPartialWriteScenario(bool writeFromConnectCb)
 {
   SslPartialWriteContext ctx(gBase);
   ctx.writeFromConnectCb = writeFromConnectCb;
-  // several records plus a partial one: a single SSL_write in partial-write
-  // mode cannot take it whole
+  // several records plus a partial one: a single SSL_write in partial-write mode cannot take it whole
   ctx.payload.resize(100000);
   for (size_t i = 0; i < ctx.payload.size(); i++)
     ctx.payload[i] = (uint8_t)(i ^ (i >> 8) ^ (i >> 16));
@@ -609,8 +589,7 @@ static void sslPartialWriteScenario(bool writeFromConnectCb)
   EXPECT_TRUE(ctx.writeFinished);
   EXPECT_EQ(ctx.writeStatus, aosSuccess);
   EXPECT_EQ(ctx.writeTransferred, ctx.payload.size());
-  EXPECT_EQ(ctx.serverReceived, (ssize_t)ctx.payload.size())
-    << "the plaintext tail never entered the TLS stream";
+  EXPECT_EQ(ctx.serverReceived, (ssize_t)ctx.payload.size()) << "the plaintext tail never entered the TLS stream";
   EXPECT_FALSE(ctx.serverMismatch);
 
   sslSocketDelete(client);
@@ -627,11 +606,9 @@ TEST(ssl, partial_write_mode_pipelined)
   sslPartialWriteScenario(false);
 }
 
-// The active-once entry point owns the SSL combiner across its synchronous
-// attempt and publication of a returned continuation. A pending return means
-// exactly one callback will finish the read; an inline return means no
-// callback. Keep the server silent until the call has returned so this
-// exercises the pending half of that contract.
+// The active-once entry point owns the SSL combiner across its synchronous attempt and publication of a returned continuation. A pending return
+// means exactly one callback will finish the read; an inline return means no callback. Keep the server silent until the call has returned so
+// this exercises the pending half of that contract.
 struct SslContinuationWakeupContext {
   asyncBase *base = nullptr;
   AsyncOpStatus connectStatus = aosUnknown;
@@ -663,8 +640,7 @@ static void sslContinuationWakeupSink(socketTy listenSocket, SslContinuationWake
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   if (SSL_write(ssl, gSslContinuationPayload, (int)strlen(gSslContinuationPayload)) <= 0)
     ctx->serverFailed = true;
-  // keep the connection open: an EOF-driven read-queue sweep must not stand in
-  // for the wakeup under test
+  // keep the connection open: an EOF-driven read-queue sweep must not stand in for the wakeup under test
   while (!ctx->serverExit)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   SSL_free(ssl);
@@ -711,12 +687,15 @@ TEST(ssl, active_once_read_publishes_continuation)
   ASSERT_EQ(socketBind(listenSocket, &address), 0);
   ASSERT_EQ(socketListen(listenSocket), 0);
   std::thread sink(sslContinuationWakeupSink, listenSocket, &ctx);
-  // an early ASSERT return must release the helper, or its thread destructor
-  // terminates the whole binary
+  // an early ASSERT return must release the helper, or its thread destructor terminates the whole binary
   struct SinkGuard {
     SslContinuationWakeupContext *ctx;
     std::thread *sink;
-    ~SinkGuard() { ctx->serverSend = true; ctx->serverExit = true; sink->join(); }
+    ~SinkGuard() {
+      ctx->serverSend = true;
+      ctx->serverExit = true;
+      sink->join();
+    }
   } sinkGuard{&ctx, &sink};
 
   aioUserEvent *watchdog = newUserEvent(gBase, 0, sslContinuationWakeupQuitCb, gBase);
@@ -732,13 +711,7 @@ TEST(ssl, active_once_read_publishes_continuation)
   ASSERT_FALSE(ctx.serverFailed.load());
 
   resetQuitOperation(gBase);
-  ssize_t result = aioSslRead(client,
-                              ctx.buffer,
-                              sizeof(ctx.buffer),
-                              afActiveOnce,
-                              2500000,
-                              sslContinuationWakeupReadCb,
-                              &ctx);
+  ssize_t result = aioSslRead(client, ctx.buffer, sizeof(ctx.buffer), afActiveOnce, 2500000, sslContinuationWakeupReadCb, &ctx);
   ASSERT_EQ(result, -(ssize_t)aosPending);
 
   ctx.serverSend = true;
@@ -759,16 +732,14 @@ TEST(ssl, active_once_read_publishes_continuation)
   socketClose(listenSocket);
 }
 
-static const char gHttpsActiveOnceRequest[] =
-  "GET / HTTP/1.1\r\n"
-  "Host: localhost\r\n"
-  "\r\n";
+static const char gHttpsActiveOnceRequest[] = "GET / HTTP/1.1\r\n"
+                                              "Host: localhost\r\n"
+                                              "\r\n";
 
-static const char gHttpsActiveOnceResponse[] =
-  "HTTP/1.1 200 OK\r\n"
-  "Content-Length: 6\r\n"
-  "\r\n"
-  "wakeup";
+static const char gHttpsActiveOnceResponse[] = "HTTP/1.1 200 OK\r\n"
+                                               "Content-Length: 6\r\n"
+                                               "\r\n"
+                                               "wakeup";
 
 static const unsigned gHttpsActiveOnceRounds = 64;
 
@@ -818,11 +789,8 @@ static void httpsActiveOnceSink(socketTy listenSocket, HttpsActiveOnceContext *c
       request.append(buffer, (size_t)result);
     }
     if (ctx->serverFailed ||
-        request != std::string(gHttpsActiveOnceRequest,
-                               sizeof(gHttpsActiveOnceRequest)-1) ||
-        !sslBlockingWriteAll(ssl,
-                             gHttpsActiveOnceResponse,
-                             sizeof(gHttpsActiveOnceResponse)-1)) {
+        request != std::string(gHttpsActiveOnceRequest, sizeof(gHttpsActiveOnceRequest) - 1) ||
+        !sslBlockingWriteAll(ssl, gHttpsActiveOnceResponse, sizeof(gHttpsActiveOnceResponse) - 1)) {
       ctx->serverFailed = true;
       break;
     }
@@ -845,9 +813,7 @@ static void httpsActiveOnceRequestCb(AsyncOpStatus status, HTTPClient*, void *ar
 
   if (ctx->parseContext.resultCode != 200 ||
       ctx->parseContext.body.size != strlen(gSslContinuationPayload) ||
-      memcmp(ctx->parseContext.body.data,
-             gSslContinuationPayload,
-             strlen(gSslContinuationPayload)) != 0)
+      memcmp(ctx->parseContext.body.data, gSslContinuationPayload, strlen(gSslContinuationPayload)) != 0)
     ctx->responseMismatch = true;
 
   if (ctx->completed.fetch_add(1) + 1 == gHttpsActiveOnceRounds)
@@ -860,7 +826,7 @@ static void httpsActiveOnceSubmit(HttpsActiveOnceContext *ctx)
 {
   aioHttpRequest(ctx->client,
                  gHttpsActiveOnceRequest,
-                 sizeof(gHttpsActiveOnceRequest)-1,
+                 sizeof(gHttpsActiveOnceRequest) - 1,
                  5000000,
                  httpParseDefault,
                  &ctx->parseContext,
@@ -878,10 +844,9 @@ static void httpsActiveOnceConnectCb(AsyncOpStatus status, HTTPClient*, void *ar
     postQuitOperation(ctx->base);
 }
 
-// HTTPS is the in-tree three-level ownership chain: client -> SSL ->
-// transport. Exercise both request writes and response reads repeatedly with
-// two loop threads so child completions may race the caller, while the public
-// SSL entry points keep continuation publication inside their combiner.
+// HTTPS is the in-tree three-level ownership chain: client -> SSL -> transport. Exercise both request writes and response reads repeatedly with
+// two loop threads so child completions may race the caller, while the public SSL entry points keep continuation publication inside their
+// combiner.
 TEST(ssl, https_client_nested_active_once_io)
 {
   HttpsActiveOnceContext ctx;
@@ -906,14 +871,11 @@ TEST(ssl, https_client_nested_active_once_io)
   std::thread sink(httpsActiveOnceSink, listenSocket, &ctx);
 
   address.ipv4 = inet_addr("127.0.0.1");
-  aioHttpConnect(ctx.client,
-                 &address,
-                 nullptr,
-                 5000000,
-                 httpsActiveOnceConnectCb,
-                 &ctx);
+  aioHttpConnect(ctx.client, &address, nullptr, 5000000, httpsActiveOnceConnectCb, &ctx);
 
-  std::thread secondLoop([] { asyncLoop(gBase); });
+  std::thread secondLoop([] {
+    asyncLoop(gBase);
+  });
   asyncLoop(gBase);
   secondLoop.join();
   sink.join();
@@ -955,14 +917,10 @@ static void smtpsActiveOnceSink(socketTy listenSocket, SmtpsActiveOnceContext *c
     return;
   }
 
-  if (!sslBlockingWriteAll(ssl,
-                           gSmtpsActiveOnceGreeting,
-                           sizeof(gSmtpsActiveOnceGreeting)-1))
+  if (!sslBlockingWriteAll(ssl, gSmtpsActiveOnceGreeting, sizeof(gSmtpsActiveOnceGreeting) - 1))
     ctx->serverFailed = true;
 
-  for (unsigned round = 0;
-       !ctx->serverFailed && round < gSmtpsActiveOnceRounds;
-       round++) {
+  for (unsigned round = 0; !ctx->serverFailed && round < gSmtpsActiveOnceRounds; round++) {
     std::string command;
     while (command.find("\r\n") == std::string::npos) {
       char buffer[128];
@@ -974,11 +932,8 @@ static void smtpsActiveOnceSink(socketTy listenSocket, SmtpsActiveOnceContext *c
       command.append(buffer, (size_t)result);
     }
     if (ctx->serverFailed ||
-        command != std::string(gSmtpsActiveOnceCommand,
-                               sizeof(gSmtpsActiveOnceCommand)-1) ||
-        !sslBlockingWriteAll(ssl,
-                             gSmtpsActiveOnceResponse,
-                             sizeof(gSmtpsActiveOnceResponse)-1))
+        command != std::string(gSmtpsActiveOnceCommand, sizeof(gSmtpsActiveOnceCommand) - 1) ||
+        !sslBlockingWriteAll(ssl, gSmtpsActiveOnceResponse, sizeof(gSmtpsActiveOnceResponse) - 1))
       ctx->serverFailed = true;
   }
 
@@ -988,10 +943,7 @@ static void smtpsActiveOnceSink(socketTy listenSocket, SmtpsActiveOnceContext *c
 
 static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx);
 
-static void smtpsActiveOnceCommandCb(AsyncOpStatus status,
-                                     const SMTPResult *result,
-                                     SMTPClient *client,
-                                     void *arg)
+static void smtpsActiveOnceCommandCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
 {
   __UNUSED(client);
   SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
@@ -1011,12 +963,7 @@ static void smtpsActiveOnceCommandCb(AsyncOpStatus status,
 
 static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx)
 {
-  aioSmtpCommand(ctx->client,
-                 "NOOP",
-                 afNone,
-                 5000000,
-                 smtpsActiveOnceCommandCb,
-                 ctx);
+  aioSmtpCommand(ctx->client, "NOOP", afNone, 5000000, smtpsActiveOnceCommandCb, ctx);
 }
 
 static void smtpsActiveOnceConnectCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
@@ -1056,13 +1003,11 @@ TEST(ssl, smtps_client_nested_active_once_io)
   std::thread sink(smtpsActiveOnceSink, listenSocket, &ctx);
 
   address.ipv4 = inet_addr("127.0.0.1");
-  aioSmtpConnect(ctx.client,
-                 address,
-                 5000000,
-                 smtpsActiveOnceConnectCb,
-                 &ctx);
+  aioSmtpConnect(ctx.client, address, 5000000, smtpsActiveOnceConnectCb, &ctx);
 
-  std::thread secondLoop([] { asyncLoop(gBase); });
+  std::thread secondLoop([] {
+    asyncLoop(gBase);
+  });
   asyncLoop(gBase);
   secondLoop.join();
   sink.join();
@@ -1078,8 +1023,8 @@ TEST(ssl, smtps_client_nested_active_once_io)
 }
 
 static const char gSmtpsQueuedGreeting[] = "220 ready\r\n";
-static const char *gSmtpsQueuedCommands[] = { "NOOP first\r\n", "NOOP second\r\n" };
-static const char *gSmtpsQueuedResponses[] = { "250 first\r\n", "251 second\r\n" };
+static const char *gSmtpsQueuedCommands[] = {"NOOP first\r\n", "NOOP second\r\n"};
+static const char *gSmtpsQueuedResponses[] = {"250 first\r\n", "251 second\r\n"};
 
 struct SmtpsQueuedResultContext {
   asyncBase *base = nullptr;
@@ -1110,7 +1055,7 @@ static void smtpsQueuedResultSink(socketTy listenSocket, SmtpsQueuedResultContex
     return;
   }
 
-  if (!sslBlockingWriteAll(ssl, gSmtpsQueuedGreeting, sizeof(gSmtpsQueuedGreeting)-1)) {
+  if (!sslBlockingWriteAll(ssl, gSmtpsQueuedGreeting, sizeof(gSmtpsQueuedGreeting) - 1)) {
     SSL_free(ssl);
     socketClose(fd);
     smtpsQueuedResultFail(ctx);
@@ -1155,8 +1100,7 @@ static void smtpsQueuedFirstCb(AsyncOpStatus status, const SMTPResult *result, S
   std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (!ctx->secondFinished.load() && std::chrono::steady_clock::now() < deadline)
     std::this_thread::yield();
-  if (!ctx->secondFinished.load() || status != aosSuccess || result->code != 250 ||
-      !result->response || strcmp(result->response, "first") != 0)
+  if (!ctx->secondFinished.load() || status != aosSuccess || result->code != 250 || !result->response || strcmp(result->response, "first") != 0)
     ctx->responseMismatch = true;
   postQuitOperation(ctx->base);
 }
@@ -1207,7 +1151,9 @@ TEST(ssl, smtps_queued_operations_keep_their_own_results)
   ASSERT_NE(coroutine, nullptr);
   ASSERT_EQ(coroutineCall(coroutine), 0);
 
-  std::thread secondLoop([] { asyncLoop(gBase); });
+  std::thread secondLoop([] {
+    asyncLoop(gBase);
+  });
   asyncLoop(gBase);
   secondLoop.join();
   sink.join();
@@ -1222,11 +1168,9 @@ TEST(ssl, smtps_queued_operations_keep_their_own_results)
   socketClose(listenSocket);
 }
 
-// address == NULL means "the transport is already connected, run only the
-// TLS handshake" - the async flavor honors that, and the coroutine flavor
-// must not dereference the null address instead. The transport is connected
-// with ioConnect() first, then ioSslConnect(NULL) drives the handshake over
-// it; a verified write proves the stream is genuinely established.
+// address == NULL means "the transport is already connected, run only the TLS handshake" - the async flavor honors that, and the coroutine
+// flavor must not dereference the null address instead. The transport is connected with ioConnect() first, then ioSslConnect(NULL) drives the
+// handshake over it; a verified write proves the stream is genuinely established.
 struct SslIoPreconnectedContext {
   SslPartialWriteContext *sink;
   aioObject *transport;
@@ -1236,8 +1180,13 @@ struct SslIoPreconnectedContext {
   ssize_t writeResult;
   bool finished;
   SslIoPreconnectedContext() :
-    sink(nullptr), transport(nullptr), client(nullptr),
-    tcpResult(-1), sslResult(-1), writeResult(-1), finished(false) {}
+    sink(nullptr),
+    transport(nullptr),
+    client(nullptr),
+    tcpResult(-1),
+    sslResult(-1),
+    writeResult(-1),
+    finished(false) {}
 };
 
 static void sslIoPreconnectedProc(void *arg)
@@ -1257,19 +1206,13 @@ static void sslIoPreconnectedProc(void *arg)
   postQuitOperation(gBase);
 }
 
-// The client-side TLS 1.3 handshake ends with SSL_connect() == 1 while the
-// final flight (Finished) is still only queued to bioOut: the flush is a
-// real transport write and the connect must not report success before it
-// lands. Making that write fail deterministically needs no TCP timing (an
-// RST races the data it discards, and IOCP accepts whole overlapped sends
-// long before any reset): the transport is a duplex local channel with FIFO
-// close semantics - everything written before the peer end closes is still
-// delivered, anything the client writes afterwards dies with a broken-pipe
-// error. The transport write queue is wedged with a parked bulk write, and
-// the peer holds the server flight until it has SEEN bulk bytes arrive, so
-// the Finished provably queues behind the wedge; then the peer closes.
-// Both writes die and the connect must fail instead of reporting a session
-// whose Finished never left the machine.
+// The client-side TLS 1.3 handshake ends with SSL_connect() == 1 while the final flight (Finished) is still only queued to bioOut: the flush is
+// a real transport write and the connect must not report success before it lands. Making that write fail deterministically needs no TCP timing
+// (an RST races the data it discards, and IOCP accepts whole overlapped sends long before any reset): the transport is a duplex local channel
+// with FIFO close semantics - everything written before the peer end closes is still delivered, anything the client writes afterwards dies with
+// a broken-pipe error. The transport write queue is wedged with a parked bulk write, and the peer holds the server flight until it has SEEN
+// bulk bytes arrive, so the Finished provably queues behind the wedge; then the peer closes. Both writes die and the connect must fail instead
+// of reporting a session whose Finished never left the machine.
 #ifdef OS_WINDOWS
 struct SslPeerChannel {
   iodevTy transportEnd;
@@ -1292,15 +1235,14 @@ static aioObject *sslPeerChannelOpen(SslPeerChannel *channel)
   return newDeviceIo(gBase, channel->transportEnd);
 }
 
-// event-based synchronous I/O on the overlapped peer end, bounded so a
-// broken scenario fails the test instead of hanging it
+// event-based synchronous I/O on the overlapped peer end, bounded so a broken scenario fails the test instead of hanging it
 static bool sslPeerIo(bool isRead, iodevTy handle, void *buffer, size_t size, size_t *transferred)
 {
   OVERLAPPED overlapped;
   memset(&overlapped, 0, sizeof(overlapped));
   overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-  BOOL started = isRead ? ReadFile(handle, buffer, (DWORD)size, nullptr, &overlapped)
-                        : WriteFile(handle, buffer, (DWORD)size, nullptr, &overlapped);
+  BOOL started =
+      isRead ? ReadFile(handle, buffer, (DWORD)size, nullptr, &overlapped) : WriteFile(handle, buffer, (DWORD)size, nullptr, &overlapped);
   bool ok = false;
   if (started || GetLastError() == ERROR_IO_PENDING) {
     DWORD bytes = 0;
@@ -1349,8 +1291,8 @@ static bool sslPeerChannelCreate(SslPeerChannel *channel)
   int fds[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
     return false;
-  // newSocketIo expects what socketCreate produces: a non-blocking socket
-  // with SIGPIPE suppressed per-descriptor where send() has no MSG_NOSIGNAL
+  // newSocketIo expects what socketCreate produces: a non-blocking socket with SIGPIPE suppressed per-descriptor where send() has no
+  // MSG_NOSIGNAL
   fcntl(fds[0], F_SETFL, O_NONBLOCK | fcntl(fds[0], F_GETFL));
 #ifdef SO_NOSIGPIPE
   int optval = 1;
@@ -1410,15 +1352,18 @@ struct SslFinalFlightContext {
   int events;
   bool serverFlightSent;
   SslFinalFlightContext(asyncBase *baseArg) :
-    base(baseArg), transport(nullptr), client(nullptr), bulkTrigger(nullptr),
-    connectStatus(aosUnknown), bulkStatus(aosUnknown),
-    events(0), serverFlightSent(false) {}
+    base(baseArg),
+    transport(nullptr),
+    client(nullptr),
+    bulkTrigger(nullptr),
+    connectStatus(aosUnknown),
+    bulkStatus(aosUnknown),
+    events(0),
+    serverFlightSent(false) {}
 };
 
-// Server side of the handshake over memory BIOs: pump channel bytes into
-// SSL_accept until the server flight is ready, prove the wedge is in place,
-// deliver the flight, break the channel. No sleeps anywhere: every step
-// waits for an observable state of the client.
+// Server side of the handshake over memory BIOs: pump channel bytes into SSL_accept until the server flight is ready, prove the wedge is in
+// place, deliver the flight, break the channel. No sleeps anywhere: every step waits for an observable state of the client.
 static void sslFinalFlightPeerProc(SslPeerChannel *channel, SslFinalFlightContext *ctx)
 {
   SSL_CTX *serverContext = sslTestMakeServerContext();
@@ -1441,7 +1386,7 @@ static void sslFinalFlightPeerProc(SslPeerChannel *channel, SslFinalFlightContex
   for (;;) {
     int acceptResult = SSL_accept(ssl);
     if (acceptResult == 1)
-      break;  // cannot happen before the flight went out; tolerated by the pump
+      break; // cannot happen before the flight went out; tolerated by the pump
     if (BIO_ctrl_pending(bioOut) > 0) {
       flightReady = true;
       break;
@@ -1455,8 +1400,7 @@ static void sslFinalFlightPeerProc(SslPeerChannel *channel, SslFinalFlightContex
   }
 
   if (flightReady) {
-    // the bytes after the ClientHello are the client's bulk write: seeing
-    // them proves the transport write queue is wedged, so the Finished that
+    // the bytes after the ClientHello are the client's bulk write: seeing them proves the transport write queue is wedged, so the Finished that
     // follows the flight below cannot overtake it
     size_t got = 0;
     if (sslPeerRead(channel, buffer, sizeof(buffer), &got)) {
@@ -1466,8 +1410,7 @@ static void sslFinalFlightPeerProc(SslPeerChannel *channel, SslFinalFlightContex
       ctx->serverFlightSent = sslPeerWrite(channel, flight.data(), flight.size());
     }
   }
-  // FIFO close: the flight above still reaches the client, while the parked
-  // bulk write and the queued Finished die with a broken-pipe error
+  // FIFO close: the flight above still reaches the client, while the parked bulk write and the queued Finished die with a broken-pipe error
   sslPeerClose(channel);
   SSL_free(ssl);
 }
@@ -1494,9 +1437,8 @@ static void sslFinalFlightBulkCb(AsyncOpStatus status, aioObject*, size_t, void 
 
 static void sslFinalFlightTriggerCb(aioUserEvent*, void *arg)
 {
-  // fires after the ClientHello went out (the connect was submitted first on
-  // this same thread); the peer will not release the server flight until
-  // these bytes are seen on its side
+  // fires after the ClientHello went out (the connect was submitted first on this same thread); the peer will not release the server flight
+  // until these bytes are seen on its side
   SslFinalFlightContext *ctx = static_cast<SslFinalFlightContext*>(arg);
   aioWrite(ctx->transport, ctx->bulk.data(), ctx->bulk.size(), afWaitAll, 10000000, sslFinalFlightBulkCb, ctx);
 }
@@ -1504,14 +1446,13 @@ static void sslFinalFlightTriggerCb(aioUserEvent*, void *arg)
 TEST(ssl, connect_fails_when_final_flight_write_fails)
 {
   SslFinalFlightContext ctx(gBase);
-  ctx.bulk.assign(1 << 20, 0x41);  // far beyond any channel buffering: parks and stays parked
+  ctx.bulk.assign(1 << 20, 0x41); // far beyond any channel buffering: parks and stays parked
 
   SslPeerChannel channel;
   ASSERT_TRUE(sslPeerChannelCreate(&channel));
   ctx.transport = sslPeerChannelOpen(&channel);
   ASSERT_NE(ctx.transport, nullptr);
-  // both sides pin TLS 1.3: the scenario is built around its final-flight
-  // handshake shape
+  // both sides pin TLS 1.3: the scenario is built around its final-flight handshake shape
   SSL_CTX *userContext = SSL_CTX_new(TLS_client_method());
   ASSERT_NE(userContext, nullptr);
   SSL_CTX_set_verify(userContext, SSL_VERIFY_NONE, nullptr);
@@ -1533,8 +1474,7 @@ TEST(ssl, connect_fails_when_final_flight_write_fails)
 
   EXPECT_TRUE(ctx.serverFlightSent);
   EXPECT_NE(ctx.bulkStatus, aosSuccess);
-  EXPECT_NE(ctx.connectStatus, aosSuccess)
-    << "connect reported success although the final handshake flight never reached the transport";
+  EXPECT_NE(ctx.connectStatus, aosSuccess) << "connect reported success although the final handshake flight never reached the transport";
 
   deleteUserEvent(ctx.bulkTrigger);
   sslSocketDelete(ctx.client);

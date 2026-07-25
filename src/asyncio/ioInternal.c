@@ -16,9 +16,8 @@
 static ConcurrentQueue opPool;
 static ConcurrentQueue opTimerPool;
 
-// Reactor operations park as already running: kernel readiness drives them
-// from submission on. The IOCP proactor must reach executeMethod to post the
-// overlapped I/O first, so its operations park as waiting until then.
+// Reactor operations park as already running: kernel readiness drives them from submission on. The IOCP proactor must reach executeMethod to
+// post the overlapped I/O first, so its operations park as waiting until then.
 #ifdef OS_WINDOWS
 static const AsyncFlags afSyncStarted = afNone;
 #else
@@ -74,10 +73,8 @@ static void readMsgFinish(asyncOpRoot *opptr)
 static void releaseOp(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
-  // Pool-sized scratch stays with the pooled operation for the next parked
-  // write or accept; only oversized captures (large payloads under
-  // backpressure) go back to the allocator, so a pooled operation retains
-  // at most the default buffer size
+  // Pool-sized scratch stays with the pooled operation for the next parked write or accept; only oversized captures (large payloads under
+  // backpressure) go back to the allocator, so a pooled operation retains at most the default buffer size
   if (op->internalBufferSize > DEFAULT_SOCKET_BUFFER_SIZE) {
     free(op->internalBuffer);
     op->internalBuffer = 0;
@@ -88,13 +85,9 @@ static void releaseOp(asyncOpRoot *opptr)
 static void releaseAcceptOp(asyncOpRoot *opptr)
 {
   asyncOp *op = (asyncOp*)opptr;
-  // Ownership leaves the operation through the success callback (aio flavor)
-  // or through the resumed coroutine reading the fields (io flavor); anything
-  // still owned here - a failed accept, or a callback-less aioAccept that
-  // nobody can receive - is closed
-  if (op->acceptSocket != INVALID_SOCKET &&
-      (opGetStatus(opptr) != aosSuccess ||
-       (opptr->callback == 0 && !(opptr->flags & afCoroutine)))) {
+  // Ownership leaves the operation through the success callback (aio flavor) or through the resumed coroutine reading the fields (io flavor);
+  // anything still owned here - a failed accept, or a callback-less aioAccept that nobody can receive - is closed
+  if (op->acceptSocket != INVALID_SOCKET && (opGetStatus(opptr) != aosSuccess || (opptr->callback == 0 && !(opptr->flags & afCoroutine)))) {
     socketClose(op->acceptSocket);
     op->acceptSocket = INVALID_SOCKET;
   }
@@ -191,9 +184,8 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
 aioObject *newSocketIo(asyncBase *base, socketTy hSocket)
 {
 #ifdef SO_NOSIGPIPE
-  // Accepted sockets never pass through socketCreate, and Darwin/BSD have no
-  // MSG_NOSIGNAL, so SIGPIPE suppression must be a property of the descriptor
-  // itself, set at the point every socket enters the async machinery.
+  // Accepted sockets never pass through socketCreate, and Darwin/BSD have no MSG_NOSIGNAL, so SIGPIPE suppression must be a property of the
+  // descriptor itself, set at the point every socket enters the async machinery.
   int optval = 1;
   setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
 #endif
@@ -208,10 +200,8 @@ aioObject *newDeviceIo(asyncBase *base, iodevTy hDevice)
 {
   int needGuard = 0;
 #ifndef OS_WINDOWS
-  // write() has no MSG_NOSIGNAL equivalent, so descriptors that can raise
-  // SIGPIPE need protection: pipes, plus sockets handed here by mistake.
-  // Character devices (serial ports, ttys) cannot raise it and stay
-  // guard-free.
+  // write() has no MSG_NOSIGNAL equivalent, so descriptors that can raise SIGPIPE need protection: pipes, plus sockets handed here by mistake.
+  // Character devices (serial ports, ttys) cannot raise it and stay guard-free.
   struct stat deviceStat;
   if (fstat(hDevice, &deviceStat) == 0 && (S_ISFIFO(deviceStat.st_mode) || S_ISSOCK(deviceStat.st_mode)))
     needGuard = 1;
@@ -252,9 +242,8 @@ asyncOpRoot *implRead(aioObject *object,
 
   if (copyFromBuffer(buffer, bytesTransferred, sb, size))
     return 0;
-  // A partial hit from the read-ahead buffer completes a non-afWaitAll read
-  // (the reactor executors and iocp share this contract): one more syscall
-  // could hit EAGAIN and park the already delivered bytes behind the timeout
+  // A partial hit from the read-ahead buffer completes a non-afWaitAll read (the reactor executors and iocp share this contract): one more
+  // syscall could hit EAGAIN and park the already delivered bytes behind the timeout
   if (*bytesTransferred != 0 && !(flags & afWaitAll))
     return 0;
 
@@ -269,8 +258,7 @@ asyncOpRoot *implRead(aioObject *object,
         sb->dataSize = bytes;
         if (copyFromBuffer(buffer, bytesTransferred, sb, size) || !(flags & afWaitAll))
           break;
-        // A short refill means the queue is drained right now: park without
-        // paying for the guaranteed-EAGAIN syscall
+        // A short refill means the queue is drained right now: park without paying for the guaranteed-EAGAIN syscall
         if (bytes == sb->totalSize)
           continue;
       }
@@ -418,10 +406,9 @@ ssize_t aioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags 
   return context.Result;
 }
 
-// One receive syscall and status/truncation oracle for both datagram read paths:
-// Winsock consumes an oversized datagram and reports WSAEMSGSIZE, POSIX
-// returns the clipped payload flagged MSG_TRUNC - either way the datagram is
-// gone and must complete as aosBufferTooSmall, never be retried.
+// One receive syscall and status/truncation oracle for both datagram read paths: Winsock consumes an oversized datagram and reports
+// WSAEMSGSIZE, POSIX returns the clipped payload flagged MSG_TRUNC - either way the datagram is gone and must complete as aosBufferTooSmall,
+// never be retried.
 static inline int messageSizeIsSupported(size_t size)
 {
   return size <= (size_t)INT_MAX;
@@ -479,12 +466,9 @@ static ssize_t writeMsgSyscall(aioObject *object, const HostAddress *address, co
 #endif
 }
 
-// Datagram fast paths run their syscall without entering the combiner, so the
-// sticky delete sweep cannot stop them; the callers gate on DeletePending
-// before touching the socket - after objectDelete an incoming flood would
-// otherwise keep the path succeeding and teardown would never finish.
-// Fire-and-forget learns the rejection inline; a callback completes with
-// aosCanceled through the global queue.
+// Datagram fast paths run their syscall without entering the combiner, so the sticky delete sweep cannot stop them; the callers gate on
+// DeletePending before touching the socket - after objectDelete an incoming flood would otherwise keep the path succeeding and teardown would
+// never finish. Fire-and-forget learns the rejection inline; a callback completes with aosCanceled through the global queue.
 static ssize_t datagramRejectClosing(aioObject *object,
                                      AsyncFlags flags,
                                      uint64_t usTimeout,
@@ -495,10 +479,8 @@ static ssize_t datagramRejectClosing(aioObject *object,
 {
   if (callback == 0)
     return -(ssize_t)aosCanceled;
-  // The rejected operation only delivers aosCanceled; nothing ever reads a
-  // write payload from it, so skip the capture copy. This also keeps the op
-  // pools clean: this op bypasses opRelease, so a captured buffer would ride
-  // into the pool around the releaseMethod size cap
+  // The rejected operation only delivers aosCanceled; nothing ever reads a write payload from it, so skip the capture copy. This also keeps the
+  // op pools clean: this op bypasses opRelease, so a captured buffer would ride into the pool around the releaseMethod size cap
   asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afNoCopy, usTimeout, callback, arg, opCode, context);
   if (opCode == actReadMsg)
     memset(&op->host, 0, sizeof(op->host));
@@ -526,9 +508,8 @@ ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flag
   }
 
   if (status != aosPending) {
-    // Data, truncation and fatal socket errors are all terminal: only
-    // would-block may be retried by a parked operation. In particular a
-    // pending UDP error is consumed by this syscall and cannot be rediscovered.
+    // Data, truncation and fatal socket errors are all terminal: only would-block may be retried by a parked operation. In particular a pending
+    // UDP error is consumed by this syscall and cannot be rediscovered.
     if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION))
       return status == aosSuccess ? result : -(ssize_t)status;
 
@@ -537,8 +518,7 @@ ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flag
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.readMsg, readMsgFinish, buffer, size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags, usTimeout, (void*)callback, arg, actReadMsg, &context);
-    op->bytesTransferred = status == aosBufferTooSmall ? size :
-                           status == aosSuccess ? (size_t)result : 0;
+    op->bytesTransferred = status == aosBufferTooSmall ? size : status == aosSuccess ? (size_t)result : 0;
     if (status == aosSuccess || status == aosBufferTooSmall)
       sockaddrToHostAddress(&source, &op->host);
     else
@@ -581,8 +561,7 @@ ssize_t aioWriteMsg(aioObject *object,
 
     if (flags & afActiveOnce)
       currentFinishedSync = 0;
-    // The operation is already terminal; the op only carries its completion,
-    // so the payload capture copy is skipped (afNoCopy)
+    // The operation is already terminal; the op only carries its completion, so the payload capture copy is skipped (afNoCopy)
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afNoCopy, usTimeout, (void*)callback, arg, actWriteMsg, &context);
@@ -669,16 +648,15 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
   }
 
   if (status != aosPending) {
-    // Preserve the fairness budget for every terminal inline result. Fatal
-    // errors cannot be retried: recvmsg/recvfrom may have consumed socket state.
+    // Preserve the fairness budget for every terminal inline result. Fatal errors cannot be retried: recvmsg/recvfrom may have consumed socket
+    // state.
     if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)
       return status == aosSuccess ? result : -(ssize_t)status;
 
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.readMsg, 0, buffer, size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine, usTimeout, 0, 0, actReadMsg, &context);
-    op->bytesTransferred = status == aosBufferTooSmall ? size :
-                           status == aosSuccess ? (size_t)result : 0;
+    op->bytesTransferred = status == aosBufferTooSmall ? size : status == aosSuccess ? (size_t)result : 0;
     opForceStatus(&op->root, status);
     addToGlobalQueue(&op->root);
     coroutineYield();
@@ -708,8 +686,7 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
     if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)
       return status == aosSuccess ? result : -(ssize_t)status;
 
-    // The operation is already terminal; the op only carries its completion,
-    // so the payload capture copy is skipped (afNoCopy)
+    // The operation is already terminal; the op only carries its completion, so the payload capture copy is skipped (afNoCopy)
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine | afNoCopy, usTimeout, 0, 0, actWriteMsg, &context);

@@ -1,7 +1,6 @@
-// Shared command-line front end of the SMTP examples. Every example accepts
-// the same nine arguments and needs the same preparation - resolve the
-// server address and select the transport mode - so main() of each example
-// shows only its own I/O style (callbacks / sendMail / coroutines).
+// Shared command-line front end of the SMTP examples. Every example accepts the same nine arguments and needs the same preparation - resolve
+// the server address and select the transport mode - so main() of each example shows only its own I/O style (callbacks / sendMail /
+// coroutines).
 #pragma once
 
 #include "asyncio/socket.h"
@@ -29,9 +28,8 @@ struct SmtpArgs {
   const char *text;
 };
 
-// Returns 0 on success; otherwise prints the diagnostic and returns the
-// process exit code.
-inline int parseSmtpArgs(int argc, char **argv, SmtpArgs &args)
+// Returns 0 on success; otherwise prints the diagnostic and returns the process exit code.
+inline int parseSmtpArgs(int argc, char**argv, SmtpArgs &args)
 {
   if (argc != 10) {
     fprintf(stderr, "usage: %s <server:port> <type> <client host> <login> <password> <from> <to> <subject> <text>\n", argv[0]);

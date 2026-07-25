@@ -96,16 +96,14 @@ struct TestBackend: asyncBase {
   uint64_t lastEventTimerPeriod = 0;
   std::function<int(aioUserEvent*, EventTimerUpdate, uint32_t, uint64_t)> eventTimerHook;
   std::function<uint64_t(aioUserEvent*, uint64_t, uint32_t, uint64_t)> eventTimerConsumeHook;
-  // Backs the loop-slot bitmap and timer-loop state array that createAsyncBase
-  // allocates for production bases.
+  // Backs the loop-slot bitmap and timer-loop state array that createAsyncBase allocates for production bases.
   std::array<uintptr_t, 1> loopSlots{};
   alignas(CACHE_LINE_SIZE) std::array<TimerLoopState, 8> loopStates{};
 
   TestBackend() :
     asyncBase{},
     base(*this) {
-    // Cursor 0 keeps the wheel's first rotation aligned with the small
-    // absolute ticks the tests use as checkpoints
+    // Cursor 0 keeps the wheel's first rotation aligned with the small absolute ticks the tests use as checkpoints
     timerWheelInit(&base, 0);
     base.methodImpl.combinerTaskHandler = taskHandler;
     base.methodImpl.enqueue = enqueue;
@@ -205,9 +203,8 @@ struct TestBackend: asyncBase {
   static int activateEvent(aioUserEvent *event) {
     TestBackend &backend = from(event->header.base);
     backend.activateCalls++;
-    // Model the generation-checked reference claim normally performed when
-    // the kernel readiness is harvested. Deleted events remain claimable only
-    // for cancellation of a committed coroutine waiter.
+    // Model the generation-checked reference claim normally performed when the kernel readiness is harvested. Deleted events remain claimable
+    // only for cancellation of a committed coroutine waiter.
     if (!eventManualTryClaimReference(event, eventHandleGeneration(event)))
       return 1;
     enqueue(event->header.base, (asyncOpRoot*)((uintptr_t)event | eventCompletionTag));

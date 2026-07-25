@@ -1,5 +1,5 @@
-// Runtime-prepared header recognition tables: httpHeaderTablePrepare
-// validation rules and the lookup roundtrip; no parser or networking involved
+// Runtime-prepared header recognition tables: httpHeaderTablePrepare validation rules and the lookup roundtrip; no parser or networking
+// involved
 
 #include "p2putils/HttpHeaderTable.h"
 #include "p2putils/HttpParseCommon.h"
@@ -25,12 +25,7 @@ int lookupId(const HttpHeaderTable &table, const std::string &name)
 
 TEST(http_header_table, prepare_roundtrip)
 {
-  const HttpHeaderTableEntry entries[] = {
-    {"X-Alpha", 1},
-    {"X-Beta", 2},
-    {"Session-Token", 777},
-    {"Content-Md5", 0x3FFFFFFF}
-  };
+  const HttpHeaderTableEntry entries[] = {{"X-Alpha", 1}, {"X-Beta", 2}, {"Session-Token", 777}, {"Content-Md5", 0x3FFFFFFF}};
 
   HttpHeaderTable table;
   ASSERT_TRUE(httpHeaderTablePrepare(&table, entries, 4));
@@ -74,8 +69,7 @@ TEST(http_header_table, reserved_names_always_recognized)
 
 TEST(http_header_table, parse_default_table)
 {
-  // the table of the httpParseDefault callback: its own names plus the
-  // riding reserved ones
+  // the table of the httpParseDefault callback: its own names plus the riding reserved ones
   EXPECT_EQ(lookupId(httpParseDefaultTable, "Content-Type"), hpdContentType);
   EXPECT_EQ(lookupId(httpParseDefaultTable, "content-length"), hhContentLength);
   EXPECT_EQ(lookupId(httpParseDefaultTable, "X-Anything"), 0);
@@ -128,19 +122,16 @@ TEST(http_header_table, lookup_verdicts)
   const char partial[] = "Content-Le";
   const char *p = partial;
   int token = -1;
-  EXPECT_EQ(httpHeaderTableLookup(&table, &p, partial + strlen(partial), &token),
-            ParserResultNeedMoreData);
+  EXPECT_EQ(httpHeaderTableLookup(&table, &p, partial + strlen(partial), &token), ParserResultNeedMoreData);
   EXPECT_EQ(p, partial);
 
   const char badCharset[] = "Bad Header:";
   p = badCharset;
-  EXPECT_EQ(httpHeaderTableLookup(&table, &p, badCharset + strlen(badCharset), &token),
-            ParserResultError);
+  EXPECT_EQ(httpHeaderTableLookup(&table, &p, badCharset + strlen(badCharset), &token), ParserResultError);
 
   const char emptyName[] = ":";
   p = emptyName;
-  EXPECT_EQ(httpHeaderTableLookup(&table, &p, emptyName + strlen(emptyName), &token),
-            ParserResultError);
+  EXPECT_EQ(httpHeaderTableLookup(&table, &p, emptyName + strlen(emptyName), &token), ParserResultError);
 
   httpHeaderTableFree(&table);
 }
@@ -179,4 +170,4 @@ TEST(http_header_table, reuse_after_free)
   httpHeaderTableFree(&table);
 }
 
-}
+} // namespace

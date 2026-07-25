@@ -19,18 +19,18 @@ void sendMailCoro(void *arg)
   Context *context = static_cast<Context*>(arg);
   SMTPResult smtpResult = {};
   int result = ioSmtpSendMail(context->Client,
-                 context->Args.serverAddress,
-                 context->Args.startTls,
-                 context->Args.clientHost,
-                 context->Args.login,
-                 context->Args.password,
-                 context->Args.from,
-                 context->Args.to,
-                 context->Args.subject,
-                 context->Args.text,
-                 &smtpResult,
-                 afNone,
-                 5000000);
+                              context->Args.serverAddress,
+                              context->Args.startTls,
+                              context->Args.clientHost,
+                              context->Args.login,
+                              context->Args.password,
+                              context->Args.from,
+                              context->Args.to,
+                              context->Args.subject,
+                              context->Args.text,
+                              &smtpResult,
+                              afNone,
+                              5000000);
 
   if (result != 0) {
     int status = -result;
@@ -49,7 +49,7 @@ void sendMailCoro(void *arg)
   postQuitOperation(context->Base);
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   Context context;
   int parseResult = parseSmtpArgs(argc, argv, context.Args);

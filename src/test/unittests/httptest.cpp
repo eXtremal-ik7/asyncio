@@ -10,8 +10,8 @@
 
 namespace {
 
-// Standalone httpParseDefault driver with the same component envelope the
-// client machinery uses: Initialize, one whole-buffer httpParse, Finalize
+// Standalone httpParseDefault driver with the same component envelope the client machinery uses: Initialize, one whole-buffer httpParse,
+// Finalize
 void parseDefaultResponse(HTTPParseDefaultContext &context, const char *response)
 {
   HttpComponent component;
@@ -21,27 +21,26 @@ void parseDefaultResponse(HTTPParseDefaultContext &context, const char *response
   HttpParserState state;
   httpInit(&state);
   httpSetBuffer(&state, response, strlen(response));
-  ASSERT_EQ(httpParse(&state, &httpParseDefaultTable, httpParseDefault, &context),
-            ParserResultOk);
+  ASSERT_EQ(httpParse(&state, &httpParseDefaultTable, httpParseDefault, &context), ParserResultOk);
 
   component.type = httpDtFinalize;
   httpParseDefault(&component, &context);
 }
 
-}
+} // namespace
 
-// Content-Type is the first thing stored into the accumulation buffer, so it
-// legitimately lands at offset 0; the absent-field marker must not swallow it
+// Content-Type is the first thing stored into the accumulation buffer, so it legitimately lands at offset 0; the absent-field marker must not
+// swallow it
 TEST(http, parse_default_reports_content_type)
 {
   HTTPParseDefaultContext context;
   httpParseDefaultInit(&context, nullptr);
   parseDefaultResponse(context,
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: text/html\r\n"
-    "Content-Length: 5\r\n"
-    "\r\n"
-    "hello");
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: text/html\r\n"
+                       "Content-Length: 5\r\n"
+                       "\r\n"
+                       "hello");
 
   EXPECT_EQ(context.resultCode, 200u);
   ASSERT_EQ(context.contentType.size, strlen("text/html"));
@@ -52,19 +51,18 @@ TEST(http, parse_default_reports_content_type)
   dynamicBufferFree(&context.buffer);
 }
 
-// Without Content-Type the body starts at offset 0 too; the second chunk must
-// not be mistaken for the body start
+// Without Content-Type the body starts at offset 0 too; the second chunk must not be mistaken for the body start
 TEST(http, parse_default_chunked_body_keeps_first_fragment)
 {
   HTTPParseDefaultContext context;
   httpParseDefaultInit(&context, nullptr);
   parseDefaultResponse(context,
-    "HTTP/1.1 200 OK\r\n"
-    "Transfer-Encoding: chunked\r\n"
-    "\r\n"
-    "5\r\nhello\r\n"
-    "6\r\n world\r\n"
-    "0\r\n\r\n");
+                       "HTTP/1.1 200 OK\r\n"
+                       "Transfer-Encoding: chunked\r\n"
+                       "\r\n"
+                       "5\r\nhello\r\n"
+                       "6\r\n world\r\n"
+                       "0\r\n\r\n");
 
   ASSERT_EQ(context.body.size, strlen("hello world"));
   EXPECT_EQ(memcmp(context.body.data, "hello world", context.body.size), 0);
@@ -76,10 +74,10 @@ TEST(http, parse_default_empty_body_with_content_type)
   HTTPParseDefaultContext context;
   httpParseDefaultInit(&context, nullptr);
   parseDefaultResponse(context,
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: text/html\r\n"
-    "Content-Length: 0\r\n"
-    "\r\n");
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: text/html\r\n"
+                       "Content-Length: 0\r\n"
+                       "\r\n");
 
   ASSERT_EQ(context.contentType.size, strlen("text/html"));
   ASSERT_NE(context.contentType.data, nullptr);
@@ -90,13 +88,10 @@ TEST(http, parse_default_empty_body_with_content_type)
   dynamicBufferFree(&context.buffer);
 }
 
-// The server streams a header block larger than the client's fixed 64KB
-// input buffer. The request must fail with aosBufferTooSmall instead of
-// re-parsing the full buffer in a hot loop that pins the event loop thread
-// forever (implRead of the 0 remaining bytes completes synchronously with 0,
-// the parser reports NeedMoreData again, repeat). The scenario runs as a
-// death test under a watchdog, so the hang turns into a killed child process
-// and a test failure instead of a hung test suite.
+// The server streams a header block larger than the client's fixed 64KB input buffer. The request must fail with aosBufferTooSmall instead of
+// re-parsing the full buffer in a hot loop that pins the event loop thread forever (implRead of the 0 remaining bytes completes synchronously
+// with 0, the parser reports NeedMoreData again, repeat). The scenario runs as a death test under a watchdog, so the hang turns into a killed
+// child process and a test failure instead of a hung test suite.
 #if GTEST_HAS_DEATH_TEST
 
 struct HttpOversizedHeaderContext {
@@ -121,7 +116,7 @@ static void httpOversizedHeaderConnectCb(AsyncOpStatus status, HTTPClient *clien
     exit(2);
 
   static const char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
-  aioHttpRequest(client, request, sizeof(request)-1, 10000000, httpParseDefault, &ctx->parseContext, httpOversizedHeaderRequestCb, ctx);
+  aioHttpRequest(client, request, sizeof(request) - 1, 10000000, httpParseDefault, &ctx->parseContext, httpOversizedHeaderRequestCb, ctx);
 }
 
 static void httpOversizedHeaderAcceptCb(AsyncOpStatus status, aioObject*, HostAddress, socketTy acceptSocket, void *arg)
@@ -138,12 +133,12 @@ static void httpOversizedHeaderScenario()
   armDeathTestWatchdog(30);
 
   HttpOversizedHeaderContext ctx;
-  ctx.base = createAsyncBase(amOSDefault, 1);  // own base: gBase must not be touched after fork()
+  ctx.base = createAsyncBase(amOSDefault, 1); // own base: gBase must not be touched after fork()
   ctx.client = nullptr;
   ctx.requestStatus = aosUnknown;
   // status line, then one header the client can never buffer entirely
   ctx.response = "HTTP/1.1 200 OK\r\nX-Huge-Header: ";
-  ctx.response.append(2*65536, 'a');
+  ctx.response.append(2 * 65536, 'a');
 
   if (!startTCPServer(ctx.base, httpOversizedHeaderAcceptCb, &ctx, gPort))
     exit(2);

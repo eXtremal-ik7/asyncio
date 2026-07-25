@@ -93,12 +93,11 @@ typedef void aioObjectDestructor(aioObjectRoot*);
 void *alignedMalloc(size_t size, size_t alignment);
 void alignedFree(void *ptr);
 
-// Type-stable storage. Pooled cells retain the header needed by stale kernel
-// envelopes; the remainder is poisoned between uses in ASan builds.
+// Type-stable storage. Pooled cells retain the header needed by stale kernel envelopes; the remainder is poisoned between uses in ASan builds.
 void *objectAlloc(ConcurrentQueue *pool, size_t size, size_t alignment);
 void objectFree(ConcurrentQueue *pool, void *object, size_t size);
 void *__tagged_pointer_make(void *ptr, uintptr_t data);
-void __tagged_pointer_decode(void *ptr, void **outPtr, uintptr_t *outData);
+void __tagged_pointer_decode(void *ptr, void**outPtr, uintptr_t *outData);
 
 #if defined(__has_include)
 #if __has_include(<sanitizer/asan_interface.h>)
@@ -141,7 +140,7 @@ static inline void poolCacheHandoff(const void *ptr)
 #endif
 }
 
-static inline int objectPoolGet(ConcurrentQueue *pool, void **result, size_t size)
+static inline int objectPoolGet(ConcurrentQueue *pool, void**result, size_t size)
 {
   if (!concurrentQueuePop(pool, result))
     return 0;
@@ -163,7 +162,7 @@ int asyncOpAlloc(asyncBase *base,
                  int isRealTime,
                  ConcurrentQueue *objectPool,
                  ConcurrentQueue *objectTimerPool,
-                 asyncOpRoot **result);
+                 asyncOpRoot**result);
 void releaseAsyncOp(asyncOpRoot *op);
 void initAsyncOpRoot(asyncOpRoot *op,
                      aioExecuteProc *startMethod,

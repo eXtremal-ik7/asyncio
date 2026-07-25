@@ -6,7 +6,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
- 
+
 struct timeMark {
   uint64_t mark;
 };

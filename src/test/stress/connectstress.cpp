@@ -1,16 +1,11 @@
-// Composite-connect lifetime stress. Worker threads spin up zmtp sockets over
-// loopback TCP and drive aioZmtpConnect with short, randomized timeouts while
-// several loop threads deliver the handshake child completions and the
-// timeouts. This targets the resumeParent() branch of the *shared* combiner:
-// a parent connect operation (the zmtp handshake state machine) carries a
-// timeout and stays pending across several child round-trips; every child
-// completion pushes combinerPushOperation(aaContinue) on the parent from one
-// thread, while the parent's own timeout pushes aaCancel from another. Both
-// target the same operation node (op->next) - the Treiber-stack double-push.
+// Composite-connect lifetime stress. Worker threads spin up zmtp sockets over loopback TCP and drive aioZmtpConnect with short, randomized
+// timeouts while several loop threads deliver the handshake child completions and the timeouts. This targets the resumeParent() branch of the
+// *shared* combiner: a parent connect operation (the zmtp handshake state machine) carries a timeout and stays pending across several child
+// round-trips; every child completion pushes combinerPushOperation(aaContinue) on the parent from one thread, while the parent's own timeout
+// pushes aaCancel from another. Both target the same operation node (op->next) - the Treiber-stack double-push.
 //
-// zmtp is only the vehicle: no libzmq, no TLS certificates. The raced code is
-// backend-agnostic and shared by ssl/http/smtp/btc/rlpx connect as well, so a
-// report here is a report for all of them, on reactors and the proactor alike.
+// zmtp is only the vehicle: no libzmq, no TLS certificates. The raced code is backend-agnostic and shared by ssl/http/smtp/btc/rlpx connect as
+// well, so a report here is a report for all of them, on reactors and the proactor alike.
 //
 // Checked invariants (mirroring the udp lifetime suite):
 //   - every aioZmtpConnect reports its callback exactly once (none lost - a
@@ -18,8 +13,7 @@
 //   - the destructor callback fires exactly once per socket and no connect
 //     callback of that socket fires after it;
 //   - the system drains: no progress for 10 seconds is a jammed combiner.
-// The memory errors themselves (touching a recycled op/object through a
-// corrupted combiner chain) are the address sanitizer's job: build with
+// The memory errors themselves (touching a recycled op/object through a corrupted combiner chain) are the address sanitizer's job: build with
 // -DBUILD_SANITIZE_ADDRESS=ON, the recycling pools are asan-poisoned.
 //
 // Usage: connectstress [workers] [loopThreads] [iterations] [seed]
@@ -66,8 +60,7 @@ struct ConnCtx {
   std::atomic<unsigned> callbacks{0};
   std::atomic<unsigned> destructors{0};
   std::atomic<unsigned> afterDestructor{0};
-  // Raw handle for the post-mortem dump: a stuck socket is alive by
-  // definition (a stranded operation pins it), so peeking from the stalled
+  // Raw handle for the post-mortem dump: a stuck socket is alive by definition (a stranded operation pins it), so peeking from the stalled
   // verdict path is safe - everything is quiescent by then.
   aioObjectRoot *handle{nullptr};
 };
@@ -90,11 +83,11 @@ static void connectCb(AsyncOpStatus status, zmtpSocket*, void *arg)
   callbacksDelivered.fetch_add(1, std::memory_order_relaxed);
 
   switch (status) {
-    case aosSuccess:      stSuccess.fetch_add(1, std::memory_order_relaxed); break;
-    case aosTimeout:      stTimeout.fetch_add(1, std::memory_order_relaxed); break;
-    case aosCanceled:     stCanceled.fetch_add(1, std::memory_order_relaxed); break;
+    case aosSuccess: stSuccess.fetch_add(1, std::memory_order_relaxed); break;
+    case aosTimeout: stTimeout.fetch_add(1, std::memory_order_relaxed); break;
+    case aosCanceled: stCanceled.fetch_add(1, std::memory_order_relaxed); break;
     case aosDisconnected: stDisconnected.fetch_add(1, std::memory_order_relaxed); break;
-    default:              stOther.fetch_add(1, std::memory_order_relaxed); break;
+    default: stOther.fetch_add(1, std::memory_order_relaxed); break;
   }
 }
 
@@ -105,14 +98,11 @@ static void destructorCb(aioObjectRoot*, void *arg)
   destructorsFired.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Loopback zmtp peer. The zmtp greeting is symmetric, so a paced echo drives
-// the real handshake to completion: read the client's stage, wait, echo it
-// back and its matching read child completes. The per-round delay spreads those
-// child completions - each an aaContinue push on the parent - across the
-// parent's timeout window, so the timer's aaCancel and a child's aaContinue
-// race on the same parent op. The state machine does not validate content, so
-// echoing the client's own bytes satisfies each read. A quarter of the
-// connections die after two rounds so disconnect children (aaFinish) race too.
+// Loopback zmtp peer. The zmtp greeting is symmetric, so a paced echo drives the real handshake to completion: read the client's stage, wait,
+// echo it back and its matching read child completes. The per-round delay spreads those child completions - each an aaContinue push on the
+// parent - across the parent's timeout window, so the timer's aaCancel and a child's aaContinue race on the same parent op. The state machine
+// does not validate content, so echoing the client's own bytes satisfies each read. A quarter of the connections die after two rounds so
+// disconnect children (aaFinish) race too.
 static void responder()
 {
   while (!gStop.load(std::memory_order_relaxed)) {
@@ -163,43 +153,32 @@ static void worker(unsigned id, unsigned iterations, unsigned seed, std::deque<C
     aioObject *transport = newSocketIo(gBase, fd);
     zmtpSocket *zs = zmtpSocketNew(gBase, transport, zmtpSocketDEALER);
     objectsCreated.fetch_add(1, std::memory_order_relaxed);
-    // zmtpSocket embeds aioObjectRoot as its first member; the user destructor
-    // hook is separate from zmtp's own object destructor
+    // zmtpSocket embeds aioObjectRoot as its first member; the user destructor hook is separate from zmtp's own object destructor
     ctx->handle = reinterpret_cast<aioObjectRoot*>(zs);
     objectSetDestructorCb(ctx->handle, destructorCb, ctx);
 
     ctx->expected.fetch_add(1, std::memory_order_relaxed);
     opsSubmitted.fetch_add(1, std::memory_order_relaxed);
 
-    // Arming mix: the short realtime timer is the one that expires mid-handshake
-    // and races the child completions' aaContinue push. Timeout 0 is the control
-    // path - no parent timer, only the delete race.
+    // Arming mix: the short realtime timer is the one that expires mid-handshake and races the child completions' aaContinue push. Timeout 0 is
+    // the control path - no parent timer, only the delete race.
     switch (rng() % 4) {
       case 0:
-      case 1:
-        aioZmtpConnect(zs, target, afRealtime, 20 + rng() % 3000, connectCb, ctx);
-        break;
-      case 2:
-        aioZmtpConnect(zs, target, afRealtime, 20 + rng() % 300, connectCb, ctx);
-        break;
-      case 3:
-        aioZmtpConnect(zs, target, afNone, 0, connectCb, ctx);
-        break;
+      case 1: aioZmtpConnect(zs, target, afRealtime, 20 + rng() % 3000, connectCb, ctx); break;
+      case 2: aioZmtpConnect(zs, target, afRealtime, 20 + rng() % 300, connectCb, ctx); break;
+      case 3: aioZmtpConnect(zs, target, afNone, 0, connectCb, ctx); break;
     }
 
-    // Let the handshake actually run so its child completions (each an
-    // aaContinue push on the parent) race the parent timeout, then delete. A
-    // quarter delete immediately for the cancelIo-vs-resume-vs-timeout race;
-    // the rest sleep a spread straddling the handshake, so some deletes land
-    // mid-handshake and some after it resolves. The sleep also throttles the
-    // connect rate so the paced peer is not overrun into RST.
+    // Let the handshake actually run so its child completions (each an aaContinue push on the parent) race the parent timeout, then delete. A
+    // quarter delete immediately for the cancelIo-vs-resume-vs-timeout race; the rest sleep a spread straddling the handshake, so some deletes
+    // land mid-handshake and some after it resolves. The sleep also throttles the connect rate so the paced peer is not overrun into RST.
     if (rng() % 4 != 0)
       std::this_thread::sleep_for(std::chrono::microseconds(rng() % 2500));
     zmtpSocketDelete(zs);
   }
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   unsigned workers = argc > 1 ? static_cast<unsigned>(atoi(argv[1])) : 4;
   unsigned loopThreads = argc > 2 ? static_cast<unsigned>(atoi(argv[2])) : 4;
@@ -256,30 +235,30 @@ int main(int argc, char **argv)
 
   std::vector<std::thread> loops;
   for (unsigned i = 0; i < loopThreads; i++)
-    loops.emplace_back([]() { asyncLoop(gBase); });
+    loops.emplace_back([]() {
+      asyncLoop(gBase);
+    });
 
   auto startedAt = std::chrono::steady_clock::now();
   std::vector<std::deque<ConnCtx>> arenas(workers);
   std::vector<std::thread> workerThreads;
   for (unsigned i = 0; i < workers; i++)
     workerThreads.emplace_back(worker, i, iterations, seed, &arenas[i], &target);
-  for (auto &thread : workerThreads)
+  for (auto &thread: workerThreads)
     thread.join();
 
-  // Drain: every connect must report and every socket must destruct; no
-  // progress for 10 seconds is a verdict, not a timeout
+  // Drain: every connect must report and every socket must destruct; no progress for 10 seconds is a verdict, not a timeout
   uint64_t expectedOps = opsSubmitted.load();
   unsigned expectedObjects = objectsCreated.load();
   drainOrDie(arenas, expectedOps, expectedObjects, callbacksDelivered, destructorsFired, "sockets", "sock");
 
   postQuitOperation(gBase);
-  for (auto &thread : loops)
+  for (auto &thread: loops)
     thread.join();
 
   gStop.store(true, std::memory_order_relaxed);
-  // Closing the listener wakes a thread blocked in accept() on macOS/BSD but not
-  // on Linux, so nudge each responder with a throwaway loopback connection: it
-  // returns from accept(), observes gStop and exits. Then close and join.
+  // Closing the listener wakes a thread blocked in accept() on macOS/BSD but not on Linux, so nudge each responder with a throwaway loopback
+  // connection: it returns from accept(), observes gStop and exits. Then close and join.
   for (unsigned i = 0; i < 32; i++) {
     socketTy w = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
     if (w != kBadSocket) {
@@ -288,19 +267,25 @@ int main(int argc, char **argv)
     }
   }
   socketClose(gListener);
-  for (auto &thread : responders)
+  for (auto &thread: responders)
     thread.join();
 
   uint64_t exactlyOnceViolations = countExactlyOnceViolations(arenas);
 
   double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count();
-  printf("status: success %" PRIu64 " timeout %" PRIu64 " canceled %" PRIu64
-         " disconnected %" PRIu64 " other %" PRIu64 "\n",
-         stSuccess.load(), stTimeout.load(), stCanceled.load(), stDisconnected.load(), stOther.load());
-  printf("sockets %u, connects %" PRIu64 ", callbacks %" PRIu64 ", after-destructor %" PRIu64
-         ", exactly-once violations %" PRIu64 ", %.1fs\n",
-         expectedObjects, expectedOps, callbacksDelivered.load(),
-         afterDestructorTotal.load(), exactlyOnceViolations, elapsed);
+  printf("status: success %" PRIu64 " timeout %" PRIu64 " canceled %" PRIu64 " disconnected %" PRIu64 " other %" PRIu64 "\n",
+         stSuccess.load(),
+         stTimeout.load(),
+         stCanceled.load(),
+         stDisconnected.load(),
+         stOther.load());
+  printf("sockets %u, connects %" PRIu64 ", callbacks %" PRIu64 ", after-destructor %" PRIu64 ", exactly-once violations %" PRIu64 ", %.1fs\n",
+         expectedObjects,
+         expectedOps,
+         callbacksDelivered.load(),
+         afterDestructorTotal.load(),
+         exactlyOnceViolations,
+         elapsed);
   if (afterDestructorTotal.load() || exactlyOnceViolations) {
     fprintf(stderr, "FAILED\n");
     return 1;

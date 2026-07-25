@@ -92,8 +92,7 @@ aioObject *initializeUDPClient(asyncBase *base)
 void armDeathTestWatchdog(unsigned seconds)
 {
 #ifdef OS_WINDOWS
-  // no alarm() on Windows; the death-test child is a fresh process (no fork),
-  // so a plain watchdog thread is safe there
+  // no alarm() on Windows; the death-test child is a fresh process (no fork), so a plain watchdog thread is safe there
   std::thread([seconds]() {
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
     TerminateProcess(GetCurrentProcess(), 3);

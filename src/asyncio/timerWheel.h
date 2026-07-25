@@ -55,8 +55,7 @@ uint64_t getMonotonicTicks(void);
 
 static inline uint64_t timerDeadlineTick(uint64_t absoluteMicroseconds)
 {
-  return absoluteMicroseconds / TIMER_TICK_MICROSECONDS +
-         (absoluteMicroseconds % TIMER_TICK_MICROSECONDS != 0);
+  return absoluteMicroseconds / TIMER_TICK_MICROSECONDS + (absoluteMicroseconds % TIMER_TICK_MICROSECONDS != 0);
 }
 
 static inline uint32_t timerSleepMilliseconds(uint64_t wakeTick)

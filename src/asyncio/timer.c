@@ -20,14 +20,12 @@ timeMark getTimeMark()
   return mark;
 }
 
-
 uint64_t usDiff(timeMark first, timeMark second)
 {
 #ifdef WIN32
   LARGE_INTEGER win32Frequency;
   QueryPerformanceFrequency(&win32Frequency);
-  return (uint64_t)((second.mark - first.mark) /
-                    (double)win32Frequency.QuadPart * 1000000.0);
+  return (uint64_t)((second.mark - first.mark) / (double)win32Frequency.QuadPart * 1000000.0);
 #else
   return second.mark - first.mark;
 #endif

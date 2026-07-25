@@ -7,7 +7,6 @@ extern "C" {
 
 #include "asyncio/asyncioTypes.h"
 
-
 typedef struct dynamicBuffer {
   void *data;
   size_t size;
@@ -15,15 +14,13 @@ typedef struct dynamicBuffer {
   size_t offset;
 } dynamicBuffer;
 
-// initialSize 0 is valid: no memory is allocated until the first write/alloc
-// grows the buffer.
+// initialSize 0 is valid: no memory is allocated until the first write/alloc grows the buffer.
 void dynamicBufferInit(dynamicBuffer *buffer, size_t initialSize);
 void dynamicBufferFree(dynamicBuffer *buffer);
 void *dynamicBufferAlloc(dynamicBuffer *buffer, size_t size);
 void dynamicBufferClear(dynamicBuffer *buffer);
 void *dynamicBufferPtr(dynamicBuffer *buffer);
 void dynamicBufferWrite(dynamicBuffer *buffer, const void *data, size_t size);
-
 
 #ifdef __cplusplus
 }

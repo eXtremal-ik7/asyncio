@@ -17,8 +17,7 @@ typedef HANDLE iodevTy;
 #define INVALID_DEVICE INVALID_HANDLE_VALUE
 typedef SOCKET socketTy;
 typedef int socketLenTy;
-// Winsock buffer lengths are ULONG: clamp each chunk so a >4Gb remainder
-// never truncates to len == 0 (a phantom EOF/empty transfer)
+// Winsock buffer lengths are ULONG: clamp each chunk so a >4Gb remainder never truncates to len == 0 (a phantom EOF/empty transfer)
 static inline ULONG wsaChunkSize(size_t remaining)
 {
   return remaining > ULONG_MAX ? ULONG_MAX : (ULONG)remaining;
@@ -51,8 +50,8 @@ typedef struct HostAddress {
     uint32_t ipv4;
     uint16_t ipv6[8];
   };
-  uint16_t port;     // host byte order
-  uint16_t family;   // AF_* value
+  uint16_t port;   // host byte order
+  uint16_t family; // AF_* value
 } HostAddress;
 
 /* Convert HostAddress to sockaddr. Returns the sockaddr size. */

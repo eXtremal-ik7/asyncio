@@ -7,8 +7,7 @@
 
 namespace {
 
-void expectStreamStillUsable(xmstream &stream, void *originalData,
-                             size_t originalSize, size_t originalCapacity)
+void expectStreamStillUsable(xmstream &stream, void *originalData, size_t originalSize, size_t originalCapacity)
 {
   EXPECT_EQ(stream.data(), originalData);
   EXPECT_EQ(stream.offsetOf(), originalSize);
@@ -45,8 +44,7 @@ TEST(xmstream, reserve_rejects_unrepresentable_size_larger_than_one_tib)
   xmstream stream;
   void *originalData = stream.data();
   size_t originalCapacity = stream.capacity();
-  const size_t hugeSize =
-    static_cast<size_t>((std::numeric_limits<ptrdiff_t>::max)()) + 1;
+  const size_t hugeSize = static_cast<size_t>((std::numeric_limits<ptrdiff_t>::max)()) + 1;
 
   EXPECT_GT(hugeSize, static_cast<size_t>(UINT64_C(1) << 40));
   EXPECT_EQ(stream.reserve(hugeSize), nullptr);

@@ -78,9 +78,9 @@ static inline size_t putBase64(dynamicBuffer *buffer, const void *data, size_t *
   // Helper returns the buffer size incl. NUL; CRLF reuses the NUL slot + 1
   char *ptr = dynamicBufferAlloc(buffer, base64getEncodeLength(length) + 1);
   size_t base64Length = base64Encode(ptr, data, length);
-  ptr[base64Length]   = '\r';
-  ptr[base64Length+1] = '\n';
-  *size = base64Length+2;
+  ptr[base64Length] = '\r';
+  ptr[base64Length + 1] = '\n';
+  *size = base64Length + 2;
   return offset;
 }
 
@@ -89,8 +89,7 @@ static inline void dynamicBufferWriteString(dynamicBuffer *buffer, const char *d
   dynamicBufferWrite(buffer, data, strlen(data));
 }
 
-// Envelope addresses and header values: drop CR/LF so user data cannot
-// inject protocol or header lines
+// Envelope addresses and header values: drop CR/LF so user data cannot inject protocol or header lines
 static void dynamicBufferWriteNoCrlf(dynamicBuffer *buffer, const char *data)
 {
   for (;;) {
@@ -103,11 +102,9 @@ static void dynamicBufferWriteNoCrlf(dynamicBuffer *buffer, const char *data)
   }
 }
 
-// Body writer, RFC 5321 4.5.2/2.3.8: doubles a leading dot on every line (the
-// text cannot contain the DATA terminator), normalizes bare LF/CR line
-// endings to CRLF (CR and LF reach the wire only as a pair) and appends the
-// ".<CRLF>" terminator without an extra blank line when the text already ends
-// with a line break
+// Body writer, RFC 5321 4.5.2/2.3.8: doubles a leading dot on every line (the text cannot contain the DATA terminator), normalizes bare LF/CR
+// line endings to CRLF (CR and LF reach the wire only as a pair) and appends the ".<CRLF>" terminator without an extra blank line when the text
+// already ends with a line break
 static void dynamicBufferWriteMailBody(dynamicBuffer *buffer, const char *text)
 {
   const char *p = text;
@@ -128,8 +125,7 @@ static void dynamicBufferWriteMailBody(dynamicBuffer *buffer, const char *text)
 
 static int cancel(asyncOpRoot *opptr)
 {
-  // Target the object child operations are queued on (SSL ops forward the
-  // cancel to the underlying socket themselves)
+  // Target the object child operations are queued on (SSL ops forward the cancel to the underlying socket themselves)
   SMTPClient *client = (SMTPClient*)opptr->object;
   if (client->TlsSocket)
     cancelIo(sslSocketHandle(client->TlsSocket));
@@ -141,7 +137,7 @@ static int cancel(asyncOpRoot *opptr)
 static void connectFinish(asyncOpRoot *opptr)
 {
   SMTPOp *op = (SMTPOp*)opptr;
-  SMTPResult result = { op->ResultCode, (const char*)op->Response.data };
+  SMTPResult result = {op->ResultCode, (const char*)op->Response.data};
   ((smtpConnectCb*)opptr->callback)(opGetStatus(opptr), &result, (SMTPClient*)opptr->object, opptr->arg);
   dynamicBufferFree(&op->Response);
 }
@@ -149,7 +145,7 @@ static void connectFinish(asyncOpRoot *opptr)
 static void commandFinish(asyncOpRoot *opptr)
 {
   SMTPOp *op = (SMTPOp*)opptr;
-  SMTPResult result = { op->ResultCode, (const char*)op->Response.data };
+  SMTPResult result = {op->ResultCode, (const char*)op->Response.data};
   ((smtpResponseCb*)opptr->callback)(opGetStatus(opptr), &result, (SMTPClient*)opptr->object, opptr->arg);
   dynamicBufferFree(&op->Response);
 }
@@ -161,7 +157,6 @@ static void releaseProc(asyncOpRoot *opptr)
   if (!opptr->callback && !(opptr->flags & afCoroutine))
     dynamicBufferFree(&op->Response);
 }
-
 
 static SMTPOp *allocSmtpOp(aioExecuteProc executeProc,
                            aioFinishProc finishProc,
@@ -201,7 +196,8 @@ static int isDigit(char s)
   return (s >= '0' && s <= '9');
 }
 
-static inline int isDigits(const char *s, size_t size) {
+static inline int isDigits(const char *s, size_t size)
+{
   for (size_t i = 0; i < size; i++) {
     if (!isDigit(s[i]))
       return 0;
@@ -217,9 +213,8 @@ static void smtpStoreResult(SMTPOp *op, unsigned code, const char *response)
   dynamicBufferWrite(&op->Response, response, strlen(response) + 1);
 }
 
-// Try to extract one complete server response from [ptr, end); aosPending
-// means more data is needed. On success ptr is advanced and an operation-local
-// snapshot of the response is stored.
+// Try to extract one complete server response from [ptr, end); aosPending means more data is needed. On success ptr is advanced and an
+// operation-local snapshot of the response is stored.
 static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
 {
   char firstReplyCode[4];
@@ -229,11 +224,8 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
   if (client->end - base < 5)
     return aosPending;
 
-  // Check begin of response: 3-digit code followed by a multiline/single-line
-  // separator, or by CRLF when the optional response text is absent
-  if (!isDigits(base, 3) ||
-      (base[3] != '-' && base[3] != ' ' &&
-       (base[3] != '\r' || base[4] != '\n')))
+  // Check begin of response: 3-digit code followed by a multiline/single-line separator, or by CRLF when the optional response text is absent
+  if (!isDigits(base, 3) || (base[3] != '-' && base[3] != ' ' && (base[3] != '\r' || base[4] != '\n')))
     return (AsyncOpStatus)smtpInvalidFormat;
 
   firstReplyCode[0] = base[0];
@@ -243,15 +235,13 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
   unsigned resultCode = (unsigned)atoi(firstReplyCode);
 
   if (base[3] == '-') {
-    // Multiline response detected
-    // Find end of message
+    // Multiline response detected Find end of message
     size_t linesCount = 1;
     char *lf = memchr(base + 4, '\n', client->end - base - 4);
     if (!lf)
       return aosPending;
     if (lf[-1] != '\r') {
-      // Lines must end with CRLF; the squash below strips exactly the CR
-      // (also keeps the length from underflowing on a line like "NNN-<LF>")
+      // Lines must end with CRLF; the squash below strips exactly the CR (also keeps the length from underflowing on a line like "NNN-<LF>")
       return (AsyncOpStatus)smtpInvalidFormat;
     }
 
@@ -263,9 +253,7 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
         return aosPending;
 
       linesCount++;
-      if (lf - p < 4 || lf[-1] != '\r' || memcmp(p, firstReplyCode, 3) != 0 ||
-          (p[3] != '-' && p[3] != ' ' &&
-           (p[3] != '\r' || lf != p + 4)))
+      if (lf - p < 4 || lf[-1] != '\r' || memcmp(p, firstReplyCode, 3) != 0 || (p[3] != '-' && p[3] != ' ' && (p[3] != '\r' || lf != p + 4)))
         return (AsyncOpStatus)smtpInvalidFormat;
 
       if (p[3] != '-') {
@@ -283,12 +271,12 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
       lf = memchr(p, '\n', client->end - p);
 
       const char *text = p + (p[3] == '\r' ? 3 : 4);
-      size_t lineSize = lf-1-text;
+      size_t lineSize = lf - 1 - text;
       memmove(out, text, lineSize);
 
       out[lineSize] = '\n';
       p = lf + 1;
-      out += lineSize+1;
+      out += lineSize + 1;
     }
 
     *out = 0;
@@ -300,32 +288,30 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
     base[3] = 0;
     client->ptr = base + 5;
   } else {
-    // Other response parse
-    // Find '\n'
+    // Other response parse Find '\n'
     char *lf = memchr(base + 4, '\n', client->end - base - 4);
     if (!lf)
       return aosPending;
     if (lf[-1] != '\r') {
-      // Line must end with CRLF: zeroing *(lf-1) terminates Response exactly
-      // at the CR
+      // Line must end with CRLF: zeroing *(lf-1) terminates Response exactly at the CR
       return (AsyncOpStatus)smtpInvalidFormat;
     }
     response = base + 4;
-    *(lf-1) = 0;
-    client->ptr = lf+1;
+    *(lf - 1) = 0;
+    client->ptr = lf + 1;
   }
 
   smtpStoreResult(op, resultCode, response);
   return aosSuccess;
 }
 
-// Distinguished expectation for smtpCheckReply: RCPT accepts 250 (delivered),
-// 251 (will forward) and 252 (cannot verify, will attempt delivery)
-enum { smtpExpectRcpt = 1 };
+// Distinguished expectation for smtpCheckReply: RCPT accepts 250 (delivered), 251 (will forward) and 252 (cannot verify, will attempt delivery)
+enum {
+  smtpExpectRcpt = 1
+};
 
-// Reply codes are phase-specific: expected is the exact code for the current
-// step, smtpExpectRcpt the RCPT set, 0 keeps the generic 2xx/3xx acceptance
-// for user-issued commands
+// Reply codes are phase-specific: expected is the exact code for the current step, smtpExpectRcpt the RCPT set, 0 keeps the generic 2xx/3xx
+// acceptance for user-issued commands
 static AsyncOpStatus smtpCheckReply(SMTPOp *op, unsigned expected)
 {
   unsigned code = op->ResultCode;
@@ -339,8 +325,7 @@ static AsyncOpStatus smtpCheckReply(SMTPOp *op, unsigned expected)
   return accepted ? aosSuccess : (AsyncOpStatus)smtpError;
 }
 
-// Read callbacks only account transferred bytes and signal the parent; the
-// continuation (parse, next read) is driven by the executeProc
+// Read callbacks only account transferred bytes and signal the parent; the continuation (parse, next read) is driven by the executeProc
 static void smtpReadCb(AsyncOpStatus status, aioObject *object, size_t bytesRead, void *arg)
 {
   __UNUSED(object);
@@ -359,11 +344,9 @@ static void smtpSslReadCb(AsyncOpStatus status, SSLSocket *object, size_t bytesR
   resumeParent(&op->Root, status);
 }
 
-// Parse the buffered response, reading more from the transport as needed.
-// Runs only under the client combiner (executeProc context): a read posted
-// here is published before the operation can go pending, so a later cancel
-// sweep always finds the outstanding child and a timed-out parent is
-// guaranteed a resume
+// Parse the buffered response, reading more from the transport as needed. Runs only under the client combiner (executeProc context): a read
+// posted here is published before the operation can go pending, so a later cancel sweep always finds the outstanding child and a timed-out
+// parent is guaranteed a resume
 static AsyncOpStatus smtpReadResponse(SMTPClient *client, SMTPOp *op, unsigned expectedCode)
 {
   for (;;) {
@@ -373,8 +356,7 @@ static AsyncOpStatus smtpReadResponse(SMTPClient *client, SMTPOp *op, unsigned e
 
     size_t remaining = client->end - client->ptr;
     if (remaining == sizeof(client->buffer)) {
-      // Buffer full without a complete response: a zero-size read would
-      // complete with 0 bytes and spin here forever
+      // Buffer full without a complete response: a zero-size read would complete with 0 bytes and spin here forever
       return (AsyncOpStatus)smtpInvalidFormat;
     }
     if (remaining && client->ptr != client->buffer)
@@ -384,25 +366,13 @@ static AsyncOpStatus smtpReadResponse(SMTPClient *client, SMTPOp *op, unsigned e
 
     size_t bytesTransferred = 0;
     if (client->TlsSocket) {
-      ssize_t result = aioSslRead(client->TlsSocket,
-                                  client->end,
-                                  sizeof(client->buffer) - remaining,
-                                  afActiveOnce,
-                                  0,
-                                  smtpSslReadCb,
-                                  op);
+      ssize_t result = aioSslRead(client->TlsSocket, client->end, sizeof(client->buffer) - remaining, afActiveOnce, 0, smtpSslReadCb, op);
       if (result < 0)
         return (AsyncOpStatus)-result;
       bytesTransferred = (size_t)result;
     } else {
-      asyncOpRoot *readOp = implRead(client->PlainSocket,
-                                     client->end,
-                                     sizeof(client->buffer) - remaining,
-                                     afNone,
-                                     0,
-                                     smtpReadCb,
-                                     op,
-                                     &bytesTransferred);
+      asyncOpRoot *readOp =
+          implRead(client->PlainSocket, client->end, sizeof(client->buffer) - remaining, afNone, 0, smtpReadCb, op, &bytesTransferred);
       if (readOp) {
         combinerPushOperation(readOp);
         return aosPending;
@@ -426,35 +396,21 @@ static void smtpSslWriteCb(AsyncOpStatus status, SSLSocket *object, size_t bytes
   resumeParent(&((SMTPOp*)arg)->Root, status);
 }
 
-// Send one command; the caller state parses its response only after the write
-// completed, so a write error fails the operation instead of being dropped.
-// Data buffered before the command was sent cannot be its reply: a peer
-// speaking ahead of the protocol must not advance the state machine
+// Send one command; the caller state parses its response only after the write completed, so a write error fails the operation instead of being
+// dropped. Data buffered before the command was sent cannot be its reply: a peer speaking ahead of the protocol must not advance the state
+// machine
 static AsyncOpStatus smtpWriteCommand(SMTPClient *client, SMTPOp *op, const void *data, size_t size)
 {
   if (client->ptr != client->end)
     return (AsyncOpStatus)smtpInvalidFormat;
 
   if (client->TlsSocket) {
-    ssize_t result = aioSslWrite(client->TlsSocket,
-                                 data,
-                                 size,
-                                 afWaitAll | afActiveOnce,
-                                 0,
-                                 smtpSslWriteCb,
-                                 op);
+    ssize_t result = aioSslWrite(client->TlsSocket, data, size, afWaitAll | afActiveOnce, 0, smtpSslWriteCb, op);
     return result < 0 ? (AsyncOpStatus)-result : aosSuccess;
   }
 
   size_t bytesTransferred = 0;
-  asyncOpRoot *writeOp = implWrite(client->PlainSocket,
-                                   data,
-                                   size,
-                                   afWaitAll,
-                                   0,
-                                   smtpWriteCb,
-                                   op,
-                                   &bytesTransferred);
+  asyncOpRoot *writeOp = implWrite(client->PlainSocket, data, size, afWaitAll, 0, smtpWriteCb, op, &bytesTransferred);
   if (writeOp) {
     combinerPushOperation(writeOp);
     return aosPending;
@@ -463,9 +419,8 @@ static AsyncOpStatus smtpWriteCommand(SMTPClient *client, SMTPOp *op, const void
   return aosSuccess;
 }
 
-// One protocol exchange: finish reading the response to the previous command
-// (which must carry expectedCode), then send the next one; its response is
-// consumed on entry to nextState
+// One protocol exchange: finish reading the response to the previous command (which must carry expectedCode), then send the next one; its
+// response is consumed on entry to nextState
 static AsyncOpStatus smtpStepReadWrite(SMTPClient *client, SMTPOp *op, unsigned expectedCode, const void *data, size_t size, int nextState)
 {
   AsyncOpStatus status = smtpReadResponse(client, op, expectedCode);
@@ -486,17 +441,14 @@ static AsyncOpStatus smtpStepConnect(SMTPClient *client, SMTPOp *op)
   return aosPending;
 }
 
-// STARTTLS upgrade: wrap the plain socket into a TLS session and run the
-// handshake over the established connection
+// STARTTLS upgrade: wrap the plain socket into a TLS session and run the handshake over the established connection
 static AsyncOpStatus smtpStepUpgradeTls(SMTPClient *client, SMTPOp *op, int nextState)
 {
-  // Repeating STARTTLS is a caller error, but the existing TLS wrapper owns
-  // PlainSocket and must not be overwritten or leaked
+  // Repeating STARTTLS is a caller error, but the existing TLS wrapper owns PlainSocket and must not be overwritten or leaked
   if (client->TlsSocket)
     return (AsyncOpStatus)smtpError;
 
-  // Plaintext buffered past the STARTTLS response would later be parsed as if
-  // it were TLS-protected (plaintext injection) - refuse the upgrade
+  // Plaintext buffered past the STARTTLS response would later be parsed as if it were TLS-protected (plaintext injection) - refuse the upgrade
   if (client->ptr != client->end)
     return (AsyncOpStatus)smtpInvalidFormat;
 
@@ -527,7 +479,7 @@ static AsyncOpStatus smtpStartTlsStart(asyncOpRoot *opptr)
     if (op->State == stInitialize) {
       const char startTls[] = "STARTTLS\r\n";
       op->State = stStartTls;
-      status = smtpWriteCommand(client, op, startTls, sizeof(startTls)-1);
+      status = smtpWriteCommand(client, op, startTls, sizeof(startTls) - 1);
     } else if (op->State == stStartTls) {
       if ((status = smtpReadResponse(client, op, 220)) == aosSuccess)
         return smtpStepUpgradeTls(client, op, stFinished);
@@ -548,7 +500,7 @@ static AsyncOpStatus smtpLoginStart(asyncOpRoot *opptr)
     if (op->State == stInitialize) {
       const char authLogin[] = "AUTH LOGIN\r\n";
       op->State = stSendLogin;
-      status = smtpWriteCommand(client, op, authLogin, sizeof(authLogin)-1);
+      status = smtpWriteCommand(client, op, authLogin, sizeof(authLogin) - 1);
     } else if (op->State == stSendLogin) {
       status = smtpStepReadWrite(client, op, 334, op->login, op->loginSize, stSendPassword);
     } else if (op->State == stSendPassword) {
@@ -568,69 +520,57 @@ static AsyncOpStatus smtpSendMailStart(asyncOpRoot *opptr)
   for (;;) {
     AsyncOpStatus status = aosSuccess;
     switch (op->State) {
-      case stInitialize :
-        return smtpStepConnect(client, op);
+      case stInitialize: return smtpStepConnect(client, op);
 
-      case stReadGreeting :
+      case stReadGreeting:
         if ((status = smtpReadResponse(client, op, 220)) == aosSuccess)
           op->State = stEhlo1;
         break;
 
-      case stEhlo1 :
+      case stEhlo1:
         op->State = op->startTls ? stSendStartTls : stLogin;
         status = smtpWriteCommand(client, op, op->ehlo, op->ehloSize);
         break;
 
-      case stSendStartTls : {
+      case stSendStartTls: {
         const char startTls[] = "STARTTLS\r\n";
-        status = smtpStepReadWrite(client, op, 250, startTls, sizeof(startTls)-1, stStartTls);
+        status = smtpStepReadWrite(client, op, 250, startTls, sizeof(startTls) - 1, stStartTls);
         break;
       }
 
-      case stStartTls :
+      case stStartTls:
         if ((status = smtpReadResponse(client, op, 220)) == aosSuccess)
           return smtpStepUpgradeTls(client, op, stEhlo2);
         break;
 
-      case stEhlo2 :
+      case stEhlo2:
         op->State = stLogin;
         status = smtpWriteCommand(client, op, op->ehlo, op->ehloSize);
         break;
 
-      case stLogin : {
+      case stLogin: {
         const char authLogin[] = "AUTH LOGIN\r\n";
-        status = smtpStepReadWrite(client, op, 250, authLogin, sizeof(authLogin)-1, stSendLogin);
+        status = smtpStepReadWrite(client, op, 250, authLogin, sizeof(authLogin) - 1, stSendLogin);
         break;
       }
 
-      case stSendLogin :
-        status = smtpStepReadWrite(client, op, 334, op->login, op->loginSize, stSendPassword);
-        break;
+      case stSendLogin: status = smtpStepReadWrite(client, op, 334, op->login, op->loginSize, stSendPassword); break;
 
-      case stSendPassword :
-        status = smtpStepReadWrite(client, op, 334, op->password, op->passwordSize, stFrom);
-        break;
+      case stSendPassword: status = smtpStepReadWrite(client, op, 334, op->password, op->passwordSize, stFrom); break;
 
-      case stFrom :
-        status = smtpStepReadWrite(client, op, 235, op->from, op->fromSize, stTo);
-        break;
+      case stFrom: status = smtpStepReadWrite(client, op, 235, op->from, op->fromSize, stTo); break;
 
-      case stTo :
-        status = smtpStepReadWrite(client, op, 250, op->to, op->toSize, stSendData);
-        break;
+      case stTo: status = smtpStepReadWrite(client, op, 250, op->to, op->toSize, stSendData); break;
 
-      case stSendData : {
+      case stSendData: {
         const char data[] = "DATA\r\n";
-        status = smtpStepReadWrite(client, op, smtpExpectRcpt, data, sizeof(data)-1, stText);
+        status = smtpStepReadWrite(client, op, smtpExpectRcpt, data, sizeof(data) - 1, stText);
         break;
       }
 
-      case stText :
-        status = smtpStepReadWrite(client, op, 354, op->text, op->textSize, stFinished);
-        break;
+      case stText: status = smtpStepReadWrite(client, op, 354, op->text, op->textSize, stFinished); break;
 
-      default :
-        return smtpReadResponse(client, op, 250);
+      default: return smtpReadResponse(client, op, 250);
     }
     if (status != aosSuccess)
       return status;
@@ -671,9 +611,7 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
     return 0;
   }
 
-  SMTPClient *client = (SMTPClient*)objectAlloc(&objectPool,
-                                                sizeof(SMTPClient),
-                                                16);
+  SMTPClient *client = (SMTPClient*)objectAlloc(&objectPool, sizeof(SMTPClient), 16);
   if (!client) {
     socketClose(socket);
     return 0;
@@ -723,9 +661,8 @@ void smtpResultFree(SMTPResult *result)
   result->response = 0;
 }
 
-// Shared tail of every coroutine-style entry point: run the operation, wait
-// for its completion, transfer the operation-local response and convert the
-// status to the 0/-status convention.
+// Shared tail of every coroutine-style entry point: run the operation, wait for its completion, transfer the operation-local response and
+// convert the status to the 0/-status convention.
 static int smtpIoResult(SMTPOp *op, SMTPResult *result)
 {
   combinerPushOperation(&op->Root);
@@ -799,12 +736,7 @@ int ioSmtpStartTls(SMTPClient *client, SMTPResult *result, AsyncFlags flags, uin
   return smtpIoResult(op, result);
 }
 
-int ioSmtpLogin(SMTPClient *client,
-                const char *login,
-                const char *password,
-                SMTPResult *result,
-                AsyncFlags flags,
-                uint64_t usTimeout)
+int ioSmtpLogin(SMTPClient *client, const char *login, const char *password, SMTPResult *result, AsyncFlags flags, uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpLoginStart, 0, client, SmtpOpCommand, 0, 0, flags | afCoroutine, usTimeout);
   smtpLoginPrepare(op, login, password);
@@ -819,10 +751,8 @@ int ioSmtpCommand(SMTPClient *client, const char *command, SMTPResult *result, A
   return smtpIoResult(op, result);
 }
 
-// Builds the whole mail transaction in the operation buffer: base64 login and
-// password, EHLO/MAIL From/RCPT To lines and the message itself. Pointers into
-// the buffer are resolved only after the last write, when no further growth
-// can move the storage.
+// Builds the whole mail transaction in the operation buffer: base64 login and password, EHLO/MAIL From/RCPT To lines and the message itself.
+// Pointers into the buffer are resolved only after the last write, when no further growth can move the storage.
 static void smtpSendMailPrepare(SMTPOp *op,
                                 HostAddress smtpServerAddress,
                                 int startTls,

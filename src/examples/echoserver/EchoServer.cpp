@@ -5,9 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-
 const size_t echoBufferSize = 1024;
-
 
 void readCb(AsyncOpStatus status, aioObject *socket, size_t transferred, void *arg)
 {
@@ -21,10 +19,9 @@ void readCb(AsyncOpStatus status, aioObject *socket, size_t transferred, void *a
     deleteAioObject(socket);
   } else {
     fprintf(stderr, " * receive error\n");
-    deleteAioObject(socket);    
+    deleteAioObject(socket);
   }
 }
-
 
 void acceptCb(AsyncOpStatus status, aioObject *listener, HostAddress client, socketTy acceptSocket, void *arg)
 {
@@ -39,14 +36,13 @@ void acceptCb(AsyncOpStatus status, aioObject *listener, HostAddress client, soc
   aioAccept(listener, 0, acceptCb, nullptr);
 }
 
-
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   if (argc != 3) {
     fprintf(stderr, "usage: %s <method> <port>\n", argv[0]);
     return 1;
   }
-  
+
   AsyncMethod method;
   if (strcmp(argv[1], "default") == 0) {
     method = amOSDefault;
@@ -60,12 +56,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "ERROR: unknown method %s, default used\n", argv[1]);
     method = amOSDefault;
   }
-  
+
   HostAddress address;
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
   address.port = static_cast<uint16_t>(atoi(argv[2]));
-  
+
   initializeAsyncIo(aiNone);
   socketTy hSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 1);
   socketReuseAddr(hSocket);

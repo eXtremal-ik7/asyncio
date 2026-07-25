@@ -27,7 +27,7 @@ socketTy socketCreate(int af, int type, int protocol, int isAsync)
 
   int optval = 1;
   if (type == SOCK_STREAM)
-    setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&optval, sizeof(optval));
+    setsockopt(hSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&optval, sizeof(optval));
 #ifdef SO_NOSIGPIPE
   setsockopt(hSocket, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
 #endif
@@ -45,7 +45,6 @@ int socketBind(socketTy hSocket, const HostAddress *address)
   socketLenTy addrlen = hostAddressToSockaddr(address, &localAddr);
   return bind(hSocket, (struct sockaddr*)&localAddr, addrlen);
 }
-
 
 int socketListen(socketTy hSocket)
 {
@@ -89,7 +88,7 @@ int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitA
 #ifdef MSG_NOSIGNAL
   int flags = MSG_NOSIGNAL;
 #else
-  int flags = 0;  // Darwin: SIGPIPE is suppressed per-descriptor via SO_NOSIGPIPE
+  int flags = 0; // Darwin: SIGPIPE is suppressed per-descriptor via SO_NOSIGPIPE
 #endif
   if (!waitAll) {
     ssize_t result = send(hSocket, buffer, size, flags);

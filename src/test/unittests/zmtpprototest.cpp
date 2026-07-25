@@ -2,9 +2,8 @@
 #include "gtest/gtest.h"
 #include <string.h>
 
-// Streams here carry the READY command payload exactly as it reaches
-// readReadyCmd: the command name length byte first, frame flags and
-// length already stripped.
+// Streams here carry the READY command payload exactly as it reaches readReadyCmd: the command name length byte first, frame flags and length
+// already stripped.
 
 TEST(zmtpProto, ready_with_socket_type)
 {

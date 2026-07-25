@@ -1,8 +1,7 @@
 #pragma once
 
-// Shared drain / verdict tooling of the lifetime-style stress binaries. Each
-// binary fills per-worker arenas of contexts carrying the exactly-once
-// counters (expected/callbacks/destructors) and a raw object handle, then:
+// Shared drain / verdict tooling of the lifetime-style stress binaries. Each binary fills per-worker arenas of contexts carrying the
+// exactly-once counters (expected/callbacks/destructors) and a raw object handle, then:
 //  - drainOrDie() waits until every submission reported and every object
 //    destructed; 10 seconds without progress is a verdict, not a timeout - it
 //    dumps up to 16 stuck objects (a stuck object is alive by definition,
@@ -24,10 +23,12 @@
 
 template<typename Ctx>
 static void drainOrDie(std::vector<std::deque<Ctx>> &arenas,
-                       uint64_t expectedOps, unsigned expectedObjects,
+                       uint64_t expectedOps,
+                       unsigned expectedObjects,
                        std::atomic<uint64_t> &callbacksDelivered,
                        std::atomic<unsigned> &destructorsFired,
-                       const char *objectsNoun, const char *dumpTag,
+                       const char *objectsNoun,
+                       const char *dumpTag,
                        void (*extraStallSummary)(const std::vector<std::deque<Ctx>>&) = nullptr)
 {
   auto lastProgressAt = std::chrono::steady_clock::now();
@@ -44,13 +45,18 @@ static void drainOrDie(std::vector<std::deque<Ctx>> &arenas,
       lastProgress = progress;
       lastProgressAt = now;
     } else if (now - lastProgressAt > std::chrono::seconds(10)) {
-      fprintf(stderr, "STALL: %u/%u %s destroyed, %" PRIu64 "/%" PRIu64 " callbacks delivered\n",
-              destroyed, expectedObjects, objectsNoun, delivered, expectedOps);
+      fprintf(stderr,
+              "STALL: %u/%u %s destroyed, %" PRIu64 "/%" PRIu64 " callbacks delivered\n",
+              destroyed,
+              expectedObjects,
+              objectsNoun,
+              delivered,
+              expectedOps);
       if (extraStallSummary)
         extraStallSummary(arenas);
       unsigned dumped = 0;
-      for (auto &arena : arenas) {
-        for (auto &ctx : arena) {
+      for (auto &arena: arenas) {
+        for (auto &ctx: arena) {
           if (ctx.destructors.load() || ctx.callbacks.load() == ctx.expected.load() || !ctx.handle)
             continue;
           aioObjectRoot *o = ctx.handle;
@@ -82,8 +88,8 @@ template<typename Ctx>
 static uint64_t countExactlyOnceViolations(const std::vector<std::deque<Ctx>> &arenas)
 {
   uint64_t violations = 0;
-  for (auto &arena : arenas) {
-    for (auto &ctx : arena) {
+  for (auto &arena: arenas) {
+    for (auto &ctx: arena) {
       if (ctx.callbacks.load() != ctx.expected.load() || ctx.destructors.load() != 1)
         violations++;
     }

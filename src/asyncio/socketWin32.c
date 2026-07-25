@@ -30,25 +30,21 @@ int socketBind(socketTy hSocket, const HostAddress *address)
   return bind(hSocket, (struct sockaddr*)&localAddr, addrlen);
 }
 
-
 int socketListen(socketTy hSocket)
 {
   return listen(hSocket, SOMAXCONN);
 }
-
 
 int socketShutdown(socketTy hSocket, int how)
 {
   return shutdown(hSocket, how);
 }
 
-
 void socketReuseAddr(socketTy hSocket)
 {
   int optval = 1;
   setsockopt(hSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
 }
-
 
 int socketSyncRead(socketTy hSocket, void *buffer, size_t size, int waitAll, size_t *bytesTransferred)
 {
@@ -90,8 +86,7 @@ int socketSyncWrite(socketTy hSocket, const void *buffer, size_t size, int waitA
     if (WSASend(hSocket, &wsabuf, 1, &bytesNum, 0, 0, 0) == 0 && bytesNum != 0) {
       *bytesTransferred = bytesNum;
       return 1;
-    }
-    else {
+    } else {
       *bytesTransferred = 0;
       return 0;
     }

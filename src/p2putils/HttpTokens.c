@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static ParserResultTy lookupToken(const char **p,
+static ParserResultTy lookupToken(const char**p,
                                   const char *end,
                                   char eos,
                                   const unsigned char *byteTable,
@@ -37,8 +37,7 @@ static ParserResultTy lookupToken(const char **p,
 
   *token = 0;
   if (entry->name && entry->hash == hash && entry->length == length) {
-    // a hash match alone must not identify a token: the input comes from the
-    // network and can be crafted to collide, compare the folded bytes
+    // a hash match alone must not identify a token: the input comes from the network and can be crafted to collide, compare the folded bytes
     size_t i;
     for (i = 0; i < length; i++) {
       if (byteTable[(unsigned char)entry->name[i]] != byteTable[(unsigned char)begin[i]])
@@ -52,47 +51,45 @@ static ParserResultTy lookupToken(const char **p,
   return ParserResultOk;
 }
 
-ParserResultTy httpMethodLookup(const char **p, const char *end, int *token)
+ParserResultTy httpMethodLookup(const char**p, const char *end, int *token)
 {
-  return lookupToken(p, end, ' ', httpTokenCharTable,
-                     HttpMethodTable, HttpMethodDisplacement, HttpMethodTableSize, HttpMethodGroupCount, token);
+  return lookupToken(p,
+                     end,
+                     ' ',
+                     httpTokenCharTable,
+                     HttpMethodTable,
+                     HttpMethodDisplacement,
+                     HttpMethodTableSize,
+                     HttpMethodGroupCount,
+                     token);
 }
 
-ParserResultTy httpHeaderTableLookup(const HttpHeaderTable *table,
-                                     const char **p, const char *end, int *token)
+ParserResultTy httpHeaderTableLookup(const HttpHeaderTable *table, const char**p, const char *end, int *token)
 {
-  return lookupToken(p, end, ':', httpTokenFoldTable,
-                     table->entries, table->displacement, table->tableSize, table->groupCount, token);
+  return lookupToken(p, end, ':', httpTokenFoldTable, table->entries, table->displacement, table->tableSize, table->groupCount, token);
 }
 
-const HttpHeaderTable httpHeaderDefaultTable = {
-  HttpHeaderReservedTable,
-  HttpHeaderReservedDisplacement,
-  HttpHeaderReservedTableSize,
-  HttpHeaderReservedGroupCount,
-  0
-};
+const HttpHeaderTable httpHeaderDefaultTable = {HttpHeaderReservedTable,
+                                                HttpHeaderReservedDisplacement,
+                                                HttpHeaderReservedTableSize,
+                                                HttpHeaderReservedGroupCount,
+                                                0};
 
-const HttpHeaderTable httpParseDefaultTable = {
-  HttpParseDefaultTable,
-  HttpParseDefaultDisplacement,
-  HttpParseDefaultTableSize,
-  HttpParseDefaultGroupCount,
-  0
-};
+const HttpHeaderTable httpParseDefaultTable = {HttpParseDefaultTable,
+                                               HttpParseDefaultDisplacement,
+                                               HttpParseDefaultTableSize,
+                                               HttpParseDefaultGroupCount,
+                                               0};
 
-// Runtime builder of user header-recognition tables. Produces the same CHD
-// shape the generated tables use, so the lookup above serves both. The
-// reserved names are merged into every built table straight from the
-// generated reserved table, which stays the single list of them.
+// Runtime builder of user header-recognition tables. Produces the same CHD shape the generated tables use, so the lookup above serves both. The
+// reserved names are merged into every built table straight from the generated reserved table, which stays the single list of them.
 
 enum {
   // table keys are bounded, so are the CHD retries
   httpHeaderTableMaxSize = 65536
 };
 
-// FNV-1a over the folded name bytes, mirroring lookupToken; rejects an
-// empty name and bytes outside of the RFC 9110 token charset
+// FNV-1a over the folded name bytes, mirroring lookupToken; rejects an empty name and bytes outside of the RFC 9110 token charset
 static int hashHeaderName(const char *name, uint64_t *hashOut, uint32_t *lengthOut)
 {
   uint64_t hash = 0xcbf29ce484222325ull;
@@ -132,17 +129,19 @@ static int compareGroups(const void *l, const void *r)
   return lg->index < rg->index ? -1 : (lg->index > rg->index ? 1 : 0);
 }
 
-// One CHD placement attempt: keys are grouped by the high hash bits, groups
-// are placed largest first by searching a displacement that maps every key
-// of the group onto free slots. slots (table index -> key index, -1 = free)
-// and displacement are filled on success. groups, bucketStart, bucketed and
-// positions are caller-provided scratch of groupCount, groupCount+1 and
-// keyCount elements respectively.
-static int placeHeaderKeys(const HttpTokenEntry *keys, size_t keyCount,
-                           size_t tableSize, size_t groupCount,
-                           HeaderTableGroup *groups, size_t *bucketStart,
-                           uint32_t *bucketed, size_t *positions,
-                           int32_t *slots, uint16_t *displacement)
+// One CHD placement attempt: keys are grouped by the high hash bits, groups are placed largest first by searching a displacement that maps
+// every key of the group onto free slots. slots (table index -> key index, -1 = free) and displacement are filled on success. groups,
+// bucketStart, bucketed and positions are caller-provided scratch of groupCount, groupCount+1 and keyCount elements respectively.
+static int placeHeaderKeys(const HttpTokenEntry *keys,
+                           size_t keyCount,
+                           size_t tableSize,
+                           size_t groupCount,
+                           HeaderTableGroup *groups,
+                           size_t *bucketStart,
+                           uint32_t *bucketed,
+                           size_t *positions,
+                           int32_t *slots,
+                           uint16_t *displacement)
 {
   size_t i;
   for (i = 0; i < groupCount; i++) {
@@ -173,7 +172,7 @@ static int placeHeaderKeys(const HttpTokenEntry *keys, size_t keyCount,
   for (i = 0; i < groupCount; i++) {
     size_t groupSize = groups[i].size;
     if (groupSize == 0)
-      break;  // sorted by size, the rest are empty
+      break; // sorted by size, the rest are empty
 
     size_t begin = bucketStart[groups[i].index];
     size_t d;
@@ -209,13 +208,14 @@ static int placeHeaderKeys(const HttpTokenEntry *keys, size_t keyCount,
   return 1;
 }
 
-// Searches table shapes from the smallest fitting one up (power-of-two
-// sizes, displacement arrays of the size down to a quarter of it) and packs
-// the winning placement into the single backing allocation of *table
+// Searches table shapes from the smallest fitting one up (power-of-two sizes, displacement arrays of the size down to a quarter of it) and
+// packs the winning placement into the single backing allocation of *table
 static int buildHeaderTable(HttpHeaderTable *table,
-                            const HttpTokenEntry *keys, size_t keyCount,
+                            const HttpTokenEntry *keys,
+                            size_t keyCount,
                             size_t stringBytes,
-                            uint32_t *bucketed, size_t *positions)
+                            uint32_t *bucketed,
+                            size_t *positions)
 {
   size_t tableSize = 1;
   while (tableSize < keyCount)
@@ -235,8 +235,7 @@ static int buildHeaderTable(HttpHeaderTable *table,
       size_t lowerBound = tableSize / 4 > 0 ? tableSize / 4 : 1;
       size_t g;
       for (g = tableSize; g >= lowerBound && !placed; g /= 2) {
-        if (placeHeaderKeys(keys, keyCount, tableSize, g,
-                            groups, bucketStart, bucketed, positions, slots, displacement)) {
+        if (placeHeaderKeys(keys, keyCount, tableSize, g, groups, bucketStart, bucketed, positions, slots, displacement)) {
           groupCount = g;
           placed = 1;
         }
@@ -255,7 +254,7 @@ static int buildHeaderTable(HttpHeaderTable *table,
   }
   if (!placed)
     return 0;
-  tableSize /= 2;  // the loop advanced past the winning size
+  tableSize /= 2; // the loop advanced past the winning size
 
   // single backing block: entries, then displacement, then the name bytes
   size_t entriesBytes = tableSize * sizeof(HttpTokenEntry);
@@ -301,8 +300,7 @@ static int buildHeaderTable(HttpHeaderTable *table,
   return 1;
 }
 
-int httpHeaderTablePrepare(HttpHeaderTable *table,
-                           const HttpHeaderTableEntry *entries, size_t count)
+int httpHeaderTablePrepare(HttpHeaderTable *table, const HttpHeaderTableEntry *entries, size_t count)
 {
   table->entries = 0;
   table->displacement = 0;
@@ -310,8 +308,7 @@ int httpHeaderTablePrepare(HttpHeaderTable *table,
   table->groupCount = 0;
   table->block = 0;
 
-  // more keys than the largest table can hold never places (this also keeps
-  // the arithmetic below far from overflow)
+  // more keys than the largest table can hold never places (this also keeps the arithmetic below far from overflow)
   if (count > httpHeaderTableMaxSize)
     return 0;
 
@@ -333,7 +330,8 @@ int httpHeaderTablePrepare(HttpHeaderTable *table,
     int valid = 1;
     for (i = 0; i < count && valid; i++) {
       valid = entries[i].name != 0 &&
-              entries[i].id >= 1 && entries[i].id < hhReservedBase &&
+              entries[i].id >= 1 &&
+              entries[i].id < hhReservedBase &&
               hashHeaderName(entries[i].name, &keys[i].hash, &keys[i].length);
       if (valid) {
         keys[i].name = entries[i].name;
@@ -354,9 +352,8 @@ int httpHeaderTablePrepare(HttpHeaderTable *table,
     }
 
     if (valid) {
-      // equal folded-bytes hashes reject duplicated names, reserved names
-      // appearing in the user list and genuine 64-bit collisions alike:
-      // the lookup can deliver only one value per full hash
+      // equal folded-bytes hashes reject duplicated names, reserved names appearing in the user list and genuine 64-bit collisions alike: the
+      // lookup can deliver only one value per full hash
       qsort(sortedHashes, keyCount, sizeof(uint64_t), compareHashes);
       for (i = 1; i < keyCount && valid; i++)
         valid = sortedHashes[i] != sortedHashes[i - 1];

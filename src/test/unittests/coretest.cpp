@@ -18,8 +18,7 @@ static_assert(COMBINER_TAG_PROGRESS_WRITE == IO_EVENT_WRITE, "WRITE tag must map
 static_assert(COMBINER_TAG_ERROR == IO_EVENT_ERROR, "ERROR tag must map directly to backend events");
 static_assert(COMBINER_TAG_CANCEL == (1u << 3), "CANCEL must precede DELETE");
 static_assert(COMBINER_TAG_DELETE == (1u << 4), "DELETE must remain the final header.tag tag");
-static_assert(sizeof(asyncOpListLink) == 48,
-              "timeout links carry a full object generation handle");
+static_assert(sizeof(asyncOpListLink) == 48, "timeout links carry a full object generation handle");
 
 TEST(core_decision, active_io_event_selection_covers_complete_boolean_table)
 {
@@ -28,18 +27,10 @@ TEST(core_decision, active_io_event_selection_covers_complete_boolean_table)
       for (int initializationIsWrite = 0; initializationIsWrite <= 1; ++initializationIsWrite) {
         for (int hasReadQueue = 0; hasReadQueue <= 1; ++hasReadQueue) {
           for (int hasWriteQueue = 0; hasWriteQueue <= 1; ++hasWriteQueue) {
-            SCOPED_TRACE(::testing::Message()
-                         << "initialization=" << hasInitialization
-                         << " running=" << running
-                         << " initWrite=" << initializationIsWrite
-                         << " readQueue=" << hasReadQueue
-                         << " writeQueue=" << hasWriteQueue);
-            uint32_t expected = hasInitialization
-              ? (running == arRunning
-                   ? (initializationIsWrite ? IO_EVENT_WRITE : IO_EVENT_READ)
-                   : 0)
-              : (hasReadQueue ? IO_EVENT_READ : 0) |
-                (hasWriteQueue ? IO_EVENT_WRITE : 0);
+            SCOPED_TRACE(::testing::Message() << "initialization=" << hasInitialization << " running=" << running << " initWrite="
+                                              << initializationIsWrite << " readQueue=" << hasReadQueue << " writeQueue=" << hasWriteQueue);
+            uint32_t expected = hasInitialization ? (running == arRunning ? (initializationIsWrite ? IO_EVENT_WRITE : IO_EVENT_READ) : 0)
+                                                  : (hasReadQueue ? IO_EVENT_READ : 0) | (hasWriteQueue ? IO_EVENT_WRITE : 0);
             EXPECT_EQ(combinerSelectActiveIoEvents(hasInitialization,
                                                    static_cast<AsyncOpRunningTy>(running),
                                                    initializationIsWrite,
@@ -62,20 +53,17 @@ TEST(core_decision, operation_state_selectors_cover_all_running_states)
     CombinerReapAction reap;
   };
   const Case cases[] = {
-    {arWaiting,    aosPending, ciaNone,    craKeep},
-    {arRunning,    aosPending, ciaExecute, craKeep},
-    {arCancelling, aosPending, ciaRelease, craKeep},
-    {arWaiting,    aosSuccess, ciaNone,    craRelease},
-    {arRunning,    aosSuccess, ciaRelease, craCancel},
-    {arCancelling, aosSuccess, ciaRelease, craKeep},
+      {arWaiting, aosPending, ciaNone, craKeep},
+      {arRunning, aosPending, ciaExecute, craKeep},
+      {arCancelling, aosPending, ciaRelease, craKeep},
+      {arWaiting, aosSuccess, ciaNone, craRelease},
+      {arRunning, aosSuccess, ciaRelease, craCancel},
+      {arCancelling, aosSuccess, ciaRelease, craKeep},
   };
 
-  for (const Case &test : cases) {
-    SCOPED_TRACE(::testing::Message()
-                 << "running=" << test.running
-                 << " status=" << test.status);
-    EXPECT_EQ(combinerSelectInitializationAction(test.running, test.status),
-              test.initialization);
+  for (const Case &test: cases) {
+    SCOPED_TRACE(::testing::Message() << "running=" << test.running << " status=" << test.status);
+    EXPECT_EQ(combinerSelectInitializationAction(test.running, test.status), test.initialization);
     EXPECT_EQ(combinerSelectReapAction(test.running, test.status), test.reap);
   }
 }
@@ -128,10 +116,8 @@ TEST(core_combiner, captured_submission_stack_runs_in_fifo_order)
 
   combinerPushOperation(&first.root);
 
-  EXPECT_EQ(backend.started,
-            (std::vector<asyncOpRoot*>{&first.root, &second.root, &third.root}));
-  EXPECT_EQ(listContents(object.root.readQueue),
-            (std::vector<asyncOpRoot*>{&first.root, &second.root, &third.root}));
+  EXPECT_EQ(backend.started, (std::vector<asyncOpRoot*>{&first.root, &second.root, &third.root}));
+  EXPECT_EQ(listContents(object.root.readQueue), (std::vector<asyncOpRoot*>{&first.root, &second.root, &third.root}));
   EXPECT_EQ(first.executeCalls, 1u);
   EXPECT_EQ(second.executeCalls, 0u);
   EXPECT_EQ(third.executeCalls, 0u);
@@ -156,9 +142,7 @@ TEST(core_combiner, repeated_signal_bits_are_coalesced)
   combinerPushOperation(&op.root);
 
   EXPECT_EQ(op.executeCalls, 2u);
-  EXPECT_EQ(std::count(backend.handledSignals.begin(),
-                       backend.handledSignals.end(),
-                       COMBINER_TAG_PROGRESS_READ), 1);
+  EXPECT_EQ(std::count(backend.handledSignals.begin(), backend.handledSignals.end(), COMBINER_TAG_PROGRESS_READ), 1);
   cancelAndDrain(backend, object);
   deleteOwner(backend, object);
 }
@@ -229,8 +213,7 @@ TEST(core_combiner, terminal_result_losing_timeout_race_is_released_once)
   EXPECT_EQ(op.executeCalls, 1u);
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
   EXPECT_EQ(op.cancelCalls, 0u);
-  EXPECT_EQ(op.releaseCalls, 1u)
-    << "the terminal execute result lost its CAS and was detached without release";
+  EXPECT_EQ(op.releaseCalls, 1u) << "the terminal execute result lost its CAS and was detached without release";
   EXPECT_EQ(object.root.readQueue.head, nullptr);
 
   backend.drainCompletions();
@@ -238,8 +221,7 @@ TEST(core_combiner, terminal_result_losing_timeout_race_is_released_once)
   EXPECT_EQ(op.callbackStatus, aosTimeout);
   EXPECT_EQ(object.root.refs, 1u);
 
-  // Keep the intentionally failing regression test self-contained on the
-  // current implementation, which strands the operation reference.
+  // Keep the intentionally failing regression test self-contained on the current implementation, which strands the operation reference.
   if (object.root.refs > 1)
     objectDecrementReference(&object.root, object.root.refs - 1);
   deleteOwner(backend, object);
@@ -253,9 +235,7 @@ TEST(core_cancel, waiting_and_synchronously_cancelled_running_operations_release
   running.root.running = arRunning;
   waiting.root.running = arWaiting;
   alreadyTerminal.root.running = arWaiting;
-  ASSERT_TRUE(opSetStatus(&alreadyTerminal.root,
-                          opGetGeneration(&alreadyTerminal.root),
-                          aosTimeout));
+  ASSERT_TRUE(opSetStatus(&alreadyTerminal.root, opGetGeneration(&alreadyTerminal.root), aosTimeout));
   eqPushBack(&object.root.readQueue, &running.root);
   eqPushBack(&object.root.readQueue, &waiting.root);
   eqPushBack(&object.root.readQueue, &alreadyTerminal.root);
@@ -266,8 +246,7 @@ TEST(core_cancel, waiting_and_synchronously_cancelled_running_operations_release
   EXPECT_EQ(running.releaseCalls, 1u);
   EXPECT_EQ(waiting.releaseCalls, 1u);
   EXPECT_EQ(alreadyTerminal.releaseCalls, 0u);
-  EXPECT_EQ(listContents(object.root.readQueue),
-            (std::vector<asyncOpRoot*>{&alreadyTerminal.root}));
+  EXPECT_EQ(listContents(object.root.readQueue), (std::vector<asyncOpRoot*>{&alreadyTerminal.root}));
 
   uint32_t needStart = 0;
   reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
@@ -320,14 +299,11 @@ TEST(core_cancel, reap_rebuilds_multiple_retained_nodes_and_late_progress_advanc
 
   reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
   EXPECT_EQ(running.root.running, arCancelling);
-  EXPECT_EQ(listContents(object.root.readQueue),
-            (std::vector<asyncOpRoot*>{&running.root, &waiting.root}));
+  EXPECT_EQ(listContents(object.root.readQueue), (std::vector<asyncOpRoot*>{&running.root, &waiting.root}));
 
-  // A second idempotent reconcile covers the already-cancelling survivor and
-  // rebuilds both links again.
+  // A second idempotent reconcile covers the already-cancelling survivor and rebuilds both links again.
   reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
-  EXPECT_EQ(listContents(object.root.readQueue),
-            (std::vector<asyncOpRoot*>{&running.root, &waiting.root}));
+  EXPECT_EQ(listContents(object.root.readQueue), (std::vector<asyncOpRoot*>{&running.root, &waiting.root}));
   EXPECT_EQ(waiting.root.executeQueue.prev, &running.root);
 
   combinerPushProgress(&running.root);
@@ -350,8 +326,7 @@ TEST(core_cancel, multiple_status_race_losers_remain_linked_for_winner_reap)
 
   cancelOperationList(&object.root.readQueue, aosCanceled);
 
-  EXPECT_EQ(listContents(object.root.readQueue),
-            (std::vector<asyncOpRoot*>{&first.root, &second.root}));
+  EXPECT_EQ(listContents(object.root.readQueue), (std::vector<asyncOpRoot*>{&first.root, &second.root}));
   EXPECT_EQ(second.root.executeQueue.prev, &first.root);
   uint32_t needStart = 0;
   reapObject(&object.root, COMBINER_TAG_CANCEL, &needStart);
@@ -370,11 +345,7 @@ TEST(core_cancel, stale_generation_does_not_cancel_reused_operation)
   uintptr_t staleGeneration = opGetGeneration(&op.root);
   op.root.tag = ((staleGeneration + 1) << TAG_STATUS_SIZE) | aosPending;
 
-  opCancel(&op.root,
-           staleGeneration,
-           aosTimeout,
-           &object.root,
-           __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed));
+  opCancel(&op.root, staleGeneration, aosTimeout, &object.root, __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed));
 
   EXPECT_EQ(opGetStatus(&op.root), aosPending);
   EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
@@ -388,20 +359,12 @@ TEST(core_cancel, winning_cancel_does_not_read_operation_after_status_cas)
   TestObject object(backend);
   TestOp op(object);
   uintptr_t generation = opGetGeneration(&op.root);
-  uintptr_t objectGeneration =
-    __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
+  uintptr_t objectGeneration = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
 
-  // A timer producer owns only the operation tag. Once its terminal CAS wins,
-  // the combiner may release/recycle the operation immediately; every route
-  // to the object must therefore come from the arm-time handle passed below.
-  ASAN_POISON_MEMORY_REGION(
-    reinterpret_cast<uint8_t*>(&op.root) + sizeof(op.root.tag),
-    sizeof(op.root) - sizeof(op.root.tag));
-  EXPECT_TRUE(opCancel(&op.root,
-                       generation,
-                       aosTimeout,
-                       &object.root,
-                       objectGeneration));
+  // A timer producer owns only the operation tag. Once its terminal CAS wins, the combiner may release/recycle the operation immediately; every
+  // route to the object must therefore come from the arm-time handle passed below.
+  ASAN_POISON_MEMORY_REGION(reinterpret_cast<uint8_t*>(&op.root) + sizeof(op.root.tag), sizeof(op.root) - sizeof(op.root.tag));
+  EXPECT_TRUE(opCancel(&op.root, generation, aosTimeout, &object.root, objectGeneration));
   ASAN_UNPOISON_MEMORY_REGION(&op.root, sizeof(op.root));
 
   EXPECT_EQ(opGetStatus(&op.root), aosTimeout);
@@ -428,8 +391,7 @@ TEST(core_cancel, covers_submitted_but_not_started_operation)
   backend.drainCompletions();
 
   EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
-  EXPECT_EQ(opGetStatus(&submitted.root), aosCanceled)
-    << "cancelIo swept queues before the captured submission was started";
+  EXPECT_EQ(opGetStatus(&submitted.root), aosCanceled) << "cancelIo swept queues before the captured submission was started";
   EXPECT_EQ(submitted.executeCalls, 0u);
   EXPECT_EQ(submitted.finishCalls, 1u);
 
@@ -462,11 +424,9 @@ TEST(core_cancel, submission_after_cancel_boundary_survives)
   deleteOwner(backend, object);
 }
 
-// Regression: the bulk sweep belongs to the CANCELIO position alone. A grid
-// timeout lands an ordinary CANCEL bit on an earlier chain position; if that
-// position could spend the cancelIo() request, the sweep would run before
-// the operations submitted between the two positions have started and they
-// would survive a cancel issued after them.
+// Regression: the bulk sweep belongs to the CANCELIO position alone. A grid timeout lands an ordinary CANCEL bit on an earlier chain position;
+// if that position could spend the cancelIo() request, the sweep would run before the operations submitted between the two positions have
+// started and they would survive a cancel issued after them.
 TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submitted_before_cancel_io)
 {
   TestBackend backend;
@@ -479,16 +439,14 @@ TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submit
   active.executeHook = [&](TestOp &op) {
     if (op.executeCalls != 1)
       return;
-    // A grid timeout fires while the combiner is busy: its CANCEL bit lands
-    // on the chain position of the moment...
+    // A grid timeout fires while the combiner is busy: its CANCEL bit lands on the chain position of the moment...
     combinerPushOperation(&timedOut.root);
     opCancel(&timedOut.root,
              opGetGeneration(&timedOut.root),
              aosTimeout,
              &object.root,
              __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed));
-    // ...then the user submits two more operations and only afterwards
-    // cancels everything submitted so far
+    // ...then the user submits two more operations and only afterwards cancels everything submitted so far
     combinerPushOperation(&first.root);
     combinerPushOperation(&second.root);
     cancelIo(&object.root);
@@ -500,21 +458,19 @@ TEST(core_cancel, earlier_grid_cancel_position_must_not_exempt_operations_submit
   EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
   EXPECT_EQ(opGetStatus(&timedOut.root), aosTimeout);
   EXPECT_EQ(opGetStatus(&first.root), aosCanceled)
-    << "the early grid-timeout position spent the cancelIo request and exempted a pre-cancel submission";
+      << "the early grid-timeout position spent the cancelIo request and exempted a pre-cancel submission";
   EXPECT_EQ(opGetStatus(&second.root), aosCanceled)
-    << "the cancelIo position arrived with its request already spent by the earlier CANCEL position";
+      << "the cancelIo position arrived with its request already spent by the earlier CANCEL position";
 
   if (opGetStatus(&first.root) == aosPending || opGetStatus(&second.root) == aosPending)
     cancelAndDrain(backend, object);
   deleteOwner(backend, object);
 }
 
-// Regression: every cancelIo() call publishes its own positional boundary.
-// A second call while an earlier request was still undrained used to
-// coalesce into an object-global counter without a position of its own; the
-// earlier boundary's sweep consumed the whole counter, and an operation
-// submitted between the two calls survived the second one although the
-// "everything submitted before the cancel gets swept" contract covers it.
+// Regression: every cancelIo() call publishes its own positional boundary. A second call while an earlier request was still undrained used to
+// coalesce into an object-global counter without a position of its own; the earlier boundary's sweep consumed the whole counter, and an
+// operation submitted between the two calls survived the second one although the "everything submitted before the cancel gets swept" contract
+// covers it.
 TEST(core_cancel, repeated_cancel_io_publishes_its_own_boundary)
 {
   TestBackend backend;
@@ -526,8 +482,7 @@ TEST(core_cancel, repeated_cancel_io_publishes_its_own_boundary)
   active.executeHook = [&](TestOp &op) {
     if (op.executeCalls != 1)
       return;
-    // The combiner is busy running this execute: the first cancelIo lands
-    // its boundary on the current chain position...
+    // The combiner is busy running this execute: the first cancelIo lands its boundary on the current chain position...
     cancelIo(&object.root);
     // ...the user submits another operation on top of that boundary...
     combinerPushOperation(&between.root);
@@ -542,17 +497,15 @@ TEST(core_cancel, repeated_cancel_io_publishes_its_own_boundary)
 
   EXPECT_EQ(opGetStatus(&active.root), aosCanceled);
   EXPECT_EQ(opGetStatus(&between.root), aosCanceled)
-    << "the second cancelIo was coalesced into the already-published request and lost its boundary";
-  EXPECT_EQ(opGetStatus(&after.root), aosPending)
-    << "a submission after the last cancelIo must not be swept";
+      << "the second cancelIo was coalesced into the already-published request and lost its boundary";
+  EXPECT_EQ(opGetStatus(&after.root), aosPending) << "a submission after the last cancelIo must not be swept";
 
   cancelAndDrain(backend, object);
   deleteOwner(backend, object);
 }
 
-// Back-to-back cancelIo calls with no submission in between land on the same
-// head word: the second OR is idempotent, both requests share one position
-// and one sweep covers them - repeated requests must not multiply sweeps.
+// Back-to-back cancelIo calls with no submission in between land on the same head word: the second OR is idempotent, both requests share one
+// position and one sweep covers them - repeated requests must not multiply sweeps.
 TEST(core_cancel, back_to_back_cancel_io_requests_coalesce_into_one_position)
 {
   TestBackend backend;
@@ -622,10 +575,7 @@ TEST(core_initialization, read_direction_progress_drives_handshake_slot)
   EXPECT_EQ(handshake.executeCalls, 2u);
   EXPECT_EQ(write.executeCalls, 1u);
   EXPECT_EQ(object.root.initializationOp, nullptr);
-  EXPECT_NE(std::find(backend.handledSignals.begin(),
-                      backend.handledSignals.end(),
-                      COMBINER_TAG_PROGRESS_READ),
-            backend.handledSignals.end());
+  EXPECT_NE(std::find(backend.handledSignals.begin(), backend.handledSignals.end(), COMBINER_TAG_PROGRESS_READ), backend.handledSignals.end());
   backend.drainCompletions();
   deleteOwner(backend, object);
 }
@@ -718,8 +668,7 @@ TEST(core_initialization, direct_reap_handles_running_and_waiting_terminal_state
   EXPECT_EQ(waiting.cancelCalls, 0u);
   EXPECT_EQ(waiting.releaseCalls, 1u);
   EXPECT_EQ(object.root.initializationOp, nullptr);
-  EXPECT_EQ(needStart & (IO_EVENT_READ | IO_EVENT_WRITE),
-            IO_EVENT_READ | IO_EVENT_WRITE);
+  EXPECT_EQ(needStart & (IO_EVENT_READ | IO_EVENT_WRITE), IO_EVENT_READ | IO_EVENT_WRITE);
 
   backend.drainCompletions();
   deleteOwner(backend, object);
@@ -735,8 +684,7 @@ TEST(core_initialization, cancel_boundary_on_init_start_node_releases_once)
   active.executeHook = [&](TestOp &op) {
     if (op.executeCalls != 1)
       return;
-    // CANCELIO is attached to this init node. The backend must first install
-    // and start it and only then sweep it; no pre-start slot exists.
+    // CANCELIO is attached to this init node. The backend must first install and start it and only then sweep it; no pre-start slot exists.
     combinerPushOperation(&connect.root);
     cancelIo(&object.root);
   };
@@ -807,9 +755,7 @@ TEST(core_initialization, terminal_status_from_child_releases_without_reexecutio
   TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
   object.root.initializationOp = &connect.root;
   connect.root.running = arRunning;
-  ASSERT_TRUE(opSetStatus(&connect.root,
-                          opGetGeneration(&connect.root),
-                          aosUnknownError));
+  ASSERT_TRUE(opSetStatus(&connect.root, opGetGeneration(&connect.root), aosUnknownError));
   uint32_t needStart = 0;
 
   processInitializationOp(&object.root, &needStart);
@@ -838,9 +784,8 @@ TEST(core_initialization, operation_cancelled_before_start_is_never_executed)
   deleteOwner(backend, object);
 }
 
-// Mirror of the kqueue/epoll realtime arm-failure path: the backend records
-// the terminal status on the operation and returns without emitting any
-// combiner signal.
+// Mirror of the kqueue/epoll realtime arm-failure path: the backend records the terminal status on the operation and returns without emitting
+// any combiner signal.
 static void failingRealtimeStartTimer(asyncOpRoot *op)
 {
   (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
@@ -851,16 +796,14 @@ TEST(core_timer_arm, realtime_arm_failure_still_delivers_completion)
   TestBackend backend;
   backend.base.methodImpl.startTimer = failingRealtimeStartTimer;
   TestObject object(backend);
-  // A reactor operation parked after its sync attempt: running from
-  // submission on, woken only by kernel readiness or its realtime timeout.
+  // A reactor operation parked after its sync attempt: running from submission on, woken only by kernel readiness or its realtime timeout.
   TestOp op(object, OPCODE_READ, afRealtime | afRunning, 1000000);
   op.setResults({aosPending});
 
   combinerPushOperation(&op.root);
 
   EXPECT_EQ(opGetStatus(&op.root), aosUnknownError);
-  ASSERT_EQ(backend.completions.size(), 1u)
-      << "operation with a failed timer arm was stranded in its queue";
+  ASSERT_EQ(backend.completions.size(), 1u) << "operation with a failed timer arm was stranded in its queue";
   backend.drainCompletions();
   EXPECT_EQ(op.finishCalls, 1u);
   EXPECT_EQ(op.callbackStatus, aosUnknownError);
@@ -991,7 +934,9 @@ TEST(core_delete_lifecycle, callback_retain_extends_lifetime)
   TestObject object(backend);
   TestOp op(object);
   op.setResults({aosSuccess});
-  op.finishHook = [&](TestOp&) { objectIncrementReference(&object.root, 1); };
+  op.finishHook = [&](TestOp&) {
+    objectIncrementReference(&object.root, 1);
+  };
   combinerPushOperation(&op.root);
   objectDelete(&object.root);
 
@@ -1034,8 +979,8 @@ TEST(core_delete_lifecycle, init_node_after_delete_is_rejected_before_claim)
   TestOp connect(object, OPCODE_WRITE | OPCODE_INIT);
   connect.setResults({aosPending});
 
-  // The operation reference keeps the object storage alive across delete.
-  // Its node is published afterwards, as can happen to a concurrent submitter.
+  // The operation reference keeps the object storage alive across delete. Its node is published afterwards, as can happen to a concurrent
+  // submitter.
   objectDelete(&object.root);
   combinerPushOperation(&connect.root);
 
@@ -1056,9 +1001,8 @@ TEST(core_delete_lifecycle, kept_parent_with_consumed_child_wake_is_not_stranded
   TestBackend backend;
   TestObject object(backend);
   TestOp parent(object);
-  // Protocol parent: cancel forwards to the transport and reports the child
-  // completion as in flight. If the parent is ever re-driven on the dying
-  // object, its fresh child is immediately cancelled by the same teardown.
+  // Protocol parent: cancel forwards to the transport and reports the child completion as in flight. If the parent is ever re-driven on the
+  // dying object, its fresh child is immediately cancelled by the same teardown.
   parent.cancelResult = 0;
   parent.setResults({aosPending, aosPending});
   parent.executeHook = [&](TestOp &op) {
@@ -1068,10 +1012,9 @@ TEST(core_delete_lifecycle, kept_parent_with_consumed_child_wake_is_not_stranded
   combinerPushOperation(&parent.root);
   ASSERT_EQ(parent.root.running, arRunning);
 
-  // objectDelete split at its internal window: the deleting thread has stored
-  // the flag but not yet pushed CANCELIO when the child-success progress
-  // dispatch runs. The gate suppresses the re-drive that would have issued a
-  // new child, so the cancel sweep keeps a parent no completion can reach.
+  // objectDelete split at its internal window: the deleting thread has stored the flag but not yet pushed CANCELIO when the child-success
+  // progress dispatch runs. The gate suppresses the re-drive that would have issued a new child, so the cancel sweep keeps a parent no
+  // completion can reach.
   __uint_atomic_store(&object.root.DeletePending, 1, amoRelease);
   combinerPushProgress(&parent.root);
   cancelIo(&object.root);
@@ -1083,7 +1026,6 @@ TEST(core_delete_lifecycle, kept_parent_with_consumed_child_wake_is_not_stranded
   EXPECT_EQ(object.destructorCallbacks, 1u);
   EXPECT_EQ(object.resourceDestructors, 1u);
 }
-
 
 TEST(core_tagged_pointer, round_trips_aligned_pointer_and_low_bits)
 {
@@ -1141,12 +1083,7 @@ TEST(core_operation_allocation, regular_and_realtime_pools_reuse_aligned_storage
   asyncOpRoot *regular = nullptr;
   asyncOpRoot *realtime = nullptr;
 
-  EXPECT_EQ(asyncOpAlloc(&backend.base,
-                         sizeof(asyncOpRoot),
-                         0,
-                         &regularPool,
-                         &realtimePool,
-                         &regular), 1);
+  EXPECT_EQ(asyncOpAlloc(&backend.base, sizeof(asyncOpRoot), 0, &regularPool, &realtimePool, &regular), 1);
   ASSERT_NE(regular, nullptr);
   EXPECT_EQ(reinterpret_cast<uintptr_t>(regular) & (kCombinerAlignment - 1), 0u);
   EXPECT_EQ(regular->timerId, nullptr);
@@ -1154,20 +1091,10 @@ TEST(core_operation_allocation, regular_and_realtime_pools_reuse_aligned_storage
 
   concurrentQueuePush(&regularPool, regular);
   asyncOpRoot *reused = nullptr;
-  EXPECT_EQ(asyncOpAlloc(&backend.base,
-                         sizeof(asyncOpRoot),
-                         0,
-                         &regularPool,
-                         &realtimePool,
-                         &reused), 0);
+  EXPECT_EQ(asyncOpAlloc(&backend.base, sizeof(asyncOpRoot), 0, &regularPool, &realtimePool, &reused), 0);
   EXPECT_EQ(reused, regular);
 
-  EXPECT_EQ(asyncOpAlloc(&backend.base,
-                         sizeof(asyncOpRoot),
-                         1,
-                         &regularPool,
-                         &realtimePool,
-                         &realtime), 1);
+  EXPECT_EQ(asyncOpAlloc(&backend.base, sizeof(asyncOpRoot), 1, &regularPool, &realtimePool, &realtime), 1);
   ASSERT_NE(realtime, nullptr);
   EXPECT_EQ(backend.initializeTimerCalls, 1u);
   EXPECT_NE(realtime->timerId, nullptr);
@@ -1207,8 +1134,7 @@ TEST(core_object_storage, generation_advances_before_user_destructor)
 {
   TestBackend backend;
   TestObject object(backend);
-  uintptr_t before =
-    __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
+  uintptr_t before = __uint64_atomic_load(&object.root.header.tag.high, amoRelaxed);
 
   objectDelete(&object.root);
 
@@ -1320,14 +1246,14 @@ TEST(core_loop_slots, concurrent_loops_receive_distinct_indices)
 
   EXPECT_EQ(backend.base.messageLoopThreadCounter, count);
   EXPECT_EQ(backend.loopSlots[0] & 0xffu, 0xffu);
-  for (int value : entered)
+  for (int value: entered)
     EXPECT_EQ(value, 1);
   std::sort(ids.begin(), ids.end());
   for (unsigned i = 0; i < count; i++)
     EXPECT_EQ(ids[i], i);
 
   release.store(true, std::memory_order_release);
-  for (std::thread &thread : threads)
+  for (std::thread &thread: threads)
     thread.join();
 
   EXPECT_EQ(backend.base.messageLoopThreadCounter, 0u);
@@ -1339,8 +1265,7 @@ TEST(core_loop_slots, overflow_is_rejected_before_timer_sleep_indexing)
   TestBackend backend;
   backend.loopSlots[0] = 0xffu;
 #ifndef NDEBUG
-  EXPECT_DEATH((void)loopThreadEnter(&backend.base),
-               "asyncLoop concurrency exceeds");
+  EXPECT_DEATH((void)loopThreadEnter(&backend.base), "asyncLoop concurrency exceeds");
 #else
   EXPECT_FALSE(loopThreadEnter(&backend.base));
 #endif
@@ -1378,23 +1303,16 @@ struct SyncScenario {
   unsigned initCalls = 0;
   bool deleteDuringSync = false;
 
-  explicit SyncScenario(TestObject &owner) : object(&owner) {}
+  explicit SyncScenario(TestObject &owner) :
+    object(&owner) {}
 
-  TestOp &createOperation(int opCode, AsyncFlags flags, uint64_t timeout, bool callback)
-  {
+  TestOp &createOperation(int opCode, AsyncFlags flags, uint64_t timeout, bool callback) {
     if (!operation)
       operation = std::make_unique<TestOp>(*object, opCode, flags, timeout, callback);
     return *operation;
   }
 
-  static asyncOpRoot *create(aioObjectRoot*,
-                             AsyncFlags flags,
-                             uint64_t timeout,
-                             void *callback,
-                             void*,
-                             int opCode,
-                             void *context)
-  {
+  static asyncOpRoot *create(aioObjectRoot*, AsyncFlags flags, uint64_t timeout, void *callback, void*, int opCode, void *context) {
     SyncScenario &scenario = *static_cast<SyncScenario*>(context);
     scenario.creates++;
     asyncOpRoot *op = &scenario.createOperation(opCode, flags, timeout, callback != nullptr).root;
@@ -1403,13 +1321,7 @@ struct SyncScenario {
     return op;
   }
 
-  static asyncOpRoot *sync(aioObjectRoot *object,
-                           AsyncFlags flags,
-                           uint64_t timeout,
-                           void *callback,
-                           void*,
-                           void *context)
-  {
+  static asyncOpRoot *sync(aioObjectRoot *object, AsyncFlags flags, uint64_t timeout, void *callback, void*, void *context) {
     SyncScenario &scenario = *static_cast<SyncScenario*>(context);
     scenario.syncCalls++;
     if (scenario.deleteDuringSync)
@@ -1422,21 +1334,12 @@ struct SyncScenario {
     return &op.root;
   }
 
-  static void makeResult(void *context)
-  {
-    static_cast<SyncScenario*>(context)->makeResults++;
-  }
+  static void makeResult(void *context) { static_cast<SyncScenario*>(context)->makeResults++; }
 
-  static void init(asyncOpRoot*, void *context)
-  {
-    static_cast<SyncScenario*>(context)->initCalls++;
-  }
+  static void init(asyncOpRoot*, void *context) { static_cast<SyncScenario*>(context)->initCalls++; }
 };
 
-void runSyncScenario(SyncScenario &scenario,
-                     AsyncFlags flags,
-                     void *callback = nullptr,
-                     int opCode = OPCODE_READ)
+void runSyncScenario(SyncScenario &scenario, AsyncFlags flags, void *callback = nullptr, int opCode = OPCODE_READ)
 {
   scenario.opCode = opCode;
   runAioOperation(&scenario.object->root,
@@ -1460,10 +1363,10 @@ struct IoScenario {
   AsyncOpStatus status = aosUnknown;
   bool returned = false;
 
-  explicit IoScenario(TestObject &object) : sync(object) {}
+  explicit IoScenario(TestObject &object) :
+    sync(object) {}
 
-  static void run(void *arg)
-  {
+  static void run(void *arg) {
     IoScenario &scenario = *static_cast<IoScenario*>(arg);
     scenario.sync.opCode = scenario.opCode;
     scenario.result = runIoOperation(&scenario.sync.object->root,
@@ -1596,8 +1499,7 @@ TEST(core_sync_path, existing_queue_uses_async_submission_without_sync_attempt)
 
   EXPECT_EQ(scenario.syncCalls, 0u);
   EXPECT_EQ(scenario.creates, 1u);
-  EXPECT_EQ(listContents(object.root.writeQueue),
-            (std::vector<asyncOpRoot*>{&active.root, &scenario.operation->root}));
+  EXPECT_EQ(listContents(object.root.writeQueue), (std::vector<asyncOpRoot*>{&active.root, &scenario.operation->root}));
   cancelIo(&object.root);
   backend.drainCompletions();
   objectDelete(&object.root);
@@ -1622,10 +1524,7 @@ TEST(core_sync_path, speculative_allocation_is_released_after_combiner_handoff)
   });
   while (phase.load(std::memory_order_acquire) != 1)
     std::this_thread::yield();
-  bool handedOff = __uint64_atomic_compare_and_swap(&object.root.header.tag.low,
-                                                     busy.data,
-                                                     0,
-                                                     amoSeqCst);
+  bool handedOff = __uint64_atomic_compare_and_swap(&object.root.header.tag.low, busy.data, 0, amoSeqCst);
   phase.store(2, std::memory_order_release);
   submitter.join();
 
@@ -1659,8 +1558,7 @@ TEST(core_sync_path, busy_combiner_publishes_async_node_without_sync_attempt)
   EXPECT_EQ(scenario.syncCalls, 0u);
   EXPECT_EQ(scenario.creates, 1u);
   ASSERT_NE(scenario.operation, nullptr);
-  EXPECT_EQ(listContents(object.root.readQueue),
-            (std::vector<asyncOpRoot*>{&active.root, &scenario.operation->root}));
+  EXPECT_EQ(listContents(object.root.readQueue), (std::vector<asyncOpRoot*>{&active.root, &scenario.operation->root}));
   cancelIo(&object.root);
   backend.drainCompletions();
   objectDelete(&object.root);
@@ -1697,9 +1595,8 @@ TEST(core_io_path, fairness_budget_queues_then_resumes_coroutine)
   EXPECT_EQ(scenario.sync.creates, 1u);
   EXPECT_EQ(scenario.sync.initCalls, 1u);
   ASSERT_NE(scenario.sync.operation, nullptr);
-  EXPECT_EQ(scenario.sync.operation->root.flags & (afRealtime | afWaitAll),
-            afRealtime | afWaitAll)
-    << "the fairness fallback must preserve caller flags";
+  EXPECT_EQ(scenario.sync.operation->root.flags & (afRealtime | afWaitAll), afRealtime | afWaitAll)
+      << "the fairness fallback must preserve caller flags";
   deliverCoroutineCompletion(backend);
   EXPECT_TRUE(scenario.returned);
   EXPECT_EQ(scenario.status, aosSuccess);
@@ -1795,12 +1692,10 @@ TEST(core_delete_lifecycle, next_sync_operation_after_close_is_rejected)
 
   runSyncScenario(scenario, afNone, &scenario);
 
-  EXPECT_EQ(scenario.syncCalls, 0u)
-    << "combinerAcquire entered syncImpl after the object became closing";
+  EXPECT_EQ(scenario.syncCalls, 0u) << "combinerAcquire entered syncImpl after the object became closing";
   EXPECT_EQ(scenario.makeResults, 0u);
   ASSERT_EQ(scenario.creates, 1u);
-  // The rejected operation is routed through the combiner and dies in the
-  // sticky delete sweep: exactly one canceled completion, no syscall
+  // The rejected operation is routed through the combiner and dies in the sticky delete sweep: exactly one canceled completion, no syscall
   backend.drainCompletions();
   EXPECT_EQ(opGetStatus(&scenario.operation->root), aosCanceled);
   EXPECT_EQ(scenario.operation->finishCalls, 1u);
@@ -1821,20 +1716,16 @@ TEST(core_head, fd_handle_roundtrips_pointer_and_generation)
   uint64_t generation = 0;
   objectHeader *decoded = kernelHandleDecode(encoded, &generation);
   EXPECT_EQ(decoded, &object->root.header);
-  EXPECT_EQ(generation,
-            __uint64_atomic_load(&object->root.header.tag.high, amoRelaxed));
+  EXPECT_EQ(generation, __uint64_atomic_load(&object->root.header.tag.high, amoRelaxed));
   alignedFree(object);
 }
 
 TEST(core_head, user_event_handle_roundtrips_pointer_and_generation)
 {
-  auto *event =
-    static_cast<aioUserEvent*>(alignedMalloc(sizeof(aioUserEvent), 64));
+  auto *event = static_cast<aioUserEvent*>(alignedMalloc(sizeof(aioUserEvent), 64));
   ASSERT_NE(event, nullptr);
   __uint64_atomic_store(&event->header.tag.low, 1, amoRelaxed);
-  __uint64_atomic_store(&event->header.tag.high,
-                         (UINT64_C(1) << 40) | 0x12345u,
-                         amoRelaxed);
+  __uint64_atomic_store(&event->header.tag.high, (UINT64_C(1) << 40) | 0x12345u, amoRelaxed);
   objectHeaderSetType(&event->header, ohtUserEvent);
 
   uint64_t encoded = kernelHandleEncode(&event->header);
@@ -1847,8 +1738,7 @@ TEST(core_head, user_event_handle_roundtrips_pointer_and_generation)
 
 TEST(core_head, nonnull_header_never_encodes_as_zero)
 {
-  auto *header =
-    static_cast<objectHeader*>(alignedMalloc(sizeof(objectHeader), 64));
+  auto *header = static_cast<objectHeader*>(alignedMalloc(sizeof(objectHeader), 64));
   ASSERT_NE(header, nullptr);
   __uint64_atomic_store(&header->tag.high, 0, amoRelaxed);
   EXPECT_NE(kernelHandleEncode(header), 0u);
@@ -1857,8 +1747,7 @@ TEST(core_head, nonnull_header_never_encodes_as_zero)
 
 TEST(core_head, fd_handle_generation_wraps_modulo_compact_field)
 {
-  auto *object =
-    static_cast<aioObject*>(alignedMalloc(sizeof(aioObject), 64));
+  auto *object = static_cast<aioObject*>(alignedMalloc(sizeof(aioObject), 64));
   ASSERT_NE(object, nullptr);
   uint64_t fullGeneration = REACTOR_HANDLE_GENERATION_MASK + 18;
   __uint64_atomic_store(&object->root.header.tag.high, fullGeneration, amoRelaxed);
@@ -1881,16 +1770,11 @@ TEST(core_head, validated_push_drops_generation_mismatch_without_touching_word0)
   Cell *object = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
   ASSERT_NE(object, nullptr);
   __uint64_atomic_store(&object->header.tag.high, 17, amoRelaxed);
-  __uint64_atomic_store(&object->header.tag.low,
-                         taggedAsyncOpStub().data,
-                         amoRelaxed);
-  uintptr_t before =
-    __uint64_atomic_load(&object->header.tag.low, amoRelaxed);
+  __uint64_atomic_store(&object->header.tag.low, taggedAsyncOpStub().data, amoRelaxed);
+  uintptr_t before = __uint64_atomic_load(&object->header.tag.low, amoRelaxed);
   objectFree(&pool, object, sizeof(Cell)); // payload is poisoned; header.tag stays live
 
-  EXPECT_FALSE(combinerPushValidated(reinterpret_cast<aioObjectRoot*>(object),
-                                     16,
-                                     COMBINER_TAG_PROGRESS_READ));
+  EXPECT_FALSE(combinerPushValidated(reinterpret_cast<aioObjectRoot*>(object), 16, COMBINER_TAG_PROGRESS_READ));
   EXPECT_EQ(__uint64_atomic_load(&object->header.tag.low, amoRelaxed), before);
 
   Cell *recovered = static_cast<Cell*>(objectAlloc(&pool, sizeof(Cell), 64));
@@ -1905,9 +1789,7 @@ TEST(core_head, validated_push_delivers_matching_signal)
   TestObject object(backend);
   __uint64_atomic_store(&object.root.header.tag.high, 29, amoRelaxed);
 
-  EXPECT_TRUE(combinerPushValidated(&object.root,
-                                    29,
-                                    COMBINER_TAG_PROGRESS_READ));
+  EXPECT_TRUE(combinerPushValidated(&object.root, 29, COMBINER_TAG_PROGRESS_READ));
   ASSERT_EQ(backend.handledSignals.size(), 1u);
   EXPECT_NE(backend.handledSignals.front() & COMBINER_TAG_PROGRESS_READ, 0u);
   EXPECT_EQ(__uint64_atomic_load(&object.root.header.tag.low, amoRelaxed), 0u);
@@ -1921,29 +1803,21 @@ TEST(core_head, validated_push_accepts_matching_compact_generation_after_wrap)
   } cell{};
   uint64_t fullGeneration = REACTOR_HANDLE_GENERATION_MASK + 30;
   __uint64_atomic_store(&cell.header.tag.high, fullGeneration, amoRelaxed);
-  __uint64_atomic_store(&cell.header.tag.low,
-                         taggedAsyncOpStub().data,
-                         amoRelaxed);
+  __uint64_atomic_store(&cell.header.tag.low, taggedAsyncOpStub().data, amoRelaxed);
 
   aioObject *object = reinterpret_cast<aioObject*>(&cell);
   uint64_t encoded = kernelHandleEncode(&object->root.header);
   uint64_t decodedGeneration = 0;
   objectHeader *decoded = kernelHandleDecode(encoded, &decodedGeneration);
   EXPECT_EQ(decodedGeneration, fullGeneration);
-  EXPECT_TRUE(combinerPushValidated((aioObjectRoot*)decoded,
-                                    decodedGeneration,
-                                    COMBINER_TAG_PROGRESS_READ));
-  EXPECT_NE(__uint64_atomic_load(&cell.header.tag.low, amoRelaxed) &
-              COMBINER_TAG_PROGRESS_READ,
-            0u);
+  EXPECT_TRUE(combinerPushValidated((aioObjectRoot*)decoded, decodedGeneration, COMBINER_TAG_PROGRESS_READ));
+  EXPECT_NE(__uint64_atomic_load(&cell.header.tag.low, amoRelaxed) & COMBINER_TAG_PROGRESS_READ, 0u);
 }
 
 #ifndef OS_WINDOWS
-// socketStatusFromErrno centralizes the errno->status mapping shared by the
-// epoll and kqueue read/write/recvmsg/sendto paths. Pin the normalization:
-// EAGAIN and EINTR park the operation (retry), EPIPE and ENOTCONN both surface
-// as the unified aosNotConnected, connected-UDP ECONNREFUSED is a peer-side
-// disconnect, and unrelated errors stay opaque as aosUnknownError.
+// socketStatusFromErrno centralizes the errno->status mapping shared by the epoll and kqueue read/write/recvmsg/sendto paths. Pin the
+// normalization: EAGAIN and EINTR park the operation (retry), EPIPE and ENOTCONN both surface as the unified aosNotConnected, connected-UDP
+// ECONNREFUSED is a peer-side disconnect, and unrelated errors stay opaque as aosUnknownError.
 TEST(core_status, errno_maps_retry_and_broken_connection_distinctly)
 {
   EXPECT_EQ(socketStatusFromErrno(EAGAIN), aosPending);

@@ -29,18 +29,9 @@ enum ReceiverTy {
   receiverTyCoroutine
 };
 
-static const char *SenderTyNames[] = {
-  "ZMQ",
-  "Async(NO BATCH!)",
-  "Coroutine(NO BATCH!)",
-  "RAW(NO BATCH!)"
-};
+static const char *SenderTyNames[] = {"ZMQ", "Async(NO BATCH!)", "Coroutine(NO BATCH!)", "RAW(NO BATCH!)"};
 
-static const char *ReceiverTyNames[] = {
-  "ZMQ",
-  "Async",
-  "Coroutine"
-};
+static const char *ReceiverTyNames[] = {"ZMQ", "Async", "Coroutine"};
 
 __NO_PADDING_BEGIN
 struct Configuration {
@@ -55,11 +46,14 @@ struct SenderContext {
   asyncBase *base;
   socketTy socketId;
   zmtpSocket *socket;
-  decltype (std::chrono::steady_clock::now()) startPoint;
+  decltype(std::chrono::steady_clock::now()) startPoint;
   std::unique_ptr<uint8_t[]> data;
   uint64_t counter;
   std::atomic<unsigned> deleted;
-  SenderContext(Configuration *cfgArg) : cfg(cfgArg), sent(0), deleted(0) {
+  SenderContext(Configuration *cfgArg) :
+    cfg(cfgArg),
+    sent(0),
+    deleted(0) {
     data.reset(new uint8_t[gPacketSize]);
   }
 };
@@ -68,21 +62,24 @@ struct ReceiverContext {
   Configuration *cfg;
   uint64_t received;
   int64_t milliSecondsElapsed;
-  decltype (std::chrono::steady_clock::now()) startPoint;
-  decltype (std::chrono::steady_clock::now()) endPoint;
+  decltype(std::chrono::steady_clock::now()) startPoint;
+  decltype(std::chrono::steady_clock::now()) endPoint;
   asyncBase *base;
   aioObject *listener;
   zmtpStream stream;
   uint64_t counter;
   std::atomic<unsigned> deleted;
-  ReceiverContext(Configuration *cfgArg) : cfg(cfgArg), received(0), milliSecondsElapsed(0), deleted(0) {}
+  ReceiverContext(Configuration *cfgArg) :
+    cfg(cfgArg),
+    received(0),
+    milliSecondsElapsed(0),
+    deleted(0) {}
 };
 __NO_PADDING_END
 
-// The measured send loop shared by every sender flavor: batches of 128
-// packets until gInterval seconds elapse or the send function reports an
-// error. Returns the number of packets sent; the send lambda inlines, so the
-// hot loop compiles to the same code as the former per-sender copies.
+// The measured send loop shared by every sender flavor: batches of 128 packets until gInterval seconds elapse or the send function reports an
+// error. Returns the number of packets sent; the send lambda inlines, so the hot loop compiles to the same code as the former per-sender
+// copies.
 template<typename SendFn>
 uint64_t timedBatchSend(SendFn send)
 {
@@ -99,15 +96,14 @@ uint64_t timedBatchSend(SendFn send)
     }
 
     auto currentTime = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::seconds>(currentTime-startTime).count() >= gInterval)
+    if (std::chrono::duration_cast<std::chrono::seconds>(currentTime - startTime).count() >= gInterval)
       run = false;
   }
 
   return packetsNum;
 }
 
-// An async TCP socket bound to an ephemeral local port; false when the bind
-// fails and the benchmark leg must be skipped.
+// An async TCP socket bound to an ephemeral local port; false when the bind fails and the benchmark leg must be skipped.
 bool createBoundClient(socketTy &clientSocket)
 {
   HostAddress address;
@@ -118,8 +114,8 @@ bool createBoundClient(socketTy &clientSocket)
   return socketBind(clientSocket, &address) == 0;
 }
 
-// Listener on the benchmark port; the bind retry lets the previous run's
-// socket leave TIME_WAIT. Returns nullptr when the port stays unavailable.
+// Listener on the benchmark port; the bind retry lets the previous run's socket leave TIME_WAIT. Returns nullptr when the port stays
+// unavailable.
 aioObject *createListener(asyncBase *base, uint16_t port)
 {
   HostAddress address;
@@ -146,11 +142,10 @@ void senderZMQ(SenderContext *ctx)
   int linger = 0;
   int timeout = 1000;
   int msgBufferSize = 100000;
-  zmq_setsockopt (socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
+  zmq_setsockopt(socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
   zmq_setsockopt(socket, ZMQ_LINGER, &linger, sizeof(int));
   zmq_setsockopt(socket, ZMQ_SNDHWM, &msgBufferSize, sizeof(msgBufferSize));
   zmq_setsockopt(socket, ZMQ_RCVHWM, &msgBufferSize, sizeof(msgBufferSize));
-
 
   char address[128];
   snprintf(address, sizeof(address), "tcp://127.0.0.1:%u", static_cast<unsigned>(ctx->cfg->port));
@@ -180,8 +175,7 @@ void senderZMQ(SenderContext *ctx)
 static void senderAsyncSendCb(AsyncOpStatus status, zmtpSocket *socket, void *arg)
 {
   auto ctx = static_cast<SenderContext*>(arg);
-  // Completions still queued behind the cutoff arrive after zmtpSocketDelete:
-  // the socket is gone, they must not pump new sends into it
+  // Completions still queued behind the cutoff arrive after zmtpSocketDelete: the socket is gone, they must not pump new sends into it
   if (ctx->deleted.load(std::memory_order_relaxed) != 0)
     return;
   if (status == aosSuccess) {
@@ -289,7 +283,6 @@ void senderCoroutineProc(void *arg)
   postQuitOperation(ctx->base);
 }
 
-
 void senderCoroutine(SenderContext *ctx)
 {
   ctx->base = createAsyncBase(amOSDefault, 1);
@@ -333,10 +326,10 @@ void senderRawProc(void *arg)
 #endif
 
     // Send first packet
-    ssize_t sendResult = send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize+2, 0);
+    ssize_t sendResult = send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize + 2, 0);
     if (sendResult > 0) {
       ctx->sent += timedBatchSend([&]() {
-        return send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize+2, 0);
+        return send(ctx->socketId, reinterpret_cast<const char*>(packet), ctx->cfg->packetSize + 2, 0);
       });
     } else {
       fprintf(stderr, "senderRaw: send (first packet) failed error=%zi\n", -sendResult);
@@ -368,7 +361,7 @@ void receiverZMQ(ReceiverContext *ctx)
   int linger = 0;
   int timeout = 3000;
   int msgBufferSize = 100000;
-  zmq_setsockopt (socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
+  zmq_setsockopt(socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
   zmq_setsockopt(socket, ZMQ_LINGER, &linger, sizeof(int));
   zmq_setsockopt(socket, ZMQ_SNDHWM, &msgBufferSize, sizeof(msgBufferSize));
   zmq_setsockopt(socket, ZMQ_RCVHWM, &msgBufferSize, sizeof(msgBufferSize));
@@ -392,7 +385,7 @@ void receiverZMQ(ReceiverContext *ctx)
         }
       }
 
-      ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(endTime-startTime).count();
+      ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
     }
   } else {
     fprintf(stderr, "receiverZMQ: zmq_bind failed error=%i\n", bindResult);
@@ -405,8 +398,7 @@ void receiverZMQ(ReceiverContext *ctx)
 static void receiverAsyncRecvCb(AsyncOpStatus status, zmtpSocket *socket, zmtpUserMsgTy, zmtpStream *stream, void *arg)
 {
   auto ctx = static_cast<ReceiverContext*>(arg);
-  // Same cutoff contract as the sender: late completions arrive after
-  // zmtpSocketDelete and must not touch the socket
+  // Same cutoff contract as the sender: late completions arrive after zmtpSocketDelete and must not touch the socket
   if (ctx->deleted.load(std::memory_order_relaxed) != 0)
     return;
   if (status == aosSuccess) {
@@ -437,7 +429,7 @@ static void receiverAsyncRecvCb(AsyncOpStatus status, zmtpSocket *socket, zmtpUs
   } else if (status == aosTimeout || status == aosDisconnected) {
     if (ctx->received == 0)
       fprintf(stderr, "receiverAsync: zmtp receive timeout\n");
-    ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(ctx->endPoint-ctx->startPoint).count();
+    ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(ctx->endPoint - ctx->startPoint).count();
     if (ctx->deleted.fetch_add(1) == 0) {
       zmtpSocketDelete(socket);
       postQuitOperation(ctx->base);
@@ -518,7 +510,7 @@ void receiverCoroutineProc(void *arg)
         }
       }
 
-      ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(endTime-startTime).count();
+      ctx->milliSecondsElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
     }
   } else {
     fprintf(stderr, "receiverCoroutine: ioZmtpAccept failed error=%i\n", acceptResult);
@@ -552,32 +544,18 @@ void runBenchmark(SenderTy senderType, ReceiverTy receiverType, uint16_t port)
   std::thread sender;
 
   switch (receiverType) {
-    case receiverTyZMQ :
-      receiver = std::thread(receiverZMQ, &receiverCtx);
-      break;
-    case receiverTyAio :
-      receiver = std::thread(receiverAsync, &receiverCtx);
-      break;
-    case receiverTyCoroutine :
-      receiver = std::thread(receiverCoroutine, &receiverCtx);
-      break;
+    case receiverTyZMQ: receiver = std::thread(receiverZMQ, &receiverCtx); break;
+    case receiverTyAio: receiver = std::thread(receiverAsync, &receiverCtx); break;
+    case receiverTyCoroutine: receiver = std::thread(receiverCoroutine, &receiverCtx); break;
   }
 
   std::this_thread::sleep_for(std::chrono::milliseconds(333));
 
   switch (senderType) {
-    case senderTyZMQ :
-      sender = std::thread(senderZMQ, &senderCtx);
-      break;
-    case senderTyAio :
-      sender = std::thread(senderAsync, &senderCtx);
-      break;
-    case senderTyCoroutine :
-      sender = std::thread(senderCoroutine, &senderCtx);
-      break;
-    case senderTyRawSend :
-      sender = std::thread(senderRaw, &senderCtx);
-      break;
+    case senderTyZMQ: sender = std::thread(senderZMQ, &senderCtx); break;
+    case senderTyAio: sender = std::thread(senderAsync, &senderCtx); break;
+    case senderTyCoroutine: sender = std::thread(senderCoroutine, &senderCtx); break;
+    case senderTyRawSend: sender = std::thread(senderRaw, &senderCtx); break;
   }
 
   sender.join();
@@ -585,12 +563,14 @@ void runBenchmark(SenderTy senderType, ReceiverTy receiverType, uint16_t port)
 
   printf("Sender=%s Receiver=%s ", SenderTyNames[senderType], ReceiverTyNames[receiverType]);
   if (receiverCtx.milliSecondsElapsed)
-    printf("rate: %.3lf messages/second; time elapsed: %.3lf sec\n", receiverCtx.received / (receiverCtx.milliSecondsElapsed/1000.0), receiverCtx.milliSecondsElapsed/1000.0);
+    printf("rate: %.3lf messages/second; time elapsed: %.3lf sec\n",
+           receiverCtx.received / (receiverCtx.milliSecondsElapsed / 1000.0),
+           receiverCtx.milliSecondsElapsed / 1000.0);
   else
     printf("rate: unknown (test failed)\n");
 }
 
-int main(int, char **)
+int main(int, char**)
 {
   initializeAsyncIo(aiNone);
   uint16_t port = gPort;

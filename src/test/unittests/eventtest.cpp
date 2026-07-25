@@ -1,7 +1,5 @@
-// aioUserEvent contract tests. The core_* suites exercise the protocol's
-// decision machinery on TestBackend; user_event* suites exercise the public
-// API on the real backend. The `event` family keeps focused regressions for
-// defects found while implementing the contract.
+// aioUserEvent contract tests. The core_* suites exercise the protocol's decision machinery on TestBackend; user_event* suites exercise the
+// public API on the real backend. The `event` family keeps focused regressions for defects found while implementing the contract.
 
 #include "coretest.h"
 #include "reactor.h"
@@ -45,11 +43,9 @@ void deletingTimerCallback(aioUserEvent *event, void *arg)
 
 using namespace std::chrono_literals;
 
-// Rendezvous between a test thread and a TestBackend hook: the hook parks in
-// enter() until the test calls open(); the test waits for the parked hook
-// with waitEntered(). Deciding WHICH hook invocation blocks stays in each
-// test's lambda, and cleanup after a failed waitEntered() stays at the call
-// site. Once open() ran, later enter() calls pass straight through.
+// Rendezvous between a test thread and a TestBackend hook: the hook parks in enter() until the test calls open(); the test waits for the parked
+// hook with waitEntered(). Deciding WHICH hook invocation blocks stays in each test's lambda, and cleanup after a failed waitEntered() stays at
+// the call site. Once open() ran, later enter() calls pass straight through.
 struct HookGate {
   std::mutex mutex;
   std::condition_variable changed;
@@ -152,8 +148,7 @@ public:
     if (loop.joinable()) {
       postQuitOperation(base);
       loop.join();
-      // The quit is sticky and the joined loop leaves the base quiescent:
-      // rearm right away so a later loop round on the same base (a second
+      // The quit is sticky and the joined loop leaves the base quiescent: rearm right away so a later loop round on the same base (a second
       // helper invocation inside one test) runs instead of replaying the stop
       resetQuitOperation(base);
     }
@@ -184,10 +179,8 @@ void drainQueuedUserEvents(asyncBase *base)
     state->changed.notify_one();
   };
 
-  // A personal kernel event is no longer a globalQueue node, so appending a
-  // quit marker would overtake it. Trigger a second personal event instead:
-  // once its callback runs, the loop still finishes the whole harvested
-  // kernel batch before observing the quit posted below.
+  // A personal kernel event is no longer a globalQueue node, so appending a quit marker would overtake it. Trigger a second personal event
+  // instead: once its callback runs, the loop still finishes the whole harvested kernel batch before observing the quit posted below.
   aioUserEvent *fence = newUserEvent(base, 0, callback, &barrier);
   ASSERT_NE(fence, nullptr);
   userEventActivate(fence);
@@ -256,8 +249,7 @@ TEST(core_user_event, claimed_manual_batch_survives_delete)
   userEventActivate(event);
   ASSERT_EQ(backend.completions.size(), 1u);
 
-  // TestBackend claims the kernel-delivery reference in activateEvent().
-  // Delete closes admission, but that accepted semaphore batch must drain.
+  // TestBackend claims the kernel-delivery reference in activateEvent(). Delete closes admission, but that accepted semaphore batch must drain.
   deleteUserEvent(event);
   EXPECT_EQ(context.destructors, 0u);
   backend.drainCompletions();
@@ -296,8 +288,7 @@ TEST(core_user_event, timer_state_is_lazy_for_a_manual_only_pool_cell)
   EXPECT_LE(sizeof(aioTimer), 2u * CACHE_LINE_SIZE);
   EXPECT_EQ(eventTimerLoad(event, amoAcquire), nullptr);
 
-  // Neither manual delivery nor a redundant Stop turns a manual-only cell
-  // into a timer-bearing one.
+  // Neither manual delivery nor a redundant Stop turns a manual-only cell into a timer-bearing one.
   userEventActivate(event);
   backend.drainCompletions();
   userEventStopTimer(event);
@@ -363,9 +354,8 @@ TEST(core_user_event, stale_timer_generation_cannot_touch_restarted_schedule)
   EXPECT_EQ(backend.startTimerCalls, 2u);
   EXPECT_EQ(backend.stopTimerCalls, 1u);
 
-  // The bucket generation changed before backend restart. Even a kernel
-  // delivery which had already copied the old event pointer cannot enqueue a
-  // control pass or spend the new counter.
+  // The bucket generation changed before backend restart. Even a kernel delivery which had already copied the old event pointer cannot enqueue
+  // a control pass or spend the new counter.
   eventTimerSignal(event, firstGeneration, incarnation, 1);
   backend.drainCompletions();
   EXPECT_EQ(context.finishes, 1u);
@@ -444,8 +434,7 @@ TEST(core_user_event, giant_kqueue_batch_is_delivered_exactly)
   uint32_t generation = backend.lastEventTimerGeneration;
   uint64_t incarnation = eventHandleGeneration(event);
 
-  // An exact multiple of 2^32 must not alias to zero in the 32-bit control
-  // lane: the precise batch travels in the side accumulator.
+  // An exact multiple of 2^32 must not alias to zero in the 32-bit control lane: the precise batch travels in the side accumulator.
   eventTimerSignal(event, generation, incarnation, (uint64_t)1 << 32);
   EXPECT_EQ(context.finishes, 5u);
   EXPECT_EQ(backend.stopTimerCalls, 1u);
@@ -493,10 +482,8 @@ TEST(core_user_event, timerfd_edge_arriving_during_read_is_not_lost)
   deleteUserEvent(event);
 }
 
-// A POSIX harvested timer envelope may still hold its permanently paired
-// timer/event storage after stop released the last logical reference. Signal
-// publication must fail instead of retaining 0 -> 1 and queuing a second
-// terminal control pass.
+// A POSIX harvested timer envelope may still hold its permanently paired timer/event storage after stop released the last logical reference.
+// Signal publication must fail instead of retaining 0 -> 1 and queuing a second terminal control pass.
 TEST(core_user_event, retired_timer_signal_cannot_resurrect_zero_ref_event)
 {
   TestBackend backend;
@@ -553,18 +540,16 @@ TEST(core_user_event, stale_timer_incarnation_cannot_claim_recycled_event)
 
   userEventStartTimer(second, 100, 1);
   uint32_t secondGeneration = backend.lastEventTimerGeneration;
-  EXPECT_NE(secondGeneration, firstGeneration) << "schedule generations must continue across reuse: reactors read the CURRENT event incarnation from the paired timer, so the generation is the only stale-envelope guard";
+  EXPECT_NE(secondGeneration, firstGeneration) << "schedule generations must continue across reuse: reactors read the CURRENT event "
+                                                  "incarnation from the paired timer, so the generation is the only stale-envelope guard";
 
-  // Model the real reactor path for a stale envelope of the previous
-  // incarnation's arm: the timer generation is the old one, but the event
-  // incarnation is re-read from the live paired timer, already overwritten
-  // by the new arm (epoll/kqueue load timer->event.generation).
+  // Model the real reactor path for a stale envelope of the previous incarnation's arm: the timer generation is the old one, but the event
+  // incarnation is re-read from the live paired timer, already overwritten by the new arm (epoll/kqueue load timer->event.generation).
   eventTimerSignal(second, firstGeneration, secondIncarnation, 1);
   backend.drainCompletions();
   EXPECT_EQ(secondContext.finishes, 0u);
 
-  // Model a stale kernel envelope whose generation happens to match the live
-  // bucket but whose arm belonged to the previous logical event.
+  // Model a stale kernel envelope whose generation happens to match the live bucket but whose arm belonged to the previous logical event.
   eventTimerSignal(second, secondGeneration, firstIncarnation, 1);
   backend.drainCompletions();
   EXPECT_EQ(secondContext.finishes, 0u);
@@ -682,9 +667,8 @@ TEST(core_user_event, timer_publisher_does_not_wait_for_a_busy_kernel_owner)
     return;
   }
 
-  // publisherReturned deliberately shares the gate's mutex, and the owner must
-  // stay parked while the publisher is measured: release it by hand inside the
-  // same critical section instead of through open().
+  // publisherReturned deliberately shares the gate's mutex, and the owner must stay parked while the publisher is measured: release it by hand
+  // inside the same critical section instead of through open().
   bool publisherReturned = false;
   eventIncrementReference(event, 1);
   std::thread publisher([&]() {
@@ -795,8 +779,7 @@ TEST(user_event, semaphore_delivers_every_activation)
   deleteUserEvent(event);
 }
 
-// Shared by the concurrent-activation pair below. Namespace scope so the
-// producer lambda reads the count without capturing it (MSVC refuses to
+// Shared by the concurrent-activation pair below. Namespace scope so the producer lambda reads the count without capturing it (MSVC refuses to
 // capture a constexpr local implicitly, C3493).
 constexpr unsigned kActivationThreads = 4;
 constexpr unsigned kActivationsPerProducer = 128;
@@ -946,8 +929,7 @@ void deleteInsideEventCb(aioUserEvent *event, void *arg)
 
   deleteUserEvent(event);
 
-  // This is application work after deleteUserEvent returns. The accepted
-  // delivery reference must keep both event storage and application state
+  // This is application work after deleteUserEvent returns. The accepted delivery reference must keep both event storage and application state
   // alive until this callback actually finishes.
   {
     std::lock_guard<std::mutex> lock(probe->mutex);
@@ -992,9 +974,8 @@ TEST(user_event_lifetime, strong_reference_keeps_terminal_event_alive_until_rele
   ASSERT_NE(event, nullptr);
   eventSetDestructorCb(event, lifetimeContractDestructor, &probe);
 
-  // This reference represents an independently using producer. The owner may
-  // close the event first; the producer still owns valid storage, observes the
-  // terminal state and releases its reference when finished.
+  // This reference represents an independently using producer. The owner may close the event first; the producer still owns valid storage,
+  // observes the terminal state and releases its reference when finished.
   eventIncrementReference(event, 1);
   deleteUserEvent(event); // closes the event and consumes one strong reference
   {
@@ -1002,9 +983,8 @@ TEST(user_event_lifetime, strong_reference_keeps_terminal_event_alive_until_rele
     EXPECT_EQ(probe.destructors, 0u);
   }
 
-  // Like copying a shared_ptr, an existing holder may copy its lifetime
-  // reference after close. This must neither reopen the event nor be confused
-  // with the exactly-once close transition already performed by delete.
+  // Like copying a shared_ptr, an existing holder may copy its lifetime reference after close. This must neither reopen the event nor be
+  // confused with the exactly-once close transition already performed by delete.
   eventIncrementReference(event, 1);
   userEventActivate(event); // safe no-op through the retained reference
   drainQueuedUserEvents(gBase);
@@ -1055,8 +1035,8 @@ TEST(user_event_lifetime, producer_threads_release_their_references_after_delete
         });
       }
 
-      // The owner has closed the event, but this thread's strong reference
-      // keeps the pointer valid and makes the operation a safe terminal no-op.
+      // The owner has closed the event, but this thread's strong reference keeps the pointer valid and makes the operation a safe terminal
+      // no-op.
       userEventActivate(event);
 
       {
@@ -1098,8 +1078,8 @@ TEST(user_event_lifetime, producer_threads_release_their_references_after_delete
   for (std::thread &producer: producers)
     producer.join();
 
-  // delete is logically synchronous but physical timer/waiter reconciliation
-  // is a queued loop task; keep draining until that internal reference drops.
+  // delete is logically synchronous but physical timer/waiter reconciliation is a queued loop task; keep draining until that internal reference
+  // drops.
   drainQueuedUserEvents(gBase);
 
   std::lock_guard<std::mutex> lock(probe.mutex);
@@ -1249,9 +1229,8 @@ void lateActionEventCb(aioUserEvent *event, void *arg)
   }
 
   if (firstCall) {
-    // deleteUserEvent has already returned in the external thread. A callback
-    // accepted before that transition may finish, but must not resurrect the
-    // event or publish a fresh timer schedule.
+    // deleteUserEvent has already returned in the external thread. A callback accepted before that transition may finish, but must not
+    // resurrect the event or publish a fresh timer schedule.
     if (action == LateCallbackAction::activate)
       userEventActivate(event);
     else
@@ -1313,9 +1292,8 @@ void verifyLateCallbackActionIsRejected(LateCallbackAction action)
   }
   probe.changed.notify_all();
 
-  // A broken implementation produces a second callback immediately (manual
-  // action) or on the 5 ms tick. A correct one reaches its destructor after
-  // the first callback. Either outcome makes this wait deterministic.
+  // A broken implementation produces a second callback immediately (manual action) or on the 5 ms tick. A correct one reaches its destructor
+  // after the first callback. Either outcome makes this wait deterministic.
   {
     std::unique_lock<std::mutex> lock(probe.mutex);
     probe.changed.wait_for(lock, 250ms, [&]() {
@@ -1405,8 +1383,7 @@ TEST(user_event_timer, zero_and_negative_counters_repeat_until_stopped)
     bool repeated = waitForEventCallbacks(probe, baseline + 3);
     userEventStopTimer(event);
 
-    // Stop does not retract a tick already accepted by the loop. Let that
-    // bounded tail drain, then require the count to become stable.
+    // Stop does not retract a tick already accepted by the loop. Let that bounded tail drain, then require the count to become stable.
     std::this_thread::sleep_for(40ms);
     unsigned settled = publicEventCallbackCount(probe);
     std::this_thread::sleep_for(40ms);
@@ -1462,8 +1439,8 @@ TEST(user_event_timer, later_start_replaces_period_and_counter)
   ASSERT_NE(event, nullptr);
 
   EventLoopThread loop(gBase);
-  // The first schedule would fire during the observation window if it were
-  // still current. Only the two callbacks from the replacement are allowed.
+  // The first schedule would fire during the observation window if it were still current. Only the two callbacks from the replacement are
+  // allowed.
   userEventStartTimer(event, 200000, 1);
   userEventStartTimer(event, 5000, 2);
   bool delivered = waitForEventCallbacks(probe, 2);
@@ -1496,8 +1473,7 @@ TEST(user_event_timer, manual_activation_does_not_consume_timer_counter)
   aioUserEvent *event = newUserEvent(gBase, 0, publicEventCb, &probe);
   ASSERT_NE(event, nullptr);
 
-  // Keep the manual delivery pending while the finite timer is armed. The
-  // manual callback is not one of the timer's two counted deliveries.
+  // Keep the manual delivery pending while the finite timer is armed. The manual callback is not one of the timer's two counted deliveries.
   userEventActivate(event);
   userEventStartTimer(event, 5000, 2);
   EventLoopThread loop(gBase);
@@ -1516,9 +1492,8 @@ TEST(user_event_timer, manual_activation_may_overlap_serialized_timer_control)
   aioUserEvent *event = newUserEvent(gBase, 1, publicEventCb, &probe);
   ASSERT_NE(event, nullptr);
 
-  // Timer control has exactly one application-side writer. Activations remain
-  // fully concurrent with that writer and must not be lost; the long period
-  // prevents the schedules themselves from contributing callbacks.
+  // Timer control has exactly one application-side writer. Activations remain fully concurrent with that writer and must not be lost; the long
+  // period prevents the schedules themselves from contributing callbacks.
   constexpr unsigned kControlIterations = 32;
   constexpr unsigned kProducerThreads = 4;
   constexpr unsigned kActivationsPerThread = 64;
@@ -1587,8 +1562,7 @@ TEST(user_event_timer, recycled_event_timer_belongs_to_its_new_base)
   asyncBase *otherBase = createAsyncBase(amOSDefault, 1);
   ASSERT_NE(otherBase, nullptr);
 
-  // Put at least one timer-bearing slot into the old base's pool. With a
-  // correct per-base pool the next allocation below is fresh; with the
+  // Put at least one timer-bearing slot into the old base's pool. With a correct per-base pool the next allocation below is fresh; with the
   // process-global pool it reuses a timer still registered on gBase.
   aioUserEvent *oldEvent = newUserEvent(gBase, 0, nullptr, nullptr);
   ASSERT_NE(oldEvent, nullptr);
@@ -1626,9 +1600,8 @@ struct CoroutineEventProbe {
 
 void retainCoroutineEvent(CoroutineEventProbe *probe)
 {
-  // The coroutine owns this reference for the complete helper call, including
-  // suspension. The test/main coroutine keeps the initial reference for its
-  // concurrent Activate/Delete calls.
+  // The coroutine owns this reference for the complete helper call, including suspension. The test/main coroutine keeps the initial reference
+  // for its concurrent Activate/Delete calls.
   eventIncrementReference(probe->event, 1);
 }
 
@@ -1740,9 +1713,8 @@ TEST(core_user_event, delete_resumes_waiter_without_timer_state)
       << "waiting must borrow the coroutine's reference, not retain another";
   EXPECT_NE(__uint64_atomic_load(&probe.event->header.tag.low, amoRelaxed) & TAG_EVENT_WAITER_COMMITTED, 0u);
 
-  // Model a normal activation paused after publishing signalState but before
-  // posting its kernel doorbell. Cancellation must make progress independently
-  // of that producer.
+  // Model a normal activation paused after publishing signalState but before posting its kernel doorbell. Cancellation must make progress
+  // independently of that producer.
   __uintptr_atomic_store(&probe.event->signalState, 1, amoRelaxed);
   deleteUserEvent(probe.event);
   EXPECT_EQ(backend.activateCalls, 1u);
@@ -1793,10 +1765,8 @@ TEST(core_user_event, delete_cancellation_is_sticky_against_late_timer_delivery)
   EXPECT_EQ(lifetime.destructors, 1u);
 }
 
-// Shared by the manual-wake pair below: an externally woken sleeper must not
-// get the concurrently accepted sleep tick back as a credit for its next
-// wait. The expectation message names each flavor's failure mode; the
-// non-semaphore flavor additionally pins that ioSleep armed the paired
+// Shared by the manual-wake pair below: an externally woken sleeper must not get the concurrently accepted sleep tick back as a credit for its
+// next wait. The expectation message names each flavor's failure mode; the non-semaphore flavor additionally pins that ioSleep armed the paired
 // timer cell.
 void verifyManualWakeDiscardsSleepTick(int isSemaphore, const char *creditMessage)
 {
@@ -1986,10 +1956,9 @@ TEST(user_event_coroutine, pending_credit_makes_sleep_return_without_arming)
     drainQueuedUserEvents(gBase);
 }
 
-// ioSleep bypasses userEventStartTimer, so its period must saturate inside
-// the eventTimerPublishConfig funnel itself: unclamped it reaches the kernel
-// wrapped (kqueue fires a negative period immediately, the iocp due time
-// lands in the past) and "sleep practically forever" returns at once.
+// ioSleep bypasses userEventStartTimer, so its period must saturate inside the eventTimerPublishConfig funnel itself: unclamped it reaches the
+// kernel wrapped (kqueue fires a negative period immediately, the iocp due time lands in the past) and "sleep practically forever" returns at
+// once.
 TEST(user_event_coroutine, huge_sleep_saturates_instead_of_returning_at_once)
 {
   CoroutineEventProbe probe;
@@ -2032,8 +2001,7 @@ TEST(user_event_coroutine, external_wake_cancels_sleep_without_crediting_next_wa
   userEventActivate(probe.event);
   bool externallyWoken = waitForCoroutinePhase(probe, 1);
 
-  // Wait well past the original sleep deadline. Its canceled generation must
-  // not resume the second wait or leave it a credit.
+  // Wait well past the original sleep deadline. Its canceled generation must not resume the second wait or leave it a credit.
   std::this_thread::sleep_for(200ms);
   EXPECT_TRUE(externallyWoken);
   EXPECT_EQ(probe.phase.load(std::memory_order_acquire), 1u) << "late tick from the externally-woken sleep resumed the next wait";
@@ -2175,8 +2143,7 @@ TEST(event, iosleep_leaves_deleted_sentinel_intact)
   aioUserEvent *event = newUserEvent(&backend.base, 0, nullptr, nullptr);
   ASSERT_NE(event, nullptr);
 
-  // A delete can land between ioSleep's liveness check and its credit
-  // inspection; the consume must back off instead of doing arithmetic on the
+  // A delete can land between ioSleep's liveness check and its credit inspection; the consume must back off instead of doing arithmetic on the
   // terminal sentinel.
   __uint64_atomic_store(&event->waiter.low, ewtDeleted, amoRelaxed);
   __uint64_atomic_store(&event->waiter.high, 7, amoRelaxed);

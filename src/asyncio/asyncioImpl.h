@@ -211,11 +211,11 @@ static inline AsyncOpTaggedPtr taggedAsyncOpMake(asyncOpRoot *op)
   return result;
 }
 
-static inline void taggedAsyncOpDecode(AsyncOpTaggedPtr ptr, asyncOpRoot **op, uint32_t *tag)
+static inline void taggedAsyncOpDecode(AsyncOpTaggedPtr ptr, asyncOpRoot**op, uint32_t *tag)
 {
   const uintptr_t mask = (STATIC_CAST(uintptr_t, 1) << COMBINER_TAG_SIZE) - 1;
   *op = (asyncOpRoot*)(ptr.data & ~mask);
-  *tag = STATIC_CAST(uint32_t, ptr.data & mask);
+  *tag = STATIC_CAST(uint32_t, ptr.data &mask);
 }
 
 static inline int combinerPushValidated(aioObjectRoot *object, uint64_t generation, uint32_t tag)
@@ -266,8 +266,7 @@ static inline asyncOpRoot *combinerAcquire(aioObjectRoot *object,
   if (head.data)
     return allocated;
 
-  if (queue->head || object->initializationOp ||
-      __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
+  if (queue->head || object->initializationOp || __uint_atomic_load(&object->DeletePending, amoRelaxed)) {
     if (!allocated) {
       allocated = newAsyncOp(object, flags, usTimeout, callback, arg, opCode, contextPtr);
       allocatedTagged = taggedAsyncOpMake(allocated);
@@ -341,8 +340,7 @@ static inline void runAioOperation(aioObjectRoot *object,
     AsyncOpTaggedPtr forRun = taggedAsyncOpNull();
     asyncOpRoot *op = syncImpl(object, flags, usTimeout, callback, arg, contextPtr);
     if (!op) {
-      if (callback == 0 || ((flags & afActiveOnce) &&
-                            currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
+      if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION)) {
         makeResult(contextPtr);
       } else {
         if (flags & afActiveOnce)
@@ -372,8 +370,7 @@ static inline asyncOpRoot *runIoOperation(aioObjectRoot *object,
 {
   assert(!coroutineIsMain() && "Trying to run 'io' operation from main coroutine");
   List *queue = !(opCode & OPCODE_WRITE) ? &object->readQueue : &object->writeQueue;
-  asyncOpRoot *op = combinerAcquire(object, queue, createAsyncOp, flags | afCoroutine,
-                                    usTimeout, 0, 0, opCode, contextPtr);
+  asyncOpRoot *op = combinerAcquire(object, queue, createAsyncOp, flags | afCoroutine, usTimeout, 0, 0, opCode, contextPtr);
   if (!op) {
     AsyncOpTaggedPtr forRun = taggedAsyncOpNull();
     op = syncImpl(object, flags | afCoroutine, usTimeout, 0, 0, contextPtr);
@@ -412,11 +409,8 @@ static inline uint32_t combinerActiveIoEvents(aioObjectRoot *object)
 {
   asyncOpRoot *initialization = object->initializationOp;
   if (initialization)
-    return combinerSelectActiveIoEvents(1, initialization->running,
-                                        initialization->opCode & OPCODE_WRITE, 0, 0);
-  return combinerSelectActiveIoEvents(0, arWaiting, 0,
-                                      object->readQueue.head != 0,
-                                      object->writeQueue.head != 0);
+    return combinerSelectActiveIoEvents(1, initialization->running, initialization->opCode & OPCODE_WRITE, 0, 0);
+  return combinerSelectActiveIoEvents(0, arWaiting, 0, object->readQueue.head != 0, object->writeQueue.head != 0);
 }
 
 typedef enum CombinerInitializationAction {

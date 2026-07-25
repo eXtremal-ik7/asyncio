@@ -33,10 +33,8 @@ typedef struct epollBase {
 
 typedef struct EPollObject {
   aioObject Object;
-  // Whether the fd is currently in the epoll set. Registration is lazy:
-  // EPOLLERR/EPOLLHUP ignore the requested mask, so an idle object with a
-  // pending error condition would wake every epoll_wait if its fd stayed
-  // in the set with an empty mask. Only touched under the object combiner.
+  // Whether the fd is currently in the epoll set. Registration is lazy: EPOLLERR/EPOLLHUP ignore the requested mask, so an idle object with a
+  // pending error condition would wake every epoll_wait if its fd stayed in the set with an empty mask. Only touched under the object combiner.
   uint32_t Registered;
 } EPollObject;
 __NO_PADDING_END
@@ -59,29 +57,27 @@ AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr);
 static int epollMonotonicNow(uint64_t *nowNs);
 static int epollTimerPublish(aioTimer *timer, asyncBase *target, uint64_t envelope, uint32_t events);
 
-static struct asyncImpl epollImpl = {
-  combinerTaskHandler,
-  epollEnqueue,
-  epollNextFinishedOperation,
-  epollNewAioObject,
-  newAsyncOp,
-  cancelAsyncOp,
-  epollInitializeTimer,
-  epollStartTimer,
-  epollStopTimer,
-  epollInitializeUserEvent,
-  epollActivate,
-  connectSyscall,
-  acceptSyscall,
-  readSyscall,
-  epollAsyncWrite,
-  readMsgSyscall,
-  writeMsgSyscall,
-  epollWakeupLoop,
-  epollUpdateEventTimer,
-  epollConsumeEventTimerTick,
-  epollReleaseUserEvent
-};
+static struct asyncImpl epollImpl = {combinerTaskHandler,
+                                     epollEnqueue,
+                                     epollNextFinishedOperation,
+                                     epollNewAioObject,
+                                     newAsyncOp,
+                                     cancelAsyncOp,
+                                     epollInitializeTimer,
+                                     epollStartTimer,
+                                     epollStopTimer,
+                                     epollInitializeUserEvent,
+                                     epollActivate,
+                                     connectSyscall,
+                                     acceptSyscall,
+                                     readSyscall,
+                                     epollAsyncWrite,
+                                     readMsgSyscall,
+                                     writeMsgSyscall,
+                                     epollWakeupLoop,
+                                     epollUpdateEventTimer,
+                                     epollConsumeEventTimerTick,
+                                     epollReleaseUserEvent};
 
 static int epollControl(int epollFd, int action, uint32_t events, int fd, uint64_t envelope)
 {
@@ -114,9 +110,8 @@ asyncBase *epollNewAsyncBase()
     base->B.methodImpl = epollImpl;
     base->epollFd = epoll_create(MAX_EVENTS);
     if (base->eventFd == -1 || base->epollFd == -1) {
-      // Descriptor exhaustion. A base without its epoll set or its doorbell
-      // eventfd cannot run a message loop: fail creation instead of returning
-      // an object that spins on EBADF
+      // Descriptor exhaustion. A base without its epoll set or its doorbell eventfd cannot run a message loop: fail creation instead of
+      // returning an object that spins on EBADF
       if (base->eventFd != -1)
         close(base->eventFd);
       if (base->epollFd != -1)
@@ -133,14 +128,10 @@ asyncBase *epollNewAsyncBase()
       return 0;
     }
 
-    // The event fd bypasses the combiner logic, so register it here
-    // explicitly. Edge-triggered: every eventfd_write raises a fresh edge,
-    // so the message loop drains the counter without a re-arm syscall
-    if (epollControl(base->epollFd,
-                     EPOLL_CTL_ADD,
-                     EPOLLIN | EPOLLET,
-                     base->eventFd,
-                     kernelHandleEncode(&base->eventObject->root.header)) == -1) {
+    // The event fd bypasses the combiner logic, so register it here explicitly. Edge-triggered: every eventfd_write raises a fresh edge, so the
+    // message loop drains the counter without a re-arm syscall
+    if (epollControl(base->epollFd, EPOLL_CTL_ADD, EPOLLIN | EPOLLET, base->eventFd, kernelHandleEncode(&base->eventObject->root.header)) ==
+        -1) {
       close(base->eventFd);
       base->eventObject->hDevice = -1;
       objectFree(&objectPool, base->eventObject, sizeof(EPollObject));
@@ -164,9 +155,8 @@ void epollEnqueue(asyncBase *base, asyncOpRoot *op)
 
 void epollWakeupLoop(asyncBase *base)
 {
-  // Pure kick, no queue node. The eventfd is EPOLLIN|EPOLLET-registered: the
-  // write raises an edge that wakes one sleeper, which drains the counter;
-  // with nobody sleeping the next epoll_wait returns once immediately
+  // Pure kick, no queue node. The eventfd is EPOLLIN|EPOLLET-registered: the write raises an edge that wakes one sleeper, which drains the
+  // counter; with nobody sleeping the next epoll_wait returns once immediately
   eventfd_write(((epollBase*)base)->eventFd, 1);
 }
 
@@ -182,8 +172,8 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
     uint32_t currentEvents = epollEvents(pass.oldIoEvents);
     uint32_t newEvents;
 
-    // Calculate the current mask because no fd->mask map is kept. Any delivered
-    // event consumes the EPOLLONESHOT shot, whatever direction it carries.
+    // Calculate the current mask because no fd->mask map is kept. Any delivered event consumes the EPOLLONESHOT shot, whatever direction it
+    // carries.
     if (pass.ioEvents)
       currentEvents = 0;
 
@@ -205,11 +195,9 @@ void combinerTaskHandler(aioObjectRoot *object, asyncOpRoot *op, uint32_t sig)
                      kernelHandleEncode(&fdObject->Object.root.header));
       }
     } else if (currentEvents) {
-      // No operation left on an armed fd: remove it from the set instead of
-      // keeping it with an empty mask - EPOLLERR/EPOLLHUP ignore the mask and
-      // would wake every epoll_wait for as long as the error condition holds.
-      // An fd disarmed by a delivered EPOLLONESHOT shot stays fully silent,
-      // so that state is left in the set as is
+      // No operation left on an armed fd: remove it from the set instead of keeping it with an empty mask - EPOLLERR/EPOLLHUP ignore the mask
+      // and would wake every epoll_wait for as long as the error condition holds. An fd disarmed by a delivered EPOLLONESHOT shot stays fully
+      // silent, so that state is left in the set as is
       epollControl(base->epollFd, EPOLL_CTL_DEL, 0, fd, 0);
       fdObject->Registered = 0;
     }
@@ -229,8 +217,7 @@ void epollNextFinishedOperation(asyncBase *base)
     do {
       executeGlobalQueue(base);
 
-      // Checked after the drain (already-queued callbacks run) and before
-      // every kernel wait; the exit re-rings the doorbell while other threads
+      // Checked after the drain (already-queued callbacks run) and before every kernel wait; the exit re-rings the doorbell while other threads
       // remain registered, so one postQuitOperation reaches every sleeper
       if (__uintptr_atomic_load(&base->quitRequested, amoAcquire)) {
         if (loopThreadExit(base))
@@ -238,16 +225,14 @@ void epollNextFinishedOperation(asyncBase *base)
         return;
       }
 
-      // UINT32_MAX = wait with no timeout: an idle base blocks until queue
-      // traffic, a timer-arm kick or kernel readiness supplies a doorbell.
+      // UINT32_MAX = wait with no timeout: an idle base blocks until queue traffic, a timer-arm kick or kernel readiness supplies a doorbell.
       uint64_t sleepFrom = getMonotonicTicks();
       uint64_t wakeTick = timerLoopPrepareSleep(base, timerState, sleepFrom);
       uint32_t sleepMs = timerSleepMilliseconds(wakeTick);
       nfds = epoll_wait(localBase->epollFd, events, MAX_EVENTS, sleepMs == UINT32_MAX ? -1 : (int)sleepMs);
       timerLoopCancelSleep(timerState);
-      // Unconditional sweep (the modulo election is gone): an idle pass costs
-      // one relaxed load, and the wakeup handshake relies on whichever thread
-      // the kick lands on doing the sweep itself
+      // Unconditional sweep (the modulo election is gone): an idle pass costs one relaxed load, and the wakeup handshake relies on whichever
+      // thread the kick lands on doing the sweep itself
       processTimeoutQueue(base, timerState, getMonotonicTicks());
     } while (nfds <= 0 && errno == EINTR);
 
@@ -275,8 +260,7 @@ void epollNextFinishedOperation(asyncBase *base)
         case ohtTimer: {
           aioTimer *timer = (aioTimer*)header;
           if (timer->header.timer.kind == tkUserEvent) {
-            // Publish one provisional tick. The owner replaces it with the
-            // accumulated timerfd count after it has serialized against
+            // Publish one provisional tick. The owner replaces it with the accumulated timerfd count after it has serialized against
             // start/stop.
             uint64_t timerGeneration = __uint64_atomic_load(&timer->header.tag.high, amoAcquire);
             int isStale = timerGeneration != generation;
@@ -301,7 +285,7 @@ void epollNextFinishedOperation(asyncBase *base)
           uint64_t deadline = __uint64_atomic_load(&timer->operation.deadline, amoRelaxed);
           isStale |= now < deadline;
           if (!isStale) {
-            aioObjectRoot *object = (aioObjectRoot*)__pointer_atomic_load((void *volatile*)&timer->operation.object, amoRelaxed);
+            aioObjectRoot *object = (aioObjectRoot*)__pointer_atomic_load((void* volatile*)&timer->operation.object, amoRelaxed);
             uint64_t objectGeneration = __uint64_atomic_load(&timer->operation.objectGeneration, amoRelaxed);
             (void)opCancel(timer->operation.op, timerGeneration, status, object, objectGeneration);
           }
@@ -311,17 +295,15 @@ void epollNextFinishedOperation(asyncBase *base)
         case ohtObject: {
           aioObject *object = (aioObject*)header;
           if (object == localBase->eventObject) {
-            // Drain only: a write landing after this read raises a fresh
-            // edge, EAGAIN means a sibling won the drain race - neither
-            // case needs a re-arm
+            // Drain only: a write landing after this read raises a fresh edge, EAGAIN means a sibling won the drain race - neither case needs a
+            // re-arm
             eventfd_t eventValue;
             eventfd_read(localBase->eventFd, &eventValue);
             break;
           }
 
-          // Encode kernel readiness straight into combiner tag bits (their
-          // values deliberately match IO_EVENT_*): EPOLLERR/EPOLLHUP wake
-          // both directions, EPOLLRDHUP additionally raises the error sweep.
+          // Encode kernel readiness straight into combiner tag bits (their values deliberately match IO_EVENT_*): EPOLLERR/EPOLLHUP wake both
+          // directions, EPOLLRDHUP additionally raises the error sweep.
           uint32_t bits = 0;
           if (events[n].events & (EPOLLIN | EPOLLERR | EPOLLHUP))
             bits |= COMBINER_TAG_PROGRESS_READ;
@@ -472,8 +454,7 @@ static void epollTimerRollbackArm(aioTimer *timer)
 
 void epollStartTimer(asyncOpRoot *op)
 {
-  // The paired cell is created once per pooled slot; a constructor-time
-  // allocation failure must not disable this slot's timeouts forever.
+  // The paired cell is created once per pooled slot; a constructor-time allocation failure must not disable this slot's timeouts forever.
   aioTimer *timer = (aioTimer*)opEnsureTimerCell(op);
   if (!timer) {
     (void)opSetStatus(op, opGetGeneration(op), aosUnknownError);
@@ -491,9 +472,9 @@ void epollStartTimer(asyncOpRoot *op)
   uint64_t generation = opGetGeneration(op);
 
   timerPublishBegin(timer);
-    __uint64_atomic_store(&timer->operation.deadline, deadline, amoRelaxed);
-    __pointer_atomic_store((void *volatile*)&timer->operation.object, object, amoRelaxed);
-    __uint64_atomic_store(&timer->operation.objectGeneration, objectHeaderGeneration(&object->header), amoRelaxed);
+  __uint64_atomic_store(&timer->operation.deadline, deadline, amoRelaxed);
+  __pointer_atomic_store((void* volatile*)&timer->operation.object, object, amoRelaxed);
+  __uint64_atomic_store(&timer->operation.objectGeneration, objectHeaderGeneration(&object->header), amoRelaxed);
   timerPublishEnd(timer, generation, 1);
 
   uint64_t envelope = kernelHandleEncode(&timer->header);
@@ -517,7 +498,7 @@ static int epollStartTimerGeneration(aioUserEvent *event, aioTimer *timer, uint3
   }
 
   timerPublishBegin(timer);
-    __uint64_atomic_store(&timer->event.generation, eventHandleGeneration(event), amoRelease);
+  __uint64_atomic_store(&timer->event.generation, eventHandleGeneration(event), amoRelease);
   timerPublishEnd(timer, generation, 1);
 
   uint64_t envelope = kernelHandleEncode(&timer->header);
@@ -565,8 +546,7 @@ int epollActivate(aioUserEvent *event)
   do {
     result = eventfd_write((int)event->activationId, value);
   } while (result == -1 && errno == EINTR);
-  // EAGAIN means the eventfd counter is saturated and therefore already
-  // readable; the manual signalState, not the kernel counter, carries exact
+  // EAGAIN means the eventfd counter is saturated and therefore already readable; the manual signalState, not the kernel counter, carries exact
   // multiplicity.
   return result == 0 || errno == EAGAIN;
 }
@@ -630,8 +610,8 @@ void epollReleaseUserEvent(aioUserEvent *event)
     timer->header.timer.registered = 0;
     timer->header.base = event->header.base;
   }
-  // The timer cell is the physical lifetime anchor for stale epoll batches;
-  // keep event<->timer immutable and return them to the pool as one unit.
+  // The timer cell is the physical lifetime anchor for stale epoll batches; keep event<->timer immutable and return them to the pool as one
+  // unit.
   objectFree(&event->header.base->eventPool, event, sizeof(aioUserEvent));
 }
 
@@ -641,8 +621,7 @@ AsyncOpStatus epollAsyncWrite(asyncOpRoot *opptr)
   aioObject *object = (aioObject*)op->root.object;
   int fd = getFd(object);
 
-  // Linux has no per-descriptor SIGPIPE suppression, so sockets take an
-  // explicit MSG_NOSIGNAL send; pipes go through the masking write helper.
+  // Linux has no per-descriptor SIGPIPE suppression, so sockets take an explicit MSG_NOSIGNAL send; pipes go through the masking write helper.
   ssize_t bytesWritten;
   if (object->root.header.objectType == ioObjectSocket)
     bytesWritten = send(fd, (uint8_t*)op->buffer + op->bytesTransferred, op->transactionSize - op->bytesTransferred, MSG_NOSIGNAL);

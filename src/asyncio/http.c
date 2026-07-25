@@ -35,8 +35,7 @@ struct HTTPOp {
   size_t dataSize;
 };
 
-// Pooled operations keep their scratch buffer up to this size (matches the
-// transport's default read-ahead buffer); larger request captures are
+// Pooled operations keep their scratch buffer up to this size (matches the transport's default read-ahead buffer); larger request captures are
 // returned to the allocator on completion
 static const size_t POOLED_BUFFER_SIZE_LIMIT = 16384;
 
@@ -53,8 +52,7 @@ static int cancel(asyncOpRoot *opptr)
   return 0;
 }
 
-// httpConnectCb and httpRequestCb are the same function type, so connect and
-// request operations share one finish thunk
+// httpConnectCb and httpRequestCb are the same function type, so connect and request operations share one finish thunk
 static void operationFinish(asyncOpRoot *opptr)
 {
   ((httpRequestCb*)opptr->callback)(opGetStatus(opptr), (HTTPClient*)opptr->object, opptr->arg);
@@ -76,13 +74,12 @@ static void httpsResumeProc(AsyncOpStatus status, SSLSocket *object, size_t tran
   resumeParent((asyncOpRoot*)arg, status);
 }
 
-
 static void httpRequestProc(AsyncOpStatus status, aioObject *object, size_t transferred, void *arg)
 {
   __UNUSED(object);
   asyncOpRoot *opptr = (asyncOpRoot*)arg;
   HTTPClient *client = (HTTPClient*)opptr->object;
-  httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset+transferred);
+  httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset + transferred);
   resumeParent(opptr, status);
 }
 
@@ -91,7 +88,7 @@ static void httpsRequestProc(AsyncOpStatus status, SSLSocket *object, size_t tra
   __UNUSED(object);
   asyncOpRoot *opptr = (asyncOpRoot*)arg;
   HTTPClient *client = (HTTPClient*)opptr->object;
-  httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset+transferred);
+  httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset + transferred);
   resumeParent(opptr, status);
 }
 
@@ -140,25 +137,13 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
     size_t bytesTransferred = 0;
     op->state = 1;
     if (client->isHttps) {
-      ssize_t result = aioSslWrite(client->sslSocket,
-                                   op->internalBuffer,
-                                   op->dataSize,
-                                   afWaitAll | afActiveOnce,
-                                   0,
-                                   httpsResumeProc,
-                                   op);
+      ssize_t result = aioSslWrite(client->sslSocket, op->internalBuffer, op->dataSize, afWaitAll | afActiveOnce, 0, httpsResumeProc, op);
       if (result < 0)
         return (AsyncOpStatus)-result;
       bytesTransferred = (size_t)result;
     } else {
-      asyncOpRoot *childOp = implWrite(client->plainSocket,
-                                       op->internalBuffer,
-                                       op->dataSize,
-                                       afWaitAll,
-                                       0,
-                                       httpResumeProc,
-                                       op,
-                                       &bytesTransferred);
+      asyncOpRoot *childOp =
+          implWrite(client->plainSocket, op->internalBuffer, op->dataSize, afWaitAll, 0, httpResumeProc, op, &bytesTransferred);
       if (childOp) {
         combinerPushOperation(childOp);
         return aosPending;
@@ -170,42 +155,35 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
 
   for (;;) {
     switch (httpParse(&client->state, client->headerTable, op->parseCallback, op->parseArg)) {
-      case ParserResultOk : {
+      case ParserResultOk: {
         HttpComponent component;
         component.type = httpDtFinalize;
         op->parseCallback(&component, op->parseArg);
-        return aosSuccess;  
+        return aosSuccess;
       }
-      case ParserResultNeedMoreData : {
+      case ParserResultNeedMoreData: {
         size_t offset = httpDataRemaining(&client->state);
         if (offset == client->inBufferSize) {
-          // a message element larger than the buffer can never complete;
-          // reading 0 bytes below would spin this loop forever
+          // a message element larger than the buffer can never complete; reading 0 bytes below would spin this loop forever
           return aosBufferTooSmall;
         }
 
-        // move 'tail' to begin of buffer; the regions overlap when the parser
-        // consumed less than half of the buffered data
+        // move 'tail' to begin of buffer; the regions overlap when the parser consumed less than half of the buffered data
         if (offset)
           memmove(client->inBuffer, httpDataPtr(&client->state), offset);
 
         size_t bytesTransferred = 0;
         client->inBufferOffset = offset;
         if (client->isHttps) {
-          ssize_t result = aioSslRead(client->sslSocket,
-                                      client->inBuffer+offset,
-                                      client->inBufferSize-offset,
-                                      afActiveOnce,
-                                      0,
-                                      httpsRequestProc,
-                                      op);
+          ssize_t result =
+              aioSslRead(client->sslSocket, client->inBuffer + offset, client->inBufferSize - offset, afActiveOnce, 0, httpsRequestProc, op);
           if (result < 0)
             return (AsyncOpStatus)-result;
           bytesTransferred = (size_t)result;
         } else {
           asyncOpRoot *readOp = implRead(client->plainSocket,
-                                         client->inBuffer+offset,
-                                         client->inBufferSize-offset,
+                                         client->inBuffer + offset,
+                                         client->inBufferSize - offset,
                                          afNone,
                                          0,
                                          httpRequestProc,
@@ -216,13 +194,12 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
             return aosPending;
           }
         }
-        httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset+bytesTransferred);
+        httpSetBuffer(&client->state, client->inBuffer, client->inBufferOffset + bytesTransferred);
         break;
       }
 
-      case ParserResultCancelled :
-      case ParserResultError :
-        return aosUnknownError;
+      case ParserResultCancelled:
+      case ParserResultError: return aosUnknownError;
     }
   }
 }
@@ -269,16 +246,15 @@ void httpParseDefaultInit(HTTPParseDefaultContext *context, HTTPClient *client)
     httpClientSetHeaderTable(client, &httpParseDefaultTable);
 }
 
-// Offset 0 is a real position in the accumulation buffer (Content-Type is
-// stored first when present, a body without Content-Type starts at 0 too),
-// so the absent-field marker must live outside the valid range
+// Offset 0 is a real position in the accumulation buffer (Content-Type is stored first when present, a body without Content-Type starts at 0
+// too), so the absent-field marker must live outside the valid range
 static const size_t absentOffset = (size_t)-1;
 
 void httpParseDefault(HttpComponent *component, void *arg)
 {
   HTTPParseDefaultContext *context = (HTTPParseDefaultContext*)arg;
   switch (component->type) {
-    case httpDtInitialize : {
+    case httpDtInitialize: {
       context->contentTypeOffset = absentOffset;
       context->bodyOffset = absentOffset;
       context->contentType.data = 0;
@@ -290,16 +266,16 @@ void httpParseDefault(HttpComponent *component, void *arg)
       break;
     }
 
-    case httpDtStartLine : {
+    case httpDtStartLine: {
       context->resultCode = component->startLine.code;
       break;
     }
 
-    case httpDtHeaderEntry : {
+    case httpDtHeaderEntry: {
       switch (component->header.entryType) {
-        case hpdContentType : {
+        case hpdContentType: {
           context->contentTypeOffset = context->buffer.offset;
-          char *out = (char*)dynamicBufferAlloc(&context->buffer, component->header.stringValue.size+1);
+          char *out = (char*)dynamicBufferAlloc(&context->buffer, component->header.stringValue.size + 1);
           memcpy(out, component->header.stringValue.data, component->header.stringValue.size);
           out[component->header.stringValue.size] = 0;
           context->contentType.size = component->header.stringValue.size;
@@ -310,17 +286,17 @@ void httpParseDefault(HttpComponent *component, void *arg)
       break;
     }
 
-    case httpDtData :
-    case httpDtDataFragment : {
+    case httpDtData:
+    case httpDtDataFragment: {
       if (context->bodyOffset == absentOffset)
-          context->bodyOffset = context->buffer.offset;
+        context->bodyOffset = context->buffer.offset;
 
       char *out = (char*)dynamicBufferAlloc(&context->buffer, component->data.size);
       memcpy(out, component->data.data, component->data.size);
       break;
     }
 
-    case httpDtFinalize : {
+    case httpDtFinalize: {
       *(char*)dynamicBufferAlloc(&context->buffer, 1) = 0;
       if (context->contentTypeOffset != absentOffset)
         context->contentType.data = (char*)context->buffer.data + context->contentTypeOffset;
@@ -347,15 +323,12 @@ static void httpClientDestructor(aioObjectRoot *root)
   objectFree(&objectPool, client, sizeof(HTTPClient));
 }
 
-// Shared constructor body; `socket` is stored into the union member selected
-// by isHttps
+// Shared constructor body; `socket` is stored into the union member selected by isHttps
 static HTTPClient *httpClientNewCommon(asyncBase *base, void *socket, int isHttps)
 {
   if (!socket)
     return 0;
-  HTTPClient *client = (HTTPClient*)objectAlloc(&objectPool,
-                                                sizeof(HTTPClient),
-                                                16);
+  HTTPClient *client = (HTTPClient*)objectAlloc(&objectPool, sizeof(HTTPClient), 16);
   if (!client)
     return 0;
   if (!client->inBuffer) {
@@ -400,9 +373,8 @@ void httpClientDelete(HTTPClient *client)
   objectDelete(&client->root);
 }
 
-// Copies caller data into the operation-owned scratch buffer, growing it when
-// needed (a fresh operation starts with an empty buffer and pooled operations
-// reuse it; realloc of a null buffer is the first allocation)
+// Copies caller data into the operation-owned scratch buffer, growing it when needed (a fresh operation starts with an empty buffer and pooled
+// operations reuse it; realloc of a null buffer is the first allocation)
 static void httpOpSetData(HTTPOp *op, const void *data, size_t size)
 {
   if (op->internalBufferSize < size) {
@@ -442,12 +414,11 @@ void aioHttpRequest(HTTPClient *client,
                     httpRequestCb callback,
                     void *arg)
 {
-  HTTPOp *op = allocHttpOp(httpParseStart, operationFinish, client, httpOpConnect, parseCallback, parseArg,
-                           (void*)callback, arg, afNone, usTimeout);
+  HTTPOp *op =
+      allocHttpOp(httpParseStart, operationFinish, client, httpOpConnect, parseCallback, parseArg, (void*)callback, arg, afNone, usTimeout);
   httpOpSetData(op, request, requestSize);
   combinerPushOperation(&op->root);
 }
-
 
 int ioHttpConnect(HTTPClient *client, const HostAddress *address, const char *tlsextHostName, uint64_t usTimeout)
 {

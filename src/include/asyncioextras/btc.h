@@ -10,7 +10,8 @@ enum btcStatusTy {
   btcInvalidChecksum
 };
 
-static inline AsyncOpStatus btcMakeStatus(btcStatusTy status) {
+static inline AsyncOpStatus btcMakeStatus(btcStatusTy status)
+{
   return static_cast<AsyncOpStatus>(status);
 }
 
@@ -24,8 +25,22 @@ void btcSocketDelete(BTCSocket *socket);
 aioObject *btcGetPlainSocket(BTCSocket *socket);
 void btcSocketSetMagic(BTCSocket *socket, uint32_t magic);
 
-ssize_t aioBtcRecv(BTCSocket *socket, char command[12], xmstream &stream, size_t sizeLimit, AsyncFlags flags, uint64_t timeout, btcRecvCb callback, void *arg);
-ssize_t aioBtcSend(BTCSocket *socket, const char *command, void *data, size_t size, AsyncFlags flags, uint64_t timeout, btcSendCb callback, void *arg);
+ssize_t aioBtcRecv(BTCSocket *socket,
+                   char command[12],
+                   xmstream &stream,
+                   size_t sizeLimit,
+                   AsyncFlags flags,
+                   uint64_t timeout,
+                   btcRecvCb callback,
+                   void *arg);
+ssize_t aioBtcSend(BTCSocket *socket,
+                   const char *command,
+                   void *data,
+                   size_t size,
+                   AsyncFlags flags,
+                   uint64_t timeout,
+                   btcSendCb callback,
+                   void *arg);
 
 ssize_t ioBtcRecv(BTCSocket *socket, char command[12], xmstream &stream, size_t sizeLimit, AsyncFlags flags, uint64_t timeout);
 ssize_t ioBtcSend(BTCSocket *socket, const char *command, void *data, size_t size, AsyncFlags flags, uint64_t timeout);

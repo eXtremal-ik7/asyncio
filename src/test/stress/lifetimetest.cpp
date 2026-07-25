@@ -1,17 +1,13 @@
-// Object lifetime stress. Worker threads create aio objects, park
-// operations on them, feed them datagrams and destroy them while several
-// loop threads race to deliver completions, timeouts and readiness events -
-// the concurrent counterpart of the deterministic unittest lifetime suite.
+// Object lifetime stress. Worker threads create aio objects, park operations on them, feed them datagrams and destroy them while several loop
+// threads race to deliver completions, timeouts and readiness events - the concurrent counterpart of the deterministic unittest lifetime suite.
 // Checked invariants:
 //   - every submitted operation reports exactly once (none lost, none twice);
 //   - the destructor callback fires exactly once per object and no callback
 //     of that object fires after it;
 //   - the system drains: a stall means a jammed combiner or a lost wakeup.
-// The actual memory errors (touching a destroyed object from a combiner
-// chain, cross-object corruption through recycled memory) are the address
-// sanitizer's job: configure with -DBUILD_SANITIZE_ADDRESS=ON - objects
-// parked in the recycling pools are asan-poisoned, so stale touches report
-// use-after-poison while the allocation pattern stays production-like.
+// The actual memory errors (touching a destroyed object from a combiner chain, cross-object corruption through recycled memory) are the address
+// sanitizer's job: configure with -DBUILD_SANITIZE_ADDRESS=ON - objects parked in the recycling pools are asan-poisoned, so stale touches
+// report use-after-poison while the allocation pattern stays production-like.
 //
 // Usage: lifetimetest [workers] [loopThreads] [iterations] [opsPerObject] [seed]
 
@@ -38,12 +34,10 @@ struct ObjectCtx {
   std::atomic<unsigned> callbacks{0};
   std::atomic<unsigned> destructors{0};
   std::atomic<unsigned> afterDestructor{0};
-  // Raw handle for the post-mortem dump: a stuck object is alive by
-  // definition (references pin it), so peeking at it from the stalled
-  // verdict path is safe - everything is quiescent by then
+  // Raw handle for the post-mortem dump: a stuck object is alive by definition (references pin it), so peeking at it from the stalled verdict
+  // path is safe - everything is quiescent by then
   aioObjectRoot *handle{nullptr};
-  // Every submission gets its own slot: concurrent reads into one shared
-  // buffer would be a data race between the sync fast path and a parked
+  // Every submission gets its own slot: concurrent reads into one shared buffer would be a data race between the sync fast path and a parked
   // operation executed by the combiner - a race of the test, not the library
   std::atomic<unsigned> bufferSlot{0};
   char buffer[64 * sizeof(uint32_t)];
@@ -73,14 +67,13 @@ static void lifetimeDestructorCb(aioObjectRoot*, void *arg)
   destructorsFired.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Extra STALL breakdown of this suite: whether the stranded work is missing
-// callbacks (operations hold references), a lost delete, or a destructor
-// that outran its callbacks
+// Extra STALL breakdown of this suite: whether the stranded work is missing callbacks (operations hold references), a lost delete, or a
+// destructor that outran its callbacks
 static void classifyStalledObjects(const std::vector<std::deque<ObjectCtx>> &arenas)
 {
   unsigned stuckWithCallbacksMissing = 0, stuckCallbacksComplete = 0, destroyedCallbacksMissing = 0;
-  for (auto &arena : arenas) {
-    for (auto &ctx : arena) {
+  for (auto &arena: arenas) {
+    for (auto &ctx: arena) {
       bool complete = ctx.callbacks.load() == ctx.expected.load();
       if (!ctx.destructors.load())
         complete ? stuckCallbacksComplete++ : stuckWithCallbacksMissing++;
@@ -88,9 +81,12 @@ static void classifyStalledObjects(const std::vector<std::deque<ObjectCtx>> &are
         destroyedCallbacksMissing++;
     }
   }
-  fprintf(stderr, "  stuck objects: %u with missing callbacks (stranded operations hold references), "
-                  "%u with all callbacks (lost delete), %u destroyed but callbacks missing\n",
-          stuckWithCallbacksMissing, stuckCallbacksComplete, destroyedCallbacksMissing);
+  fprintf(stderr,
+          "  stuck objects: %u with missing callbacks (stranded operations hold references), "
+          "%u with all callbacks (lost delete), %u destroyed but callbacks missing\n",
+          stuckWithCallbacksMissing,
+          stuckCallbacksComplete,
+          destroyedCallbacksMissing);
 }
 
 static void submitRead(aioObject *object, ObjectCtx *ctx, AsyncFlags flags, uint64_t usTimeout)
@@ -135,48 +131,37 @@ static void worker(unsigned id, unsigned iterations, unsigned opsPerObject, unsi
     objectSetDestructorCb(ctx->handle, lifetimeDestructorCb, ctx);
 
     for (unsigned k = 0; k < opsPerObject; k++) {
-      // A mix of arming modes so the delete races different completion
-      // sources: nothing (cancel is the only way out), a precise per-op
-      // timer, the second-grid timer
+      // A mix of arming modes so the delete races different completion sources: nothing (cancel is the only way out), a precise per-op timer,
+      // the second-grid timer
       switch (rng() % 4) {
         case 0:
-        case 1:
-          submitRead(object, ctx, afNone, 0);
-          break;
-        case 2:
-          submitRead(object, ctx, afRealtime, 50 + rng() % 2000);
-          break;
-        case 3:
-          submitRead(object, ctx, afNone, 300000);
-          break;
+        case 1: submitRead(object, ctx, afNone, 0); break;
+        case 2: submitRead(object, ctx, afRealtime, 50 + rng() % 2000); break;
+        case 3: submitRead(object, ctx, afNone, 300000); break;
       }
     }
 
-    // A few datagrams so part of the reads complete successfully and the
-    // loop threads keep entering this object's combiner
+    // A few datagrams so part of the reads complete successfully and the loop threads keep entering this object's combiner
     unsigned feeds = rng() % 3;
     for (unsigned f = 0; f < feeds; f++) {
       uint32_t payload = i;
-      sendto(sender, reinterpret_cast<const char*>(&payload), sizeof(payload), 0,
-             reinterpret_cast<sockaddr*>(&selfAddress), sizeof(selfAddress));
+      sendto(sender,
+             reinterpret_cast<const char*>(&payload),
+             sizeof(payload),
+             0,
+             reinterpret_cast<sockaddr*>(&selfAddress),
+             sizeof(selfAddress));
     }
 
-    // Jitter widens the interleaving between loop-thread activity and the
-    // destruction below
+    // Jitter widens the interleaving between loop-thread activity and the destruction below
     switch (rng() % 3) {
-      case 0:
-        break;
-      case 1:
-        std::this_thread::yield();
-        break;
-      case 2:
-        std::this_thread::sleep_for(std::chrono::microseconds(rng() % 100));
-        break;
+      case 0: break;
+      case 1: std::this_thread::yield(); break;
+      case 2: std::this_thread::sleep_for(std::chrono::microseconds(rng() % 100)); break;
     }
 
     if (rng() % 8 == 0) {
-      // cancelIo flavor: everything pending dies, the object must stay
-      // usable for one more submission before dying for real
+      // cancelIo flavor: everything pending dies, the object must stay usable for one more submission before dying for real
       cancelIo(aioObjectHandle(object));
       submitRead(object, ctx, afNone, 0);
     }
@@ -187,7 +172,7 @@ static void worker(unsigned id, unsigned iterations, unsigned opsPerObject, unsi
   socketClose(sender);
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   unsigned workers = argc > 1 ? static_cast<unsigned>(atoi(argv[1])) : 4;
   unsigned loopThreads = argc > 2 ? static_cast<unsigned>(atoi(argv[2])) : 3;
@@ -204,34 +189,37 @@ int main(int argc, char **argv)
 
   std::vector<std::thread> loops;
   for (unsigned i = 0; i < loopThreads; i++)
-    loops.emplace_back([]() { asyncLoop(gBase); });
+    loops.emplace_back([]() {
+      asyncLoop(gBase);
+    });
 
   auto startedAt = std::chrono::steady_clock::now();
   std::vector<std::deque<ObjectCtx>> arenas(workers);
   std::vector<std::thread> workerThreads;
   for (unsigned i = 0; i < workers; i++)
     workerThreads.emplace_back(worker, i, iterations, opsPerObject, seed, &arenas[i]);
-  for (auto &thread : workerThreads)
+  for (auto &thread: workerThreads)
     thread.join();
 
-  // Drain: every operation must report and every object must destruct on
-  // its own; no progress for 10 seconds is a verdict, not a timeout
+  // Drain: every operation must report and every object must destruct on its own; no progress for 10 seconds is a verdict, not a timeout
   uint64_t expectedOps = opsSubmitted.load();
   unsigned expectedObjects = objectsCreated.load();
-  drainOrDie(arenas, expectedOps, expectedObjects, callbacksDelivered, destructorsFired,
-             "objects", "obj", classifyStalledObjects);
+  drainOrDie(arenas, expectedOps, expectedObjects, callbacksDelivered, destructorsFired, "objects", "obj", classifyStalledObjects);
 
   postQuitOperation(gBase);
-  for (auto &thread : loops)
+  for (auto &thread: loops)
     thread.join();
 
   uint64_t exactlyOnceViolations = countExactlyOnceViolations(arenas);
 
   double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count();
-  printf("objects %u, ops %" PRIu64 ", callbacks %" PRIu64 ", after-destructor %" PRIu64
-         ", exactly-once violations %" PRIu64 ", %.1fs\n",
-         expectedObjects, expectedOps, callbacksDelivered.load(),
-         afterDestructorTotal.load(), exactlyOnceViolations, elapsed);
+  printf("objects %u, ops %" PRIu64 ", callbacks %" PRIu64 ", after-destructor %" PRIu64 ", exactly-once violations %" PRIu64 ", %.1fs\n",
+         expectedObjects,
+         expectedOps,
+         callbacksDelivered.load(),
+         afterDestructorTotal.load(),
+         exactlyOnceViolations,
+         elapsed);
   if (afterDestructorTotal.load() || exactlyOnceViolations) {
     fprintf(stderr, "FAILED\n");
     return 1;

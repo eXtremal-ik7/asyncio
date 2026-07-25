@@ -1,5 +1,4 @@
-// BTC transport contract: the receive completion callback's command argument
-// must name the message that was actually received.
+// BTC transport contract: the receive completion callback's command argument must name the message that was actually received.
 
 #include "unittest.h"
 
@@ -24,7 +23,8 @@ struct BtcRecvProbe {
   char callbackCommand[12];
   AsyncOpStatus recvStatus = aosPending;
 
-  explicit BtcRecvProbe(asyncBase *baseArg) : base(baseArg) {
+  explicit BtcRecvProbe(asyncBase *baseArg) :
+    base(baseArg) {
     memset(userCommand, 0xAA, sizeof(userCommand));
     memset(callbackCommand, 0xBB, sizeof(callbackCommand));
   }
@@ -64,8 +64,7 @@ TEST(btc, recv_callback_reports_received_command_name)
 
   BtcRecvProbe probe(gBase);
 
-  // Post the receive first: no bytes have arrived yet, so the completion is
-  // deferred and must travel through the operation's finish path.
+  // Post the receive first: no bytes have arrived yet, so the completion is deferred and must travel through the operation's finish path.
   aioBtcRecv(receiver, probe.userCommand, probe.stream, 1024, afNone, 5000000, btcRecvNameCb, &probe);
 
   uint8_t payload[4] = {1, 2, 3, 4};
@@ -95,7 +94,8 @@ struct BtcSendLimitProbe {
   asyncBase *base;
   AsyncOpStatus status = aosPending;
 
-  explicit BtcSendLimitProbe(asyncBase *baseArg) : base(baseArg) {}
+  explicit BtcSendLimitProbe(asyncBase *baseArg) :
+    base(baseArg) {}
 };
 
 void btcSendLimitCb(AsyncOpStatus status, BTCSocket*, void *arg)
@@ -119,9 +119,7 @@ TEST(btc, send_rejects_payload_above_header_limit)
   BtcSendLimitProbe probe(gBase);
   const size_t oversized = static_cast<size_t>(UINT32_MAX) + 1;
 
-  EXPECT_EQ(aioBtcSend(socket, "block", &payload, oversized, afNone, 5000000,
-                      btcSendLimitCb, &probe),
-            -aosPending);
+  EXPECT_EQ(aioBtcSend(socket, "block", &payload, oversized, afNone, 5000000, btcSendLimitCb, &probe), -aosPending);
   asyncLoop(gBase);
 
   EXPECT_EQ(probe.status, aosBufferTooSmall);

@@ -38,19 +38,15 @@ void sendMailCoro(void *arg)
 {
   bool acc = true;
   Context *context = static_cast<Context*>(arg);
-  std::string ehlo = (std::string)"EHLO " + context->Args.clientHost;
-  std::string from = (std::string)"MAIL From: <" + context->Args.from + ">";
-  std::string to = (std::string)"RCPT To: <" + context->Args.to + ">";
-  std::string text = (std::string)
-    "From: " + context->Args.from + "\r\n" +
-    "To: " + context->Args.to + "\r\n" +
-    "Subject: " + context->Args.subject + "\r\n" +
-    context->Args.text + "\r\n.";
+  std::string ehlo = (std::string) "EHLO " + context->Args.clientHost;
+  std::string from = (std::string) "MAIL From: <" + context->Args.from + ">";
+  std::string to = (std::string) "RCPT To: <" + context->Args.to + ">";
+  std::string text = (std::string) "From: " + context->Args.from + "\r\n" + "To: " + context->Args.to + "\r\n" +
+                     "Subject: " + context->Args.subject + "\r\n" + context->Args.text + "\r\n.";
   SMTPResult result = {};
   int status;
 
-  // Workflow like Haskell's MayBe
-  // TCP connect
+  // Workflow like Haskell's MayBe TCP connect
   status = ioSmtpConnect(context->Client, context->Args.serverAddress, &result, 5000000);
   doSmtp(status, &result, &acc);
   // EHLO <localhost>
@@ -83,7 +79,7 @@ void sendMailCoro(void *arg)
   postQuitOperation(context->Base);
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   Context context;
   int parseResult = parseSmtpArgs(argc, argv, context.Args);

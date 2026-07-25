@@ -104,7 +104,7 @@ static inline void *opEnsureTimerCell(asyncOpRoot *op)
   return op->timerId;
 }
 
-static inline void asyncOpEnsureInternalBuffer(void **buffer, size_t *bufferSize, size_t required)
+static inline void asyncOpEnsureInternalBuffer(void**buffer, size_t *bufferSize, size_t required)
 {
   if (*bufferSize < required) {
     *buffer = realloc(*buffer, required);

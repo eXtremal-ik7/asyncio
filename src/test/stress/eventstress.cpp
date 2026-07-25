@@ -1,7 +1,6 @@
-// User-event timer backend stress. This is intentionally standalone (no
-// gtest), so the same finite-count/rearm protocol runs on Windows builds too.
-// Each round forces thousands of one-shot backend rearms and verifies exact
-// semaphore delivery plus exactly-once destruction before the slot is reused.
+// User-event timer backend stress. This is intentionally standalone (no gtest), so the same finite-count/rearm protocol runs on Windows builds
+// too. Each round forces thousands of one-shot backend rearms and verifies exact semaphore delivery plus exactly-once destruction before the
+// slot is reused.
 //
 // Usage: eventstress [rounds] [ticksPerRound] [periodUs] [loopThreads]
 
@@ -37,9 +36,7 @@ static void eventDestructor(aioUserEvent*, void *arg)
   static_cast<EventCtx*>(arg)->destructors.fetch_add(1, std::memory_order_release);
 }
 
-static bool waitFor(const std::atomic<unsigned> &value,
-                    unsigned expected,
-                    Clock::duration timeout)
+static bool waitFor(const std::atomic<unsigned> &value, unsigned expected, Clock::duration timeout)
 {
   Clock::time_point deadline = Clock::now() + timeout;
   while (value.load(std::memory_order_acquire) < expected) {
@@ -50,14 +47,17 @@ static bool waitFor(const std::atomic<unsigned> &value,
   return true;
 }
 
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   unsigned rounds = argc > 1 ? static_cast<unsigned>(atoi(argv[1])) : 8;
   unsigned ticks = argc > 2 ? static_cast<unsigned>(atoi(argv[2])) : 1000;
   uint64_t periodUs = argc > 3 ? static_cast<uint64_t>(strtoull(argv[3], nullptr, 10)) : 100;
   unsigned loopThreads = argc > 4 ? static_cast<unsigned>(atoi(argv[4])) : 2;
-  if (!rounds || !ticks || ticks > static_cast<unsigned>(INT_MAX) ||
-      !periodUs || periodUs > static_cast<uint64_t>(INT64_MAX) / 10 ||
+  if (!rounds ||
+      !ticks ||
+      ticks > static_cast<unsigned>(INT_MAX) ||
+      !periodUs ||
+      periodUs > static_cast<uint64_t>(INT64_MAX) / 10 ||
       !loopThreads) {
     fprintf(stderr, "usage: eventstress [rounds] [ticksPerRound] [periodUs] [loopThreads]\n");
     return 1;
@@ -73,7 +73,9 @@ int main(int argc, char **argv)
   std::vector<std::thread> loops;
   loops.reserve(loopThreads);
   for (unsigned i = 0; i < loopThreads; i++)
-    loops.emplace_back([base]() { asyncLoop(base); });
+    loops.emplace_back([base]() {
+      asyncLoop(base);
+    });
 
   uint64_t totalCallbacks = 0;
   Clock::time_point started = Clock::now();
@@ -89,12 +91,7 @@ int main(int argc, char **argv)
     userEventStartTimer(event, periodUs, static_cast<int>(ticks));
 
     if (!waitFor(ctx.callbacks, ticks, std::chrono::seconds(30))) {
-      fprintf(stderr,
-              "STALL round %u: %u/%u callbacks, %u destructor(s)\n",
-              round,
-              ctx.callbacks.load(),
-              ticks,
-              ctx.destructors.load());
+      fprintf(stderr, "STALL round %u: %u/%u callbacks, %u destructor(s)\n", round, ctx.callbacks.load(), ticks, ctx.destructors.load());
       fflush(nullptr);
       std::_Exit(2);
     }
@@ -109,13 +106,7 @@ int main(int argc, char **argv)
     unsigned destructors = ctx.destructors.load(std::memory_order_acquire);
     unsigned late = ctx.afterDestructor.load(std::memory_order_acquire);
     if (delivered != ticks || destructors != 1 || late != 0) {
-      fprintf(stderr,
-              "VIOLATION round %u: callbacks %u/%u, destructors %u, after-destructor %u\n",
-              round,
-              delivered,
-              ticks,
-              destructors,
-              late);
+      fprintf(stderr, "VIOLATION round %u: callbacks %u/%u, destructors %u, after-destructor %u\n", round, delivered, ticks, destructors, late);
       fflush(nullptr);
       std::_Exit(3);
     }
@@ -124,7 +115,7 @@ int main(int argc, char **argv)
 
   // One quit token is handed from each exiting loop thread to the next.
   postQuitOperation(base);
-  for (std::thread &loop : loops)
+  for (std::thread &loop: loops)
     loop.join();
 
   double seconds = std::chrono::duration<double>(Clock::now() - started).count();

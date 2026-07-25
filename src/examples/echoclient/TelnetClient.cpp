@@ -11,7 +11,6 @@
 #include <netdb.h>
 #endif
 
-
 const size_t clientBufferSize = 1024;
 
 __NO_PADDING_BEGIN
@@ -39,7 +38,7 @@ void readCb(AsyncOpStatus status, aioObject *object, size_t transferred, void *a
   __UNUSED(object);
   ClientData *data = static_cast<ClientData*>(arg);
   if (status == aosSuccess) {
-    for (uint8_t *p = data->buffer, *pe = p+transferred; p < pe; p++)
+    for (uint8_t *p = data->buffer, *pe = p + transferred; p < pe; p++)
       printf("%02X", static_cast<unsigned>(*p));
     printf("\n");
   } else if (status == aosDisconnected) {
@@ -49,7 +48,6 @@ void readCb(AsyncOpStatus status, aioObject *object, size_t transferred, void *a
     fprintf(stderr, "receive error!\n");
   }
 }
-
 
 void pingTimerCb(aioUserEvent *event, void *arg)
 {
@@ -64,7 +62,6 @@ void pingTimerCb(aioUserEvent *event, void *arg)
   }
 }
 
-
 void connectCb(AsyncOpStatus status, aioObject *object, void *arg)
 {
   __UNUSED(object);
@@ -78,14 +75,13 @@ void connectCb(AsyncOpStatus status, aioObject *object, void *arg)
   }
 }
 
-
-int main(int argc, char **argv)
+int main(int argc, char**argv)
 {
   if (argc != 3) {
     fprintf(stderr, "usage: %s <method> <host:port>\n", argv[0]);
     return 1;
   }
-  
+
   AsyncMethod method;
   if (strcmp(argv[1], "default") == 0) {
     method = amOSDefault;
@@ -98,8 +94,8 @@ int main(int argc, char **argv)
   } else {
     fprintf(stderr, "ERROR: unknown method %s, default used\n", argv[1]);
     method = amOSDefault;
-  }  
-  
+  }
+
   HostAddress address;
   initializeAsyncIo(aiNone);
   srand(static_cast<unsigned>(time(nullptr)));
@@ -126,7 +122,7 @@ int main(int argc, char **argv)
   }
 
   asyncBase *base = createAsyncBase(method, 1);
-  
+
   address.family = AF_INET;
   address.ipv4 = INADDR_ANY;
   address.port = 0;
@@ -135,7 +131,7 @@ int main(int argc, char **argv)
     exit(1);
   }
 
-  ClientData data;  
+  ClientData data;
   aioObject *socketOp = newSocketIo(base, hSocket);
   aioUserEvent *stdInputOp = newUserEvent(base, 0, pingTimerCb, &data);
 
@@ -144,7 +140,7 @@ int main(int argc, char **argv)
   address.port = static_cast<uint16_t>(uri.port);
   data.base = base;
   data.socket = socketOp;
-  data.isConnected = false;    
+  data.isConnected = false;
   aioConnect(socketOp, &address, 3000000, connectCb, &data);
   userEventStartTimer(stdInputOp, 1000000, -1);
   asyncLoop(base);

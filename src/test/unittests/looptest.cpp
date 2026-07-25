@@ -1,9 +1,6 @@
-// Message-loop lifecycle contract: postQuitOperation is a sticky
-// level-triggered stop (every current AND future asyncLoop invocation
-// returns), resetQuitOperation is the quiescent-only rearm that makes the
-// base reusable for a next round of loop threads. The suite runs against the
-// real OS backend: the defect class here is a late asyncLoop entrant missing
-// a quit that was posted before it registered.
+// Message-loop lifecycle contract: postQuitOperation is a sticky level-triggered stop (every current AND future asyncLoop invocation returns),
+// resetQuitOperation is the quiescent-only rearm that makes the base reusable for a next round of loop threads. The suite runs against the real
+// OS backend: the defect class here is a late asyncLoop entrant missing a quit that was posted before it registered.
 
 #include "unittest.h"
 
@@ -19,11 +16,9 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// A loop hung by the defect under test sits in an eternal kernel wait, which
-// would hang the whole gtest binary. The pump converts that hang into a
-// measurable delay: after a grace period it re-posts quit until the caller
-// reports completion, freeing one stuck entrant per post under the broken
-// one-shot-token scheme. On the fixed code the pump never fires.
+// A loop hung by the defect under test sits in an eternal kernel wait, which would hang the whole gtest binary. The pump converts that hang
+// into a measurable delay: after a grace period it re-posts quit until the caller reports completion, freeing one stuck entrant per post under
+// the broken one-shot-token scheme. On the fixed code the pump never fires.
 class QuitRescuePump {
 public:
   QuitRescuePump(asyncBase *base, milliseconds grace) {
@@ -83,9 +78,8 @@ bool waitForFire(FireProbe &probe, unsigned expected, milliseconds timeout)
 
 } // namespace
 
-// Quit posted before any thread entered the loop: every later entrant must
-// observe it and return. The one-shot token consumed by the first entrant
-// leaves the second one asleep forever.
+// Quit posted before any thread entered the loop: every later entrant must observe it and return. The one-shot token consumed by the first
+// entrant leaves the second one asleep forever.
 TEST(loop_lifecycle, quit_before_entry_stops_every_later_asyncLoop)
 {
   asyncBase *base = createAsyncBase(amOSDefault, 2);
@@ -103,10 +97,8 @@ TEST(loop_lifecycle, quit_before_entry_stops_every_later_asyncLoop)
   EXPECT_EQ(rescue.rescues(), 0u);
 }
 
-// Entrants staggered in time against a single quit: whichever moment a thread
-// registers, one posted quit must stop it. Under the token scheme the first
-// entrant eats the token with nobody else registered (remaining == 0, no
-// re-post), and every following entrant hangs.
+// Entrants staggered in time against a single quit: whichever moment a thread registers, one posted quit must stop it. Under the token scheme
+// the first entrant eats the token with nobody else registered (remaining == 0, no re-post), and every following entrant hangs.
 TEST(loop_lifecycle, single_quit_covers_staggered_entrants)
 {
   constexpr unsigned kThreads = 4;
@@ -124,7 +116,7 @@ TEST(loop_lifecycle, single_quit_covers_staggered_entrants)
       asyncLoop(base);
     });
   }
-  for (auto &thread : entrants)
+  for (auto &thread: entrants)
     thread.join();
   auto elapsedMs = duration_cast<milliseconds>(steady_clock::now() - begin).count();
 
@@ -132,10 +124,8 @@ TEST(loop_lifecycle, single_quit_covers_staggered_entrants)
   EXPECT_EQ(rescue.rescues(), 0u);
 }
 
-// resetQuitOperation must erase a quit that nobody ever consumed: the next
-// round of loop threads runs normally instead of swallowing a stale stop
-// (with the queue-token scheme the leftover token kills the first entrant of
-// the new round).
+// resetQuitOperation must erase a quit that nobody ever consumed: the next round of loop threads runs normally instead of swallowing a stale
+// stop (with the queue-token scheme the leftover token kills the first entrant of the new round).
 TEST(loop_lifecycle, reset_clears_pending_quit_before_any_entry)
 {
   asyncBase *base = createAsyncBase(amOSDefault, 1);
@@ -150,7 +140,9 @@ TEST(loop_lifecycle, reset_clears_pending_quit_before_any_entry)
   ASSERT_NE(event, nullptr);
   userEventStartTimer(event, 50000, 1);
 
-  std::thread loop([base]() { asyncLoop(base); });
+  std::thread loop([base]() {
+    asyncLoop(base);
+  });
   bool delivered = waitForFire(probe, 1, 2000ms);
   if (!delivered)
     postQuitOperation(base);
@@ -160,8 +152,7 @@ TEST(loop_lifecycle, reset_clears_pending_quit_before_any_entry)
   deleteUserEvent(event);
 }
 
-// Full round-trip: quit stops round one, reset rearms the base, round two is
-// fully operational (timers fire, quit stops it again).
+// Full round-trip: quit stops round one, reset rearms the base, round two is fully operational (timers fire, quit stops it again).
 TEST(loop_lifecycle, reset_restores_base_after_quit)
 {
   asyncBase *base = createAsyncBase(amOSDefault, 1);
@@ -177,7 +168,9 @@ TEST(loop_lifecycle, reset_restores_base_after_quit)
   ASSERT_NE(event, nullptr);
   userEventStartTimer(event, 50000, 1);
 
-  std::thread loop([base]() { asyncLoop(base); });
+  std::thread loop([base]() {
+    asyncLoop(base);
+  });
   bool delivered = waitForFire(probe, 1, 2000ms);
   if (!delivered)
     postQuitOperation(base);
@@ -191,8 +184,8 @@ TEST(loop_lifecycle, reset_restores_base_after_quit)
   deleteUserEvent(event);
 }
 
-// Quit stops processing but does not cancel work: a timer armed in round one
-// survives the quit/reset pause and fires in round two, exactly once.
+// Quit stops processing but does not cancel work: a timer armed in round one survives the quit/reset pause and fires in round two, exactly
+// once.
 TEST(loop_lifecycle, timer_survives_quit_reset_cycle)
 {
   asyncBase *base = createAsyncBase(amOSDefault, 1);
@@ -204,14 +197,18 @@ TEST(loop_lifecycle, timer_survives_quit_reset_cycle)
   ASSERT_NE(event, nullptr);
   userEventStartTimer(event, 400000, 1);
 
-  std::thread roundOne([base]() { asyncLoop(base); });
+  std::thread roundOne([base]() {
+    asyncLoop(base);
+  });
   std::this_thread::sleep_for(50ms);
   postQuitOperation(base);
   roundOne.join();
 
   resetQuitOperation(base);
 
-  std::thread roundTwo([base]() { asyncLoop(base); });
+  std::thread roundTwo([base]() {
+    asyncLoop(base);
+  });
   bool delivered = waitForFire(probe, 1, 3000ms);
   if (!delivered)
     postQuitOperation(base);
