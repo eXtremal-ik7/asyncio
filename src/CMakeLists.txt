@@ -10,7 +10,6 @@ project(asyncio)
 set (CMAKE_CXX_STANDARD 11)
 
 # Library features (can be overridden by an embedding project)
-option(ASYNCIO_ENABLE_SSL "SSL support (OpenSSL is required)" ON)
 option(ASYNCIO_ENABLE_ZMTP "ZMTP (zmq) protocol support" ON)
 option(ASYNCIO_ENABLE_BTC "Bitcoin network protocol support" ON)
 option(ASYNCIO_ENABLE_RLPX "RPLx (Ethereum) network protocol support" ON)
@@ -57,9 +56,7 @@ if (BUILD_PROFILING)
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fno-inline -fno-omit-frame-pointer")
 endif()
 
-if (ASYNCIO_ENABLE_SSL OR ASYNCIO_ENABLE_BTC)
-  cxxpm_add_package(openssl default)
-endif()
+cxxpm_add_package(openssl default)
 
 if (ASYNCIO_ENABLE_ZMTP)
   cxxpm_add_package(zeromq default)

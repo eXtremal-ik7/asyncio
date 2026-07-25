@@ -14,25 +14,24 @@ struct Context {
   SmtpArgs Args;
 };
 
-static void doSmtp(SMTPClient *client, int result, bool *acc)
+static void doSmtp(int status, SMTPResult *result, bool *acc)
 {
   if (*acc) {
-    *acc = result == 0;
-    int code = smtpClientGetResultCode(client);
-    const char *response = smtpClientGetResponse(client);
-    if (result != 0) {
-      int status = -result;
-      if (status == smtpInvalidFormat)
+    *acc = status == 0;
+    if (status != 0) {
+      int opStatus = -status;
+      if (opStatus == smtpInvalidFormat)
         fprintf(stderr, "SMTP Protocol mismatch\n");
-      else if (status == smtpError)
-        fprintf(stderr, "SMTP Error code: %u; text: %s\n", code, response ? response : "?");
+      else if (opStatus == smtpError)
+        fprintf(stderr, "SMTP Error code: %u; text: %s\n", result->code, result->response ? result->response : "?");
       else
-        fprintf(stderr, "Error %i\n", status);
-    } else if (response) {
-      fprintf(stdout, "--> %s\n", response);
+        fprintf(stderr, "Error %i\n", opStatus);
+    } else if (result->response) {
+      fprintf(stdout, "--> %s\n", result->response);
       fflush(stdout);
     }
   }
+  smtpResultFree(result);
 }
 
 void sendMailCoro(void *arg)
@@ -47,28 +46,39 @@ void sendMailCoro(void *arg)
     "To: " + context->Args.to + "\r\n" +
     "Subject: " + context->Args.subject + "\r\n" +
     context->Args.text + "\r\n.";
+  SMTPResult result = {};
+  int status;
 
   // Workflow like Haskell's MayBe
   // TCP connect
-  doSmtp(context->Client, ioSmtpConnect(context->Client, context->Args.serverAddress, 5000000), &acc);
+  status = ioSmtpConnect(context->Client, context->Args.serverAddress, &result, 5000000);
+  doSmtp(status, &result, &acc);
   // EHLO <localhost>
-  doSmtp(context->Client, ioSmtpCommand(context->Client, ehlo.c_str(), afNone, 5000000), &acc);
+  status = ioSmtpCommand(context->Client, ehlo.c_str(), &result, afNone, 5000000);
+  doSmtp(status, &result, &acc);
   if (context->Args.startTls) {
     // STARTTLS
-    doSmtp(context->Client, ioSmtpStartTls(context->Client, afNone, 5000000), &acc);
+    status = ioSmtpStartTls(context->Client, &result, afNone, 5000000);
+    doSmtp(status, &result, &acc);
     // EHLO <localhost>
-    doSmtp(context->Client, ioSmtpCommand(context->Client, ehlo.c_str(), afNone, 5000000), &acc);
+    status = ioSmtpCommand(context->Client, ehlo.c_str(), &result, afNone, 5000000);
+    doSmtp(status, &result, &acc);
   }
   // AUTH LOGIN
-  doSmtp(context->Client, ioSmtpLogin(context->Client, context->Args.login, context->Args.password, afNone, 5000000), &acc);
+  status = ioSmtpLogin(context->Client, context->Args.login, context->Args.password, &result, afNone, 5000000);
+  doSmtp(status, &result, &acc);
   // MAIL From
-  doSmtp(context->Client, ioSmtpCommand(context->Client, from.c_str(), afNone, 5000000), &acc);
+  status = ioSmtpCommand(context->Client, from.c_str(), &result, afNone, 5000000);
+  doSmtp(status, &result, &acc);
   // RCPT To
-  doSmtp(context->Client, ioSmtpCommand(context->Client, to.c_str(), afNone, 5000000), &acc);
+  status = ioSmtpCommand(context->Client, to.c_str(), &result, afNone, 5000000);
+  doSmtp(status, &result, &acc);
   // DATA
-  doSmtp(context->Client, ioSmtpCommand(context->Client, "DATA", afNone, 5000000), &acc);
+  status = ioSmtpCommand(context->Client, "DATA", &result, afNone, 5000000);
+  doSmtp(status, &result, &acc);
   // <email text>
-  doSmtp(context->Client, ioSmtpCommand(context->Client, text.c_str(), afNone, 5000000), &acc);
+  status = ioSmtpCommand(context->Client, text.c_str(), &result, afNone, 5000000);
+  doSmtp(status, &result, &acc);
 
   postQuitOperation(context->Base);
 }

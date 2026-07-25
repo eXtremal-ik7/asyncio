@@ -1,5 +1,5 @@
-#ifndef __ASYNCIO_IO_H_
-#define __ASYNCIO_IO_H_
+#ifndef __ASYNCIO_IO_INTERNAL_H_
+#define __ASYNCIO_IO_INTERNAL_H_
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,4 +119,4 @@ int copyFromBuffer(void *dst, size_t *offset, struct ioBuffer *src, size_t size)
 }
 #endif
 
-#endif //__ASYNCIO_IO_H_
+#endif //__ASYNCIO_IO_INTERNAL_H_

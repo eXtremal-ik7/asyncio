@@ -6,7 +6,7 @@ endif()
 set(Sources
   asyncioImpl.c
   events.c
-  io.c
+  ioInternal.c
   lifetime.c
   timerWheel.c
   dynamicBuffer.c
@@ -19,10 +19,8 @@ set(Sources
   base64.c
 )
 
-if (ASYNCIO_ENABLE_SSL)
-  include_directories(${OPENSSL_INCLUDE_DIRECTORY})
-  set(Sources ${Sources} socketSSL.c)
-endif()
+include_directories(${OPENSSL_INCLUDE_DIRECTORY})
+set(Sources ${Sources} socketSSL.c)
 
 if (WIN32)
   set(Sources ${Sources} iocp.c coroutineWin32.c deviceWin32.c socketWin32.c)

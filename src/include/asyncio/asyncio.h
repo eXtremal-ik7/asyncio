@@ -30,9 +30,12 @@ typedef enum AsyncOpStatus {
   aosSuccess = 0,
   aosPending,
   aosTimeout,
+  // The established stream ended (orderly EOF or reset), a connection attempt
+  // was refused, or a connected datagram received an asynchronous peer
+  // rejection.
   aosDisconnected,
-  // The socket is not, or is no longer, a usable connection for this
-  // operation: EPIPE, ENOTCONN or their Winsock equivalents.
+  // The operation requires a usable connected socket, but none exists for it:
+  // EPIPE, ENOTCONN or their Winsock equivalents.
   aosNotConnected,
   aosCanceled,
   aosBufferTooSmall,
@@ -117,8 +120,10 @@ void setSocketBuffer(aioObject *socket, size_t bufferSize);
 // be delivered before asyncLoop(base) is ever entered. No callback thread
 // affinity is guaranteed across activation sources. With isSemaphore == 0,
 // activations coalesce while one delivery is pending; with isSemaphore != 0,
-// every userEventActivate call produces a delivery. The pending gate is
-// released before the callback, so callbacks of the same event may overlap.
+// activations are counted independently while the event remains open.
+// deleteUserEvent may discard activations not yet accepted for callback
+// delivery. The pending gate is released before the callback, so callbacks of
+// the same event may overlap.
 // The caller receives one initial strong reference. Exactly one holder closes
 // the event with deleteUserEvent instead of ordinary release.
 aioUserEvent *newUserEvent(asyncBase *base, int isSemaphore, aioEventCb callback, void *arg);
@@ -175,7 +180,8 @@ void aioAccept(aioObject *object, uint64_t usTimeout, aioAcceptCb callback, void
 
 // Byte-stream I/O for devices and stream-oriented sockets. Message-oriented
 // sockets must use the Msg variants to preserve datagram boundaries and
-// truncation.
+// truncation. Msg variants reject sizes above INT_MAX with aosUnknownError on
+// every platform because native datagram APIs use narrower length types.
 ssize_t aioRead(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioCb callback, void *arg);
 ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioReadMsgCb callback, void *arg);
 ssize_t aioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags flags, uint64_t usTimeout, aioCb callback, void *arg);

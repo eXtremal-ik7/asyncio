@@ -2,18 +2,23 @@
 
 High-performance asynchronous network I/O library for C/C++.
 
-> **Note:** not related to the Python [`asyncio`](https://docs.python.org/3/library/asyncio.html) module — this is an independent C/C++ library that only shares the name.
+> **Note:** not related to the Python [`asyncio`](https://docs.python.org/3/library/asyncio.html) module — this is an independent C/C++
+> library that only shares the name.
 
 - Single event loop API over native OS backends: epoll (Linux, Android), kqueue (macOS, FreeBSD), I/O completion ports (Windows)
 - Composable asynchronous operations with timeouts, cancellation, object/operation pooling and a synchronous fast path
 - Every primitive comes in two flavors: callback API (`aio*`) and stackful coroutine API (`io*`; x86, x86_64, aarch64)
 - TCP/UDP sockets, pipes/devices, timers, user events
-- Protocols on top of the core: TLS (OpenSSL), HTTP client, SMTP client, Bitcoin network protocol, ZMTP (ZeroMQ); RLPx (Ethereum) is a work-in-progress stub
+- Protocols on top of the core: TLS (OpenSSL), HTTP client, SMTP client, Bitcoin network protocol and ZMTP (ZeroMQ);
+  RLPx (Ethereum) is a work-in-progress stub
 - Incremental zero-copy HTTP/URI parsers (`p2putils`)
 
 ## Dependencies
 
-The build is driven by [cxx-pm](https://github.com/eXtremal-ik7/cxx-pm), a source-based C++ package manager. It bootstraps itself at the first CMake configure and downloads/builds third-party dependencies for the enabled features (OpenSSL for SSL/BTC, ZeroMQ for ZMTP, GTest for tests), so the first configure requires network access and can take a while. Built packages are cached in `~/.cxxpm` and shared between projects.
+The build is driven by [cxx-pm](https://github.com/eXtremal-ik7/cxx-pm), a source-based C++ package manager. It bootstraps itself at the first
+CMake configure and downloads/builds third-party dependencies, so the first configure requires network access and can take a while. OpenSSL
+is always installed; ZeroMQ and GTest are installed when their corresponding features are enabled. Built packages are cached in `~/.cxxpm`
+and shared between projects.
 
 ## Linux & macOS build
 
@@ -33,12 +38,13 @@ cmake --build build -j
 Feature options (shown with defaults):
 
 ```
--DASYNCIO_ENABLE_SSL=ON    # TLS support (OpenSSL)
 -DASYNCIO_ENABLE_BTC=ON    # Bitcoin network protocol
 -DASYNCIO_ENABLE_ZMTP=ON   # ZMTP (ZeroMQ) protocol
 -DASYNCIO_ENABLE_RLPX=ON   # RLPx (Ethereum) protocol (stub)
 -DASYNCIO_BUILD_TESTS=OFF  # unit tests (GTest)
 ```
+
+TLS, HTTP and SMTP support is always built; OpenSSL is a required dependency.
 
 ## Windows build with Visual Studio
 

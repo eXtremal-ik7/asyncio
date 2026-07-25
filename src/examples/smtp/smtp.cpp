@@ -24,7 +24,7 @@ struct Context {
   SmtpArgs Args;
 };
 
-void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *arg)
+void responseCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
 {
   Context *context = static_cast<Context*>(arg);
   if (status != aosSuccess) {
@@ -32,7 +32,7 @@ void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *a
     if (smtpStatus == smtpInvalidFormat)
       fprintf(stderr, "SMTP Protocol mismatch\n");
     else if (smtpStatus == smtpError)
-      fprintf(stderr, "SMTP Error code: %u; text: %s\n", code, smtpClientGetResponse(client) ? smtpClientGetResponse(client) : "?");
+      fprintf(stderr, "SMTP Error code: %u; text: %s\n", result->code, result->response ? result->response : "?");
     else
       fprintf(stderr, "Error %i\n", status);
 
@@ -40,7 +40,7 @@ void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *a
     return;
   }
 
-  const char *response = smtpClientGetResponse(client);
+  const char *response = result->response;
   if (response) {
     fprintf(stdout, "--> %s\n", response);
     fflush(stdout);
@@ -110,7 +110,7 @@ void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *a
   }
 }
 
-void connectCb(AsyncOpStatus status, SMTPClient *client, void *arg)
+void connectCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
 {
   Context *context = static_cast<Context*>(arg);
   if (status != aosSuccess) {
@@ -119,7 +119,7 @@ void connectCb(AsyncOpStatus status, SMTPClient *client, void *arg)
     return;
   }
 
-  const char *response = smtpClientGetResponse(client);
+  const char *response = result->response;
   if (response) {
     fprintf(stdout, "--> %s\n", response);
     fflush(stdout);

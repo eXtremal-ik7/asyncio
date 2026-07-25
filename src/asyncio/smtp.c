@@ -6,6 +6,7 @@
 #include "asyncio/socket.h"
 #include "asyncioImpl.h"
 #include <memory.h>
+#include <stdlib.h>
 #include <string.h>
 
 static ConcurrentQueue opPool;
@@ -44,9 +45,6 @@ typedef struct SMTPClient {
   char buffer[8192];
   char *ptr;
   char *end;
-
-  unsigned ResultCode;
-  const char *Response;
 } SMTPClient;
 
 typedef struct SMTPOp {
@@ -54,6 +52,8 @@ typedef struct SMTPOp {
   HostAddress Address;
   int State;
   dynamicBuffer Buffer;
+  dynamicBuffer Response;
+  unsigned ResultCode;
 
   // Specific data
   int startTls;
@@ -140,19 +140,26 @@ static int cancel(asyncOpRoot *opptr)
 
 static void connectFinish(asyncOpRoot *opptr)
 {
-  ((smtpConnectCb*)opptr->callback)(opGetStatus(opptr), (SMTPClient*)opptr->object, opptr->arg);
+  SMTPOp *op = (SMTPOp*)opptr;
+  SMTPResult result = { op->ResultCode, (const char*)op->Response.data };
+  ((smtpConnectCb*)opptr->callback)(opGetStatus(opptr), &result, (SMTPClient*)opptr->object, opptr->arg);
+  dynamicBufferFree(&op->Response);
 }
 
 static void commandFinish(asyncOpRoot *opptr)
 {
-  SMTPClient *client = (SMTPClient*)opptr->object;
-  ((smtpResponseCb*)opptr->callback)(opGetStatus(opptr), client->ResultCode, client, opptr->arg);
+  SMTPOp *op = (SMTPOp*)opptr;
+  SMTPResult result = { op->ResultCode, (const char*)op->Response.data };
+  ((smtpResponseCb*)opptr->callback)(opGetStatus(opptr), &result, (SMTPClient*)opptr->object, opptr->arg);
+  dynamicBufferFree(&op->Response);
 }
 
 static void releaseProc(asyncOpRoot *opptr)
 {
   SMTPOp *op = (SMTPOp*)opptr;
   dynamicBufferFree(&op->Buffer);
+  if (!opptr->callback && !(opptr->flags & afCoroutine))
+    dynamicBufferFree(&op->Response);
 }
 
 
@@ -168,9 +175,11 @@ static SMTPOp *allocSmtpOp(aioExecuteProc executeProc,
   SMTPOp *op = 0;
   asyncOpAlloc(client->root.header.base, sizeof(SMTPOp), flags & afRealtime, &opPool, &opTimerPool, (asyncOpRoot**)&op);
   dynamicBufferInit(&op->Buffer, 1024);
+  dynamicBufferInit(&op->Response, 0);
 
   initAsyncOpRoot(&op->Root, executeProc, cancel, finishProc, releaseProc, &client->root, callback, arg, flags, type, timeout);
   op->State = stInitialize;
+  op->ResultCode = 0;
   dynamicBufferClear(&op->Buffer);
   return op;
 }
@@ -201,13 +210,21 @@ static inline int isDigits(const char *s, size_t size) {
   return 1;
 }
 
+static void smtpStoreResult(SMTPOp *op, unsigned code, const char *response)
+{
+  op->ResultCode = code;
+  dynamicBufferClear(&op->Response);
+  dynamicBufferWrite(&op->Response, response, strlen(response) + 1);
+}
+
 // Try to extract one complete server response from [ptr, end); aosPending
-// means more data is needed. On success ptr is advanced past the response,
-// Response and ResultCode are set
-static AsyncOpStatus smtpTryParse(SMTPClient *client)
+// means more data is needed. On success ptr is advanced and an operation-local
+// snapshot of the response is stored.
+static AsyncOpStatus smtpTryParse(SMTPClient *client, SMTPOp *op)
 {
   char firstReplyCode[4];
   char *base = client->ptr;
+  const char *response;
 
   if (client->end - base < 5)
     return aosPending;
@@ -223,7 +240,7 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
   firstReplyCode[1] = base[1];
   firstReplyCode[2] = base[2];
   firstReplyCode[3] = 0;
-  client->ResultCode = atoi(firstReplyCode);
+  unsigned resultCode = (unsigned)atoi(firstReplyCode);
 
   if (base[3] == '-') {
     // Multiline response detected
@@ -276,10 +293,10 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
 
     *out = 0;
     client->ptr = (char*)p;
-    client->Response = base;
+    response = base;
   } else if (base[3] == '\r') {
     // RFC 5321 permits a reply code without the optional space and text
-    client->Response = base + 3;
+    response = base + 3;
     base[3] = 0;
     client->ptr = base + 5;
   } else {
@@ -293,11 +310,12 @@ static AsyncOpStatus smtpTryParse(SMTPClient *client)
       // at the CR
       return (AsyncOpStatus)smtpInvalidFormat;
     }
-    client->Response = base + 4;
+    response = base + 4;
     *(lf-1) = 0;
     client->ptr = lf+1;
   }
 
+  smtpStoreResult(op, resultCode, response);
   return aosSuccess;
 }
 
@@ -308,9 +326,9 @@ enum { smtpExpectRcpt = 1 };
 // Reply codes are phase-specific: expected is the exact code for the current
 // step, smtpExpectRcpt the RCPT set, 0 keeps the generic 2xx/3xx acceptance
 // for user-issued commands
-static AsyncOpStatus smtpCheckReply(SMTPClient *client, unsigned expected)
+static AsyncOpStatus smtpCheckReply(SMTPOp *op, unsigned expected)
 {
-  unsigned code = client->ResultCode;
+  unsigned code = op->ResultCode;
   int accepted;
   if (expected == 0)
     accepted = code >= 200 && code <= 399;
@@ -349,9 +367,9 @@ static void smtpSslReadCb(AsyncOpStatus status, SSLSocket *object, size_t bytesR
 static AsyncOpStatus smtpReadResponse(SMTPClient *client, SMTPOp *op, unsigned expectedCode)
 {
   for (;;) {
-    AsyncOpStatus status = smtpTryParse(client);
+    AsyncOpStatus status = smtpTryParse(client, op);
     if (status != aosPending)
-      return status == aosSuccess ? smtpCheckReply(client, expectedCode) : status;
+      return status == aosSuccess ? smtpCheckReply(op, expectedCode) : status;
 
     size_t remaining = client->end - client->ptr;
     if (remaining == sizeof(client->buffer)) {
@@ -363,7 +381,6 @@ static AsyncOpStatus smtpReadResponse(SMTPClient *client, SMTPOp *op, unsigned e
       memmove(client->buffer, client->ptr, remaining);
     client->ptr = client->buffer;
     client->end = client->buffer + remaining;
-    client->Response = 0;
 
     size_t bytesTransferred = 0;
     if (client->TlsSocket) {
@@ -667,8 +684,6 @@ SMTPClient *smtpClientNew(asyncBase *base, HostAddress localAddress, SmtpServerT
   client->Type = type;
   client->ptr = client->buffer;
   client->end = client->buffer;
-  client->ResultCode = 0;
-  client->Response = 0;
   if (type == smtpServerPlain) {
     client->PlainSocket = newSocketIo(base, socket);
     if (!client->PlainSocket) {
@@ -699,23 +714,32 @@ void smtpClientDelete(SMTPClient *client)
   objectDelete(&client->root);
 }
 
-int smtpClientGetResultCode(SMTPClient *client)
+void smtpResultFree(SMTPResult *result)
 {
-  return client->ResultCode;
-}
-
-const char *smtpClientGetResponse(SMTPClient *client)
-{
-  return client->Response;
+  if (!result)
+    return;
+  free((void*)result->response);
+  result->code = 0;
+  result->response = 0;
 }
 
 // Shared tail of every coroutine-style entry point: run the operation, wait
-// for its completion and convert the status to the 0/-status convention
-static int smtpIoResult(SMTPOp *op)
+// for its completion, transfer the operation-local response and convert the
+// status to the 0/-status convention.
+static int smtpIoResult(SMTPOp *op, SMTPResult *result)
 {
   combinerPushOperation(&op->Root);
   coroutineYield();
   AsyncOpStatus status = opGetStatus(&op->Root);
+  if (result) {
+    result->code = op->ResultCode;
+    result->response = op->Response.data;
+    op->Response.data = 0;
+    op->Response.size = 0;
+    op->Response.allocatedSize = 0;
+    op->Response.offset = 0;
+  }
+  dynamicBufferFree(&op->Response);
   releaseAsyncOp(&op->Root);
   return status == aosSuccess ? 0 : -status;
 }
@@ -741,7 +765,13 @@ void aioSmtpStartTls(SMTPClient *client, AsyncFlags flags, uint64_t usTimeout, s
   combinerPushOperation(&op->Root);
 }
 
-void aioSmtpLogin(SMTPClient *client, const char *login, const char *password, AsyncFlags flags, uint64_t usTimeout, smtpResponseCb callback, void *arg)
+void aioSmtpLogin(SMTPClient *client,
+                  const char *login,
+                  const char *password,
+                  AsyncFlags flags,
+                  uint64_t usTimeout,
+                  smtpResponseCb callback,
+                  void *arg)
 {
   SMTPOp *op = allocSmtpOp(smtpLoginStart, commandFinish, client, SmtpOpCommand, (void*)callback, arg, flags, usTimeout);
   smtpLoginPrepare(op, login, password);
@@ -756,32 +786,37 @@ void aioSmtpCommand(SMTPClient *client, const char *command, AsyncFlags flags, u
   combinerPushOperation(&op->Root);
 }
 
-int ioSmtpConnect(SMTPClient *client, HostAddress address, uint64_t usTimeout)
+int ioSmtpConnect(SMTPClient *client, HostAddress address, SMTPResult *result, uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpConnectStart, 0, client, SmtpOpConnect, 0, 0, afCoroutine, usTimeout);
   op->Address = address;
-  return smtpIoResult(op);
+  return smtpIoResult(op, result);
 }
 
-int ioSmtpStartTls(SMTPClient *client, AsyncFlags flags, uint64_t usTimeout)
+int ioSmtpStartTls(SMTPClient *client, SMTPResult *result, AsyncFlags flags, uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpStartTlsStart, 0, client, SmtpOpStartTls, 0, 0, flags | afCoroutine, usTimeout);
-  return smtpIoResult(op);
+  return smtpIoResult(op, result);
 }
 
-int ioSmtpLogin(SMTPClient *client, const char *login, const char *password, AsyncFlags flags, uint64_t usTimeout)
+int ioSmtpLogin(SMTPClient *client,
+                const char *login,
+                const char *password,
+                SMTPResult *result,
+                AsyncFlags flags,
+                uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpLoginStart, 0, client, SmtpOpCommand, 0, 0, flags | afCoroutine, usTimeout);
   smtpLoginPrepare(op, login, password);
-  return smtpIoResult(op);
+  return smtpIoResult(op, result);
 }
 
-int ioSmtpCommand(SMTPClient *client, const char *command, AsyncFlags flags, uint64_t usTimeout)
+int ioSmtpCommand(SMTPClient *client, const char *command, SMTPResult *result, AsyncFlags flags, uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpCommandStart, 0, client, SmtpOpCommand, 0, 0, flags | afCoroutine, usTimeout);
   dynamicBufferWriteString(&op->Buffer, command);
   dynamicBufferWriteString(&op->Buffer, "\r\n");
-  return smtpIoResult(op);
+  return smtpIoResult(op, result);
 }
 
 // Builds the whole mail transaction in the operation buffer: base64 login and
@@ -887,10 +922,11 @@ int ioSmtpSendMail(SMTPClient *client,
                    const char *to,
                    const char *subject,
                    const char *text,
+                   SMTPResult *result,
                    AsyncFlags flags,
                    uint64_t usTimeout)
 {
   SMTPOp *op = allocSmtpOp(smtpSendMailStart, 0, client, SmtpOpCommand, 0, 0, flags | afCoroutine, usTimeout);
   smtpSendMailPrepare(op, smtpServerAddress, startTls, localHost, login, password, from, to, subject, text);
-  return smtpIoResult(op);
+  return smtpIoResult(op, result);
 }

@@ -17,6 +17,7 @@ struct Context {
 void sendMailCoro(void *arg)
 {
   Context *context = static_cast<Context*>(arg);
+  SMTPResult smtpResult = {};
   int result = ioSmtpSendMail(context->Client,
                  context->Args.serverAddress,
                  context->Args.startTls,
@@ -27,23 +28,23 @@ void sendMailCoro(void *arg)
                  context->Args.to,
                  context->Args.subject,
                  context->Args.text,
+                 &smtpResult,
                  afNone,
                  5000000);
 
-  int code = smtpClientGetResultCode(context->Client);
-  const char *response = smtpClientGetResponse(context->Client);
   if (result != 0) {
     int status = -result;
     if (status == smtpInvalidFormat)
       fprintf(stderr, "SMTP Protocol mismatch\n");
     else if (status == smtpError)
-      fprintf(stderr, "SMTP Error code: %u; text: %s\n", code, response ? response : "?");
+      fprintf(stderr, "SMTP Error code: %u; text: %s\n", smtpResult.code, smtpResult.response ? smtpResult.response : "?");
     else
       fprintf(stderr, "Error %i\n", status);
-  } else if (response) {
-    fprintf(stdout, "--> %s\n", response);
+  } else if (smtpResult.response) {
+    fprintf(stdout, "--> %s\n", smtpResult.response);
     fflush(stdout);
   }
+  smtpResultFree(&smtpResult);
 
   postQuitOperation(context->Base);
 }

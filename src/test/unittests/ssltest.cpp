@@ -989,18 +989,18 @@ static void smtpsActiveOnceSink(socketTy listenSocket, SmtpsActiveOnceContext *c
 static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx);
 
 static void smtpsActiveOnceCommandCb(AsyncOpStatus status,
-                                     unsigned code,
+                                     const SMTPResult *result,
                                      SMTPClient *client,
                                      void *arg)
 {
+  __UNUSED(client);
   SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
   ctx->commandStatus = status;
   if (status != aosSuccess) {
     postQuitOperation(ctx->base);
     return;
   }
-  const char *response = smtpClientGetResponse(client);
-  if (code != 250 || !response || strcmp(response, "first\n\n") != 0)
+  if (result->code != 250 || !result->response || strcmp(result->response, "first\n\n") != 0)
     ctx->responseMismatch = true;
 
   if (ctx->completed.fetch_add(1) + 1 == gSmtpsActiveOnceRounds)
@@ -1019,13 +1019,13 @@ static void smtpsActiveOnceSubmit(SmtpsActiveOnceContext *ctx)
                  ctx);
 }
 
-static void smtpsActiveOnceConnectCb(AsyncOpStatus status, SMTPClient *client, void *arg)
+static void smtpsActiveOnceConnectCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
 {
+  __UNUSED(client);
   SmtpsActiveOnceContext *ctx = static_cast<SmtpsActiveOnceContext*>(arg);
   ctx->connectStatus = status;
   if (status == aosSuccess) {
-    const char *response = smtpClientGetResponse(client);
-    if (!response || *response != 0)
+    if (!result->response || *result->response != 0)
       ctx->responseMismatch = true;
     smtpsActiveOnceSubmit(ctx);
   } else {
@@ -1070,6 +1070,151 @@ TEST(ssl, smtps_client_nested_active_once_io)
   EXPECT_EQ(ctx.connectStatus, aosSuccess);
   EXPECT_EQ(ctx.commandStatus.load(), aosSuccess);
   EXPECT_EQ(ctx.completed.load(), gSmtpsActiveOnceRounds);
+  EXPECT_FALSE(ctx.responseMismatch.load());
+  EXPECT_FALSE(ctx.serverFailed.load());
+
+  smtpClientDelete(ctx.client);
+  socketClose(listenSocket);
+}
+
+static const char gSmtpsQueuedGreeting[] = "220 ready\r\n";
+static const char *gSmtpsQueuedCommands[] = { "NOOP first\r\n", "NOOP second\r\n" };
+static const char *gSmtpsQueuedResponses[] = { "250 first\r\n", "251 second\r\n" };
+
+struct SmtpsQueuedResultContext {
+  asyncBase *base = nullptr;
+  SMTPClient *client = nullptr;
+  int connectResult = -1;
+  std::atomic<AsyncOpStatus> firstStatus{aosUnknown};
+  std::atomic<AsyncOpStatus> secondStatus{aosUnknown};
+  std::atomic<bool> secondFinished{false};
+  std::atomic<bool> responseMismatch{false};
+  std::atomic<bool> serverFailed{false};
+};
+
+static void smtpsQueuedResultFail(SmtpsQueuedResultContext *ctx)
+{
+  ctx->serverFailed = true;
+  ctx->secondFinished = true;
+  postQuitOperation(ctx->base);
+}
+
+static void smtpsQueuedResultSink(socketTy listenSocket, SmtpsQueuedResultContext *ctx)
+{
+  socketTy fd;
+  SSL *ssl = sslTestServerHandshake(listenSocket, &fd);
+  if (!ssl) {
+    if (fd != (socketTy)(-1))
+      socketClose(fd);
+    smtpsQueuedResultFail(ctx);
+    return;
+  }
+
+  if (!sslBlockingWriteAll(ssl, gSmtpsQueuedGreeting, sizeof(gSmtpsQueuedGreeting)-1)) {
+    SSL_free(ssl);
+    socketClose(fd);
+    smtpsQueuedResultFail(ctx);
+    return;
+  }
+
+  for (unsigned round = 0; round < 2; round++) {
+    std::string command;
+    while (command.find("\r\n") == std::string::npos) {
+      char buffer[128];
+      int result = SSL_read(ssl, buffer, (int)sizeof(buffer));
+      if (result <= 0)
+        break;
+      command.append(buffer, (size_t)result);
+    }
+    if (command != gSmtpsQueuedCommands[round] ||
+        !sslBlockingWriteAll(ssl, gSmtpsQueuedResponses[round], strlen(gSmtpsQueuedResponses[round]))) {
+      smtpsQueuedResultFail(ctx);
+      break;
+    }
+  }
+
+  SSL_free(ssl);
+  socketClose(fd);
+}
+
+static void smtpsQueuedSecondCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
+{
+  __UNUSED(client);
+  SmtpsQueuedResultContext *ctx = static_cast<SmtpsQueuedResultContext*>(arg);
+  ctx->secondStatus = status;
+  if (status != aosSuccess || result->code != 251 || !result->response || strcmp(result->response, "second") != 0)
+    ctx->responseMismatch = true;
+  ctx->secondFinished = true;
+}
+
+static void smtpsQueuedFirstCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
+{
+  __UNUSED(client);
+  SmtpsQueuedResultContext *ctx = static_cast<SmtpsQueuedResultContext*>(arg);
+  ctx->firstStatus = status;
+  std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!ctx->secondFinished.load() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  if (!ctx->secondFinished.load() || status != aosSuccess || result->code != 250 ||
+      !result->response || strcmp(result->response, "first") != 0)
+    ctx->responseMismatch = true;
+  postQuitOperation(ctx->base);
+}
+
+static void smtpsQueuedConnectProc(void *arg)
+{
+  SmtpsQueuedResultContext *ctx = static_cast<SmtpsQueuedResultContext*>(arg);
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = inet_addr("127.0.0.1");
+  address.port = gPort;
+  SMTPResult result = {};
+  ctx->connectResult = ioSmtpConnect(ctx->client, address, &result, 5000000);
+  if (ctx->connectResult != 0 || result.code != 220 || !result.response || strcmp(result.response, "ready") != 0) {
+    ctx->responseMismatch = true;
+    postQuitOperation(ctx->base);
+    smtpResultFree(&result);
+    return;
+  }
+  smtpResultFree(&result);
+  aioSmtpCommand(ctx->client, "NOOP first", afNone, 5000000, smtpsQueuedFirstCb, ctx);
+  aioSmtpCommand(ctx->client, "NOOP second", afNone, 5000000, smtpsQueuedSecondCb, ctx);
+}
+
+TEST(ssl, smtps_queued_operations_keep_their_own_results)
+{
+  SmtpsQueuedResultContext ctx;
+  ctx.base = gBase;
+
+  HostAddress localAddress = {};
+  localAddress.family = AF_INET;
+  localAddress.ipv4 = INADDR_ANY;
+  localAddress.port = 0;
+  ctx.client = smtpClientNew(gBase, localAddress, smtpServerSmtps);
+  ASSERT_NE(ctx.client, nullptr);
+
+  HostAddress address;
+  address.family = AF_INET;
+  address.ipv4 = INADDR_ANY;
+  address.port = gPort;
+  socketTy listenSocket = socketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0);
+  socketReuseAddr(listenSocket);
+  ASSERT_EQ(socketBind(listenSocket, &address), 0);
+  ASSERT_EQ(socketListen(listenSocket), 0);
+  std::thread sink(smtpsQueuedResultSink, listenSocket, &ctx);
+
+  coroutineTy *coroutine = coroutineNew(smtpsQueuedConnectProc, &ctx, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  ASSERT_EQ(coroutineCall(coroutine), 0);
+
+  std::thread secondLoop([] { asyncLoop(gBase); });
+  asyncLoop(gBase);
+  secondLoop.join();
+  sink.join();
+
+  EXPECT_EQ(ctx.connectResult, 0);
+  EXPECT_EQ(ctx.firstStatus.load(), aosSuccess);
+  EXPECT_EQ(ctx.secondStatus.load(), aosSuccess);
   EXPECT_FALSE(ctx.responseMismatch.load());
   EXPECT_FALSE(ctx.serverFailed.load());
 

@@ -3,8 +3,9 @@
 #include <mswsock.h>
 #include <windows.h>
 #include "asyncioImpl.h"
-#include "io.h"
+#include "ioInternal.h"
 #include "atomic.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -856,6 +857,8 @@ AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *opptr)
   WSABUF wsabuf;
   iocpOp *op = (iocpOp*)opptr;
   aioObject *object = getObject(op);
+  if (op->info.transactionSize > (size_t)INT_MAX)
+    return aosUnknownError;
 
   const size_t acceptResultSize = sizeof(recvFromData);
   asyncOpEnsureInternalBuffer(&op->info.internalBuffer, &op->info.internalBufferSize, acceptResultSize);
@@ -863,7 +866,6 @@ AsyncOpStatus iocpAsyncReadMsg(asyncOpRoot *opptr)
   recvFromData *rf = op->info.internalBuffer;
   rf->size = sizeof(rf->addr);
   DWORD flags = 0;
-  // TODO: correct processing >4Gb data blocks
   wsabuf.buf = op->info.buffer;
   wsabuf.len = (ULONG)op->info.transactionSize;
 
@@ -887,10 +889,11 @@ AsyncOpStatus iocpAsyncWriteMsg(asyncOpRoot *opptr)
   WSABUF wsabuf;
   iocpOp *op = (iocpOp*)opptr;
   aioObject *object = getObject(op);
+  if (op->info.transactionSize > (size_t)INT_MAX)
+    return aosUnknownError;
 
   struct sockaddr_storage remoteAddress;
   socklen_t addrLen = hostAddressToSockaddr(&op->info.host, &remoteAddress);
-  // TODO: correct processing >4Gb data blocks
   wsabuf.buf = op->info.buffer;
   wsabuf.len = (ULONG)op->info.transactionSize;
   memset(&op->overlapped, 0, sizeof(op->overlapped));

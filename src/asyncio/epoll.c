@@ -1,5 +1,5 @@
 #include "asyncioImpl.h"
-#include "io.h"
+#include "ioInternal.h"
 #include "reactor.h"
 #include "asyncio/coroutine.h"
 #include "atomic.h"

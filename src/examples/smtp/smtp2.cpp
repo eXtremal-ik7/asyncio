@@ -11,15 +11,16 @@ struct Context {
   asyncBase *Base;
 };
 
-void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *arg)
+void responseCb(AsyncOpStatus status, const SMTPResult *result, SMTPClient *client, void *arg)
 {
+  (void)client;
   Context *context = static_cast<Context*>(arg);
   if (status != aosSuccess) {
     SmtpOpStatus smtpStatus = static_cast<SmtpOpStatus>(status);
     if (smtpStatus == smtpInvalidFormat)
       fprintf(stderr, "SMTP Protocol mismatch\n");
     else if (smtpStatus == smtpError)
-      fprintf(stderr, "SMTP Error code: %u; text: %s\n", code, smtpClientGetResponse(client) ? smtpClientGetResponse(client) : "?");
+      fprintf(stderr, "SMTP Error code: %u; text: %s\n", result->code, result->response ? result->response : "?");
     else
       fprintf(stderr, "Error %i\n", status);
 
@@ -27,7 +28,7 @@ void responseCb(AsyncOpStatus status, unsigned code, SMTPClient *client, void *a
     return;
   }
 
-  const char *response = smtpClientGetResponse(client);
+  const char *response = result->response;
   if (response) {
     fprintf(stdout, "--> %s\n", response);
     fflush(stdout);

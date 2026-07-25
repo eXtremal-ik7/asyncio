@@ -131,6 +131,7 @@ static AsyncOpStatus httpParseStart(asyncOpRoot *opptr)
   if (op->state == 0) {
     client->requestBytesSent = 0;
     httpInit(&client->state);
+    httpSetBuffer(&client->state, client->inBuffer, 0);
 
     HttpComponent component;
     component.type = httpDtInitialize;
@@ -441,7 +442,8 @@ void aioHttpRequest(HTTPClient *client,
                     httpRequestCb callback,
                     void *arg)
 {
-  HTTPOp *op = allocHttpOp(httpParseStart, operationFinish, client, httpOpConnect, parseCallback, parseArg, (void*)callback, arg, afNone, usTimeout);
+  HTTPOp *op = allocHttpOp(httpParseStart, operationFinish, client, httpOpConnect, parseCallback, parseArg,
+                           (void*)callback, arg, afNone, usTimeout);
   httpOpSetData(op, request, requestSize);
   combinerPushOperation(&op->root);
 }

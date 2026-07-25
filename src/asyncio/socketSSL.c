@@ -3,7 +3,7 @@
 #include "asyncio/socket.h"
 #include "asyncio/socketSSL.h"
 #include "asyncioImpl.h"
-#include "io.h"
+#include "ioInternal.h"
 #include "atomic.h"
 #include <openssl/bio.h>
 #include <openssl/ssl.h>

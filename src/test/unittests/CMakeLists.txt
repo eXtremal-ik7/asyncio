@@ -30,14 +30,12 @@ set(
 set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2putils ${GTEST_LIBRARIES})
 include_directories(${GTEST_INCLUDE_DIRS})
 
-# asyncio/http.h pulls in socketSSL.h; http.c drags socketSSL.c into the link
-if (ASYNCIO_ENABLE_SSL)
-  include_directories(${OPENSSL_INCLUDE_DIRECTORY})
-  set(LIBRARIES ${LIBRARIES} ${OPENSSL_LIBRARIES})
-  if (WIN32)
-    # static libcrypto uses the system certificate store
-    set(LIBRARIES ${LIBRARIES} crypt32)
-  endif()
+# SSL, HTTP and SMTP are always part of asyncio.
+include_directories(${OPENSSL_INCLUDE_DIRECTORY})
+set(LIBRARIES ${LIBRARIES} ${OPENSSL_LIBRARIES})
+if (WIN32)
+  # static libcrypto uses the system certificate store
+  set(LIBRARIES ${LIBRARIES} crypt32)
 endif()
 
 if (ASYNCIO_ENABLE_ZMTP)

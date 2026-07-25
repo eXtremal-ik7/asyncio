@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -1294,6 +1295,48 @@ TEST(socket, test_udp_fire_and_forget_sync_result)
   asyncLoop(gBase);
   deleteAioObject(context.clientSocket);
   deleteAioObject(context.serverSocket);
+}
+
+struct UnsupportedDatagramSizeContext {
+  asyncBase *base;
+  aioObject *socket;
+  HostAddress address;
+  ssize_t readResult = 0;
+  ssize_t writeResult = 0;
+};
+
+static void unsupportedDatagramSizeProc(void *arg)
+{
+  UnsupportedDatagramSizeContext *ctx = static_cast<UnsupportedDatagramSizeContext*>(arg);
+  uint8_t byte = 0;
+  size_t size = (size_t)INT_MAX + 1;
+  ctx->writeResult = ioWriteMsg(ctx->socket, &ctx->address, &byte, size, afNoCopy, 100000);
+  ctx->readResult = ioReadMsg(ctx->socket, &byte, size, afNone, 100000);
+  postQuitOperation(ctx->base);
+}
+
+TEST(socket, unsupported_datagram_size_is_rejected)
+{
+  UnsupportedDatagramSizeContext context = {};
+  context.base = gBase;
+  context.socket = initializeUDPClient(gBase);
+  ASSERT_NE(context.socket, nullptr);
+  context.address.family = AF_INET;
+  context.address.ipv4 = inet_addr("127.0.0.1");
+  context.address.port = gPort;
+
+  uint8_t byte = 0;
+  size_t size = (size_t)INT_MAX + 1;
+  EXPECT_EQ(aioWriteMsg(context.socket, &context.address, &byte, size, afNoCopy, 100000, nullptr, nullptr), -(ssize_t)aosUnknownError);
+  EXPECT_EQ(aioReadMsg(context.socket, &byte, size, afNone, 100000, nullptr, nullptr), -(ssize_t)aosUnknownError);
+
+  coroutineTy *coroutine = coroutineNew(unsupportedDatagramSizeProc, &context, 0x10000);
+  ASSERT_NE(coroutine, nullptr);
+  if (!coroutineCall(coroutine))
+    asyncLoop(gBase);
+  EXPECT_EQ(context.writeResult, -(ssize_t)aosUnknownError);
+  EXPECT_EQ(context.readResult, -(ssize_t)aosUnknownError);
+  deleteAioObject(context.socket);
 }
 
 // The coroutine datagram variants have a single reporting channel - the

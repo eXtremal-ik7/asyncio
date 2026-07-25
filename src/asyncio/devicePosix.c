@@ -1,5 +1,5 @@
 #include "asyncio/device.h"
-#include "io.h"
+#include "ioInternal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>

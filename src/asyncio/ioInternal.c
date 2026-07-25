@@ -1,10 +1,11 @@
-#include "io.h"
+#include "ioInternal.h"
 #include "asyncio/coroutine.h"
 #include "asyncio/device.h"
 #include "asyncio/socket.h"
 #include "atomic.h"
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #ifndef OS_WINDOWS
@@ -126,10 +127,10 @@ static asyncOpRoot *newAsyncOp(aioObjectRoot *object,
   op->state = 0;
   op->transactionSize = context->TransactionSize;
   op->bytesTransferred = 0;
-  if (opCode == actAccept) {
+  if (opCode == actAccept)
     op->acceptSocket = INVALID_SOCKET;
+  if (opCode == actAccept || opCode == actReadMsg)
     memset(&op->host, 0, sizeof(op->host));
-  }
   if (context->TransactionSize && (opCode & OPCODE_WRITE) && !(flags & afNoCopy)) {
     asyncOpEnsureInternalBuffer(&op->internalBuffer, &op->internalBufferSize, context->TransactionSize);
     memcpy(op->internalBuffer, context->Buffer, context->TransactionSize);
@@ -312,6 +313,11 @@ asyncOpRoot *implWrite(aioObject *object,
                        void *arg,
                        size_t *bytesTransferred)
 {
+  if (size == 0) {
+    *bytesTransferred = 0;
+    return 0;
+  }
+
   size_t bytes = 0;
   int result;
   if (object->root.header.objectType == ioObjectSocket) {
@@ -416,8 +422,14 @@ ssize_t aioWrite(aioObject *object, const void *buffer, size_t size, AsyncFlags 
 // Winsock consumes an oversized datagram and reports WSAEMSGSIZE, POSIX
 // returns the clipped payload flagged MSG_TRUNC - either way the datagram is
 // gone and must complete as aosBufferTooSmall, never be retried.
+static inline int messageSizeIsSupported(size_t size)
+{
+  return size <= (size_t)INT_MAX;
+}
+
 static ssize_t readMsgSyscall(aioObject *object, void *buffer, size_t size, struct sockaddr_storage *source, AsyncOpStatus *status)
 {
+  assert(messageSizeIsSupported(size));
 #ifdef OS_WINDOWS
   socketLenTy addrlen = sizeof(*source);
   ssize_t result = recvfrom(object->hSocket, buffer, (int)size, 0, (struct sockaddr*)source, &addrlen);
@@ -457,6 +469,7 @@ static ssize_t readMsgSyscall(aioObject *object, void *buffer, size_t size, stru
 
 static ssize_t writeMsgSyscall(aioObject *object, const HostAddress *address, const void *buffer, size_t size)
 {
+  assert(messageSizeIsSupported(size));
   struct sockaddr_storage remoteAddress;
   socketLenTy addrlen = hostAddressToSockaddr(address, &remoteAddress);
 #ifdef OS_WINDOWS
@@ -504,7 +517,13 @@ ssize_t aioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flag
 
   struct sockaddr_storage source;
   AsyncOpStatus status;
-  ssize_t result = readMsgSyscall(object, buffer, size, &source, &status);
+  ssize_t result;
+  if (messageSizeIsSupported(size)) {
+    result = readMsgSyscall(object, buffer, size, &source, &status);
+  } else {
+    result = -1;
+    status = aosUnknownError;
+  }
 
   if (status != aosPending) {
     // Data, truncation and fatal socket errors are all terminal: only
@@ -552,21 +571,23 @@ ssize_t aioWriteMsg(aioObject *object,
   }
 
   // Datagram socket can be accessed by multiple threads without lock
-  ssize_t result = writeMsgSyscall(object, address, buffer, size);
+  int sizeIsSupported = messageSizeIsSupported(size);
+  ssize_t result = sizeIsSupported ? writeMsgSyscall(object, address, buffer, size) : -1;
 
-  if (result >= 0) {
+  if (result >= 0 || !sizeIsSupported) {
+    AsyncOpStatus status = result >= 0 ? aosSuccess : aosUnknownError;
     if (callback == 0 || ((flags & afActiveOnce) && currentFinishedSync++ < MAX_SYNCHRONOUS_FINISHED_OPERATION))
-      return result;
+      return status == aosSuccess ? result : -(ssize_t)status;
 
     if (flags & afActiveOnce)
       currentFinishedSync = 0;
-    // The datagram already left through the syscall; the op only carries
-    // the completion, so the payload capture copy is skipped (afNoCopy)
+    // The operation is already terminal; the op only carries its completion,
+    // so the payload capture copy is skipped (afNoCopy)
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.writeMsg, rwFinish, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afNoCopy, usTimeout, (void*)callback, arg, actWriteMsg, &context);
-    op->bytesTransferred = (size_t)result;
-    opForceStatus(&op->root, aosSuccess);
+    op->bytesTransferred = status == aosSuccess ? (size_t)result : 0;
+    opForceStatus(&op->root, status);
     addToGlobalQueue(&op->root);
   } else {
     struct Context context;
@@ -639,7 +660,13 @@ ssize_t ioReadMsg(aioObject *object, void *buffer, size_t size, AsyncFlags flags
   // Datagram socket can be accessed by multiple threads without lock
   struct sockaddr_storage source;
   AsyncOpStatus status;
-  ssize_t result = readMsgSyscall(object, buffer, size, &source, &status);
+  ssize_t result;
+  if (messageSizeIsSupported(size)) {
+    result = readMsgSyscall(object, buffer, size, &source, &status);
+  } else {
+    result = -1;
+    status = aosUnknownError;
+  }
 
   if (status != aosPending) {
     // Preserve the fairness budget for every terminal inline result. Fatal
@@ -673,21 +700,23 @@ ssize_t ioWriteMsg(aioObject *object, const HostAddress *address, const void *bu
     return -(ssize_t)aosCanceled;
 
   // Datagram socket can be accessed by multiple threads without lock
-  ssize_t result = writeMsgSyscall(object, address, buffer, size);
+  int sizeIsSupported = messageSizeIsSupported(size);
+  ssize_t result = sizeIsSupported ? writeMsgSyscall(object, address, buffer, size) : -1;
 
-  if (result != -1) {
-    // Data received synchronously
+  if (result != -1 || !sizeIsSupported) {
+    AsyncOpStatus status = result != -1 ? aosSuccess : aosUnknownError;
     if (++currentFinishedSync < MAX_SYNCHRONOUS_FINISHED_OPERATION)
-      return result;
+      return status == aosSuccess ? result : -(ssize_t)status;
 
-    // The datagram already left through the syscall; the op only carries
-    // the completion, so the payload capture copy is skipped (afNoCopy)
+    // The operation is already terminal; the op only carries its completion,
+    // so the payload capture copy is skipped (afNoCopy)
     struct Context context;
     fillContext(&context, object->root.header.base->methodImpl.writeMsg, 0, (void*)((uintptr_t)buffer), size);
     asyncOp *op = (asyncOp*)newAsyncOp(&object->root, flags | afCoroutine | afNoCopy, usTimeout, 0, 0, actWriteMsg, &context);
-    op->host = *address;
-    op->bytesTransferred = (size_t)result;
-    opForceStatus(&op->root, aosSuccess);
+    if (status == aosSuccess)
+      op->host = *address;
+    op->bytesTransferred = status == aosSuccess ? (size_t)result : 0;
+    opForceStatus(&op->root, status);
     addToGlobalQueue(&op->root);
     coroutineYield();
     return coroutineRwFinish(op);

@@ -4,7 +4,7 @@
 #define __ASYNCIO_REACTOR_H_
 
 #include "asyncioImpl.h"
-#include "io.h"
+#include "ioInternal.h"
 
 #ifndef OS_WINDOWS
 #include <fcntl.h>
@@ -319,6 +319,7 @@ static inline AsyncOpStatus writeMsgSyscall(asyncOpRoot *opptr)
   socklen_t addrLen = hostAddressToSockaddr(&op->host, &remoteAddress);
   ssize_t result = sendto(fd, op->buffer, op->transactionSize, ASYNCIO_MSG_NOSIGNAL, (struct sockaddr*)&remoteAddress, addrLen);
   if (result != -1) {
+    op->bytesTransferred = (size_t)result;
     return aosSuccess;
   }
 
