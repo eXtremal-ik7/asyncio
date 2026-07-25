@@ -25,10 +25,10 @@ if (NOT Sources)
   file(WRITE ${Sources} "")
 endif()
 
-add_library(asyncioextras-0.5 STATIC ${Sources})
-target_include_directories(asyncioextras-0.5 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../asyncio)
+add_library(asyncioextras-0.6 STATIC ${Sources})
+target_include_directories(asyncioextras-0.6 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../asyncio)
 
 install(
-  TARGETS asyncioextras-0.5
+  TARGETS asyncioextras-0.6
   ARCHIVE DESTINATION lib
 )

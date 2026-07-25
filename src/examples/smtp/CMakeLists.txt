@@ -1,6 +1,6 @@
 foreach(target smtp smtp2 smtp_coro smtp2_coro)
   add_executable(${target} ${target}.cpp)
-  target_link_libraries(${target} asyncio-0.5 p2putils OpenSSL::SSL OpenSSL::Crypto)
+  target_link_libraries(${target} asyncio-0.6 p2putils OpenSSL::SSL OpenSSL::Crypto)
   if (WIN32)
     target_link_libraries(${target} ws2_32 mswsock crypt32)
   else()

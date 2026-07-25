@@ -35,7 +35,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" O
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 endif ()
 
-add_library(asyncio-0.5 STATIC ${Sources})
+add_library(asyncio-0.6 STATIC ${Sources})
 
 # Build-time proof that the atomic128 layer stayed inline (nm/objdump over a
 # dedicated anchor object). MSVC intrinsics cannot silently become library
@@ -57,10 +57,10 @@ if (NOT MSVC)
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-  target_link_libraries(asyncio-0.5 rt)
+  target_link_libraries(asyncio-0.6 rt)
 endif()
 
 install(
-  TARGETS asyncio-0.5
+  TARGETS asyncio-0.6
   ARCHIVE DESTINATION lib
 )

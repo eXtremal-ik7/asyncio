@@ -27,7 +27,7 @@ set(
   clocksteptest.cpp
 )
 
-set(LIBRARIES asyncio-0.5 asyncioextras-0.5 p2putils ${GTEST_LIBRARIES})
+set(LIBRARIES asyncio-0.6 asyncioextras-0.6 p2putils ${GTEST_LIBRARIES})
 include_directories(${GTEST_INCLUDE_DIRS})
 
 # SSL, HTTP and SMTP are always part of asyncio.
