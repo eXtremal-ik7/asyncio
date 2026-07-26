@@ -21,11 +21,13 @@ private:
   int _own;
 
 public:
+  // Keep the invariant _msize > 0 implies _m != nullptr: reserve() relies on it to avoid
+  // pointer arithmetic on a null _p.
   xmstream(void *data, size_t size) :
     _m((uint8_t*)data),
     _p((uint8_t*)data),
-    _size(size),
-    _msize(size),
+    _size(data ? size : 0),
+    _msize(data ? size : 0),
     _eof(0),
     _own(0) {}
   xmstream(size_t size = 64) :
@@ -134,6 +136,8 @@ public:
       _own = 1;
       return p;
     } else {
+      if (!_m)
+        return nullptr;
       void *p = _p;
       _p += size;
       _size = required < _size ? _size : required;
